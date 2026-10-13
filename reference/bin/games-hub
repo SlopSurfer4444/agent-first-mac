@@ -1,0 +1,246 @@
+#!/usr/bin/python3
+"""Private, reviewed adoption of the owner's working game environment."""
+import sys
+sys.dont_write_bytecode = True
+import fcntl, hashlib, json, os, pwd, shutil, stat, subprocess
+from pathlib import Path
+HOME = Path(pwd.getpwuid(os.getuid()).pw_dir)
+CONTROL = HOME/'AIDev/control'
+HERE = Path(__file__).resolve().parent.parent
+ROOT = HOME/'Library/Application Support/Adapted Games'
+STANDALONE = HOME/'Library/Application Support/CS2 Standalone/runtime'
+RESOURCES = Path('/Applications/GameToMac.app/Contents/Resources')
+DONOR = HOME/'Library/Application Support/Game Library/Games/cs2'
+ENGINE = 'engine-wine11-cs2-prewarm-v1-audio-input-v1-controllers-v1'
+MANIFEST = 'manifests/games-hub.json'
+
+def need(ok, reason):
+    if not ok: raise RuntimeError(reason)
+
+def sha(p):
+    h=hashlib.sha256()
+    with p.open('rb') as f:
+        for b in iter(lambda:f.read(1048576), b''): h.update(b)
+    return h.hexdigest()
+
+def run(args, timeout=600, env=None):
+    p=subprocess.run([str(x) for x in args], capture_output=True, timeout=timeout, env=env)
+    need(p.returncode==0, 'command_failed_'+Path(args[0]).name)
+    return p.stdout
+
+def safe_directory(p):
+    for x in [*reversed(p.parents),p]:
+        s=x.lstat()
+        need(stat.S_ISDIR(s.st_mode) and s.st_uid in (0,os.getuid()) and not s.st_mode&0o002, 'unsafe_directory')
+
+def code_tree(p):
+    """Fingerprint regular code and literal links, never private prefix contents."""
+    rows=[]
+    for x in sorted(p.rglob('*')):
+        s=x.lstat(); r=str(x.relative_to(p))
+        if stat.S_ISLNK(s.st_mode): rows.append([r,'link',os.readlink(x)])
+        elif stat.S_ISREG(s.st_mode):
+            need(s.st_uid in (0,os.getuid()) and not s.st_mode&0o022,'unsafe_code')
+            rows.append([r,s.st_mode&0o777,sha(x)])
+        else: need(stat.S_ISDIR(s.st_mode),'unsafe_code_entry')
+    return hashlib.sha256(json.dumps(rows,separators=(',',':')).encode()).hexdigest()
+
+def safe_file(p):
+    s=p.lstat()
+    need(stat.S_ISREG(s.st_mode) and s.st_uid==os.getuid() and not s.st_mode&0o022,'unsafe_managed_file')
+
+def snapshot(p):
+    # Metadata only: do not parse, print or hash account/save contents.
+    rows=[]
+    for x in sorted(p.rglob('*')):
+        s=x.lstat(); r=str(x.relative_to(p))
+        need(s.st_uid==os.getuid(),'foreign_profile_owner')
+        if stat.S_ISLNK(s.st_mode):
+            target=os.readlink(x)
+            allowed={'dosdevices/z:':'/','dosdevices/c:':'../drive_c','drive_c/users/crossover/Desktop/My Mac Desktop':str(HOME/'Desktop')}
+            need(allowed.get(r)==target,'unexpected_profile_link')
+            rows.append((r,'link',target))
+        elif stat.S_ISREG(s.st_mode): rows.append((r,'file',s.st_size,s.st_mtime_ns))
+        else: need(stat.S_ISDIR(s.st_mode),'unsupported_profile_entry')
+    return rows
+
+def source_gate(commit):
+    need(HERE==CONTROL and Path(__file__).absolute()==CONTROL/'bin/games-hub','canonical_source_required')
+    def git(*a): return run(['/usr/bin/git','-c','core.hooksPath=/dev/null','-C',CONTROL,*a]).decode().strip()
+    need(len(commit)==40 and all(c in '0123456789abcdef' for c in commit),'invalid_commit')
+    need(git('rev-parse','HEAD')==commit and git('branch','--show-current')=='main' and not git('status','--porcelain'),'clean_exact_main_required')
+    d=json.loads(run([CONTROL/'bin/current-doctor','--json']))
+    need(d.get('verdict')=='PASS' and all(d.get(k) is True for k in ('configurationSourceAccepted','currentSentinelReady','integratedMain')) and d.get('gitOnly') is False,'fresh_accepted_doctor_required')
+    need(git('rev-parse','HEAD')==commit and not git('status','--porcelain'),'source_changed')
+
+def inactive():
+    env={'HOME':str(HOME),'PATH':'/usr/bin:/bin','WINEPREFIX':str(DONOR/'prefix'),'WINESERVER':str(DONOR/ENGINE/'bin/wineserver')}
+    try: run([DONOR/ENGINE/'bin/wineserver','-w'],timeout=3,env=env)
+    except subprocess.TimeoutExpired: raise RuntimeError('source_profile_active')
+
+def copy(src,dst):
+    need(not dst.exists() and not dst.is_symlink(),'destination_collision')
+    run(['/bin/cp','-cR',src,dst],timeout=1800)
+
+def rebase_fonts(prefix):
+    old=('Z:'+str(DONOR/ENGINE/'share/wine/fonts').replace('/','\\')).replace('\\','\\\\')
+    new=('Z:'+str(ROOT/'runtime/engine/share/wine/fonts').replace('/','\\')).replace('\\','\\\\')
+    n=0
+    for name in ('system.reg','user.reg','userdef.reg'):
+        p=prefix/name
+        need(p.is_file() and not p.is_symlink(),'registry_missing')
+        raw=p.read_bytes(); a=old.encode(); b=new.encode()
+        n+=raw.count(a)
+        if a in raw: p.write_bytes(raw.replace(a,b))
+    return n
+
+def shortcuts():
+    return {'CS2.command':'cs2','Prince — Ubisoft Connect.command':'prince','Steam — другие игры.command':'steam'}
+
+def shortcut_bytes(mode):
+    return ('#!/bin/zsh\nexec "$HOME/AIDev/bin/games-play" '+mode+'\n').encode()
+
+def verify_app_shortcuts(receipt, expected):
+    inventory = receipt.get('appLaunchers')
+    need(type(inventory) is dict and set(inventory) == set(expected), 'app_inventory_drift')
+    need(type(receipt.get('appPolicySha256')) is str and len(receipt['appPolicySha256']) == 64 and all(c in '0123456789abcdef' for c in receipt['appPolicySha256']), 'app_policy_binding')
+    files = {'Contents/Info.plist':0o600, 'Contents/MacOS/launcher':0o700, 'Contents/Resources/Game.icns':0o600}
+    for name in expected:
+        app = HOME/'Games'/name; safe_directory(app)
+        need(type(inventory[name]) is dict and set(inventory[name]) == set(files), 'app_inventory_drift')
+        observed_files = set(); observed_dirs = set()
+        for p in app.rglob('*'):
+            s = p.lstat(); rel = str(p.relative_to(app))
+            if stat.S_ISDIR(s.st_mode):
+                safe_directory(p); observed_dirs.add(rel)
+            else:
+                need(stat.S_ISREG(s.st_mode) and s.st_uid == os.getuid() and s.st_nlink == 1 and s.st_size <= 16*1024*1024, 'unsafe_app_file')
+                need(rel in files and s.st_mode & 0o777 == files[rel], 'app_mode_drift')
+                need(inventory[name][rel] == {'sha256':sha(p), 'mode':files[rel]}, 'app_file_drift')
+                observed_files.add(rel)
+        need(observed_files == set(files) and observed_dirs == {'Contents','Contents/MacOS','Contents/Resources'}, 'app_inventory_drift')
+    for name in expected.values():
+        p = HOME/'Games'/name; need(not p.exists() and not p.is_symlink(), 'legacy_shortcut_collision')
+
+def verify_overlay_manifest(m):
+    # Optional ordinary-payload successor; status still requires exact installed
+    # manifest bytes to equal current accepted source before invoking this check.
+    if 'runtimeOverlayPolicySha256' not in m: return
+    need(type(m.get('schema')) is int and m.get('schema') == 1 and m.get('id') == 'games-hub' and m.get('owner') == 'control-games-hub', 'overlay_hub_identity')
+    digest = m['runtimeOverlayPolicySha256']
+    need(type(digest) is str and len(digest) == 64 and all(c in '0123456789abcdef' for c in digest), 'overlay_policy_pin')
+    policy_path = HERE/'manifests/wine-runtime-overlay.json'; safe_file(policy_path)
+    need(policy_path.stat().st_size <= 1024*1024 and sha(policy_path) == digest, 'overlay_policy_pin')
+    def unique(items):
+        result = {}
+        for key,value in items:
+            need(key not in result,'duplicate_overlay_policy_key'); result[key] = value
+        return result
+    policy = json.loads(policy_path.read_text(),object_pairs_hook=unique)
+    fields = {'schema','id','owner','previousHubManifestSha256','previousDS3ManifestSha256','previousHubCriticalHashes','sourceHubManifestSha256','sourceCriticalHashes','desiredPEHashes','lifecycleSha256'}
+    need(type(policy) is dict and set(policy) == fields and type(policy['schema']) is int and policy['schema'] == 1 and policy['id'] == 'wine-runtime-overlay' and policy['owner'] == 'control-games-hub', 'overlay_policy_schema')
+    paths = {'engine/lib/wine/i386-windows/winemac.drv','engine/lib/wine/x86_64-windows/winemac.drv'}
+    need(type(policy['desiredPEHashes']) is dict and set(policy['desiredPEHashes']) == paths and type(policy['previousHubCriticalHashes']) is dict, 'overlay_pe_schema')
+    need(all(type(value) is str and len(value) == 64 and all(c in '0123456789abcdef' for c in value) for value in policy['desiredPEHashes'].values()), 'overlay_pe_pins')
+    expected = dict(policy['previousHubCriticalHashes']); expected.update(policy['desiredPEHashes'])
+    need(m.get('criticalHashes') == expected, 'overlay_critical_binding')
+
+def status():
+    safe_directory(ROOT)
+    for name in ('receipt.json','manifest.json','games-play'): safe_file(ROOT/name)
+    need((ROOT/'manifest.json').read_bytes()==(HERE/MANIFEST).read_bytes(),'installed_manifest_drift')
+    m=json.loads((HERE/MANIFEST).read_text()); receipt=json.loads((ROOT/'receipt.json').read_text())
+    verify_overlay_manifest(m)
+    need(receipt['manifestSha256']==sha(HERE/MANIFEST),'manifest_drift')
+    need(code_tree(ROOT/'runtime')==receipt['runtimeTreeSha256'],'runtime_drift')
+    need(sha(ROOT/'games-play')==receipt['launcherSha256'],'launcher_drift')
+    resolver=HOME/'AIDev/bin/games-play'
+    need(resolver.is_symlink() and resolver.resolve()==ROOT/'games-play','resolver_drift')
+    desktop=HOME/'Desktop/Игры'
+    need(desktop.is_symlink() and desktop.resolve()==HOME/'Games','desktop_link_drift')
+    if 'appLaunchers' in receipt:
+        verify_app_shortcuts(receipt,{name.replace('.command','.app'):name for name in shortcuts()})
+    else:
+        for name,mode in shortcuts().items():
+            p=HOME/'Games'/name
+            need(not p.is_symlink() and p.read_bytes()==shortcut_bytes(mode),'shortcut_drift')
+    need((ROOT/'profiles/prince/drive_c/Program Files (x86)/Ubisoft/Ubisoft Game Launcher/upc.exe').is_file(),'connect_missing')
+    for p in (ROOT/'runtime').rglob('*'):
+        if p.is_symlink(): need(p.resolve().is_relative_to(ROOT/'runtime'),'external_runtime_link')
+    return {'state':'installed','runtimeVerified':True,'independentRuntime':True,'initialCopyVerified':True}
+
+def check_source():
+    m=json.loads((HERE/MANIFEST).read_text())
+    safe_directory(DONOR/'prefix');safe_directory(STANDALONE);safe_directory(RESOURCES)
+    overlay=RESOURCES/'Controllers/EngineOverlay/lib/wine/x86_64-unix'
+    sources=RESOURCES/'Sources/ControllerRuntime'
+    need(code_tree(STANDALONE)==m['sourceTrees']['standalone'],'standalone_runtime_drift')
+    need(code_tree(sources)==m['sourceTrees']['controllerSources'],'controller_source_drift')
+    for name,digest in m['controllerOverlay'].items():
+        need(not (overlay/name).is_symlink() and sha(overlay/name)==digest,'controller_overlay_drift')
+    for rel,digest in m['criticalHashes'].items():
+        p=DONOR/ENGINE/Path(rel).relative_to('engine')
+        need(not p.is_symlink() and sha(p)==digest,'working_runtime_mismatch')
+    snapshot(DONOR/'prefix');inactive()
+    return {'state':'SOURCE_VERIFIED','workingRuntimeMatched':True,'sourceInactive':True}
+
+def install(commit):
+    source_gate(commit)
+    if ROOT.exists() or ROOT.is_symlink(): return dict(status(),changed=False)
+    m=json.loads((HERE/MANIFEST).read_text())
+    safe_directory(ROOT.parent); safe_directory(DONOR); safe_directory(HOME/'AIDev/bin')
+    hub=HOME/'Games'; resolver=HOME/'AIDev/bin/games-play'
+    desktop=HOME/'Desktop/Игры'
+    need(not desktop.exists() and not desktop.is_symlink(),'desktop_collision')
+    safe_directory(HOME/'Desktop')
+    need(not hub.exists() and not hub.is_symlink() and not resolver.exists() and not resolver.is_symlink(),'visible_destination_collision')
+    check_source()
+    standalone=STANDALONE
+    overlay=RESOURCES/'Controllers/EngineOverlay/lib/wine/x86_64-unix'
+    sources=RESOURCES/'Sources/ControllerRuntime'
+    inactive(); before=snapshot(DONOR/'prefix')
+    ROOT.mkdir(mode=0o700); (ROOT/'profiles').mkdir(mode=0o700)
+    copy(standalone,ROOT/'runtime')
+    # Exact pinned predecessor metadata is retained as provenance, not ownership.
+    provenance=ROOT/'runtime/sources/StandaloneAdoption';provenance.mkdir(mode=0o700)
+    for name in ('.owner.json','.manifest.json'):
+        if (ROOT/'runtime'/name).exists(): (ROOT/'runtime'/name).rename(provenance/name[1:])
+    for name in m['controllerOverlay']:
+        shutil.copy2(overlay/name,ROOT/'runtime/engine/lib/wine/x86_64-unix'/name)
+    copy(sources,ROOT/'runtime/sources/ControllerRuntime')
+    copy(DONOR/'prefix',ROOT/'profiles/prince')
+    inactive(); need(before==snapshot(DONOR/'prefix')==snapshot(ROOT/'profiles/prince'),'profile_changed_during_copy')
+    (ROOT/'profiles/prince').chmod(0o700)
+    fonts=rebase_fonts(ROOT/'profiles/prince')
+    need(fonts==m['fontPathCount'],'font_path_count_drift')
+    (ROOT/'logs').mkdir(mode=0o700)
+    shutil.copyfile(HERE/'bin/games-play',ROOT/'games-play'); (ROOT/'games-play').chmod(0o700)
+    shutil.copyfile(HERE/MANIFEST,ROOT/'manifest.json')
+    hub.mkdir(mode=0o700)
+    for name,mode in shortcuts().items():
+        p=hub/name; p.write_bytes(shortcut_bytes(mode)); p.chmod(0o700)
+    (hub/'README.txt').write_text('Игры на Mac\n\nPrince: включите VPN, откройте Ubisoft Connect и нажмите Play в библиотеке.\nCS2: отдельный проверенный запуск.\nSteam: установка других игр; совместимость каждой игры проверяется отдельно.\nДанные: ~/Library/Application Support/Adapted Games\nCS2 сохраняет отдельную проверенную среду. Старые данные сохранены для восстановления.\n')
+    resolver.symlink_to(ROOT/'games-play')
+    (HOME/'Desktop/Игры').symlink_to(hub)
+    receipt={'schema':1,'owner':'control-games-hub','commit':commit,'manifestSha256':sha(HERE/MANIFEST),'launcherSha256':sha(ROOT/'games-play'),'runtimeTreeSha256':code_tree(ROOT/'runtime'),'profileFiles':len(before),'fontPathsRebased':fonts}
+    (ROOT/'receipt.json').write_text(json.dumps(receipt,indent=2)+'\n')
+    return dict(status(),changed=True)
+
+def main():
+    os.umask(0o077)
+    need(len(sys.argv) in (2,3),'usage')
+    # Existing trusted private state directory gives a shared install lock.
+    lockdir=HOME/'AIDev/state'; safe_directory(lockdir)
+    lp=lockdir/'games-hub.lock'
+    fd=os.open(lp,os.O_CREAT|os.O_RDWR|os.O_NOFOLLOW,0o600)
+    with os.fdopen(fd,'w') as f:
+        fcntl.flock(f,fcntl.LOCK_EX|fcntl.LOCK_NB)
+        if sys.argv[1]=='install' and len(sys.argv)==3: result=install(sys.argv[2])
+        elif sys.argv[1]=='status' and len(sys.argv)==2: result=status()
+        elif sys.argv[1]=='check-source' and len(sys.argv)==2: result=check_source()
+        else: raise RuntimeError('usage')
+        print(json.dumps(result))
+if __name__=='__main__':
+    try: main()
+    except Exception as e:
+        print(json.dumps({'state':'BLOCKED','reason':str(e) if type(e) is RuntimeError else type(e).__name__})); sys.exit(1)

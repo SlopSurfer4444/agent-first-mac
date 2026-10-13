@@ -1,0 +1,481 @@
+#!/usr/bin/python3
+"""Fail-closed static validator for Phase 3 preparation artifacts."""
+
+from copy import deepcopy
+import json
+import os
+from pathlib import Path
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+
+
+ROOT = Path(__file__).resolve().parents[1]
+BASE = "2fdbd7e7419fc049565f87b29a21b7dd1838a754"
+BRANCH = "codex/phase-3-permissions-prep"
+MANIFEST_PATH = ROOT / "manifests/phase3-capabilities.json"
+EVIDENCE_PATH = ROOT / "evidence/phase-3/preparation.json"
+ALLOWED_FILES = {
+    "bin/check-phase3-prep",
+    "bin/phase3-preflight",
+    "docs/phase-3-permission-ceremony.md",
+    "evidence/phase-3/preparation.json",
+    "manifests/phase3-capabilities.json",
+    "tests/fixtures/phase3-preflight-positive.json",
+}
+EXPECTED_IDENTITIES = {
+    "codex_desktop": ("com.openai.codex", "2DC432GLL2"),
+    "computer_use_runtime": ("com.openai.sky.CUAService", "2DC432GLL2"),
+    "computer_use_client": ("com.openai.sky.CUAService.cli", "2DC432GLL2"),
+    "computer_use_guardian": ("com.openai.sky.CUAService.guardian", "2DC432GLL2"),
+    "computer_use_installer": (
+        "com.openai.sky.CUAService.AuthorizationPluginInstaller", "2DC432GLL2",
+    ),
+    "authorization_plugin_embedded": (
+        "com.openai.sky.CUAService.AuthorizationPlugin", "2DC432GLL2",
+    ),
+    "authorization_plugin_installed": (
+        "com.openai.sky.CUAService.AuthorizationPlugin", "2DC432GLL2",
+    ),
+    "google_chrome": ("com.google.Chrome", "EQHXZ8M8AV"),
+    "google_updater": ("com.google.GoogleUpdater", "EQHXZ8M8AV"),
+    "happ_app": ("su.ffg.happ", "A6NW69KD84"),
+    "happ_tunnel_extension": ("su.ffg.happ.tunnel", "A6NW69KD84"),
+    "amnezia_app": ("org.amnezia.AmneziaVPN", "X7UJ388FXK"),
+    "amnezia_network_extension": (
+        "org.amnezia.AmneziaVPN.network-extension", "X7UJ388FXK",
+    ),
+}
+EXPECTED_CAPABILITIES = {
+    "macos_tcc.full_disk_access_codex",
+    "macos_tcc.accessibility_computer_use",
+    "macos_tcc.screen_recording_computer_use",
+    "macos_tcc.input_monitoring_computer_use",
+    "macos_tcc.conditional_data_and_app_controls",
+    "computer_use.product_allowlist",
+    "chrome.extension_domain_and_history",
+    "background.google_updater",
+    "locked_use.authorization_plugin",
+    "developer_tools.privacy_and_security",
+    "vpn.inventory_adoption",
+    "phase4.aid_admin",
+}
+STATUS_VOCABULARY = {
+    "verified_identity", "absent", "mismatch", "safely_observed",
+    "unknown_requires_ceremony_probe", "blocked",
+}
+
+
+def require(condition, message):
+    if not condition:
+        raise ValueError(message)
+
+
+def run(argv):
+    completed = subprocess.run(
+        [str(item) for item in argv], cwd=ROOT, text=True,
+        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, check=False,
+    )
+    return completed.returncode, completed.stdout.strip()
+
+
+def validate_designated_requirement(item):
+    requirement = item["designated_requirement"]
+    require(f'identifier "{item["bundle_id"]}"' in requirement or (
+        item["id"] == "google_chrome" and 'identifier "com.google.Chrome"' in requirement
+    ), f"designated requirement identifier mismatch: {item['id']}")
+    team = item["team_id"]
+    if not item["id"].startswith("amnezia_"):
+        require(
+            f'subject.OU] = "{team}"' in requirement or f"subject.OU] = {team}" in requirement,
+            f"designated requirement Team mismatch: {item['id']}",
+        )
+    require("anchor apple generic" in requirement, f"untrusted requirement anchor: {item['id']}")
+
+
+def validate_manifest(manifest):
+    require(manifest.get("schema") == 1, "manifest schema")
+    require(manifest.get("phase") == "phase3_permissions_preparation", "manifest phase")
+    authority = manifest["authority"]
+    require(authority == {
+        "base_commit": BASE,
+        "branch": BRANCH,
+        "permission_ceremony_authorized": False,
+        "system_mutation_authorized": False,
+        "verdict_ceiling": "PREPARED_FOR_INDEPENDENT_REVIEW",
+    }, "authority drift")
+    provenance = manifest["provenance"]
+    require(provenance["verified_on"] == "2026-07-14", "provenance date")
+    for name, url in provenance.items():
+        if name == "verified_on":
+            continue
+        require(url.startswith(("https://support.apple.com/", "https://developer.apple.com/",
+                                "https://learn.chatgpt.com/")), f"non-primary source: {name}")
+
+    identities = manifest["logical_identities"]
+    require(len(identities) == len(EXPECTED_IDENTITIES), "identity count")
+    by_id = {item["id"]: item for item in identities}
+    require(set(by_id) == set(EXPECTED_IDENTITIES), "identity set")
+    for identity_id, (bundle_id, team_id) in EXPECTED_IDENTITIES.items():
+        item = by_id[identity_id]
+        require(item["bundle_id"] == bundle_id, f"bundle mismatch: {identity_id}")
+        require(item["team_id"] == team_id, f"Team mismatch: {identity_id}")
+        require(item["path"].startswith(("/Applications/", "/Library/", "$HOME/")),
+                f"non-canonical path: {identity_id}")
+        require(re.fullmatch(r"[0-9]+(?:\.[0-9]+){2,3}", item["observed_version"]) is not None,
+                f"version class: {identity_id}")
+        expected_version_policy = (
+            "rolling_vendor_identity_reattest" if identity_id == "google_updater"
+            else "exact_observed_retest_on_change"
+        )
+        require(item["version_policy"] == expected_version_policy,
+                f"version policy: {identity_id}")
+        require(item["preparation_role"] in {
+            "required_ceremony_identity", "required_attribution_identity",
+            "optional_adoption_candidate",
+        }, f"preparation role: {identity_id}")
+        expected_verification = "deep_strict" if identity_id in {
+            "codex_desktop", "computer_use_runtime", "computer_use_client",
+            "computer_use_guardian", "computer_use_installer", "google_chrome",
+            "google_updater", "happ_app",
+        } else "strict"
+        require(item["signature_verification"] == expected_verification,
+                f"signature verification mode: {identity_id}")
+        require(item["primary_owner"] in {
+            "openai_vendor", "google_vendor_updater_observed", "mac_app_store_observed",
+            "vendor_lifecycle_unknown_observed_only",
+        }, f"owner class: {identity_id}")
+        validate_designated_requirement(item)
+
+    expected_roles = {
+        "codex_desktop": "required_ceremony_identity",
+        "computer_use_runtime": "required_ceremony_identity",
+        "computer_use_client": "required_attribution_identity",
+        "computer_use_guardian": "required_attribution_identity",
+        "computer_use_installer": "required_attribution_identity",
+        "authorization_plugin_embedded": "required_attribution_identity",
+        "authorization_plugin_installed": "required_attribution_identity",
+        "google_chrome": "optional_adoption_candidate",
+        "google_updater": "optional_adoption_candidate",
+        "happ_app": "optional_adoption_candidate",
+        "happ_tunnel_extension": "optional_adoption_candidate",
+        "amnezia_app": "optional_adoption_candidate",
+        "amnezia_network_extension": "optional_adoption_candidate",
+    }
+    require({key: by_id[key]["preparation_role"] for key in by_id} == expected_roles,
+            "required versus optional identity roles drifted")
+
+    relationships = manifest["identity_relationships"]
+    require(relationships == [{
+        "id": "locked_use_payload_version_alignment",
+        "left": "authorization_plugin_installed",
+        "operator": "same_version",
+        "right": "authorization_plugin_embedded",
+        "observed_status": "mismatch",
+        "effect": "locked_use_blocked_until_vendor_supported_owner_ceremony_and_reattestation",
+    }], "identity relationship drift")
+    require(by_id["authorization_plugin_installed"]["observed_version"] !=
+            by_id["authorization_plugin_embedded"]["observed_version"],
+            "known Locked Use mismatch was erased")
+
+    capabilities = manifest["capabilities"]
+    capability_by_id = {item["id"]: item for item in capabilities}
+    require(len(capabilities) == len(EXPECTED_CAPABILITIES), "capability count")
+    require(set(capability_by_id) == EXPECTED_CAPABILITIES, "unexpected capability")
+    identity_refs = set(EXPECTED_IDENTITIES)
+    required_fields = {
+        "id", "plane", "requirement", "rationale", "responsible_identity",
+        "safe_preflight", "observed_status", "future_probe", "owner_action",
+        "restart", "revoke", "reattestation",
+    }
+    for item in capabilities:
+        require(set(item) == required_fields, f"capability fields: {item['id']}")
+        require(item["observed_status"] in STATUS_VOCABULARY, f"capability status: {item['id']}")
+        require(item["responsible_identity"] is None or item["responsible_identity"] in identity_refs,
+                f"capability identity ref: {item['id']}")
+        for field in ("rationale", "safe_preflight", "future_probe", "owner_action",
+                      "restart", "revoke", "reattestation"):
+            require(isinstance(item[field], str) and item[field].strip(),
+                    f"empty capability field: {item['id']}:{field}")
+    require(capability_by_id["macos_tcc.input_monitoring_computer_use"]["requirement"] ==
+            "conditional_not_baseline", "Input Monitoring became baseline")
+    require(capability_by_id["locked_use.authorization_plugin"]["observed_status"] == "blocked",
+            "Locked Use blocker erased")
+    require(capability_by_id["vpn.inventory_adoption"]["observed_status"] == "blocked",
+            "VPN adoption blocker erased")
+    require(capability_by_id["phase4.aid_admin"]["requirement"] == "future_phase4_only",
+            "Phase 4 boundary erased")
+    require(set(manifest["preflight_status_vocabulary"]) == STATUS_VOCABULARY,
+            "status vocabulary")
+
+    adoption = manifest["adoption_candidates"]
+    require(set(adoption) == {"codex", "chrome", "vpn"}, "adoption classes")
+    require(adoption["chrome"]["ownership_change_authorized"] is False,
+            "Chrome owner change authorized")
+    require(adoption["chrome"]["profile_session_or_history_read"] is False,
+            "Chrome private state read")
+    require(adoption["vpn"] == {
+        "status": "present_inventory_only_with_adoption_blocker",
+        "payloads": [
+            "happ_app", "happ_tunnel_extension", "amnezia_app",
+            "amnezia_network_extension",
+        ],
+        "blockers": [
+            "amnezia_app_signature_resource_envelope_obsolete",
+            "amnezia_app_gatekeeper_rejected",
+            "amnezia_network_extension_signature_resource_envelope_obsolete",
+        ],
+        "ownership_change_authorized": False,
+        "profiles_credentials_or_network_state_read": False,
+    }, "VPN inventory/adoption drift")
+    require(by_id["happ_app"]["app_store_item_id"] == "6504287215" and
+            by_id["happ_app"]["app_store_receipt_present"] is True,
+            "Happ App Store provenance drift")
+    require(by_id["amnezia_app"]["architecture_class"] == "arm64_ios_style_wrapper",
+            "Amnezia wrapper class drift")
+
+
+def validate_evidence(evidence):
+    require(evidence["schema"] == 1, "evidence schema")
+    require(evidence["phase"] == "phase3_permissions_preparation", "evidence phase")
+    require(re.fullmatch(r"[0-9a-f]{40}", evidence["implementation"]["intent_commit"]),
+            "intent commit")
+    require(evidence["implementation"]["base_commit"] == BASE, "evidence base")
+    require(evidence["implementation"]["branch"] == BRANCH, "evidence branch")
+    inventory = evidence["inventory"]
+    require(inventory["all_declared_identities_verified"] is False,
+            "optional blocker falsely verified")
+    require(inventory["required_ceremony_and_attribution_identities_verified"] is True,
+            "required identities not verified")
+    require(inventory["vpn_adoption_candidates_present"] == [
+        "happ_app", "happ_tunnel_extension", "amnezia_app",
+        "amnezia_network_extension",
+    ], "VPN candidates missing from evidence")
+    require(inventory["happ_app_store_item_id"] == "6504287215" and
+            inventory["happ_receipt_signature_and_gatekeeper_health"] == "attested",
+            "Happ attestation evidence")
+    require(inventory["optional_adoption_blockers"] == [
+        "amnezia_app_signature_resource_envelope_obsolete",
+        "amnezia_app_gatekeeper_rejected",
+        "amnezia_network_extension_signature_resource_envelope_obsolete",
+    ], "Amnezia blockers missing")
+    require(inventory["vpn_profiles_credentials_or_network_state_read"] is False,
+            "VPN private/network state read")
+    require(evidence["gate"] == {
+        "ceremony_authorized": False,
+        "l3_claimed": False,
+        "phase3_pass_claimed": False,
+        "verdict": "PREPARED_FOR_INDEPENDENT_REVIEW",
+        "ceremony_blocked": True,
+        "blocker": "installed_locked_use_authorization_plugin_version_differs_from_embedded_payload",
+    }, "evidence gate")
+    require(evidence["system_mutations"] == {
+        "performed": False,
+        "tcc_or_permission_requests": False,
+        "app_helper_extension_or_session_changes": False,
+        "admin_or_root_actions": False,
+    }, "mutation evidence")
+    require(evidence["redaction"] == {
+        "bounded": True,
+        "private_paths": False,
+        "profiles_credentials_or_sessions": False,
+        "raw_logs_or_tcc": False,
+        "secrets": False,
+        "stable_machine_identifiers": False,
+    }, "redaction evidence")
+    require(all(item["result"] in {"pass", "expected_handoff", "observed_blocker"}
+                for item in evidence["validation"]), "validation result vocabulary")
+    require(any("dirty_worktree" in item["command_class"]
+                for item in evidence["validation"]), "dirty-worktree test missing")
+
+
+def scan_text(label, text):
+    require(re.search(r"/Users/[A-Za-z0-9._-]+", text) is None, f"private path: {label}")
+    require(re.search(
+        r"\b[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[1-5][0-9A-Fa-f]{3}-"
+        r"[89ABab][0-9A-Fa-f]{3}-[0-9A-Fa-f]{12}\b", text,
+    ) is None, f"stable UUID: {label}")
+    for pattern in (
+        "BEGIN PRIVATE" + " KEY", "BEGIN OPENSSH PRIVATE" + " KEY",
+        "client_" + "secret", "refresh_" + "token", "access_" + "token",
+        "password" + "=", "authorization" + ": bearer",
+    ):
+        require(pattern.lower() not in text.lower(), f"secret pattern: {label}")
+
+
+def validate_operational_texts():
+    paths = [ROOT / name for name in ALLOWED_FILES if (ROOT / name).exists()]
+    for path in paths:
+        scan_text(str(path.relative_to(ROOT)), path.read_text(errors="ignore"))
+    preflight = (ROOT / "bin/phase3-preflight").read_text()
+    require("control_git = git_facts()" in preflight and
+            'and control_git["clean"]' in preflight,
+            "dirty control Git is not fail closed")
+    mutating_patterns = [
+        r"\bsudo\b", r"\bosascript\b", r"DevToolsSecurity\s+-enable",
+        r"\btccutil\b", r"launchctl\s+(?:load|unload|bootstrap|bootout|kickstart)",
+        r"systemextensionsctl\s+(?:reset|uninstall)", r"pluginkit\s+-[ar]",
+        r"\b(?:kill|pkill)\b", r"defaults\s+write", r"rm\s+-rf",
+        r"\bbrew\s+(?:install|upgrade|uninstall)", r"\bnix\s+build",
+        r"darwin-rebuild\s+switch",
+    ]
+    for pattern in mutating_patterns:
+        require(re.search(pattern, preflight) is None, f"mutating preflight command: {pattern}")
+    for forbidden in (
+        "/Library/Application Support/com.apple." + "TCC",
+        "Migrate" + "FromWindows",
+    ):
+        require(forbidden not in preflight, f"forbidden dependency/read: {forbidden}")
+    ceremony = (ROOT / "docs/phase-3-permission-ceremony.md").read_text()
+    for required in (
+        "PREPARED_FOR_INDEPENDENT_REVIEW", "One future bounded owner ceremony",
+        "Input Monitoring", "Browser history", "prompt-free repetition",
+        "Failure, revoke, and rollback", "Phase 4 `aid-admin`",
+        "older version than the current",
+    ):
+        require(required in ceremony, f"ceremony contract missing: {required}")
+
+
+def validate_git(contract_only):
+    status, branch = run(["/usr/bin/git", "branch", "--show-current"])
+    require(status == 0 and branch == BRANCH, "unexpected control branch")
+    ancestor, _ = run(["/usr/bin/git", "merge-base", "--is-ancestor", BASE, "HEAD"])
+    require(ancestor == 0, "base is not ancestor")
+    changed_status, changed_output = run(["/usr/bin/git", "diff", "--name-only", BASE])
+    require(changed_status == 0, "cannot read base diff")
+    untracked_status, untracked_output = run([
+        "/usr/bin/git", "ls-files", "--others", "--exclude-standard",
+    ])
+    require(untracked_status == 0, "cannot read untracked files")
+    changed = set(filter(None, changed_output.splitlines()))
+    changed.update(filter(None, untracked_output.splitlines()))
+    allowed = set(ALLOWED_FILES)
+    if contract_only:
+        allowed.remove("evidence/phase-3/preparation.json")
+    require(changed <= allowed, f"unexpected changed files: {sorted(changed - allowed)}")
+    require({
+        "bin/check-phase3-prep", "bin/phase3-preflight",
+        "docs/phase-3-permission-ceremony.md", "manifests/phase3-capabilities.json",
+        "tests/fixtures/phase3-preflight-positive.json",
+    } <= changed, "required contract diff missing")
+    diff_check, _ = run(["/usr/bin/git", "diff", "--check", BASE])
+    require(diff_check == 0, "git diff check")
+
+
+def self_test(manifest):
+    cases = []
+
+    def expect_failure(name, callback):
+        try:
+            callback()
+        except Exception:
+            cases.append({"id": name, "result": "pass"})
+        else:
+            raise ValueError(f"negative test did not fail: {name}")
+
+    altered = deepcopy(manifest)
+    altered["logical_identities"].pop()
+    expect_failure("missing_identity", lambda: validate_manifest(altered))
+    for field, value, name in (
+        ("team_id", "WRONGTEAM1", "wrong_team"),
+        ("bundle_id", "invalid.bundle", "wrong_bundle"),
+        ("designated_requirement", "identifier invalid", "wrong_designated_requirement"),
+    ):
+        altered = deepcopy(manifest)
+        altered["logical_identities"][0][field] = value
+        expect_failure(name, lambda altered=altered: validate_manifest(altered))
+    altered = deepcopy(manifest)
+    altered["capabilities"].append(deepcopy(altered["capabilities"][0]))
+    altered["capabilities"][-1]["id"] = "unexpected.capability"
+    expect_failure("unexpected_capability", lambda: validate_manifest(altered))
+    expect_failure("malformed_json", lambda: json.loads("{"))
+    expect_failure("mutating_command", lambda: require(
+        re.search(r"\bsudo\b", "sudo forbidden") is None, "mutation"))
+    expect_failure("private_path", lambda: scan_text(
+        "synthetic", "/" + "Users/example/private"))
+    expect_failure("secret", lambda: scan_text(
+        "synthetic", "access_" + "token=example"))
+    expect_failure("stable_uuid", lambda: scan_text(
+        "synthetic", "123e4567-e89b-12d3-" + "a456-426614174000"))
+    with tempfile.TemporaryDirectory(prefix="phase3-dirty-executable-") as temporary:
+        clone = Path(temporary) / "control"
+        clone_status = subprocess.run(
+            ["/usr/bin/git", "clone", "--no-hardlinks", "-q", str(ROOT), str(clone)],
+            text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, check=False,
+        )
+        require(clone_status.returncode == 0, "dirty executable test clone failed")
+        # Before the corrective commit exists, exercise the current working
+        # copies of the executable and fixture inside the isolated checkout.
+        shutil.copy2(ROOT / "bin/phase3-preflight", clone / "bin/phase3-preflight")
+        shutil.copy2(
+            ROOT / "tests/fixtures/phase3-preflight-positive.json",
+            clone / "tests/fixtures/phase3-preflight-positive.json",
+        )
+        (clone / "untracked-dirty-probe").write_text("test-only\n")
+        environment = dict(os.environ)
+        environment["PYTHONDONTWRITEBYTECODE"] = "1"
+        completed = subprocess.run(
+            [
+                str(clone / "bin/phase3-preflight"), "--json", "--fixture",
+                str(clone / "tests/fixtures/phase3-preflight-positive.json"),
+            ],
+            cwd=clone, env=environment, text=True,
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, check=False,
+        )
+        require(completed.returncode == 1, "dirty fixture preflight did not fail closed")
+        dirty_report = json.loads(completed.stdout)
+        require(dirty_report["verdict"] == "BLOCKED", "dirty fixture verdict was not BLOCKED")
+        require(dirty_report["control_git"]["clean"] is False,
+                "dirty fixture checkout was reported clean")
+        cases.append({"id": "dirty_worktree_executable", "result": "pass"})
+    return cases
+
+
+def main():
+    args = sys.argv[1:]
+    contract_only = False
+    self_test_mode = False
+    for arg in args:
+        if arg == "--contract-only":
+            contract_only = True
+        elif arg == "--self-test":
+            self_test_mode = True
+        else:
+            raise SystemExit("usage: check-phase3-prep [--contract-only] [--self-test]")
+    require(not (contract_only and self_test_mode), "choose one mode")
+
+    manifest = json.loads(MANIFEST_PATH.read_text())
+    validate_manifest(manifest)
+    fixture = json.loads((ROOT / "tests/fixtures/phase3-preflight-positive.json").read_text())
+    require(fixture["schema"] == 1 and set(fixture["identities"]) == set(EXPECTED_IDENTITIES),
+            "positive fixture identity set")
+    validate_operational_texts()
+    validate_git(contract_only)
+    compile((ROOT / "bin/phase3-preflight").read_text(), "bin/phase3-preflight", "exec")
+    compile((ROOT / "bin/check-phase3-prep").read_text(), "bin/check-phase3-prep", "exec")
+    if not contract_only and not self_test_mode:
+        require(EVIDENCE_PATH.is_file(), "preparation evidence missing")
+        validate_evidence(json.loads(EVIDENCE_PATH.read_text()))
+    elif self_test_mode and EVIDENCE_PATH.exists():
+        validate_evidence(json.loads(EVIDENCE_PATH.read_text()))
+    cases = self_test(manifest) if self_test_mode else []
+    report = {
+        "schema": 1,
+        "phase": "phase3_permissions_preparation",
+        "mode": "self_test" if self_test_mode else (
+            "contract_only" if contract_only else "full"
+        ),
+        "result": "pass",
+        "negative_tests": cases,
+    }
+    print(json.dumps(report, indent=2, sort_keys=True))
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except Exception as error:
+        print(f"phase3-prep validation failed: {error}", file=sys.stderr)
+        raise SystemExit(1)

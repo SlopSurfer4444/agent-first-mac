@@ -1,0 +1,14 @@
+{
+  "noTrigger": [
+    "Install the npm dependencies from this repository's lockfile.",
+    "Use uv to sync the Python dependencies declared by this project.",
+    "Build with the Node version pinned by this repo's mise.toml."
+  ],
+  "schema": 1,
+  "trigger": [
+    "Install ripgrep for every terminal on this Mac.",
+    "Adopt the existing VPN app without reinstalling it.",
+    "Repair the workstation Codex MCP configuration.",
+    "Remove a global CLI and preserve a rollback path."
+  ]
+}

@@ -1,0 +1,265 @@
+#!/usr/bin/python3
+"""Read-only, boolean-only doctor for the Mac side of Bridge M1."""
+
+import json
+from pathlib import Path
+import re
+import subprocess
+import sys
+
+
+ROOT = Path(__file__).resolve().parent.parent
+MANIFEST = ROOT / "manifests/tailscale-windows-host-m1.json"
+
+
+def command(argv, timeout=15):
+    try:
+        return subprocess.run(argv, text=True, stdout=subprocess.PIPE,
+                              stderr=subprocess.STDOUT, check=False,
+                              timeout=timeout)
+    except subprocess.TimeoutExpired:
+        return subprocess.CompletedProcess(argv, 124, "")
+    except OSError:
+        return subprocess.CompletedProcess(argv, 127, "")
+
+
+def plist_value(bundle, key):
+    result = command(["/usr/bin/plutil", "-extract", key, "raw", "-o", "-",
+                      str(bundle / "Contents/Info.plist")])
+    return result.stdout.strip() if result.returncode == 0 else None
+
+
+def team_id(path):
+    result = command(["/usr/bin/codesign", "-d", "--verbose=4", str(path)])
+    match = re.search(r"^TeamIdentifier=([^\n]+)$", result.stdout, re.MULTILINE)
+    return match.group(1) if match else None
+
+
+def sha256(path):
+    result = command(["/usr/bin/shasum", "-a", "256", str(path)])
+    return result.stdout.split()[0] if result.returncode == 0 else None
+
+
+def dotted(version):
+    if not isinstance(version, str) or not re.fullmatch(r"[0-9]+(?:\.[0-9]+)*",
+                                                        version):
+        return None
+    return tuple(int(part) for part in version.split("."))
+
+
+def version_at_least(actual, floor):
+    actual_parts = dotted(actual)
+    floor_parts = dotted(floor)
+    if actual_parts is None or floor_parts is None:
+        return False
+    width = max(len(actual_parts), len(floor_parts))
+    return actual_parts + (0,) * (width - len(actual_parts)) >= \
+        floor_parts + (0,) * (width - len(floor_parts))
+
+
+def no_advertised_routes(prefs):
+    """Accept only the Tailscale JSON forms that prove no route is advertised."""
+    if not isinstance(prefs, dict) or "AdvertiseRoutes" not in prefs:
+        return False
+    routes = prefs["AdvertiseRoutes"]
+    return routes is None or (isinstance(routes, list) and len(routes) == 0)
+
+
+def revision_observation():
+    """Consume bounded source-alignment evidence, never a replacement for health."""
+    unknown = {"state": "UNKNOWN", "compatible": False, "revisionExact": False,
+               "sourceRevision": None, "installedRevision": None, "sourceAdmissionMode": None}
+    def unique(pairs):
+        value = {}
+        for key, item in pairs:
+            if key in value:
+                raise ValueError("duplicate key")
+            value[key] = item
+        return value
+    try:
+        # The helper owns a 180s cooperative budget including its command cleanup.
+        # Never preempt it with this doctor's shorter ordinary-command timeout.
+        result = command([sys.executable, str(ROOT / "bin/system-revision-status"), "--json"], timeout=200)
+        if result.returncode != 0 or len(result.stdout) > 16384:
+            return unknown
+        value = json.loads(result.stdout, object_pairs_hook=unique)
+        if type(value) is not dict or type(value.get("schema")) is not int or value["schema"] != 1:
+            return unknown
+        if not all(value.get(key) is True for key in (
+                "compatible", "sourceAccepted", "installedCommitAccepted",
+                "systemInputsEqual", "childSettled", "sourceHandlesClosed", "readOnly")):
+            return unknown
+        if value.get("systemMutationsPerformed") is not False:
+            return unknown
+        source, installed = value.get("sourceRevision"), value.get("installedRevision")
+        if not all(type(item) is str and re.fullmatch(r"[0-9a-f]{40}", item)
+                   and item != "0" * 40 for item in (source, installed)):
+            return unknown
+        admission = value.get("sourceAdmissionMode")
+        if type(admission) is not str or admission not in ("historical-review", "current-state"):
+            return unknown
+        current_state = admission == "current-state"
+        exact = source == installed
+        expected = "CURRENT_REVISION" if exact else (
+            "CURRENT_CONTROL_ONLY_SUCCESSOR" if current_state else "ACCEPTED_CONTROL_ONLY_SUCCESSOR")
+        reason = (("exact_admitted_revision" if current_state else "exact_accepted_revision") if exact
+                  else ("current_system_inputs_unchanged" if current_state else "reviewed_system_inputs_unchanged"))
+        if value.get("reason") != reason:
+            return unknown
+        if value.get("state") != expected or value.get("revisionExact") is not exact:
+            return unknown
+        return {"state": expected, "compatible": True, "revisionExact": exact,
+                "sourceRevision": source, "installedRevision": installed, "sourceAdmissionMode": admission}
+    except (ValueError, TypeError, OSError, AttributeError, subprocess.SubprocessError):
+        return unknown
+
+
+def main():
+    mode = sys.argv[1:] or ["--installed"]
+    if mode not in (["--installed"], ["--connected"]):
+        raise RuntimeError("usage")
+
+    revision = revision_observation()
+    if not revision["compatible"]:
+        print(json.dumps({"schema": 1, "result": "fail",
+            "checks": {"configuration_revision": False},
+            "problems": ["configuration_revision"],
+            "configurationRevisionStatus": revision, "componentChecksRun": False,
+            "readOnly": True, "systemMutationsPerformed": False}, sort_keys=True))
+        raise SystemExit(1)
+    manifest = json.loads(MANIFEST.read_text())
+    app_manifest = manifest["application"]
+    companion = manifest["vendorCompanions"]
+    app = Path(app_manifest["path"])
+    cli = app / app_manifest["canonicalCli"]
+    sysext = app / app_manifest["systemExtension"]
+    problems = []
+    checks = {}
+
+    def check(name, condition):
+        checks[name] = bool(condition)
+        if not condition:
+            problems.append(name)
+
+    check("configuration_revision", revision["compatible"])
+
+    app_version = plist_value(app, "CFBundleShortVersionString")
+    check("application_present", app.is_dir())
+    check("application_bundle_id", plist_value(app, "CFBundleIdentifier") ==
+          app_manifest["bundleIdentifier"])
+    check("application_version_floor", version_at_least(
+        app_version, app_manifest["minimumVersion"]))
+    check("application_team", team_id(app) == app_manifest["teamIdentifier"])
+    check("application_codesign", command([
+        "/usr/bin/codesign", "--verify", "--deep", "--strict", str(app)
+    ]).returncode == 0)
+    check("application_gatekeeper", command([
+        "/usr/sbin/spctl", "--assess", "--type", "execute", str(app)
+    ]).returncode == 0)
+
+    cli_version_result = command([str(cli), "version"])
+    cli_version = (cli_version_result.stdout.splitlines()[0].strip()
+                   if cli_version_result.returncode == 0 and
+                   cli_version_result.stdout.splitlines() else None)
+    cli_file = command(["/usr/bin/file", str(cli)])
+    check("canonical_cli_executable", cli.is_file() and cli.stat().st_mode & 0o111 != 0
+          if cli.exists() else False)
+    check("canonical_cli_version_coupled", cli_version == app_version)
+    check("canonical_cli_universal", cli_file.returncode == 0 and
+          "x86_64" in cli_file.stdout and "arm64" in cli_file.stdout)
+
+    check("embedded_system_extension_present", sysext.is_dir())
+    check("embedded_system_extension_bundle_id",
+          plist_value(sysext, "CFBundleIdentifier") ==
+          app_manifest["systemExtensionBundleIdentifier"])
+    check("embedded_system_extension_version_coupled",
+          plist_value(sysext, "CFBundleShortVersionString") == app_version)
+    check("embedded_system_extension_team",
+          team_id(sysext) == app_manifest["teamIdentifier"])
+    check("embedded_system_extension_codesign", command([
+        "/usr/bin/codesign", "--verify", "--strict", str(sysext)
+    ]).returncode == 0)
+
+    receipt = command(["/usr/sbin/pkgutil", "--pkg-info", companion["receipt"]])
+    receipt_version = None
+    if receipt.returncode == 0:
+        match = re.search(r"^version: ([^\n]+)$", receipt.stdout, re.MULTILINE)
+        receipt_version = match.group(1) if match else None
+    check("package_receipt", receipt_version == manifest["source"]["version"])
+
+    wrapper = Path(companion["cliWrapper"])
+    manpage = Path(companion["manPage"])
+    marker = Path(companion["managedMarker"])
+    check("vendor_cli_wrapper", wrapper.is_file() and
+          sha256(wrapper) == companion["cliWrapperSha256"])
+    check("vendor_man_page", manpage.is_file() and
+          sha256(manpage) == companion["manPageSha256"])
+    try:
+        check("managed_marker", marker.is_file() and marker.read_text().strip() ==
+              manifest["source"]["version"] + "|" + manifest["source"]["sha256"])
+    except OSError:
+        check("managed_marker", False)
+
+    check("mac_sshd_not_loaded", command([
+        "/bin/launchctl", "print", "system/com.openssh.sshd"
+    ]).returncode != 0)
+    check("mac_tcp22_not_listening", command([
+        "/usr/sbin/lsof", "-nP", "-iTCP:22", "-sTCP:LISTEN"
+    ]).returncode != 0)
+
+    if mode == ["--connected"]:
+        sysext_state = command(["/usr/bin/systemextensionsctl", "list"])
+        sysext_lines = [line for line in sysext_state.stdout.splitlines()
+                        if app_manifest["systemExtensionBundleIdentifier"] in line]
+        check("system_extension_enabled", sysext_state.returncode == 0 and
+              len(sysext_lines) == 1 and
+              "activated enabled" in sysext_lines[0])
+
+        status_result = command([str(cli), "status", "--json"])
+        try:
+            status = json.loads(status_result.stdout) if status_result.returncode == 0 else {}
+        except json.JSONDecodeError:
+            status = {}
+        self_state = status.get("Self") if isinstance(status.get("Self"), dict) else {}
+        addresses = status.get("TailscaleIPs")
+        if not isinstance(addresses, list):
+            addresses = self_state.get("TailscaleIPs")
+        check("backend_running", status.get("BackendState") == "Running")
+        check("self_online", self_state.get("Online") is True)
+        check("overlay_address_present", isinstance(addresses, list) and
+              len(addresses) > 0 and all(isinstance(item, str) for item in addresses))
+
+        prefs_result = command([str(cli), "debug", "prefs"])
+        try:
+            prefs = json.loads(prefs_result.stdout) if prefs_result.returncode == 0 else {}
+        except json.JSONDecodeError:
+            prefs = {}
+        check("no_advertised_routes", no_advertised_routes(prefs))
+        check("not_using_exit_node", not prefs.get("ExitNodeID") and
+              not prefs.get("ExitNodeIP"))
+        check("tailscale_ssh_server_off", prefs.get("RunSSH", False) is False)
+
+    final_revision = revision_observation()
+    check("configuration_revision_stable", final_revision == revision)
+    check("configuration_revision_final", final_revision["compatible"])
+    print(json.dumps({
+        "schema": 1,
+        "result": "pass" if not problems else "fail",
+        "mode": mode[0][2:],
+        "checks": checks,
+        "configurationRevisionStatus": final_revision,
+        "problems": sorted(problems),
+        "readOnly": True,
+        "systemMutationsPerformed": False,
+        "rawStatusStored": False,
+        "identifiersEmitted": False,
+    }, indent=2, sort_keys=True))
+    raise SystemExit(0 if not problems else 1)
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except Exception as error:
+        print(json.dumps({"result": "fail", "reason": str(error)}, sort_keys=True))
+        raise SystemExit(1)

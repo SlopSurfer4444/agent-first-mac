@@ -1,0 +1,47 @@
+{
+  "publicReferenceOnly": true,
+  "warning": "Sanitized historical example. Not installation authority or current inventory.",
+  "example": {
+    "schema": 1,
+    "profile": "windows-app-rdp-client",
+    "profileActive": true,
+    "source": {
+      "project": "Windows App for macOS",
+      "version": "11.3.8",
+      "build": "3054",
+      "url": "https://go.microsoft.com/fwlink/?linkid=868963",
+      "sha256": "47052e0aba8d5b2ad9a5468349f72bee317b69c07300a40ccadefb96050b1251",
+      "nixHash": "sha256-RwUuCrqNWyrZpUaDSfcr7jF7acBzAKQMyt77lgULElE=",
+      "packageIdentifier": "com.microsoft.rdc.macos",
+      "installerIdentity": "Developer ID Installer: Microsoft Corporation (UBF8T346G9)",
+      "installerTeamIdentifier": "UBF8T346G9",
+      "notarized": true
+    },
+    "application": {
+      "path": "/Applications/Windows App.app",
+      "bundleIdentifier": "com.microsoft.rdc.macos",
+      "minimumVersion": "11.3.8",
+      "initialBuild": "3054",
+      "teamIdentifier": "UBF8T346G9",
+      "executable": "Contents/MacOS/Windows App"
+    },
+    "vendorCompanions": {},
+    "networkBoundary": {
+      "transport": "RDP over Tailscale only",
+      "publicRdpExposureAllowed": false,
+      "lanRdpExposureAllowed": false,
+      "windowsNlaRequired": true,
+      "macInboundServiceAdded": false
+    },
+    "dataBoundary": {
+      "accountOrAuthStateInspected": false,
+      "applicationSupportDataRemoved": false
+    },
+    "lifecycle": {
+      "install": "verify the pinned official package checksum, Microsoft installer identity and Apple notarization, then install commit-bound through aid-admin apply-system",
+      "smoke": "verify bundle identity, Microsoft team, strict signature, Gatekeeper, version floor, receipt and managed marker",
+      "rollback": "flip profile state in a reviewed commit; remove only the managed Windows App and its RDP receipts while preserving Microsoft AutoUpdate and all user data",
+      "removeUserData": false
+    }
+  }
+}

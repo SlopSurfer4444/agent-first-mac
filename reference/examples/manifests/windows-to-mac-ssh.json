@@ -1,0 +1,24 @@
+{
+  "publicReferenceOnly": true,
+  "warning": "Sanitized historical example. Not installation authority or current inventory.",
+  "example": {
+    "schema": 1,
+    "profile": "windows-to-mac-ssh",
+    "versionPolicy": "Apple system OpenSSH follows signed OS updates; Windows existing Git OpenSSH follows its existing owner",
+    "transport": "Windows loopback reverse forwarding through the existing strict windows-host outbound alias",
+    "listenAddress": "127.0.0.1",
+    "port": 22222,
+    "clientAlias": "mac",
+    "capabilities": [
+      "owner shell",
+      "owner SFTP"
+    ],
+    "authentication": "dedicated Windows-generated Ed25519 client key and dedicated Mac-generated host key; no private key transfer",
+    "dataBoundary": "keys, host pins, account names and rendered configurations remain private runtime files outside Git",
+    "policyScope": "An explicit local decision is required to permit only the separate unprivileged loopback SSH daemon; system Remote Login and TCP22 remain off. Existing Tailscale grants, VPN, firewall and other SSH clients remain unchanged.",
+    "persistence": "two owner LaunchAgents restart server and outbound tunnel during the Mac user login session",
+    "smoke": "strict Windows ssh mac command returns a fixed sentinel and Darwin; SFTP roundtrip confined to a disposable owned file",
+    "removal": "stop only owned labels, remove exact managed Mac runtime files and Windows include; retain all keys",
+    "rollback": "same bounded removal; restore unrelated SSH config bytes by removing only the exact leading Include line"
+  }
+}

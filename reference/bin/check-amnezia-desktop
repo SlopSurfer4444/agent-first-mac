@@ -1,0 +1,189 @@
+#!/usr/bin/python3
+"""Fail-closed static validation for the AmneziaVPN desktop lifecycle."""
+
+import json
+from pathlib import Path
+import re
+import sys
+
+
+ROOT = Path(__file__).resolve().parent.parent
+MANIFEST = ROOT / "manifests/amnezia-desktop.json"
+MODULE = ROOT / "darwin/amnezia-vpn.nix"
+
+
+def require(condition, reason):
+    if not condition:
+        raise RuntimeError(reason)
+
+
+def main():
+    require(sys.argv[1:] == [], "usage")
+    manifest_text = MANIFEST.read_text()
+    manifest = json.loads(manifest_text)
+    module = MODULE.read_text()
+    doctor = (ROOT / "bin/amnezia-desktop-doctor").read_text()
+    flake = (ROOT / "flake.nix").read_text()
+
+    require(manifest["schema"] == 1, "manifest_schema")
+    require(manifest["profile"] == "amnezia-vpn-reviewed-desktop", "profile")
+    require(type(manifest["profileActive"]) is bool, "profile_active_type")
+    require(manifest["owner"]["primary"] ==
+            "AIDev/control reviewed fixed vendor-pkg lifecycle", "primary_owner")
+    require(manifest["owner"]["lifecycleManifest"] ==
+            "manifests/amnezia-desktop.json", "lifecycle_manifest")
+    require(manifest["ownerAuthorization"]["liveApplyAuthorized"] is True,
+            "owner_apply_gate")
+    require(manifest["ownerAuthorization"]["phase6Claimed"] is False,
+            "phase6_claim")
+
+    flag = re.search(r"amneziaDesktopEnabled = (true|false);", module)
+    absent_flag = re.search(r"amneziaDesktopAbsent = (true|false);", module)
+    require(flag is not None, "profile_flag_missing")
+    require(absent_flag is not None, "absence_flag_missing")
+    require((flag.group(1) == "true") == manifest["profileActive"],
+            "profile_flag_manifest_drift")
+    require(type(manifest["desiredState"]) is str and
+            manifest["desiredState"] in ("desktop", "legacy", "absent"),
+            "desired_state")
+    require({"desktop": (True, False), "legacy": (False, False),
+             "absent": (False, True)}[manifest["desiredState"]] ==
+            (flag.group(1) == "true", absent_flag.group(1) == "true"),
+            "desired_state_flag_drift")
+
+    source = manifest["source"]
+    require(source["release"] == "4.8.21.0", "release")
+    require(source["bundleVersion"] == "4.8.21", "bundle_version")
+    require(source["sha256"] ==
+            "da339236eef1728956197c8bf9ed96a2a21047270106e6c0aa062c9e142e3ac7",
+            "source_hash")
+    require(source["nixHash"] ==
+            "sha256-2jOSNu7xcolWGXyL+e2WoqIQRycBBubAqgYsnhQuOsc=", "nix_hash")
+    require(source["installerTeamIdentifier"] == "X7UJ388FXK", "installer_team")
+
+    app = manifest["application"]
+    require(app == {
+        "path": "/Applications/AmneziaVPN.app",
+        "bundleIdentifier": "com.yourcompany.AmneziaVPN",
+        "bundleVersion": "4.8.21",
+        "teamIdentifier": "X7UJ388FXK",
+        "binaryArchitecture": "x86_64",
+        "serviceSha256":
+            "96858f0916e57f0e6bbae68cbc2b70e7eb5f3ad84a4f120c89a6defbda34cdbb",
+        "resourcePlistSha256":
+            "e85a4836b4eee622d0bbce572cc356272758b77e7b707ce90041cc4c5bd17b8a",
+    }, "application_identity")
+
+    service = manifest["service"]
+    require(service["runAs"] == "root", "service_user")
+    require(service["socketAddress"] == "127.0.0.1", "service_not_loopback")
+    require(service["socketPort"] == 5959, "service_port")
+    require(service["automaticVpnConnection"] is False, "automatic_connection")
+    require(manifest["target"]["vendorPostinstallExecuted"] is False,
+            "vendor_postinstall")
+    require(manifest["target"]["fallbackVpnPreserved"] is True, "fallback")
+    require(manifest["target"]["legacyBackupRetained"] is False,
+            "legacy_retention")
+    require(manifest["target"]["legacyRemovalMode"] ==
+            "Move only the exact attested legacy app to the owner's Trash",
+            "legacy_removal_mode")
+    require(manifest["target"]["dockPinned"] is True and
+            manifest["target"]["dockPositionAfter"] == "Happ", "dock_target")
+    require(manifest["target"]["widgetAvailable"] is False and
+            manifest["target"]["widgetConfigured"] is False, "widget_target")
+    prestate = manifest["prestate"]
+    require(prestate["nestedApplicationPath"] == "Wrapper/AmneziaVPN.app",
+            "legacy_layout")
+    require(prestate["binarySha256"] ==
+            "dcbeea0fdde339fe8c600c5b1b046449f958cabb98c559e63318a03bedba3437",
+            "legacy_binary_hash")
+    require(prestate["infoPlistSha256"] ==
+            "4e943fece767bd84d1271d4ffe6985a38e59adcdb6562b92802e8b920a326af4",
+            "legacy_info_hash")
+    require(prestate["strictCodeSignatureValid"] is False,
+            "legacy_signature_prestate")
+    require(manifest["lifecycle"]["userDataMutation"] is False,
+            "user_data_mutation")
+    require(manifest["absence"] == {
+        "retiredPayloadPath": "/var/db/agent-first-mac/amnezia-vpn-retired",
+        "daemonSha256": "97f8b6cb06b1ed315ad6c4cf9a1c7c657ce8f420e400fe31c8c2a25493d76b85",
+        "systemSupportPath": "/Library/Application Support/AmneziaVPN",
+        "systemSupportEmptyChild": "pf",
+        "rollback": "A new reviewed enabled-state commit restores only the exact retired app, daemon, marker and Dock tile; profiles and keys are not recoverable from this stage",
+        "profileAndKeyRemovalOwner": "separate bounded owner operation after managed-payload retirement",
+    }, "absence_contract")
+    require(manifest["platform"]["rosettaRequired"] is
+            (manifest["desiredState"] != "absent"), "rosetta_state")
+    require(manifest["platform"]["rosettaRequiredForInstall"] is True,
+            "rosetta_install")
+    require(all(value is False for value in manifest["dataBoundary"].values()),
+            "data_boundary")
+
+    required_module_fragments = [
+        "pkgs.fetchurl", source["url"], source["nixHash"],
+        "/usr/sbin/pkgutil --check-signature", "/usr/sbin/spctl --assess --type install",
+        "/usr/sbin/pkgutil --expand-full", "/usr/bin/ditto \"$extracted\"",
+        "test -f /Library/Apple/usr/share/rosetta/rosetta",
+        "/usr/bin/pgrep -x AmneziaVPN",
+        "Sockets.Listeners.SockNodeName -string 127.0.0.1",
+        "verify_legacy", "verify_desktop", "verify_daemon",
+        prestate["binarySha256"], prestate["infoPlistSha256"],
+        "Developer ID Installer: Privacy Technologies OU (X7UJ388FXK)",
+        "fallback_vpn_not_connected", "su\\.ffg\\.happ",
+        "unexpected_prestate", "restore_failed_install",
+        "/Applications/AmneziaVPN-iOS-4.8.19.app",
+        ".Trash/AmneziaVPN-iOS-4.8.19.app", "legacyAppRetained = false;",
+        "desktopDockPinned = true;", "pkgs.dockutil", "--after Happ",
+        "run_dockutil --add \"$canonical\"", "run_dockutil --remove \"$canonical\"",
+        "reconcile_extras", "rollback_extras", "restore_failed_extras",
+        "/var/db/agent-first-mac/amnezia-vpn", "marker=$marker_dir/managed-version",
+        "amneziaDesktopAbsent", "verify_absent", "verify_retired",
+        "reactivate_retired", "restore_failed_removal", "restore_failed_reactivation",
+        "/var/db/agent-first-mac/amnezia-vpn-retired",
+        "/bin/rmdir -- \"$support/pf\"", "/bin/rmdir -- \"$support\"",
+    ]
+    for fragment in required_module_fragments:
+        require(fragment in module, "module_contract_missing")
+    require(module.count("/usr/bin/pgrep -x AmneziaVPN") == 3,
+            "gui_process_gate_count")
+    exact_state_gate = module.index('if test -f "$marker"')
+    rosetta_gate = module.index(
+        "if ! test -f /Library/Apple/usr/share/rosetta/rosetta", exact_state_gate)
+    fallback_gate = module.index("fallback_vpn_not_connected", rosetta_gate)
+    gui_gate = module.index("if /usr/bin/pgrep -x AmneziaVPN", fallback_gate)
+    require(exact_state_gate < rosetta_gate < fallback_gate < gui_gate,
+            "exact_state_noop_must_precede_install_gates")
+    for fragment in ["/usr/sbin/netstat", "127\\.0\\.0\\.1\\.5959",
+                     "/usr/bin/defaults", "desktop_dock_tile",
+                     "widget_extension_absent"]:
+        require(fragment in doctor, "doctor_contract_missing")
+    require("./darwin/amnezia-vpn.nix" in flake, "flake_module_import")
+
+    for forbidden in ["/Users/example-user", "BEGIN PRIVATE KEY", "oauth_token",
+                      "access_token", "private_key", "server_address"]:
+        require(forbidden not in module and forbidden not in manifest_text,
+                "forbidden_repository_material")
+
+    print(json.dumps({
+        "schema": 1,
+        "result": "pass",
+        "profileActive": manifest["profileActive"],
+        "desiredState": manifest["desiredState"],
+        "release": source["release"],
+        "fixedOutputSource": True,
+        "vendorPostinstallExecuted": False,
+        "serviceLoopbackOnly": True,
+        "automaticVpnConnection": False,
+        "userDataMutation": False,
+        "legacyBackupRetained": False,
+        "desktopDockPinned": manifest["desiredState"] == "desktop",
+        "widgetAvailable": False,
+    }, indent=2, sort_keys=True))
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except Exception as error:
+        print(json.dumps({"result": "fail", "reason": str(error)}, sort_keys=True))
+        raise SystemExit(1)

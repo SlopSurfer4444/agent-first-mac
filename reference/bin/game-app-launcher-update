@@ -1,0 +1,93 @@
+#!/usr/bin/python3
+"""Exact native executable/receipt update; never launches or stops a client."""
+import sys
+sys.dont_write_bytecode=True
+import fcntl,importlib.machinery,importlib.util,os,re,stat,tempfile
+from pathlib import Path
+loader=importlib.machinery.SourceFileLoader('game_apps',str(Path(__file__).resolve().with_name('game-app-launchers')))
+spec=importlib.util.spec_from_loader(loader.name,loader);h=importlib.util.module_from_spec(spec);loader.exec_module(h)
+
+def targets():
+    result={str(i):h.HOME/'Games'/name/'Contents/MacOS/launcher' for i,name in enumerate(h.NAMES)}
+    result.update(hub=h.HUB/'receipt.json',ds3=h.DS3/'receipt.json')
+    return result
+
+def policies():
+    old=h.policy(h.MANIFEST);new=h.policy(h.ERROR_POLICY)
+    h.need(new.get('previousPolicySha256') == h.sha(h.HERE/h.MANIFEST),'previous_policy_binding')
+    for name in h.NAMES:
+        for rel in ('Contents/Info.plist','Contents/Resources/Game.icns'):
+            h.need(old['builtApps'][name][rel] == new['builtApps'][name][rel],'non_executable_update')
+    return old,new
+
+def receipt_after(before,new,commit,key):
+    names=[name for name in h.NAMES if (name == 'Dark Souls III.app') == (key == 'ds3')]
+    return dict(before,appLaunchers={name:new['builtApps'][name] for name in names},appPolicySha256=h.policy_digest(new),appCommit=commit)
+
+def check(transaction,commit,side=None):
+    old,new=policies();j=h.load(transaction/'journal.json');mapped=targets()
+    h.need(set(j) == set(mapped),'update_journal_schema')
+    for key,target in mapped.items():
+        row=j[key];h.need(set(row) == {'before','after'},'update_journal_schema')
+        for phase in ('before','after'):h.need(h.image(transaction/(key+'.'+phase)) == row[phase],'update_backup_drift')
+        observed=h.image(target);h.need(observed == row[side] if side else observed in (row['before'],row['after']),'update_target_drift')
+    for i,name in enumerate(h.NAMES):
+        expected={phase:dict(kind='file',**m['builtApps'][name]['Contents/MacOS/launcher']) for phase,m in (('before',old),('after',new))}
+        h.need(j[str(i)] == expected,'update_executable_binding')
+    for key in ('hub','ds3'):
+        before=h.load(transaction/(key+'.before'));after=h.load(transaction/(key+'.after'))
+        names=[name for name in h.NAMES if (name == 'Dark Souls III.app') == (key == 'ds3')]
+        h.need(before.get('appPolicySha256') == h.policy_digest(old) and before.get('appLaunchers') == {n:old['builtApps'][n] for n in names},'update_receipt_preimage')
+        h.need(after == receipt_after(before,new,commit,key),'update_receipt_relation')
+        h.need(j[key]['before']['mode'] == j[key]['after']['mode'] == 0o600,'update_receipt_mode')
+    return j
+
+def restore(transaction,commit):
+    j=check(transaction,commit)
+    for key,target in reversed(list(targets().items())):
+        observed=h.image(target);h.need(observed in (j[key]['before'],j[key]['after']),'update_target_changed')
+        h.replace_image(transaction/(key+'.before'),target,observed)
+    check(transaction,commit,'before')
+
+def update(commit,candidate):
+    h.source_gate(commit);old,new=policies();h.candidate_check(candidate,new);h.status()
+    current=h.load(h.DS3/'receipt.json')
+    if current.get('appPolicySha256') == h.policy_digest(new):return {'state':'GAME_APP_ERRORS_INSTALLED','changed':False,'gameStarted':False}
+    h.need(current.get('appPolicySha256') == h.policy_digest(old),'update_previous_policy')
+    transaction=h.HUB/('.game-app-errors-'+commit);mapped=targets()
+    if transaction.exists() or transaction.is_symlink():j=check(transaction,commit,'before')
+    else:
+        pending=Path(tempfile.mkdtemp(prefix='.game-app-errors-stage-',dir=h.HUB));j={}
+        for key,target in mapped.items():
+            h.copy_image(target,pending/(key+'.before'));j[key]={'before':h.image(target),'after':None}
+        for i,name in enumerate(h.NAMES):h.copy_image(candidate/name/'Contents/MacOS/launcher',pending/(str(i)+'.after'))
+        for key in ('hub','ds3'):h.write_image(pending/(key+'.after'),h.jb(receipt_after(h.load(pending/(key+'.before')),new,commit,key)))
+        for key in mapped:j[key]['after']=h.image(pending/(key+'.after'))
+        h.write_image(pending/'journal.json',h.jb(j));check(pending,commit,'before');os.rename(pending,transaction)
+    h.source_gate(commit);check(transaction,commit,'before')
+    try:
+        for key,target in mapped.items():h.replace_image(transaction/(key+'.after'),target,j[key]['before'])
+        check(transaction,commit,'after');h.status()
+    except Exception:
+        restore(transaction,commit);raise
+    return {'state':'GAME_APP_ERRORS_INSTALLED','changed':True,'gameStarted':False}
+
+def rollback(commit,apply_commit):
+    h.source_gate(commit);h.need(type(apply_commit) is str and re.fullmatch('[0-9a-f]{40}',apply_commit),'invalid_apply_commit')
+    restore(h.HUB/('.game-app-errors-'+apply_commit),apply_commit);h.status()
+    return {'state':'GAME_APP_ERRORS_ROLLED_BACK','gameStarted':False}
+
+def main():
+    os.umask(0o077);args=sys.argv[1:];h.safe_dir(h.HOME/'AIDev/state')
+    fd=os.open(h.HOME/'AIDev/state/games-hub.lock',os.O_CREAT|os.O_RDWR|os.O_NOFOLLOW,0o600)
+    s=os.fstat(fd);h.need(stat.S_ISREG(s.st_mode) and s.st_uid == os.getuid() and s.st_nlink == 1 and not s.st_mode & 0o022,'unsafe_lock')
+    with os.fdopen(fd,'w') as lock:
+        fcntl.flock(lock,fcntl.LOCK_EX|fcntl.LOCK_NB)
+        if len(args)==3 and args[0]=='install':result=update(args[1],Path(args[2]))
+        elif len(args)==3 and args[0]=='rollback':result=rollback(args[1],args[2])
+        else:raise RuntimeError('usage: game-app-launcher-update install COMMIT CANDIDATE | rollback COMMIT APPLY_COMMIT')
+    print(h.jb(result).decode())
+if __name__=='__main__':
+    try:main()
+    except Exception as e:
+        print(h.jb({'state':'BLOCKED','reason':str(e) if type(e) is RuntimeError else type(e).__name__}).decode());sys.exit(1)

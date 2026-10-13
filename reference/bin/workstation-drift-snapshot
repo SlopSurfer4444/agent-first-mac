@@ -1,0 +1,506 @@
+#!/usr/bin/python3
+"""Bounded opaque filesystem metadata observations; no scheduler or executor.
+
+This is not a full inventory, integrity check, desired state, source admission,
+or ownership acceptance. No payload contents, profiles or launch plists are read.
+Only private maintenance evidence changes. Previous observations are comparison
+bases, never accepted baselines; unresolved drift/failure has no automatic clear.
+"""
+import sys
+sys.dont_write_bytecode = True
+
+import fcntl
+import hashlib
+import json
+import os
+from pathlib import Path
+import pwd
+import re
+import stat
+
+MAX_ENTRIES = 20000
+MAX_SCOPE = 4096
+MAX_STATE = 4 * 1024 * 1024
+SCOPES = ("applications", "nix-applications", "user-applications", "home-manager-applications",
+    "homebrew-cellar", "homebrew-caskroom", "homebrew-bin", "usr-local-bin", "local-bin", "aid-bin",
+    "system-launch-agents", "system-launch-daemons", "user-launch-agents")
+STATUSES = {"BASELINE_OBSERVED", "UNCHANGED", "DRIFT", "SCAN_INCOMPLETE", "STATE_MISSING",
+    "STATE_MALFORMED", "STATE_UNAVAILABLE", "SKIPPED_BUSY"}
+REASONS = {"observed_only", "metadata_difference", "scan_unavailable", "scan_limit", "scan_changed",
+    "state_missing", "state_malformed", "state_unavailable", "busy", "noncanonical_source"}
+GUIDANCE = "Review scoped doctors and the existing owner-approved lifecycle; do not auto-repair or treat this observation as acceptance."
+DIR_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+FILE_FLAGS = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC
+
+
+class Fault(ValueError):
+    def __init__(self, reason):
+        self.reason = reason if reason in REASONS else "state_unavailable"
+        super().__init__(self.reason)
+
+
+def require(value, reason="state_malformed"):
+    if value is not True:
+        raise Fault(reason) from None
+
+
+def encoded(value):
+    return json.dumps(value, sort_keys=True, separators=(",", ":")).encode("ascii")
+
+
+def digest(value):
+    return hashlib.sha256(value).hexdigest()
+
+
+def hex64(value):
+    return type(value) is str and re.fullmatch(r"[0-9a-f]{64}", value) is not None
+
+
+def integer(value, maximum=MAX_ENTRIES):
+    return type(value) is int and 0 <= value <= maximum
+
+
+def metadata(value):
+    return [value.st_mode, value.st_size, value.st_mtime_ns, value.st_ctime_ns]
+
+
+def identity(value):
+    return value.st_dev, value.st_ino, value.st_uid, value.st_gid, value.st_mode
+
+
+def parse_json(raw):
+    require(type(raw) is bytes and 0 < len(raw) <= MAX_STATE)
+    def unique(rows):
+        result = {}
+        for key, value in rows:
+            require(key not in result)
+            result[key] = value
+        return result
+    try:
+        return json.loads(raw.decode("ascii"), object_pairs_hook=unique)
+    except (ValueError, UnicodeError, RecursionError):
+        raise Fault("state_malformed") from None
+
+
+def snapshot(scopes):
+    return {"digest": digest(encoded(scopes)), "scopes": scopes}
+
+
+def valid_snapshot(value):
+    require(type(value) is dict and set(value) == {"digest", "scopes"} and hex64(value["digest"]))
+    scopes, total = value["scopes"], 0
+    require(type(scopes) is dict and set(scopes) == set(SCOPES))
+    for row in scopes.values():
+        require(type(row) is dict and set(row) == {"present", "root", "entries"}
+            and type(row["present"]) is bool and hex64(row["root"])
+            and type(row["entries"]) is dict and len(row["entries"]) <= MAX_SCOPE
+            and all(hex64(k) and hex64(v) for k, v in row["entries"].items())
+            and (row["present"] or not row["entries"]))
+        total += len(row["entries"])
+    require(total <= MAX_ENTRIES and value["digest"] == digest(encoded(scopes)))
+    return value
+
+
+def changes(previous, current):
+    result = {"added": 0, "removed": 0, "changed": 0, "scopesChanged": 0}
+    for scope in SCOPES:
+        before, after = previous["scopes"][scope], current["scopes"][scope]
+        a, b = before["entries"], after["entries"]
+        result["added"] += len(b.keys() - a.keys())
+        result["removed"] += len(a.keys() - b.keys())
+        result["changed"] += sum(a[k] != b[k] for k in a.keys() & b.keys())
+        result["scopesChanged"] += before != after
+    return result
+
+
+def report(status, reason, *, sequence=0, observation=None, delta=None, drift=False, failure=False, published=False):
+    return {"schema": 1, "operation": "capture", "status": status, "reason": reason, "sequence": sequence,
+        "snapshotDigest": observation["digest"] if observation else None,
+        "scopeCounts": {k: len(v["entries"]) for k, v in observation["scopes"].items()} if observation else {},
+        "changes": delta or {"added": 0, "removed": 0, "changed": 0, "scopesChanged": 0},
+        "completeObservation": status in {"BASELINE_OBSERVED", "UNCHANGED", "DRIFT"},
+        "unresolvedDrift": drift, "unresolvedFailure": failure, "limitedMetadataFootprint": True,
+        "fullInventory": False, "sourceAdmission": False, "ownershipAccepted": False,
+        "installedHealthChecked": False, "configurationMutationsPerformed": False,
+        "observationPublished": published, "repairGuidance": GUIDANCE}
+
+
+def valid_report(value):
+    require(type(value) is dict and set(value) == set(report("STATE_MISSING", "state_missing")))
+    require(type(value["schema"]) is int and value["schema"] == 1
+        and type(value["operation"]) is str and value["operation"] in ("capture", "status")
+        and type(value["status"]) is str and value["status"] in STATUSES
+        and type(value["reason"]) is str and value["reason"] in REASONS and integer(value["sequence"], 2**53 - 1)
+        and (value["snapshotDigest"] is None or hex64(value["snapshotDigest"])))
+    bools = ("completeObservation", "unresolvedDrift", "unresolvedFailure", "observationPublished")
+    require(all(type(value[k]) is bool for k in bools) and value["limitedMetadataFootprint"] is True
+        and all(value[k] is False for k in ("fullInventory", "sourceAdmission", "ownershipAccepted",
+            "installedHealthChecked", "configurationMutationsPerformed")) and value["repairGuidance"] == GUIDANCE)
+    require(type(value["changes"]) is dict and set(value["changes"]) == {"added", "removed", "changed", "scopesChanged"}
+        and all(integer(v) for v in value["changes"].values())
+        and type(value["scopeCounts"]) is dict and set(value["scopeCounts"]) in (set(), set(SCOPES))
+        and all(integer(v, MAX_SCOPE) for v in value["scopeCounts"].values()))
+    require(value["completeObservation"] is (value["status"] in {"BASELINE_OBSERVED", "UNCHANGED", "DRIFT"}))
+    require(value["changes"]["scopesChanged"] <= len(SCOPES)
+        and sum(value["scopeCounts"].values()) <= MAX_ENTRIES
+        and (not value["completeObservation"] or value["snapshotDigest"] is not None
+            and set(value["scopeCounts"]) == set(SCOPES)))
+    require((value["snapshotDigest"] is None) is (not value["scopeCounts"]))
+    status, reason, delta = value["status"], value["reason"], value["changes"]
+    if status in {"BASELINE_OBSERVED", "UNCHANGED"}:
+        require(reason == "observed_only" and not any(delta.values()) and value["sequence"] > 0)
+    elif status == "DRIFT":
+        require(reason == "metadata_difference" and delta["scopesChanged"] > 0
+            and value["sequence"] > 0 and value["unresolvedDrift"] is True)
+    elif status == "SCAN_INCOMPLETE":
+        require(reason in {"scan_unavailable", "scan_limit", "scan_changed"} and not any(delta.values())
+            and value["sequence"] > 0 and value["unresolvedFailure"] is True)
+    else:
+        require(reason in ({"state_unavailable", "noncanonical_source"} if status == "STATE_UNAVAILABLE"
+            else {"STATE_MISSING": {"state_missing"}, "STATE_MALFORMED": {"state_malformed"}, "SKIPPED_BUSY": {"busy"}}[status]))
+    require(value["operation"] != "status" or value["observationPublished"] is False)
+    require(not value["observationPublished"] or value["operation"] == "capture" and value["sequence"] > 0)
+    return value
+
+
+def valid_state(value):
+    require(type(value) is dict and set(value) == {"schema", "snapshot", "latest", "unresolvedDrift", "unresolvedFailure"}
+        and type(value["schema"]) is int and value["schema"] == 1)
+    if value["snapshot"] is not None:
+        valid_snapshot(value["snapshot"])
+    latest = valid_report(value["latest"])
+    require(latest["operation"] == "capture" and latest["observationPublished"] is True
+        and latest["sequence"] > 0 and latest["status"] in {"BASELINE_OBSERVED", "UNCHANGED", "DRIFT", "SCAN_INCOMPLETE"})
+    require(latest["snapshotDigest"] == (value["snapshot"]["digest"] if value["snapshot"] else None))
+    require(latest["scopeCounts"] == ({k: len(v["entries"]) for k, v in value["snapshot"]["scopes"].items()}
+                                     if value["snapshot"] else {}))
+    for key, expected in (("unresolvedDrift", "DRIFT"), ("unresolvedFailure", "SCAN_INCOMPLETE")):
+        saved = value[key]
+        if saved is not None:
+            valid_report(saved)
+            require(saved["status"] == expected and 0 < saved["sequence"] <= latest["sequence"]
+                and saved["operation"] == "capture" and saved["observationPublished"] is True)
+            if saved["sequence"] == latest["sequence"]:
+                require(saved == latest)
+        require(latest[key] is (saved is not None))
+        if latest["status"] == expected:
+            require(saved is not None)
+            if expected == "SCAN_INCOMPLETE":
+                require(saved["sequence"] == latest["sequence"])
+    return value
+
+
+def evolve(previous, observation=None, failure=None):
+    """Pure deterministic comparison. Failures retain the last complete snapshot."""
+    if previous is not None:
+        valid_state(previous)
+    require(failure is None or failure in {"scan_unavailable", "scan_limit", "scan_changed"})
+    if failure is None:
+        valid_snapshot(observation)
+    old = previous["snapshot"] if previous else None
+    latest = report("SCAN_INCOMPLETE" if failure else "BASELINE_OBSERVED" if old is None else
+        "UNCHANGED" if old == observation else "DRIFT", failure or "observed_only",
+        sequence=(previous["latest"]["sequence"] if previous else 0) + 1,
+        observation=old if failure else observation,
+        delta=changes(old, observation) if old is not None and failure is None else None, published=True,
+        drift=previous is not None and previous["unresolvedDrift"] is not None,
+        failure=previous is not None and previous["unresolvedFailure"] is not None)
+    if latest["status"] == "DRIFT":
+        latest["reason"] = "metadata_difference"
+    state = {"schema": 1, "snapshot": old if failure else observation, "latest": latest,
+        "unresolvedDrift": previous["unresolvedDrift"] if previous else None,
+        "unresolvedFailure": previous["unresolvedFailure"] if previous else None}
+    if latest["status"] == "DRIFT" and state["unresolvedDrift"] is None:
+        latest["unresolvedDrift"] = True
+        state["unresolvedDrift"] = dict(latest)
+    if failure:
+        latest["unresolvedFailure"] = True
+        state["unresolvedFailure"] = dict(latest)
+    latest.update(unresolvedDrift=state["unresolvedDrift"] is not None, unresolvedFailure=state["unresolvedFailure"] is not None)
+    return valid_state(state)
+
+
+def open_directory(path):
+    """Walk fixed absolute edges without following any parent symlink."""
+    parts = Path(path).parts
+    require(parts and parts[0] == "/" and all(p not in (".", "..") for p in parts), "scan_unavailable")
+    fd = os.open("/", DIR_FLAGS)
+    try:
+        for part in parts[1:]:
+            child = os.open(part, DIR_FLAGS, dir_fd=fd)
+            os.close(fd)
+            fd = child
+        return fd
+    except BaseException:
+        os.close(fd)
+        raise
+
+
+def fixed_scopes(home):
+    paths = ("/Applications", "/Applications/Nix Apps", home + "/Applications", home + "/Applications/Home Manager Apps",
+        "/opt/homebrew/Cellar", "/opt/homebrew/Caskroom", "/opt/homebrew/bin", "/usr/local/bin", home + "/.local/bin",
+        home + "/AIDev/bin", "/Library/LaunchAgents", "/Library/LaunchDaemons", home + "/Library/LaunchAgents")
+    return dict(zip(SCOPES, paths))
+
+
+def entry_fingerprint(fd, name, facts):
+    value = [metadata(facts)]
+    if stat.S_ISLNK(facts.st_mode):
+        target = os.fsencode(os.readlink(name, dir_fd=fd))
+        require(len(target) <= 4096, "scan_limit")
+        value.append(digest(target))
+    if stat.S_ISDIR(facts.st_mode) and name.lower().endswith(".app"):
+        app = os.open(name, DIR_FLAGS, dir_fd=fd)
+        try:
+            try:
+                contents = os.open("Contents", DIR_FLAGS, dir_fd=app)
+            except FileNotFoundError:
+                value.append("contents_absent")
+            else:
+                try:
+                    try:
+                        info = os.stat("Info.plist", dir_fd=contents, follow_symlinks=False)
+                        value.append(metadata(info))  # Metadata only; never read plist values.
+                    except FileNotFoundError:
+                        value.append("info_absent")
+                finally:
+                    os.close(contents)
+        finally:
+            os.close(app)
+    return digest(encoded(value))
+
+
+def collect_scope(path, *, package_versions=False, store_alias=False):
+    try:
+        named = os.lstat(path)
+    except FileNotFoundError:
+        return {"present": False, "root": digest(b"absent"), "entries": {}}
+    target = path
+    if stat.S_ISLNK(named.st_mode):
+        require(store_alias and named.st_uid in (0, os.getuid()), "scan_unavailable")
+        target = os.path.realpath(path)
+        require(re.fullmatch(r"/nix/store/[0-9a-z]{32}-[^/]+/Applications", target) is not None, "scan_unavailable")
+    fd = open_directory(target)
+    try:
+        before = os.fstat(fd)
+        require(target == path or before.st_uid == 0 and not before.st_mode & 0o022, "scan_unavailable")
+        entries = {}
+        def observe(directory, prefix=b"", versions=False):
+            with os.scandir(directory) as stream:
+                for item in stream:
+                    require(len(entries) < MAX_SCOPE, "scan_limit")
+                    name = os.fsencode(item.name)
+                    require(len(name) <= 1024, "scan_limit")
+                    facts = os.stat(item.name, dir_fd=directory, follow_symlinks=False)
+                    entries[digest(prefix + name)] = entry_fingerprint(directory, item.name, facts)
+                    if versions and stat.S_ISDIR(facts.st_mode):
+                        child = os.open(item.name, DIR_FLAGS, dir_fd=directory)
+                        try:
+                            observe(child, name + b"/", False)
+                        finally:
+                            os.close(child)
+        observe(fd, versions=package_versions)
+        require(identity(os.fstat(fd)) == identity(before) and metadata(os.fstat(fd)) == metadata(before)
+            and identity(os.lstat(path)) == identity(named) and os.path.realpath(path) == target, "scan_changed")
+        return {"present": True, "root": digest(encoded([metadata(named), metadata(before), digest(os.fsencode(target))])),
+            "entries": entries}
+    finally:
+        os.close(fd)
+
+
+def collect(home):
+    scopes, total = {}, 0
+    for key, path in fixed_scopes(home).items():
+        scopes[key] = collect_scope(path, package_versions=key in ("homebrew-cellar", "homebrew-caskroom"),
+            store_alias=key in ("nix-applications", "home-manager-applications"))
+        total += len(scopes[key]["entries"])
+        require(total <= MAX_ENTRIES, "scan_limit")
+    return valid_snapshot(snapshot(scopes))
+
+
+class Store:
+    """Held owner-private directory chain, nonblocking flock, one atomic state."""
+    def __init__(self, home, uid, create):
+        self.fds, self.edges, self.lock, self.original = [], [], None, None
+        self.uid, self.publication = uid, None
+        try:
+            parts = Path(home).parts[1:] + ("AIDev", "state", "maintenance")
+            home_depth = len(Path(home).parts) - 1
+            self.fds.append(os.open("/", DIR_FLAGS))
+            for index, part in enumerate(parts):
+                parent = self.fds[-1]
+                try:
+                    child = os.open(part, DIR_FLAGS, dir_fd=parent)
+                except FileNotFoundError:
+                    if not create or index < len(parts) - 2:
+                        raise Fault("state_missing") from None
+                    os.mkdir(part, 0o700, dir_fd=parent)
+                    child = os.open(part, DIR_FLAGS, dir_fd=parent)
+                self.fds.append(child)
+                facts = os.fstat(child)
+                if index >= home_depth - 1:
+                    require(facts.st_uid == uid and not facts.st_mode & 0o022, "state_unavailable")
+                if index >= len(parts) - 2:
+                    require(stat.S_IMODE(facts.st_mode) == 0o700, "state_unavailable")
+                self.edges.append((parent, part, child, identity(facts)))
+            self.directory = self.fds[-1]
+            try:
+                self.lock = os.open("persistent.lock", os.O_RDWR | (os.O_CREAT if create else 0)
+                    | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC, 0o600, dir_fd=self.directory)
+            except FileNotFoundError:
+                raise Fault("state_missing") from None
+            self.file_valid(os.fstat(self.lock), empty=True)
+            try:
+                fcntl.flock(self.lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                raise Fault("busy") from None
+            self.verify()
+        except BaseException:
+            self.close()
+            raise
+
+    def file_valid(self, facts, empty=False):
+        require(stat.S_ISREG(facts.st_mode) and facts.st_uid == self.uid and facts.st_nlink == 1
+            and stat.S_IMODE(facts.st_mode) == 0o600 and 0 <= facts.st_size <= (0 if empty else MAX_STATE), "state_unavailable")
+
+    def verify(self):
+        for parent, name, child, stamp in self.edges:
+            require(identity(os.fstat(child)) == stamp and identity(os.stat(name, dir_fd=parent, follow_symlinks=False)) == stamp,
+                "state_unavailable")
+        require(identity(os.fstat(self.lock)) == identity(os.stat("persistent.lock", dir_fd=self.directory, follow_symlinks=False)),
+            "state_unavailable")
+        self.file_valid(os.fstat(self.lock), empty=True)
+
+    def read_raw(self):
+        self.verify()
+        try:
+            fd = os.open("observations.json", FILE_FLAGS, dir_fd=self.directory)
+        except FileNotFoundError:
+            return None
+        try:
+            facts = os.fstat(fd)
+            self.file_valid(facts)
+            chunks, count = [], 0
+            while count <= MAX_STATE:
+                block = os.read(fd, min(65536, MAX_STATE + 1 - count))
+                if not block:
+                    break
+                chunks.append(block)
+                count += len(block)
+            require(count == facts.st_size and count <= MAX_STATE
+                and metadata(os.fstat(fd)) == metadata(facts), "state_unavailable")
+            return b"".join(chunks)
+        finally:
+            os.close(fd)
+
+    def load(self):
+        self.original = self.read_raw()
+        return valid_state(parse_json(self.original)) if self.original is not None else None
+
+    def save(self, state):
+        raw = encoded(valid_state(state))
+        require(len(raw) <= MAX_STATE and self.read_raw() == self.original, "state_unavailable")
+        fd = os.open("observations.pending", os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC,
+            0o600, dir_fd=self.directory)
+        pending = True
+        try:
+            self.file_valid(os.fstat(fd))
+            offset = 0
+            while offset < len(raw):
+                count = os.write(fd, raw[offset:])
+                require(count > 0, "state_unavailable")
+                offset += count
+            os.fsync(fd)
+            self.verify()
+            require(self.read_raw() == self.original, "state_unavailable")
+            require(identity(os.stat("observations.pending", dir_fd=self.directory, follow_symlinks=False)) == identity(os.fstat(fd)),
+                "state_unavailable")
+            os.replace("observations.pending", "observations.json", src_dir_fd=self.directory, dst_dir_fd=self.directory)
+            pending = False
+            self.publication = dict(state["latest"])
+            os.fsync(self.directory)
+        finally:
+            if pending:
+                try:
+                    if identity(os.stat("observations.pending", dir_fd=self.directory, follow_symlinks=False)) == identity(os.fstat(fd)):
+                        os.unlink("observations.pending", dir_fd=self.directory)
+                finally:
+                    os.close(fd)
+            else:
+                os.close(fd)
+
+    def close(self):
+        if self.lock is not None:
+            lock, self.lock = self.lock, None
+            os.close(lock)
+        while self.fds:
+            os.close(self.fds.pop())
+
+
+def execute(operation, *, store_factory, collector):
+    store, value, previous = None, None, None
+    def unavailable(error):
+        reason = error.reason if isinstance(error, Fault) else "state_unavailable"
+        status = {"state_missing": "STATE_MISSING", "state_malformed": "STATE_MALFORMED", "busy": "SKIPPED_BUSY"}.get(reason, "STATE_UNAVAILABLE")
+        # Atomic publication is known even if directory durability or close failed.
+        # Preserve its sequence/digest/retained drift; do not claim completed capture.
+        published = store is not None and store.publication is not None
+        known = store.publication if published else previous["latest"] if previous is not None else None
+        if known is not None:
+            return dict(known, operation=operation, status="STATE_UNAVAILABLE", reason="state_unavailable",
+                completeObservation=False, observationPublished=published)
+        return dict(report(status, reason), operation=operation)
+    try:
+        store = store_factory(operation == "capture")
+        previous = store.load()
+        if operation == "status":
+            value = dict(previous["latest"]) if previous else report("STATE_MISSING", "state_missing")
+            value.update(operation="status", observationPublished=False)
+        else:
+            try:
+                observation = collector()
+                valid_snapshot(observation)
+                state = evolve(previous, observation)
+            except Exception as error:
+                reason = error.reason if isinstance(error, Fault) and error.reason in {"scan_limit", "scan_changed"} else "scan_unavailable"
+                state = evolve(previous, failure=reason)
+            store.save(state)
+            value = state["latest"]
+    except (OSError, Fault, ValueError, TypeError, KeyError) as error:
+        value = unavailable(error)
+    finally:
+        if store is not None:
+            try:
+                store.close()
+            except (OSError, Fault) as error:
+                value = unavailable(error)
+    return value
+
+
+def native(operation):
+    uid = os.getuid()
+    home = pwd.getpwuid(uid).pw_dir
+    script = str(Path(__file__).absolute())
+    require(uid > 0 and script == home + "/AIDev/control/bin/workstation-drift-snapshot"
+        and os.path.realpath(script) == script, "noncanonical_source")
+    return execute(operation, store_factory=lambda create: Store(home, uid, create), collector=lambda: collect(home))
+
+
+def main(arguments=None, *, operation=native, emit=print):
+    args = sys.argv[1:] if arguments is None else arguments
+    if type(args) is not list or args not in (["capture"], ["capture", "--json"], ["status"], ["status", "--json"]):
+        emit("workstation-drift-snapshot: use capture [--json] or status [--json]")
+        return 2
+    try:
+        value = valid_report(operation(args[0]))
+    except (OSError, Fault, ValueError, TypeError, KeyError):
+        value = dict(report("STATE_UNAVAILABLE", "state_unavailable"), operation=args[0])
+    emit(json.dumps(value, sort_keys=True, separators=(",", ":")) if "--json" in args else
+        "Limited metadata observation: " + value["status"] + "; unresolved drift=" + str(value["unresolvedDrift"]).lower()
+        + "; unresolved failure=" + str(value["unresolvedFailure"]).lower() + "; " + GUIDANCE)
+    return (3 if value["status"] == "SKIPPED_BUSY" else 0 if value["status"] in {"BASELINE_OBSERVED", "UNCHANGED"}
+        and not value["unresolvedDrift"] and not value["unresolvedFailure"] else 1)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

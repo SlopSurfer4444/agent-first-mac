@@ -1,0 +1,45 @@
+{
+  "publicReferenceOnly": true,
+  "warning": "Sanitized historical example. Not installation authority or current inventory.",
+  "example": {
+    "schema": 1,
+    "profile": "codex-windows-host-ssh-remote-control-isolation",
+    "profileActive": true,
+    "platform": "Windows 11 WindowsHost",
+    "scope": "New inbound OpenSSH sessions only",
+    "problem": {
+      "failureClass": "the SSH-launched Codex app-server inherits an existing Remote Control enrollment and its duplicate cloud registration receives HTTP 409 already-online",
+      "selectedCorrection": "set CODEX_INTERNAL_APP_SERVER_REMOTE_CONTROL_DISABLED=1 and CODEX_SSH_SKIP_APP_SERVER_BOOT=true only in sshd child-session environments; the latter lets the desktop connector use a separately owned foreground holder instead of Windows-incompatible POSIX detachment"
+    },
+    "managedTargets": [
+      "one marked global SetEnv block with exactly two assignments before the first Match stanza in the existing Windows OpenSSH sshd_config",
+      "%ProgramData%\\AIDev\\state\\codex-windows-host-ssh-remote-control-isolation\\receipt.json"
+    ],
+    "preservedState": [
+      "Windows desktop Codex Remote Control outside SSH sessions",
+      "existing OpenSSH authentication, key, account, port, bind address, firewall and startup mode",
+      "Tailscale, Grants, VPN, DNS, routes, exit node and Tailscale SSH",
+      "RDP, RustDesk, SMB, office/admin-project access, Git, other projects, projects and chats",
+      "Mac app, SSH key material and all unrelated state"
+    ],
+    "preconditions": {
+      "existingMacStdioCompatibilityDoctorPasses": true,
+      "remoteSshdRunningAutomaticAndSyntaxValid": true,
+      "noConflictingManagedBlockOrSetEnv": true,
+      "oneShotInlineRemoteControlStatusIsDisabled": true
+    },
+    "dataBoundary": {
+      "privateOrPublicKeyMaterialRead": false,
+      "codexPrivateStateRead": false,
+      "authOrSessionStateRead": false,
+      "rawLogsRead": false
+    },
+    "lifecycle": {
+      "prepare": "inspect only boolean/sanitized ownership, service, syntax and isolated app-server status facts",
+      "apply": "insert or migrate to one exact marked two-flag SetEnv block from an exact clean reviewed commit, syntax-check the candidate, atomically replace, restart only sshd and write a private receipt",
+      "doctor": "require exact block/receipt ownership, automatic running sshd, a new SSH session with both exact flags and remoteControl status disabled",
+      "rollback": "remove a first-install block or restore the exact prior one-flag legacy block when current and receipt hashes match, syntax-check and restart only sshd",
+      "failure": "restore the exact in-memory prestate and restart sshd before reporting a failed apply or rollback"
+    }
+  }
+}

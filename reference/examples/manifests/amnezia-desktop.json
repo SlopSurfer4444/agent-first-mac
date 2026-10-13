@@ -1,0 +1,78 @@
+{
+  "publicReferenceOnly": true,
+  "warning": "Sanitized historical example. Not installation authority or current inventory.",
+  "example": {
+    "schema": 1,
+    "profile": "amnezia-vpn-reviewed-desktop",
+    "profileActive": false,
+    "desiredState": "absent",
+    "platform": {
+      "operatingSystem": "macOS",
+      "minimumVersion": "14",
+      "architecture": "arm64 host with Rosetta 2",
+      "rosettaRequired": false,
+      "rosettaRequiredForInstall": true
+    },
+    "source": {
+      "project": "AmneziaVPN",
+      "release": "4.8.21.0",
+      "bundleVersion": "4.8.21",
+      "url": "https://github.com/amnezia-vpn/amnezia-client/releases/download/4.8.21.0/AmneziaVPN_4.8.21.0_macos.pkg",
+      "sha256": "da339236eef1728956197c8bf9ed96a2a21047270106e6c0aa062c9e142e3ac7",
+      "nixHash": "sha256-2jOSNu7xcolWGXyL+e2WoqIQRycBBubAqgYsnhQuOsc=",
+      "installerTeamIdentifier": "X7UJ388FXK"
+    },
+    "application": {
+      "path": "/Applications/AmneziaVPN.app",
+      "bundleIdentifier": "com.yourcompany.AmneziaVPN",
+      "bundleVersion": "4.8.21",
+      "teamIdentifier": "X7UJ388FXK",
+      "binaryArchitecture": "x86_64",
+      "serviceSha256": "96858f0916e57f0e6bbae68cbc2b70e7eb5f3ad84a4f120c89a6defbda34cdbb",
+      "resourcePlistSha256": "e85a4836b4eee622d0bbce572cc356272758b77e7b707ce90041cc4c5bd17b8a"
+    },
+    "service": {
+      "label": "AmneziaVPN-service",
+      "plist": "/Library/LaunchDaemons/AmneziaVPN.plist",
+      "program": "/Applications/AmneziaVPN.app/Contents/MacOS/AmneziaVPN-service",
+      "runAs": "root",
+      "socketFamily": "IPv4",
+      "socketAddress": "127.0.0.1",
+      "socketPort": 5959,
+      "automaticVpnConnection": false
+    },
+    "target": {
+      "legacyRemovalMode": "Move only the exact attested legacy app to the owner's Trash",
+      "marker": "/var/db/agent-first-mac/amnezia-vpn/managed-version",
+      "fallbackVpnPreserved": true,
+      "vendorPostinstallExecuted": false,
+      "dockPinned": true,
+      "dockPositionAfter": "Happ",
+      "widgetAvailable": false,
+      "widgetConfigured": false
+    },
+    "absence": {
+      "retiredPayloadPath": "/var/db/agent-first-mac/amnezia-vpn-retired",
+      "daemonSha256": "97f8b6cb06b1ed315ad6c4cf9a1c7c657ce8f420e400fe31c8c2a25493d76b85",
+      "systemSupportPath": "/Library/Application Support/AmneziaVPN",
+      "systemSupportEmptyChild": "pf",
+      "rollback": "A new reviewed enabled-state commit restores only the exact retired app, daemon, marker and Dock tile; profiles and keys are not recoverable from this stage"
+    },
+    "dataBoundary": {
+      "vpnProfilesReadOrCopied": false,
+      "vpnKeysReadOrCopied": false,
+      "keychainReadOrCopied": false,
+      "authenticationStateReadOrCopied": false,
+      "configurationLogsStored": false,
+      "userSupportDataDeleted": false
+    },
+    "lifecycle": {
+      "install": "Verify the signed package and checksum, expand without scripts, preserve the app signature, install a loopback-only root daemon, remove the exact legacy app from Applications recoverably, and pin the desktop app in the Dock",
+      "smoke": "Verify application identity, strict signature, Gatekeeper, Rosetta, service identity, loopback listener, Dock tile, legacy-app absence, widget-extension absence, fallback VPN, DNS, and HTTPS",
+      "connectionTest": "Requires a user-provided connection configuration and is intentionally outside the installation gate",
+      "rollback": "Flip the legacy-retention and Dock flags in an exact commit to restore the attested legacy app from Trash and remove only the managed Dock tile",
+      "remove": "Use the distinct absent state. Retire only exact managed payloads, remove the exact Dock tile and empty system support directories, and leave profile/key purge to the separately bounded owner operation. Never call the vendor uninstaller",
+      "userDataMutation": false
+    }
+  }
+}

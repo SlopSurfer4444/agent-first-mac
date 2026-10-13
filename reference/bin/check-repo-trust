@@ -1,0 +1,498 @@
+#!/usr/bin/python3
+"""Read-only identity check for two already registered exact repository roots.
+
+No trust writer, project-code execution, remote contact or authentication. This
+is a bounded observation, not a sandbox against a hostile same-user process.
+Only the direct fixed Git children are owned; timeouts attempt process-group
+termination and bounded direct-child reaping. Denied or incomplete cleanup is
+reported as unverified settlement. No hard kernel/syscall deadline is claimed.
+"""
+
+import argparse
+import json
+import os
+from pathlib import Path
+import pwd
+import re
+import selectors
+import signal
+import stat
+import subprocess
+import sys
+import time
+
+
+MAX_REGISTRY = 65536
+MAX_FILE = 65536
+MAX_OUTPUT = 16384
+MAX_TOTAL = 262144
+DEADLINE_SECONDS = 30.0
+COMMAND_SECONDS = 5.0
+ID = re.compile(r"[a-z0-9][a-z0-9-]{0,95}\Z")
+OID = re.compile(r"[0-9a-f]{40}\Z")
+SEGMENT = r"[A-Za-z0-9][A-Za-z0-9._-]*"
+ROOT_PATTERN = re.compile(r"\$HOME/AIDev/(?:control|(?:repos|worktrees)/" + SEGMENT
+                          + r"(?:/" + SEGMENT + r")*)\Z")
+REMOTE = re.compile(r"https://github\.com/[A-Za-z0-9][A-Za-z0-9-]{0,38}/[A-Za-z0-9_.-]{1,100}\Z")
+
+
+class CheckError(Exception):
+    def __init__(self, reason, *, child_settled=True):
+        self.reason = reason
+        self.child_settled = child_settled
+        super().__init__(reason)
+
+
+def require(value, reason):
+    if not value:
+        raise CheckError(reason)
+
+
+def cleanup_failure(original, error, reason, *, child_settled=True):
+    """Keep the first failure/interruption and never lose unsettled ownership."""
+    failure = original
+    if failure is None:
+        failure = CheckError(reason) if isinstance(error, Exception) else error
+    failure.child_settled = (getattr(failure, "child_settled", True)
+                             and getattr(error, "child_settled", True) and child_settled)
+    failure.cleanup_errors = getattr(failure, "cleanup_errors", ()) + ((reason, error),)
+    return failure
+
+
+def validate_arguments(repo_id, worktree_id, remote):
+    require(all(type(value) is str and ID.fullmatch(value) for value in (repo_id, worktree_id))
+            and repo_id != worktree_id, "invalid_arguments")
+    require(type(remote) is str and REMOTE.fullmatch(remote)
+            and remote.rsplit("/", 1)[-1] not in (".", "..", ".git"), "invalid_arguments")
+
+
+def validate_registry(raw, repo_id, worktree_id, remote):
+    """Pure schema/selection check; record presence is not physical identity."""
+    validate_arguments(repo_id, worktree_id, remote)
+    require(type(raw) is bytes and 0 < len(raw) <= MAX_REGISTRY, "invalid_registry")
+    def unique(pairs):
+        value = {}
+        for key, item in pairs:
+            require(key not in value, "invalid_registry")
+            value[key] = item
+        return value
+    try:
+        registry = json.loads(raw.decode("utf-8"), object_pairs_hook=unique,
+                              parse_constant=lambda _: require(False, "invalid_registry"))
+    except (ValueError, UnicodeError, RecursionError):
+        raise CheckError("invalid_registry") from None
+    require(type(registry) is dict and set(registry) == {"schema", "repositories"}
+            and type(registry["schema"]) is int and registry["schema"] == 1,
+            "invalid_registry")
+    rows = registry["repositories"]
+    require(type(rows) is list and 1 <= len(rows) <= 256, "invalid_registry")
+    by_id, roots = {}, set()
+    for row in rows:
+        require(type(row) is dict and set(row) == {"id", "canonicalRoot", "provenance",
+                "adoptedCommit", "trust", "route"}, "invalid_registry")
+        ident, root, adopted = row["id"], row["canonicalRoot"], row["adoptedCommit"]
+        require(type(ident) is str and ID.fullmatch(ident) and ident not in by_id,
+                "invalid_registry")
+        require(type(root) is str and len(root) <= 2048 and ROOT_PATTERN.fullmatch(root)
+                and root.lower() not in roots, "invalid_registry")
+        require(type(adopted) is str and OID.fullmatch(adopted) and adopted != "0" * 40
+                and row["route"] == "trusted", "invalid_registry")
+        control = root == "$HOME/AIDev/control"
+        require(row["trust"] == ("trusted-control" if control else "trusted-repo")
+                and row["provenance"] == ("reviewed-control" if control else "reviewed-clone"),
+                "invalid_registry")
+        by_id[ident] = dict(row)
+        roots.add(root.lower())
+    require("$home/aidev/control" in roots, "control_registry_missing")
+    require(repo_id in by_id and worktree_id in by_id, "selected_root_unregistered")
+    repo, worktree = by_id[repo_id], by_id[worktree_id]
+    require(repo["canonicalRoot"].startswith("$HOME/AIDev/repos/")
+            and worktree["canonicalRoot"].startswith("$HOME/AIDev/worktrees/")
+            and worktree["canonicalRoot"] != "$HOME/AIDev/worktrees/control"
+            and not worktree["canonicalRoot"].startswith("$HOME/AIDev/worktrees/control/"),
+            "selected_root_role_mismatch")
+    return repo, worktree
+
+
+class Guard:
+    """Hold no-follow directory/file descriptors; recheck identities and bytes."""
+    def __init__(self, home, uid):
+        self.home, self.uid = Path(home), uid
+        require(type(uid) is int and uid > 0 and self.home.is_absolute()
+                and str(self.home) == os.path.realpath(self.home), "invalid_home")
+        self.deadline = time.monotonic() + DEADLINE_SECONDS
+        self.total = 0
+        self.directories, self.files, self.absent = {}, {}, set()
+
+    def check_time(self):
+        require(time.monotonic() < self.deadline, "deadline_exceeded")
+
+    def account(self, count):
+        self.total += count
+        require(self.total <= MAX_TOTAL, "total_size_limit")
+        self.check_time()
+
+    def safe(self, info, directory):
+        require((stat.S_ISDIR(info.st_mode) if directory else stat.S_ISREG(info.st_mode))
+                and info.st_uid == self.uid and info.st_mode & 0o022 == 0
+                and (directory or info.st_nlink == 1), "unsafe_metadata")
+
+    @staticmethod
+    def identity(info, directory=False):
+        base = (info.st_dev, info.st_ino, info.st_mode, info.st_uid, info.st_gid)
+        return base if directory else base + (info.st_size, info.st_mtime_ns, info.st_ctime_ns, info.st_nlink)
+
+    def directory(self, path):
+        self.check_time()
+        path = Path(path)
+        require(path.is_absolute() and str(path) == os.path.normpath(path)
+                and (path == self.home or self.home in path.parents), "invalid_path")
+        if path in self.directories:
+            return self.directories[path][0]
+        parent = None if path == self.home else self.directory(path.parent)
+        fd = os.open(str(path) if parent is None else path.name,
+                     os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=parent)
+        try:
+            info = os.fstat(fd)
+            self.safe(info, True)
+            self.directories[path] = fd, self.identity(info, True)
+        except BaseException as failure:
+            try:
+                os.close(fd)
+            except BaseException as error:
+                cleanup_failure(failure, error, "descriptor_close_failed")
+            raise
+        return fd
+
+    def read(self, path, limit=MAX_FILE):
+        path = Path(path)
+        require(path not in self.files, "duplicate_metadata_read")
+        parent = self.directory(path.parent)
+        fd = os.open(path.name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=parent)
+        try:
+            before = os.fstat(fd)
+            self.safe(before, False)
+            require(before.st_size <= limit, "metadata_size_limit")
+            data = bytearray()
+            while True:
+                self.check_time()
+                chunk = os.read(fd, min(8192, limit + 1 - len(data)))
+                if not chunk:
+                    break
+                data.extend(chunk)
+                require(len(data) <= limit, "metadata_size_limit")
+            require(self.identity(before) == self.identity(os.fstat(fd)), "metadata_changed")
+            self.account(len(data))
+            self.files[path] = fd, self.identity(before), bytes(data)
+            return bytes(data)
+        except BaseException as failure:
+            try:
+                os.close(fd)
+            except BaseException as error:
+                cleanup_failure(failure, error, "descriptor_close_failed")
+            raise
+
+    def missing(self, path):
+        path = Path(path)
+        parent = self.directory(path.parent)
+        try:
+            os.stat(path.name, dir_fd=parent, follow_symlinks=False)
+        except FileNotFoundError:
+            self.absent.add(path)
+            return
+        raise CheckError("unsupported_git_indirection")
+
+    def recheck(self):
+        self.check_time()
+        for path, (fd, expected) in self.directories.items():
+            actual = os.stat(path, follow_symlinks=False) if path == self.home else os.stat(
+                path.name, dir_fd=self.directories[path.parent][0], follow_symlinks=False)
+            require(self.identity(actual, True) == expected
+                    and self.identity(os.fstat(fd), True) == expected, "metadata_changed")
+        for path, (fd, expected, raw) in self.files.items():
+            actual = os.stat(path.name, dir_fd=self.directories[path.parent][0], follow_symlinks=False)
+            require(self.identity(actual) == expected and self.identity(os.fstat(fd)) == expected,
+                    "metadata_changed")
+            require(os.pread(fd, len(raw) + 1, 0) == raw, "metadata_changed")
+        for path in self.absent:
+            try:
+                os.stat(path.name, dir_fd=self.directories[path.parent][0], follow_symlinks=False)
+            except FileNotFoundError:
+                continue
+            raise CheckError("metadata_changed")
+
+    def close(self):
+        failure = None
+        for fd in [row[0] for row in self.files.values()] + [row[0] for row in self.directories.values()]:
+            try:
+                os.close(fd)
+            except BaseException as error:
+                failure = cleanup_failure(failure, error, "descriptor_close_failed")
+        self.files.clear()
+        self.directories.clear()
+        if failure is not None:
+            raise failure from None
+
+
+class Git:
+    PREFIX = ("/usr/bin/git", "--no-pager", "--no-optional-locks", "--no-replace-objects",
+        "-c", "core.fsmonitor=false", "-c", "core.hooksPath=/dev/null",
+        "-c", "core.untrackedCache=false", "-c", "protocol.allow=never",
+        "-c", "credential.helper=", "-c", "core.sshCommand=/usr/bin/false")
+
+    def __init__(self, guard, process_factory=None):
+        self.guard = guard
+        self.factory = subprocess.Popen if process_factory is None else process_factory
+        self.env = {"HOME": str(guard.home), "PATH": "/usr/bin:/bin:/usr/sbin:/sbin",
+            "LANG": "C", "LC_ALL": "C", "GIT_CONFIG_NOSYSTEM": "1",
+            "GIT_CONFIG_GLOBAL": "/dev/null", "GIT_TERMINAL_PROMPT": "0",
+            "GIT_OPTIONAL_LOCKS": "0", "GIT_NO_LAZY_FETCH": "1", "GIT_ALLOW_PROTOCOL": "",
+            "GIT_ATTR_NOSYSTEM": "1", "GIT_EXTERNAL_DIFF": "/usr/bin/false"}
+
+    def read(self, cwd, *args, allow_one=False):
+        self.guard.recheck()
+        deadline = min(self.guard.deadline, time.monotonic() + COMMAND_SECONDS)
+        child = None
+        completed = False
+        failure = None
+        selector = selectors.DefaultSelector()
+        buffers = [bytearray(), bytearray()]
+        try:
+            try:
+                child = self.factory(self.PREFIX + args, cwd=str(cwd), env=dict(self.env),
+                    stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                    close_fds=True, start_new_session=True)
+            except BaseException as error:
+                if isinstance(error, Exception):
+                    raise CheckError("git_launch_failed", child_settled=False) from None
+                error.child_settled = False
+                raise
+            for index, stream in enumerate((child.stdout, child.stderr)):
+                os.set_blocking(stream.fileno(), False)
+                selector.register(stream, selectors.EVENT_READ, index)
+            size = 0
+            while selector.get_map():
+                remaining = deadline - time.monotonic()
+                require(remaining > 0, "git_timeout")
+                for key, _ in selector.select(min(remaining, 0.1)):
+                    chunk = os.read(key.fileobj.fileno(), 8192)
+                    if not chunk:
+                        selector.unregister(key.fileobj)
+                    else:
+                        size += len(chunk)
+                        require(size <= MAX_OUTPUT, "git_output_limit")
+                        buffers[key.data].extend(chunk)
+            require(deadline > time.monotonic(), "git_timeout")
+            try:
+                code = child.wait(timeout=deadline - time.monotonic())
+            except subprocess.TimeoutExpired:
+                raise CheckError("git_timeout") from None
+            self.guard.account(size)
+            require(type(code) is int and code in ((0, 1) if allow_one else (0,))
+                    and not buffers[1], "git_check_failed")
+            self.guard.recheck()
+            completed = True
+            return code, bytes(buffers[0])
+        except BaseException as error:
+            failure = error
+        finally:
+            try:
+                selector.close()
+            except BaseException as error:
+                failure = cleanup_failure(failure, error, "git_selector_close_failed", child_settled=False)
+            if child is not None:
+                running = None
+                try:
+                    running = child.poll() is None
+                except BaseException as error:
+                    failure = cleanup_failure(failure, error, "git_settlement_failed", child_settled=False)
+                if running is False and isinstance(failure, CheckError) and failure.reason == "git_timeout":
+                    # A reaped parent does not prove settlement of inherited
+                    # pipes. Do not signal a possibly reused process-group ID.
+                    failure.child_settled = False
+                if not completed and running is True:
+                    try:
+                        os.killpg(child.pid, signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
+                    except BaseException as error:
+                        # Do not retry a denied signal via another route.
+                        failure = cleanup_failure(failure, error, "git_signal_denied", child_settled=False)
+                if running is not False:
+                    try:
+                        child.wait(timeout=1.0)
+                    except BaseException as error:
+                        failure = cleanup_failure(failure, error, "git_settlement_failed", child_settled=False)
+                for stream in (child.stdout, child.stderr):
+                    try:
+                        stream.close()
+                    except BaseException as error:
+                        failure = cleanup_failure(failure, error, "git_stream_close_failed", child_settled=False)
+            if failure is not None:
+                raise failure from None
+
+
+def hold_head(guard, git_dir, common):
+    """Bind the actual loose or packed branch ref, not just symbolic HEAD."""
+    raw = guard.read(git_dir / "HEAD", 4096)
+    if re.fullmatch(rb"[0-9a-f]{40}\n", raw):
+        return
+    try:
+        text = raw.decode("ascii")
+    except UnicodeError:
+        raise CheckError("invalid_head") from None
+    require(re.fullmatch(r"ref: refs/heads/" + SEGMENT + r"(?:/" + SEGMENT + r")*\n", text),
+            "invalid_head")
+    reference = text[5:-1]
+    parts = reference.split("/")
+    directory = common
+    missing = False
+    for part in parts[:-1]:
+        directory = directory / part
+        try:
+            guard.directory(directory)
+        except FileNotFoundError:
+            guard.missing(directory)
+            missing = True
+            break
+    if not missing:
+        path = common / reference
+        if path in guard.files:
+            value = guard.files[path][2]
+        else:
+            try:
+                value = guard.read(path, 4096)
+            except FileNotFoundError:
+                guard.missing(path)
+                missing = True
+        if not missing:
+            require(re.fullmatch(rb"[0-9a-f]{40}\n", value), "invalid_head")
+            return
+    packed = common / "packed-refs"
+    raw = guard.files[packed][2] if packed in guard.files else guard.read(packed)
+    rows = [line.split(b" ", 1) for line in raw.splitlines() if not line.startswith((b"#", b"^"))]
+    values = [row[0] for row in rows if len(row) == 2 and row[1] == reference.encode("ascii")]
+    require(len(values) == 1 and re.fullmatch(rb"[0-9a-f]{40}", values[0]), "invalid_head")
+
+
+def inspect(repo_id, worktree_id, remote, *, home, uid, registry_path=None, process_factory=None):
+    """Injection is a Python test seam only; CLI always chooses platform roots."""
+    validate_arguments(repo_id, worktree_id, remote)
+    guard = Guard(home, uid)
+    failure = None
+    try:
+        registry = Path(registry_path) if registry_path is not None else guard.home / "AIDev/control/manifests/trusted-repos.json"
+        repo, worktree = validate_registry(guard.read(registry, MAX_REGISTRY), repo_id, worktree_id, remote)
+        primary = guard.home / repo["canonicalRoot"][len("$HOME/"):]
+        linked = guard.home / worktree["canonicalRoot"][len("$HOME/"):]
+        common = primary / ".git"
+        guard.directory(primary)
+        guard.directory(linked)
+        guard.directory(common)
+        guard.directory(common / "objects")
+        guard.directory(common / "objects/info")
+        guard.directory(common / "refs")
+        guard.directory(common / "info")
+        for path in (common / "commondir", common / "gitdir", common / "config.worktree",
+                     common / "info/grafts", common / "objects/info/alternates",
+                     common / "objects/info/http-alternates"):
+            guard.missing(path)
+        hold_head(guard, common, common)
+        guard.read(common / "config")
+        pointer = guard.read(linked / ".git", 4096)
+        try:
+            target = pointer.decode("utf-8")
+        except UnicodeError:
+            raise CheckError("invalid_worktree_pointer") from None
+        require(target.startswith("gitdir: ") and target.endswith("\n") and target.count("\n") == 1,
+                "invalid_worktree_pointer")
+        admin = Path(target[8:-1])
+        require(admin.parent == common / "worktrees" and re.fullmatch(SEGMENT, admin.name)
+                and target == "gitdir: " + str(admin) + "\n", "foreign_worktree_pointer")
+        guard.directory(admin)
+        require(guard.read(admin / "commondir", 4096) == b"../..\n", "foreign_common_directory")
+        require(guard.read(admin / "gitdir", 4096) == (str(linked / ".git") + "\n").encode(),
+                "worktree_backlink_mismatch")
+        hold_head(guard, admin, common)
+        guard.missing(admin / "config.worktree")
+        git = Git(guard, process_factory)
+        # Parse the one bound common config without includes or repository setup.
+        config = git.read(guard.home, "config", "--no-includes", "--file", str(common / "config"), "--null", "--list")[1]
+        origin = []
+        for item in config.split(b"\0"):
+            if not item:
+                continue
+            key, separator, value = item.partition(b"\n")
+            require(key and separator, "invalid_git_config")
+            lowered = key.lower()
+            require(not lowered.startswith((b"include.", b"includeif."))
+                    and lowered != b"extensions.worktreeconfig", "unsupported_git_config")
+            if lowered == b"remote.origin.url":
+                origin.append(value)
+        require(origin == [remote.encode("ascii")], "origin_mismatch")
+        heads = []
+        for row, root, git_dir in ((repo, primary, common), (worktree, linked, admin)):
+            for args, expected in (( ("rev-parse", "--show-toplevel"), str(root)),
+                    (("rev-parse", "--absolute-git-dir"), str(git_dir)),
+                    (("rev-parse", "--path-format=absolute", "--git-common-dir"), str(common))):
+                require(git.read(root, *args)[1] == (expected + "\n").encode(), "git_root_mismatch")
+            head = git.read(root, "rev-parse", "--verify", "HEAD^{commit}")[1]
+            require(len(head) == 41 and head.endswith(b"\n") and OID.fullmatch(head[:-1].decode("ascii")),
+                    "invalid_head")
+            heads.append((root, head))
+            adopted = row["adoptedCommit"]
+            require(git.read(root, "cat-file", "-t", adopted)[1] == b"commit\n", "adopted_commit_missing")
+            code, output = git.read(root, "merge-base", "--is-ancestor", adopted, head[:-1].decode(), allow_one=True)
+            require(code == 0 and output == b"", "adopted_commit_not_ancestor")
+        for root, head in heads:
+            require(git.read(root, "rev-parse", "--verify", "HEAD^{commit}")[1] == head, "head_changed")
+        guard.recheck()
+        return {"schema": 1, "result": "pass", "reason": "registered_identities_verified",
+                "primaryVerified": True, "linkedVerified": True, "adoptedAncestorVerified": True,
+                "trustChanged": False, "networkAccessed": False, "childrenSettled": True}
+    except BaseException as error:
+        failure = error
+    finally:
+        try:
+            guard.close()
+        except BaseException as error:
+            failure = cleanup_failure(failure, error, "descriptor_close_failed")
+        if failure is not None:
+            raise failure from None
+
+
+def native(repo_id, worktree_id, remote):
+    uid = os.getuid()
+    return inspect(repo_id, worktree_id, remote, home=pwd.getpwuid(uid).pw_dir, uid=uid)
+
+
+class Parser(argparse.ArgumentParser):
+    def error(self, message):
+        raise CheckError("invalid_arguments")
+
+
+def main(argv=None, *, operation=native, emit=print):
+    args = sys.argv[1:] if argv is None else argv
+    try:
+        parser = Parser(description=__doc__, allow_abbrev=False)
+        parser.add_argument("--repo-id", required=True)
+        parser.add_argument("--worktree-id", required=True)
+        parser.add_argument("--remote", required=True)
+        parser.add_argument("--json", action="store_true")
+        options = parser.parse_args(args)
+        validate_arguments(options.repo_id, options.worktree_id, options.remote)
+        report = operation(options.repo_id, options.worktree_id, options.remote)
+        status = 0
+    except Exception as error:
+        reason = error.reason if isinstance(error, CheckError) else "identity_check_failed"
+        report = {"schema": 1, "result": "fail", "reason": reason, "primaryVerified": False,
+            "linkedVerified": False, "adoptedAncestorVerified": False, "trustChanged": False,
+            "networkAccessed": False, "childrenSettled": getattr(error, "child_settled", True)}
+        status = 2 if reason == "invalid_arguments" else 1
+    emit(json.dumps(report, sort_keys=True, separators=(",", ":")) if "--json" in args else
+         "Repository trust identity: " + report["result"] + "; " + report["reason"])
+    return status
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

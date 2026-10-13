@@ -1,0 +1,243 @@
+#!/usr/bin/python3
+"""Read-only live doctor for the declared prestate or target profile."""
+
+import json
+import os
+from pathlib import Path
+import re
+import subprocess
+import sys
+
+
+ROOT = Path(__file__).resolve().parent.parent
+MANIFEST = ROOT / "manifests/productivity-baseline.json"
+
+
+def command(argv, timeout=None):
+    return subprocess.run(argv, text=True, stdout=subprocess.PIPE,
+                          stderr=subprocess.STDOUT, check=False, timeout=timeout)
+
+
+def default(domain, key):
+    result = command(["/usr/bin/defaults", "read", domain, key])
+    return result.stdout.strip() if result.returncode == 0 else None
+
+
+def plist_value(bundle, key):
+    result = command(["/usr/bin/plutil", "-extract", key, "raw", "-o", "-",
+                      str(bundle / "Contents/Info.plist")])
+    return result.stdout.strip() if result.returncode == 0 else None
+
+
+def codesign_team(bundle):
+    result = command(["/usr/bin/codesign", "-d", "--verbose=4", str(bundle)])
+    match = re.search(r"^TeamIdentifier=([^\n]+)$", result.stdout, re.MULTILINE)
+    return match.group(1) if match else None
+
+
+def revision_observation():
+    """Consume bounded source-alignment evidence, never a replacement for health."""
+    unknown = {"state": "UNKNOWN", "compatible": False, "revisionExact": False,
+               "sourceRevision": None, "installedRevision": None, "sourceAdmissionMode": None}
+    def unique(pairs):
+        value = {}
+        for key, item in pairs:
+            if key in value:
+                raise ValueError("duplicate key")
+            value[key] = item
+        return value
+    try:
+        # The helper owns a 180s cooperative budget including its command cleanup.
+        # Never preempt it with this doctor's shorter ordinary-command timeout.
+        result = command([sys.executable, str(ROOT / "bin/system-revision-status"), "--json"], timeout=200)
+        if result.returncode != 0 or len(result.stdout) > 16384:
+            return unknown
+        value = json.loads(result.stdout, object_pairs_hook=unique)
+        if type(value) is not dict or type(value.get("schema")) is not int or value["schema"] != 1:
+            return unknown
+        if not all(value.get(key) is True for key in (
+                "compatible", "sourceAccepted", "installedCommitAccepted",
+                "systemInputsEqual", "childSettled", "sourceHandlesClosed", "readOnly")):
+            return unknown
+        if value.get("systemMutationsPerformed") is not False:
+            return unknown
+        source, installed = value.get("sourceRevision"), value.get("installedRevision")
+        if not all(type(item) is str and re.fullmatch(r"[0-9a-f]{40}", item)
+                   and item != "0" * 40 for item in (source, installed)):
+            return unknown
+        admission = value.get("sourceAdmissionMode")
+        if type(admission) is not str or admission not in ("historical-review", "current-state"):
+            return unknown
+        current_state = admission == "current-state"
+        exact = source == installed
+        expected = "CURRENT_REVISION" if exact else (
+            "CURRENT_CONTROL_ONLY_SUCCESSOR" if current_state else "ACCEPTED_CONTROL_ONLY_SUCCESSOR")
+        reason = (("exact_admitted_revision" if current_state else "exact_accepted_revision") if exact
+                  else ("current_system_inputs_unchanged" if current_state else "reviewed_system_inputs_unchanged"))
+        if value.get("reason") != reason:
+            return unknown
+        if value.get("state") != expected or value.get("revisionExact") is not exact:
+            return unknown
+        return {"state": expected, "compatible": True, "revisionExact": exact,
+                "sourceRevision": source, "installedRevision": installed, "sourceAdmissionMode": admission}
+    except (ValueError, TypeError, OSError, AttributeError, subprocess.SubprocessError):
+        return unknown
+
+
+def main():
+    require_mode = sys.argv[1:] or ["--manifest"]
+    if require_mode not in (["--manifest"], ["--prestate"], ["--target"]):
+        raise RuntimeError("usage")
+
+    revision = revision_observation()
+    if not revision["compatible"]:
+        print(json.dumps({"schema": 1, "result": "fail",
+            "checks": {"configuration_revision": False},
+            "problems": ["configuration_revision"],
+            "configurationRevisionStatus": revision, "componentChecksRun": False,
+            "readOnly": True, "systemMutationsPerformed": False}, sort_keys=True))
+        raise SystemExit(1)
+    manifest = json.loads(MANIFEST.read_text())
+    expected_active = ({"--prestate": False, "--target": True}.get(
+        require_mode[0], manifest["profileActive"]))
+    problems = []
+    checks = {}
+
+    def check(name, condition):
+        checks[name] = bool(condition)
+        if not condition:
+            problems.append(name)
+
+    check("configuration_revision", revision["compatible"])
+
+    target = manifest["desiredState"] if expected_active else manifest["prestate"]
+    if require_mode[0] == "--manifest":
+        widget_active = manifest["fullColorWidgetsActive"]
+    else:
+        widget_active = require_mode[0] == "--target"
+    widget_target = (manifest["desiredState"] if widget_active
+                     else manifest["prestate"])
+    expected_defaults = {
+        ("NSGlobalDomain", "AppleIconAppearanceTheme"): target["iconAppearance"],
+        ("NSGlobalDomain", "AppleInterfaceStyleSwitchesAutomatically"):
+            "1" if expected_active else "0",
+        ("NSGlobalDomain", "AppleShowAllExtensions"): "1" if expected_active else "0",
+        ("NSGlobalDomain", "InitialKeyRepeat"): str(target["initialKeyRepeat"]),
+        ("NSGlobalDomain", "KeyRepeat"): str(target["keyRepeat"]),
+        ("NSGlobalDomain", "com.apple.trackpad.scaling"):
+            str(target["trackpadScaling"]).rstrip("0").rstrip("."),
+        ("com.apple.dock", "autohide"): "1" if target["dockAutohide"] else "0",
+        ("com.apple.dock", "minimize-to-application"): "1" if expected_active else "0",
+        ("com.apple.dock", "mru-spaces"): "0" if expected_active else "1",
+        ("com.apple.dock", "show-recents"): "0" if expected_active else "1",
+        ("com.apple.dock", "wvous-br-corner"):
+            str(target["bottomRightHotCornerRaw"]),
+        ("com.apple.finder", "AppleShowAllExtensions"): "1" if expected_active else "0",
+        ("com.apple.finder", "ShowPathbar"): "1" if expected_active else "0",
+        ("com.apple.finder", "ShowStatusBar"): "1" if expected_active else "0",
+        ("com.apple.AppleMultitouchTrackpad", "Clicking"): "1",
+        ("com.apple.AppleMultitouchTrackpad", "TrackpadRightClick"): "1",
+        ("com.apple.AppleMultitouchTrackpad", "TrackpadThreeFingerDrag"):
+            "1" if expected_active else "0",
+        ("com.apple.WindowManager", "GloballyEnabled"): "0",
+        ("com.apple.WindowManager", "EnableStandardClickToShowDesktop"):
+            "1" if target["clickWallpaperToShowDesktop"] else "0",
+        ("com.apple.WindowManager", "EnableTilingByEdgeDrag"): "1",
+        ("com.apple.WindowManager", "EnableTopTilingByEdgeDrag"): "1",
+        ("com.apple.WindowManager", "EnableTilingOptionAccelerator"): "1",
+        ("com.apple.WindowManager", "EnableTiledWindowMargins"): "0",
+        ("com.apple.widgets", "widgetAppearance"):
+            str(widget_target["widgetAppearanceRaw"]),
+    }
+    for (domain, key), value in expected_defaults.items():
+        check("default_" + re.sub(r"[^A-Za-z0-9]+", "_", domain + "_" + key),
+              default(domain, key) == value)
+
+    expected_screenshot = (Path.home() / "Pictures/Screenshots" if expected_active
+                           else Path.home() / "Desktop")
+    check("screenshot_location",
+          default("com.apple.screencapture", "location") == str(expected_screenshot))
+    if expected_active:
+        try:
+            mode = expected_screenshot.stat().st_mode & 0o777
+            check("screenshot_directory", expected_screenshot.is_dir() and
+                  expected_screenshot.stat().st_uid == os.getuid() and mode == 0o700)
+        except OSError:
+            check("screenshot_directory", False)
+
+    firewall = "\n".join(command([
+        "/usr/libexec/ApplicationFirewall/socketfilterfw", option]).stdout
+        for option in ["--getglobalstate", "--getblockall", "--getallowsigned",
+                       "--getstealthmode"])
+    check("firewall_global", ("Firewall is enabled" in firewall) ==
+          target["firewallEnabled"])
+    check("firewall_block_all_off", "block all state set to disabled" in firewall)
+    check("firewall_allow_signed", "built-in signed software ENABLED" in firewall and
+          "downloaded signed software ENABLED" in firewall)
+    check("firewall_stealth", ("stealth mode is on" in firewall) ==
+          target["firewallStealthMode"])
+
+    power = command(["/usr/bin/pmset", "-g", "custom"]).stdout
+    sections = power.split("AC Power:")
+    battery = sections[0]
+    ac = sections[1] if len(sections) == 2 else ""
+    check("battery_low_power", re.search(
+        r"^\s*lowpowermode\s+" +
+        ("1" if target["batteryLowPowerMode"] else "0") + r"\s*$",
+        battery, re.MULTILINE) is not None)
+    check("ac_low_power", re.search(r"^\s*lowpowermode\s+0\s*$", ac,
+                                    re.MULTILINE) is not None)
+
+    app_root = Path(manifest["target"]["applicationRoot"])
+    for app in manifest["applications"]:
+        bundle = app_root / app["bundleName"]
+        prefix = "app_" + app["name"].lower()
+        if not expected_active:
+            check(prefix + "_absent", not bundle.exists())
+            continue
+        check(prefix + "_present", bundle.is_dir())
+        if not bundle.is_dir():
+            continue
+        check(prefix + "_bundle_id", plist_value(bundle, "CFBundleIdentifier") ==
+              app["bundleIdentifier"])
+        check(prefix + "_version", plist_value(bundle, "CFBundleShortVersionString") ==
+              app["version"])
+        check(prefix + "_team", codesign_team(bundle) == app["teamIdentifier"])
+        check(prefix + "_codesign", command([
+            "/usr/bin/codesign", "--verify", "--deep", "--strict", str(bundle)
+        ]).returncode == 0)
+        check(prefix + "_gatekeeper", command([
+            "/usr/sbin/spctl", "--assess", "--type", "execute", str(bundle)
+        ]).returncode == 0)
+
+    brew_formulae = command(["/opt/homebrew/bin/brew", "list", "--formula"])
+    brew_casks = command(["/opt/homebrew/bin/brew", "list", "--cask"])
+    check("homebrew_empty", brew_formulae.returncode == 0 and
+          brew_casks.returncode == 0 and not brew_formulae.stdout.strip() and
+          not brew_casks.stdout.strip())
+    check("filevault_on", "FileVault is On" in command([
+        "/usr/bin/fdesetup", "status"]).stdout)
+
+    final_revision = revision_observation()
+    check("configuration_revision_stable", final_revision == revision)
+    check("configuration_revision_final", final_revision["compatible"])
+    print(json.dumps({
+        "schema": 1,
+        "result": "pass" if not problems else "fail",
+        "profileActive": expected_active,
+        "fullColorWidgetsActive": widget_active,
+        "checks": checks,
+        "configurationRevisionStatus": final_revision,
+        "problems": sorted(problems),
+        "readOnly": True,
+        "systemMutationsPerformed": False,
+    }, indent=2, sort_keys=True))
+    raise SystemExit(0 if not problems else 1)
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except Exception as error:
+        print(json.dumps({"result": "fail", "reason": str(error)}, sort_keys=True))
+        raise SystemExit(1)

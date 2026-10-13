@@ -1,0 +1,418 @@
+#!/usr/bin/python3
+"""Fail-closed validator for the bounded Phase 3 ceremony intent overlay."""
+
+from copy import deepcopy
+import hashlib
+import json
+import os
+from pathlib import Path
+import re
+import runpy
+import shutil
+import subprocess
+import sys
+import tempfile
+
+
+ROOT = Path(__file__).resolve().parents[1]
+BASE = "cf219755933d1a123c485a64659e50ab36beca42"
+BRANCH = "codex/phase-3-permissions-ceremony"
+INTENT_PATH = ROOT / "manifests/phase3-ceremony-intent.json"
+FIXTURE_PATH = ROOT / "tests/fixtures/phase3-ceremony-preflight-positive.json"
+ALLOWED = {
+    "ARCHITECTURE.md",
+    "bin/check-phase3-ceremony-intent", "bin/phase3-ceremony-preflight",
+    "docs/phase-3-ceremony-intent.md", "manifests/phase3-ceremony-intent.json",
+    "tests/fixtures/phase3-ceremony-preflight-positive.json",
+}
+EXPECTED_CAPABILITIES = {
+    "full_disk_access", "accessibility", "screen_and_system_audio_recording",
+    "developer_tools", "computer_use_product_allowlist",
+}
+EXPECTED_IDENTITIES = {
+    "codex_desktop", "computer_use_runtime", "computer_use_client",
+    "computer_use_guardian", "computer_use_installer",
+    "authorization_plugin_embedded", "authorization_plugin_installed",
+}
+EXPECTED_VERSION_FLOORS = [
+    ("codex_desktop", "codex_desktop"),
+    ("computer_use_runtime", "computer_use_runtime"),
+    ("computer_use_client", "computer_use_client"),
+    ("computer_use_guardian", "computer_use_guardian"),
+    ("computer_use_installer", "computer_use_installer"),
+    ("authorization_plugin_embedded", "authorization_plugin_embedded"),
+    ("authorization_plugin_installed", "authorization_plugin_embedded"),
+    ("google_chrome", "google_chrome"),
+]
+
+
+def require(condition, message):
+    if not condition:
+        raise ValueError(message)
+
+
+def run(argv, cwd=ROOT):
+    completed = subprocess.run(
+        [str(value) for value in argv], cwd=cwd, text=True,
+        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, check=False,
+    )
+    return completed.returncode, completed.stdout.strip()
+
+
+def sha256(path):
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def scan(label, text):
+    require(re.search(r"/Users/[A-Za-z0-9._-]+", text) is None, f"private path: {label}")
+    require(re.search(r"\b[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[1-5][0-9A-Fa-f]{3}-[89ABab][0-9A-Fa-f]{3}-[0-9A-Fa-f]{12}\b", text) is None,
+            f"stable UUID: {label}")
+    for pattern in ("BEGIN PRIVATE" + " KEY", "access_" + "token", "refresh_" + "token",
+                    "client_" + "secret", "password" + "=", "authorization" + ": bearer"):
+        require(pattern.lower() not in text.lower(), f"secret pattern: {label}")
+
+
+def validate_intent(intent):
+    require(intent.get("schema") == 1, "intent schema")
+    require(intent.get("phase") == "phase3_permission_ceremony_intent", "intent phase")
+    authority = intent["authority"]
+    require(authority == {
+        "authorized_on": "2026-07-14",
+        "source_commit": "5f8ce2d4bf534352af19b0ae85dfbd5d70ec3b8a",
+        "exact_owner_statement": "Разрешаю Phase 3 permission ceremony и системные запросы macOS",
+        "control_base_commit": BASE,
+        "branch": BRANCH,
+        "intent_only": True,
+        "system_mutation_authorized_in_this_commit": False,
+        "verdict_ceiling": "SIGNED_VENDOR_UPDATE_POLICY_READY_FOR_REVIEW",
+    }, "authority drift")
+    preparation = intent["accepted_preparation"]
+    expected_hashes = {
+        "manifest_sha256": (ROOT / "manifests/phase3-capabilities.json"),
+        "ceremony_contract_sha256": (ROOT / "docs/phase-3-permission-ceremony.md"),
+        "preparation_evidence_sha256": (ROOT / "evidence/phase-3/preparation.json"),
+        "acceptance_evidence_sha256": (ROOT / "evidence/phase-3/acceptance.json"),
+    }
+    require(preparation["source_commit"] == BASE, "preparation source")
+    for field, path in expected_hashes.items():
+        require(preparation[field] == sha256(path), f"immutable preparation drift: {field}")
+    require(set(intent["required_identity_refs"]) == EXPECTED_IDENTITIES, "identity scope")
+    policy = intent["signed_vendor_update_policy"]
+    require(policy == {
+        "version_rule": "numeric_dotted_at_or_above_reviewed_floor",
+        "floor_source": "accepted_preparation_logical_identity_observed_version",
+        "runtime_version_is_evidence_not_desired_state": True,
+        "network_version_authority": False,
+        "automatic_action": "reattest_stable_anchors_and_emit_bounded_runtime_evidence",
+        "required_trust_anchors": [
+            "canonical_path", "bundle_id", "team_id", "designated_requirement",
+            "signature_verification", "gatekeeper_acceptance_where_applicable",
+        ],
+        "identity_floors": [
+            {"identity_ref": identity, "floor_identity_ref": floor}
+            for identity, floor in EXPECTED_VERSION_FLOORS
+        ],
+        "locked_use_pair": {
+            "installed_identity_ref": "authorization_plugin_installed",
+            "embedded_identity_ref": "authorization_plugin_embedded",
+            "live_versions_must_equal_post_reconciliation": True,
+            "each_must_meet_reviewed_floor": True,
+        },
+        "blocking_conditions": [
+            "malformed_version", "version_below_reviewed_floor",
+            "canonical_path_drift", "bundle_team_or_designated_requirement_drift",
+            "invalid_signature", "gatekeeper_rejection_where_applicable",
+            "locked_use_pair_version_mismatch",
+        ],
+    }, "signed vendor update policy drift")
+    require(intent["locked_use"] == {
+        "known_initial_state": "installed_version_differs_from_embedded",
+        "only_authorized_reconciliation": "supported_chatgpt_computer_use_locked_use_vendor_flow",
+        "manual_bundle_copy_or_edit": False,
+        "post_reconciliation_gate": "installed_and_embedded_identity_and_version_match",
+        "reconciliation_trigger": "locked_use_aligned_false_and_status_vendor_reconciliation_required",
+        "repeat_when_aligned": False,
+        "aligned_action": "skip_vendor_reconciliation",
+    }, "Locked Use boundary")
+    capabilities = intent["capability_scope"]
+    require({item["id"] for item in capabilities} == EXPECTED_CAPABILITIES,
+            "expanded or missing capability")
+    require(len(capabilities) == len(EXPECTED_CAPABILITIES), "duplicate capability")
+    require({item["responsible_identity"] for item in capabilities} <= EXPECTED_IDENTITIES,
+            "capability identity")
+    handoffs = intent["owner_handoffs"]
+    require([item["id"] for item in handoffs] == [
+        "locked_use_vendor_reconciliation", "full_disk_access_codex",
+        "accessibility_computer_use", "screen_recording_computer_use",
+        "developer_tools_codex", "devtoolssecurity_owner_authentication",
+        "computer_use_reviewed_targets",
+    ], "owner handoff order")
+    require(all(set(item) == {
+        "id", "trigger", "owner_action", "expected_screen", "verification", "expiry",
+    } for item in handoffs), "owner handoff fields")
+    targets = intent["computer_use_targets"]
+    require([item["id"] for item in targets] == ["textedit_test_target", "chrome_work_target"],
+            "Computer Use allowlist drift")
+    require(targets[0]["path"] == "/System/Applications/TextEdit.app" and
+            targets[0]["designated_requirement"] == 'identifier "com.apple.TextEdit" and anchor apple',
+            "TextEdit identity drift")
+    require(targets[1]["identity_ref"] == "google_chrome" and
+            targets[1]["profile_session_history_extension_or_login_change"] is False,
+            "Chrome boundary drift")
+    excluded = set(intent["explicitly_excluded"])
+    for required in ("input_monitoring", "tcc_database_or_tccutil",
+                     "terminal_applications_and_chatgpt_as_computer_use_targets",
+                     "reboot_logout_phase4_phase5"):
+        require(required in excluded, f"missing exclusion: {required}")
+    require(intent["restart_boundary"]["count"] == 1 and
+            intent["restart_boundary"]["reboot_or_logout"] is False, "restart boundary")
+    require(intent["functional_cycles"]["count"] == 2 and
+            intent["functional_cycles"]["prompt_free_required"] is True, "probe cycles")
+    schema = intent["evidence_schema"]
+    require(schema["probe_value_type"] == "boolean", "evidence probe type")
+    require(schema["allowed_verdicts"] == ["BLOCKED", "READY_FOR_INDEPENDENT_ACCEPTANCE_REVIEW"],
+            "evidence verdict ceiling")
+    require("raw_logs_or_tcc" in schema["forbidden_retained_data"], "raw TCC exclusion")
+
+
+def validate_files_and_git(contract_only):
+    status, branch = run(["/usr/bin/git", "branch", "--show-current"])
+    require(status == 0 and branch == BRANCH, "wrong branch")
+    status, _ = run(["/usr/bin/git", "merge-base", "--is-ancestor", BASE, "HEAD"])
+    require(status == 0, "wrong base")
+    _, changed = run(["/usr/bin/git", "diff", "--name-only", BASE])
+    _, untracked = run(["/usr/bin/git", "ls-files", "--others", "--exclude-standard"])
+    names = set(filter(None, (changed + "\n" + untracked).splitlines()))
+    require(names <= ALLOWED, f"unexpected file: {sorted(names - ALLOWED)}")
+    require(ALLOWED <= names, "required overlay file missing")
+    status, _ = run(["/usr/bin/git", "diff", "--check", BASE])
+    require(status == 0, "git diff check")
+    if not contract_only:
+        status, dirty = run(["/usr/bin/git", "status", "--porcelain"])
+        require(status == 0 and dirty == "", "dirty ceremony checkout")
+
+
+def validate_programs():
+    preflight = (ROOT / "bin/phase3-ceremony-preflight").read_text()
+    validator = (ROOT / "bin/check-phase3-ceremony-intent").read_text()
+    compile(preflight, "bin/phase3-ceremony-preflight", "exec")
+    compile(validator, "bin/check-phase3-ceremony-intent", "exec")
+    require("git_facts()" in preflight and 'git["clean"]' in preflight,
+            "clean Git is not authoritative")
+    for pattern in (
+        r"\btccutil\b", r"\bosascript\b", r"DevToolsSecurity\s+-enable",
+        r"launchctl\s+(?:load|unload|bootstrap|bootout|kickstart)",
+        r"\bsudo\b", r"defaults\s+write", r"\b(?:kill|pkill)\b",
+    ):
+        require(re.search(pattern, preflight) is None, f"mutating preflight command: {pattern}")
+    for path in ALLOWED:
+        scan(path, (ROOT / path).read_text())
+    architecture = (ROOT / "ARCHITECTURE.md").read_text()
+    for required in (
+        "Signed vendor update policy", "reviewed minimum floor",
+        "runtime evidence", "installed/embedded Locked Use",
+        "must skip reconciliation",
+    ):
+        require(required in architecture, f"standalone architecture missing: {required}")
+
+
+def executable(fixture, expected_exit, expected_verdict, stage=None):
+    argv = [ROOT / "bin/phase3-ceremony-preflight", "--json", "--fixture", fixture]
+    if stage is not None:
+        argv.extend(["--stage", stage])
+    status, output = run(argv)
+    require(status == expected_exit, f"preflight exit: {status}")
+    report = json.loads(output)
+    require(report["verdict"] == expected_verdict, f"preflight verdict: {report['verdict']}")
+    return report
+
+
+def self_test(intent):
+    cases = []
+    def negative(name, callback):
+        try:
+            callback()
+        except Exception:
+            cases.append(name)
+        else:
+            raise ValueError(f"negative test did not fail: {name}")
+    altered = deepcopy(intent); altered["authority"]["exact_owner_statement"] = "changed"
+    negative("malformed_authority", lambda: validate_intent(altered))
+    altered = deepcopy(intent); altered["capability_scope"].append(deepcopy(altered["capability_scope"][0])); altered["capability_scope"][-1]["id"] = "input_monitoring"
+    negative("expanded_capability", lambda: validate_intent(altered))
+    altered = deepcopy(intent); del altered["signed_vendor_update_policy"]
+    negative("missing_version_policy", lambda: validate_intent(altered))
+    altered = deepcopy(intent); altered["signed_vendor_update_policy"]["identity_floors"].append(
+        {"identity_ref": "google_updater", "floor_identity_ref": "google_updater"})
+    negative("expanded_version_policy", lambda: validate_intent(altered))
+    altered = deepcopy(intent); altered["signed_vendor_update_policy"]["floor_source"] = "network_latest"
+    negative("tampered_version_policy", lambda: validate_intent(altered))
+    altered = deepcopy(intent); altered["locked_use"]["repeat_when_aligned"] = True
+    negative("repeat_when_aligned_drift", lambda: validate_intent(altered))
+    negative("malformed_json", lambda: json.loads("{"))
+    negative("private_path", lambda: scan("synthetic", "/" + "Users/example/private"))
+    negative("secret", lambda: scan("synthetic", "access_" + "token=value"))
+    negative("stable_uuid", lambda: scan(
+        "synthetic", "123e4567-e89b-12d3-" + "a456-426614174000"))
+    negative("mutating_command", lambda: require(re.search(r"\bsudo\b", "sudo forbidden") is None,
+                                                   "mutation"))
+    fixture = json.loads(FIXTURE_PATH.read_text())
+    with tempfile.TemporaryDirectory(prefix="phase3-ceremony-negative-") as temporary:
+        temp = Path(temporary)
+        for identity_id, field, value, name in (
+            ("codex_desktop", "canonical_path", "/Applications/Wrong.app", "wrong_path"),
+            ("codex_desktop", "team_id", "WRONGTEAM1", "wrong_team"),
+            ("codex_desktop", "bundle_id", "wrong.bundle", "wrong_bundle"),
+            ("codex_desktop", "designated_requirement", "wrong", "wrong_requirement"),
+            ("codex_desktop", "signature_valid", False, "invalid_signature"),
+            ("codex_desktop", "gatekeeper_assessment", "rejected", "rejected_gatekeeper"),
+        ):
+            altered = deepcopy(fixture); altered["identities"][identity_id][field] = value
+            path = temp / f"{name}.json"; path.write_text(json.dumps(altered))
+            executable(path, 1, "BLOCKED"); cases.append(name)
+        altered = deepcopy(fixture); del altered["identities"]["computer_use_runtime"]
+        path = temp / "missing.json"; path.write_text(json.dumps(altered))
+        executable(path, 1, "BLOCKED"); cases.append("missing_identity")
+        def write_case(name, payload):
+            path = temp / f"{name}.json"
+            path.write_text(json.dumps(payload))
+            return path
+
+        baseline = deepcopy(fixture)
+        baseline["identities"]["codex_desktop"]["version"] = "26.707.71524"
+        executable(write_case("baseline", baseline), 0, "CEREMONY_IDENTITY_READY",
+                   "post-reconciliation")
+        cases.append("baseline_version_passes")
+
+        current = executable(FIXTURE_PATH, 0, "CEREMONY_IDENTITY_READY",
+                             "post-reconciliation")
+        current_codex = next(item for item in current["identities"]
+                             if item["id"] == "codex_desktop")
+        require(current_codex["version"]["status"] == "at_or_above_floor",
+                "current Codex version did not pass floor")
+        require(current["locked_use"]["reconciliation_required"] is False and
+                current["locked_use"]["action"] == "skip_already_aligned",
+                "aligned Locked Use pair requested repeated reconciliation")
+        cases.append("current_higher_codex_passes")
+        cases.append("aligned_pair_skips_reconciliation")
+
+        future = deepcopy(fixture)
+        future["identities"]["codex_desktop"]["version"] = "999.1.2.3"
+        future["identities"]["google_chrome"]["version"] = "999.4.5.6"
+        executable(write_case("future_apps", future), 0, "CEREMONY_IDENTITY_READY",
+                   "post-reconciliation")
+        cases.append("future_higher_codex_and_chrome_pass")
+
+        future_pair = deepcopy(fixture)
+        for identity_id in ("authorization_plugin_installed", "authorization_plugin_embedded"):
+            future_pair["identities"][identity_id]["version"] = "999.7.8.9"
+        executable(write_case("future_pair", future_pair), 0, "CEREMONY_IDENTITY_READY",
+                   "post-reconciliation")
+        cases.append("future_equal_locked_use_pair_passes")
+
+        lower = deepcopy(fixture)
+        lower["identities"]["codex_desktop"]["version"] = "26.707.71523"
+        report = executable(write_case("lower", lower), 1, "BLOCKED",
+                            "post-reconciliation")
+        require(next(item for item in report["identities"]
+                     if item["id"] == "codex_desktop")["version"]["status"] == "below_floor",
+                "downgrade did not report below floor")
+        cases.append("lower_version_blocks")
+
+        malformed = deepcopy(fixture)
+        malformed["identities"]["codex_desktop"]["version"] = "26.707.beta"
+        report = executable(write_case("malformed", malformed), 1, "BLOCKED",
+                            "post-reconciliation")
+        require(next(item for item in report["identities"]
+                     if item["id"] == "codex_desktop")["version"]["status"] == "malformed",
+                "malformed version was not classified")
+        cases.append("malformed_version_blocks")
+
+        pair_mismatch = deepcopy(fixture)
+        pair_mismatch["identities"]["authorization_plugin_installed"]["version"] = \
+            "26.710.1000388"
+        report = executable(write_case("pair_mismatch", pair_mismatch), 1, "BLOCKED",
+                            "post-reconciliation")
+        require(report["locked_use"]["aligned"] is False and all(
+            item["version"]["status"] == "at_or_above_floor"
+            for item in report["identities"] if item["id"] in {
+                "authorization_plugin_installed", "authorization_plugin_embedded",
+            }) and report["locked_use"]["status"] == "vendor_reconciliation_required"
+            and report["locked_use"]["reconciliation_required"] is True
+            and report["locked_use"]["action"] == "vendor_reconciliation_required",
+            "Locked Use mismatch was not isolated above floor")
+        cases.append("locked_use_pair_mismatch_blocks")
+        cases.append("mismatch_requires_reconciliation")
+
+    preflight_module = runpy.run_path(
+        str(ROOT / "bin/phase3-ceremony-preflight"),
+        run_name="phase3_canonical_path_test",
+    )
+    with tempfile.TemporaryDirectory(
+        prefix="phase3-canonical-path-", dir=ROOT.parent,
+    ) as temporary:
+        temporary_path = Path(temporary)
+        target = temporary_path / "Target.app"
+        link = temporary_path / "Redirect.app"
+        target.mkdir()
+        link.symlink_to(target, target_is_directory=True)
+        synthetic = {
+            "id": "synthetic_redirect",
+            "path": str(link),
+            "bundle_id": "invalid.synthetic",
+            "team_id": "SYNTHETIC1",
+            "designated_requirement": "identifier synthetic",
+            "signature_verification": "deep_strict",
+            "version_policy": "minimum_floor",
+            "floor_identity_ref": "synthetic_redirect",
+            "floor_version": "1.0",
+        }
+        result = preflight_module["inspect"](synthetic)
+        require(result["status"] == "mismatch" and
+                result["facts"]["canonical_path_status"] == "redirected_or_symlink"
+                and "canonical_path_status" in result["mismatch_fields"],
+                "symlink redirect did not fail closed")
+        require(str(target.resolve()) not in json.dumps(result),
+                "resolved redirect target leaked")
+        cases.append("symlink_redirect_helper_blocks_without_target_leak")
+    with tempfile.TemporaryDirectory(prefix="phase3-ceremony-dirty-") as temporary:
+        clone = Path(temporary) / "control"
+        status, _ = run(["/usr/bin/git", "clone", "--no-hardlinks", "-q", ROOT, clone])
+        require(status == 0, "dirty clone")
+        (clone / "untracked-dirty-probe").write_text("test-only\n")
+        status, output = run([
+            clone / "bin/phase3-ceremony-preflight", "--json", "--fixture",
+            clone / "tests/fixtures/phase3-ceremony-preflight-positive.json",
+        ], cwd=clone)
+        report = json.loads(output)
+        require(status == 1 and report["verdict"] == "BLOCKED" and
+                report["control_git"]["clean"] is False, "dirty fixture did not fail closed")
+        cases.append("dirty_worktree_executable")
+    return cases
+
+
+def main():
+    modes = set(sys.argv[1:])
+    require(modes <= {"--contract-only", "--self-test"}, "usage")
+    require(not ({"--contract-only", "--self-test"} <= modes), "choose one mode")
+    intent = json.loads(INTENT_PATH.read_text())
+    validate_intent(intent)
+    validate_files_and_git("--contract-only" in modes)
+    validate_programs()
+    fixture = json.loads(FIXTURE_PATH.read_text())
+    require(fixture["schema"] == 1 and set(fixture["identities"]) ==
+            EXPECTED_IDENTITIES | {"textedit_test_target", "google_chrome"}, "fixture identity set")
+    cases = self_test(intent) if "--self-test" in modes else []
+    print(json.dumps({
+        "schema": 1, "phase": "phase3_permission_ceremony_intent",
+        "mode": "self_test" if cases else ("contract_only" if modes else "full"),
+        "result": "pass", "negative_tests": cases,
+    }, indent=2, sort_keys=True))
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except Exception as error:
+        print(f"phase3 ceremony intent validation failed: {error}", file=sys.stderr)
+        raise SystemExit(1)

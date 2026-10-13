@@ -1,0 +1,88 @@
+{
+  "publicReferenceOnly": true,
+  "warning": "Sanitized historical example. Not installation authority or current inventory.",
+  "example": {
+    "schema": 1,
+    "profile": "tailscale-windows-host-m1",
+    "profileActive": true,
+    "platform": {
+      "operatingSystem": "macOS",
+      "minimumVersion": "12.0",
+      "architecture": "universal x86_64 and arm64"
+    },
+    "source": {
+      "project": "Tailscale Standalone for macOS",
+      "version": "1.98.10",
+      "url": "https://pkgs.tailscale.com/stable/Tailscale-1.98.10-macos.pkg",
+      "sha256": "c2eaf5f660ad45a64d1ba43ee72401029a5cb06e6d148c5e90a987a6f546bc58",
+      "nixHash": "sha256-wur19mCtRaZNG6Q+5yQBAppcsG5tFIxekKmHpvVGvFg=",
+      "packageIdentifier": "com.tailscale.ipn.macsys",
+      "installerIdentity": "Developer ID Installer: Tailscale Inc. (W5364U7YZB)",
+      "installerTeamIdentifier": "W5364U7YZB",
+      "preinstallSha256": "bd97a1bf3d6053f67d8f06772b9b142dc52fe9d659bcf0ce89d79bd484a8233d",
+      "postinstallSha256": "41b7b0d699807d421bd29bb7e47f9df51bd38c597f8df3d695acd0dd886184fc",
+      "initialInstallPolicy": "immutable checksum and reviewed installer identity"
+    },
+    "application": {
+      "path": "/Applications/Tailscale.app",
+      "bundleIdentifier": "io.tailscale.ipn.macsys",
+      "minimumVersion": "1.98.10",
+      "initialBundleVersion": "101.98.10",
+      "teamIdentifier": "W5364U7YZB",
+      "executable": "Contents/MacOS/Tailscale",
+      "canonicalCli": "Contents/MacOS/tailscale",
+      "systemExtension": "Contents/Library/SystemExtensions/io.tailscale.ipn.macsys.network-extension.systemextension",
+      "systemExtensionBundleIdentifier": "io.tailscale.ipn.macsys.network-extension",
+      "versionRelationship": "application, embedded CLI, and System Extension must be one signed vendor release"
+    },
+    "vendorCompanions": {
+      "cliWrapper": "/usr/local/bin/tailscale",
+      "cliWrapperSha256": "26b0e5a65e1b723e38f187619964b443e44118c2e02217e9b11165ce17afa65e",
+      "manPage": "/usr/local/share/man/man8/tssentineld.8",
+      "manPageSha256": "723e0bf99d9b96f7eed77428bbfc518060515aaf047a880e662004081c483ca0",
+      "managedMarker": "/var/db/agent-first-mac/tailscale/managed-source"
+    },
+    "networkBoundary": {
+      "macRole": "control surface and outbound SSH client",
+      "windowsRole": "remote execution host",
+      "transport": "SSH over Tailscale with the dedicated public key",
+      "macRemoteLoginEnabled": false,
+      "macInboundSshEnabled": false,
+      "tailscaleSshServerEnabled": false,
+      "advertiseExitNode": false,
+      "advertiseSubnetRoutes": false,
+      "remoteControlAssumed": false,
+      "handoffAssumed": false,
+      "processMigrationPossible": false
+    },
+    "sshClientKey": {
+      "algorithm": "Ed25519",
+      "privatePath": "$HOME/.ssh/windows-host_ed25519",
+      "publicPath": "$HOME/.ssh/windows-host_ed25519.pub",
+      "privateMode": "0600",
+      "publicMode": "0644",
+      "privateKeyMayLeaveMac": false,
+      "allowedHandoffValue": "SHA256 public fingerprint only"
+    },
+    "dataBoundary": {
+      "privateKeyReadOrCopied": false,
+      "publicKeyBodyStored": false,
+      "vpnProfilesReadOrCopied": false,
+      "authenticationStateReadOrCopied": false,
+      "keychainReadOrCopied": false,
+      "rawTailscaleStatusStored": false,
+      "overlayAddressesStored": false,
+      "accountIdentifiersStored": false,
+      "stableMachineIdentifiersStored": false
+    },
+    "lifecycle": {
+      "install": "Verify the fixed official package, Apple notarization, installer identity, and collision-free prestate, invoke the vendor package only through commit-bound nix-darwin activation, and install the reviewed exact CLI wrapper from the immutable Nix store if the vendor postinstall leaves it absent",
+      "installedSmoke": "Verify the receipt, signed application, embedded CLI and System Extension, vendor companions, marker, and continued absence of Mac inbound SSH",
+      "connectedDoctor": "After the owner action, emit only booleans for System Extension enablement, backend connectivity, one or more overlay addresses, no route or exit-node advertisement, and Mac inbound SSH remaining off",
+      "rollbackBeforeConsent": "Activation removes only newly created exact managed payloads if the System Extension has not entered consent-bearing state",
+      "rollbackAfterConsent": "Use a new exact disabled-state commit and the official bounded owner uninstall flow; never erase profiles, authentication files, Keychain items, or support data automatically",
+      "remove": "Fail closed when consent-bearing or authenticated state may exist and request the bounded owner uninstall action",
+      "windowsMutation": false
+    }
+  }
+}

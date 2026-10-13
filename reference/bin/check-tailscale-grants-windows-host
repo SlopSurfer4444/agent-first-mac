@@ -1,0 +1,99 @@
+#!/usr/bin/python3
+"""Static validator for the bounded WindowsHost Tailscale Grants lifecycle."""
+
+from __future__ import annotations
+
+import json
+from pathlib import Path
+import re
+
+
+ROOT = Path(__file__).resolve().parents[1]
+
+
+def require(condition: bool, reason: str) -> None:
+    if not condition:
+        raise RuntimeError(reason)
+
+
+def main() -> None:
+    manifest_path = ROOT / "manifests/tailscale-grants-windows-host.json"
+    docs_path = ROOT / "docs/tailscale-grants-windows-host.md"
+    manifest = json.loads(manifest_path.read_text())
+    docs = docs_path.read_text()
+    architecture = (ROOT / "ARCHITECTURE.md").read_text()
+
+    require(manifest["schema"] == 1, "schema")
+    require(manifest["profile"] == "tailscale-grants-windows-host", "profile")
+    require(manifest["verifiedPrestate"] == {
+        "tailnetDeviceCount": 2,
+        "windowsPeerPresent": True,
+        "otherDeviceCount": 1,
+        "grantsCount": 1,
+        "defaultAllowAllGrant": True,
+        "legacyAclsPresent": False,
+        "groupsPresent": False,
+        "tagOwnersPresent": False,
+        "hostsPresent": False,
+        "policyTestsPresent": False,
+        "tailscaleSshSectionPresent": True,
+    }, "prestate")
+
+    target = manifest["targetPolicy"]
+    require(target["replaceOnlyDefaultAllowAllGrant"] is True, "replace_default")
+    require(target["sourceCount"] == 1 and target["destinationCount"] == 1,
+            "exact_pair")
+    require(target["networkCapabilities"] == [
+        "tcp:22", "tcp:3389", "tcp:21118"
+    ], "ports")
+    require(target["preserveTailscaleSshSectionExactly"] is True, "preserve_ssh")
+    for field in (
+        "createTags", "retagDevices", "enableTailscaleSsh", "changeDns",
+        "changeRoutes", "changeExitNode", "changeDeviceApproval", "changeSharing",
+    ):
+        require(target[field] is False, f"forbidden_target_{field}")
+
+    tests = manifest["policyTests"]
+    require(tests["protocol"] == "tcp", "test_protocol")
+    require(tests["acceptPorts"] == [22, 3389, 21118], "test_ports")
+    require(tests["denyOneUnlistedPort"] is True, "test_deny")
+    require(tests["saveMustFailClosedOnAnyTestFailure"] is True, "test_fail_closed")
+
+    boundary = manifest["dataBoundary"]
+    require(all(value is False for value in boundary.values()), "data_boundary")
+    require(manifest["rollback"]["rawPolicyStoredInGitOrEvidence"] is False,
+            "rollback_boundary")
+
+    for needle in (
+        "Grants are additive",
+        "preserves the Tailscale SSH section exactly",
+        "key-only SSH",
+        "TCP 3389",
+        "configuration-log revert",
+        "Windows RustDesk W5 remains a separate lifecycle",
+    ):
+        require(needle in docs, f"docs_{needle}")
+    require("Tailscale WindowsHost least-privilege control-plane policy" in architecture,
+            "architecture")
+
+    combined = "\n".join((manifest_path.read_text(), docs, architecture[-6000:]))
+    require(not re.search(r"\b100\.(?:\d{1,3}\.){2}\d{1,3}\b", combined),
+            "overlay_address_in_repository")
+    require(not re.search(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}", combined),
+            "account_identifier_in_repository")
+    require(".ts.net" not in combined, "tailnet_dns_name_in_repository")
+
+    print(json.dumps({
+        "profile": manifest["profile"],
+        "result": "pass",
+        "schema": 1,
+        "systemMutationsPerformed": False,
+    }, sort_keys=True))
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except Exception as error:
+        print(json.dumps({"reason": str(error), "result": "fail"}, sort_keys=True))
+        raise SystemExit(1)

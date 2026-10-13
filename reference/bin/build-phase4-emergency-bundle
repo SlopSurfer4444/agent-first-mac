@@ -1,0 +1,240 @@
+#!/usr/bin/python3
+"""Build two clean emergency-action candidates and emit a bounded review bundle."""
+
+import hashlib
+import json
+import os
+from pathlib import Path
+import shutil
+import subprocess
+import sys
+import tempfile
+
+
+ROOT = Path(__file__).resolve().parents[1]
+DEFAULT_OUTPUT = ROOT / "install-bundles/phase-4/aid-admin-emergency"
+MIGRATION_MAIN = "b67c582b4b07fd91fb6d1487ada7aca011a61833"
+CONTROL_MAIN = "217602def502f515f5c0c554f1d4c1d0aaabcb26"
+TASK_PARENT = "55c556f6566a7dcffc302d073e3f78dfc0ebeb73"
+BROKER_SHA256 = "bce4427701a0278ea7941710939fc6e0a2b36abe0f3f487564b228b7283acd8e"
+POLICY_SHA256 = "2555b3f0ed1f75cd26bc41af6512ecc30d444ba1b0113458f72efcfccc304225"
+SUDOERS_SHA256 = "b51a2c60bae3652decef1df7ffe2fd66931ee317305fbf1bc5c50e491f5c3ee6"
+RECEIPT_SHA256 = "cf5e95fd3bf33fc34794055a80865fde9feaeccac4b271aa30561e42ca30a725"
+MARKER = "CHECKPOINT_PHASE4_FINAL_PROBES_REVIEW"
+SOURCES = (
+    "Sources/AidAdminEmergencyAction/main.swift",
+    "Sources/AidAdminEmergencyCore/AidAdminEmergencyCore.swift",
+    "bin/build-phase4-emergency-bundle",
+    "tests/AidAdminEmergencyTests/AidAdminEmergencyTests.swift",
+)
+
+
+def require(condition, reason):
+    if not condition:
+        raise RuntimeError(reason)
+
+
+def run(argv, cwd=ROOT):
+    result = subprocess.run([str(value) for value in argv], cwd=cwd, text=True,
+                            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, check=False,
+                            env={"HOME": "/var/empty", "LANG": "C", "LC_ALL": "C",
+                                 "PATH": "/usr/bin:/bin", "TMPDIR": tempfile.gettempdir()})
+    require(result.returncode == 0,
+            f"command_failed_{Path(str(argv[0])).name}: {result.stdout[-1600:]}")
+    return result.stdout
+
+
+def digest(path):
+    value = hashlib.sha256()
+    with path.open("rb") as stream:
+        while chunk := stream.read(65536):
+            value.update(chunk)
+    return value.hexdigest()
+
+
+def pin(path):
+    return {"sha256": digest(path), "size": path.stat().st_size}
+
+
+def build(destination):
+    run(["/usr/bin/swiftc", "-O",
+         ROOT / "Sources/AidAdminEmergencyCore/AidAdminEmergencyCore.swift",
+         ROOT / "Sources/AidAdminEmergencyAction/main.swift",
+         "-o", destination])
+    destination.chmod(0o555)
+
+
+def behavior(binary):
+    cases = [[], ["unknown"], ["disable", "extra"], ["recover", "extra"],
+             ["__root-disable"], ["__root-recover"], ["disable;id"], ["$(id)"]]
+    values = []
+    environment = {"HOME": "/var/empty", "LANG": "C", "LC_ALL": "C",
+                   "PATH": "/usr/bin:/bin", "TMPDIR": "/var/empty",
+                   "SECRET_TOKEN": "must-not-appear"}
+    for arguments in cases:
+        result = subprocess.run([str(binary), *arguments], env=environment, text=True,
+                                stdout=subprocess.PIPE, stderr=subprocess.STDOUT, check=False)
+        require(result.returncode != 0 and "must-not-appear" not in result.stdout,
+                f"negative_action_accepted_{arguments}")
+        values.append({"arguments": arguments, "exit": result.returncode,
+                       "output": result.stdout})
+    return values
+
+
+def architecture(path):
+    value = run(["/usr/bin/file", "-b", path]).strip()
+    require("Mach-O 64-bit executable arm64" in value, "emergency_architecture")
+    return "arm64-darwin"
+
+
+def write_json(path, value):
+    path.write_text(json.dumps(value, indent=2, sort_keys=True) + "\n")
+    path.chmod(0o444)
+
+
+def main():
+    args = sys.argv[1:]
+    require(args == [] or (len(args) == 2 and args[0] == "--output"), "usage")
+    output = Path(args[1]).resolve() if args else DEFAULT_OUTPUT
+    require(not output.exists(), "output_already_exists")
+    output.parent.mkdir(parents=True, exist_ok=True)
+    scratch = Path(tempfile.mkdtemp(prefix="aid-admin-emergency-build."))
+    try:
+        candidate_a = scratch / "aid-admin-emergency-action-a"
+        candidate_b = scratch / "aid-admin-emergency-action-b"
+        build(candidate_a)
+        build(candidate_b)
+        require(behavior(candidate_a) == behavior(candidate_b), "emergency_behavior_drift")
+        require(architecture(candidate_a) == architecture(candidate_b) == "arm64-darwin",
+                "emergency_architecture_drift")
+
+        output.mkdir(mode=0o755)
+        artifact = output / "aid-admin-emergency-action"
+        shutil.copyfile(candidate_a, artifact)
+        artifact.chmod(0o555)
+        swift = run(["/usr/bin/swiftc", "--version"]).splitlines()[0]
+        manifest = output / "review-manifest.json"
+        write_json(manifest, {
+            "acceptedBases": {
+                "controlMain": CONTROL_MAIN,
+                "migrationMain": MIGRATION_MAIN,
+                "taskParent": TASK_PARENT,
+            },
+            "actionSurface": {
+                "disable": "aid-admin-emergency-action disable",
+                "recover": "aid-admin-emergency-action recover",
+                "otherInputRejected": True,
+            },
+            "architecture": "arm64-darwin",
+            "artifact": {
+                "modeClass": "executable-not-group-or-world-writable",
+                "path": artifact.name,
+                **pin(artifact),
+            },
+            "authenticationBoundaries": {
+                "disableFreshStandardSudo": True,
+                "disablePasswordPrompts": 1,
+                "disableVerificationFailureRetainsDisabledState": True,
+                "recoveryFreshStandardSudo": True,
+                "recoveryPasswordPrompts": 1,
+                "recoveryVerificationBeforeTimestampClear": True,
+                "recoveryVerificationFailureSameBoundaryRollback": True,
+                "timestampClearedAfterEachAction": True,
+            },
+            "buildProvenance": {
+                "behaviorCases": 8,
+                "behaviorIdentical": True,
+                "buildA": pin(candidate_a),
+                "buildB": pin(candidate_b),
+                "commands": [
+                    "/usr/bin/swiftc -O <emergency-core> <emergency-main> -o <clean-a>",
+                    "/usr/bin/swiftc -O <emergency-core> <emergency-main> -o <clean-b>",
+                ],
+                "sourceFileSHA256": {path: digest(ROOT / path) for path in SOURCES},
+                "swift": swift,
+            },
+            "gates": {
+                "emergencyActionExecuted": False,
+                "independentReviewRequired": True,
+                "l3Claimed": False,
+                "phase4PassClaimed": False,
+                "phase5Authorized": False,
+            },
+            "fullSudoersValidation": {
+                "bareDefaultOwnerPermissionCheckUsed": False,
+                "canonicalMain": "/private/etc/sudoers",
+                "declarativeSymlinkIncludesAllowed": True,
+                "diagnosticClasses": ["access", "include_unavailable", "rejected", "syntax"],
+                "diagnosticOutputRetained": False,
+                "explicitSyntaxArguments": ["-cf", "/private/etc/sudoers"],
+                "includedPolicySyntaxCovered": True,
+                "mainMetadata": "root:wheel 0440 regular",
+            },
+            "installedContract": {
+                "attestation": {"mode": "0400", "size": 341,
+                                "ownerAndExactHashBindingsRequired": True},
+                "binary": {"mode": "0555", "sha256": BROKER_SHA256, "size": 483712},
+                "policy": {"mode": "0444", "sha256": POLICY_SHA256, "size": 1617},
+                "receipt": {"mode": "0400", "sha256": RECEIPT_SHA256, "size": 431},
+                "sudoers": {"mode": "0440", "sha256": SUDOERS_SHA256, "size": 122},
+            },
+            "interactiveTTYContract": {
+                "childForegroundGroupVerified": True,
+                "controllingTTYRequired": True,
+                "fileActions": False,
+                "foregroundGroupInherited": True,
+                "interactiveOutputCaptured": False,
+                "passwordBytesHandled": "standard-sudo-and-terminal-only",
+                "processGroupAttribute": False,
+                "runner": "posix_spawn",
+                "standardInputInherited": True,
+                "synthesizedPTY": False,
+            },
+            "privacy": {
+                "environmentRetained": False,
+                "hostnameRetained": False,
+                "ownerIdentityRetained": False,
+                "ownerUIDRetained": False,
+                "passwordHandledOutsideStandardSudo": False,
+                "secretsRetained": False,
+            },
+            "reviewMarker": MARKER,
+            "rollback": {
+                "exactEnabledOrDisabledStateProven": True,
+                "ownerRecoveryVerificationFailureReturnsDisabled": True,
+                "recursiveDeletion": False,
+                "retainsAuditStagingAndGenerations": True,
+                "unexpectedDestinationNeverOverwritten": True,
+            },
+            "schema": 1,
+            "transitionContract": {
+                "descriptorBackedParentValidation": True,
+                "directoryRelativeFixedPathOperations": True,
+                "noReplacePrimitive": "renameatx_np(RENAME_EXCL)",
+                "parents": {
+                    "/etc/agent-first-mac": "root:wheel 0755",
+                    "/etc/sudoers.d": "root:wheel 0755",
+                    "/private/etc": "root:wheel 0755",
+                    "/private/etc/sudoers.d": "root:wheel 0755 same-directory-as-/etc/sudoers.d",
+                    "/usr/local/libexec": "root:wheel 0755",
+                    "/var/db/agent-first-mac/staging": "root:wheel 0700",
+                    "/var/log/agent-first-mac/aid-admin": "root:wheel 0700",
+                },
+            },
+            "verdict": "FINAL_PHASE4_PROBES_PREPARED_FOR_INDEPENDENT_REVIEW",
+        })
+        print(json.dumps({"artifactSHA256": digest(artifact),
+                          "artifactSize": artifact.stat().st_size,
+                          "ownerIdentityRetained": False,
+                          "result": "pass",
+                          "reviewManifestSHA256": digest(manifest)}, sort_keys=True))
+    finally:
+        shutil.rmtree(scratch, ignore_errors=True)
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except Exception as error:
+        print(json.dumps({"result": "fail", "reason": str(error)}, sort_keys=True))
+        raise SystemExit(1)

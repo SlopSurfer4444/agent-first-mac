@@ -1,0 +1,195 @@
+#!/usr/bin/python3
+"""Small read-only facade: declared catalog, workflow guidance, native doctors.
+
+No source admission, mutation executor, subprocess owner, or doctor-result
+translation lives here. execv preserves the caller context and replaces this
+process with the selected doctor; isolation belongs to the doctor's own adapter.
+"""
+import sys
+sys.dont_write_bytecode = True
+
+import json
+import os
+from pathlib import Path
+import pwd
+import re
+import stat
+
+DOCTORS = {
+    "current": ("bin/current-doctor", "--json"),
+    "revision": ("bin/system-revision-status", "--json"),
+    "productivity": ("bin/productivity-doctor", "--manifest"),
+    "tailscale": ("bin/tailscale-windows-host-doctor", "--installed"),
+    "amnezia": ("bin/amnezia-desktop-doctor", "--manifest"),
+    "windows-app": ("bin/windows-app-rdp-client-doctor",),
+    "rustdesk": ("bin/rustdesk-mac-controller-doctor",),
+}
+MAX_CATALOG = 128 * 1024
+WORKFLOW = (
+    "Review and independently accept the exact desired source configuration.",
+    "Build the exact integrated acceptance-child before any system apply.",
+    "Use only the existing typed broker under separately granted apply authority.",
+    "Verify the affected payload with its existing checks and acceptance gate.",
+    "If verification fails, follow the existing reviewed rollback and recovery contract.",
+)
+HELP = """aid - read-only workstation facade
+Usage:
+  aid help | --help
+  aid inventory [--json]
+  aid plan [--json]
+  aid doctor [--json] [--section NAME]
+Sections: current, revision, productivity, tailscale, amnezia, windows-app, rustdesk
+Doctor defaults to current and always preserves that doctor's native JSON and exit status.
+Inventory and plan are declared-only guidance, not fresh state or acceptance evidence.
+Install, adopt, upgrade, remove and rollback execution are unsupported.
+"""
+
+
+class AidError(ValueError):
+    pass
+
+
+def require(condition, reason):
+    if condition is not True:
+        raise AidError(reason) from None
+
+
+def parse(arguments):
+    """Closed grammar; no filesystem or process work even on rejected arguments."""
+    require(type(arguments) is list and all(type(v) is str for v in arguments), "unsupported_arguments")
+    if arguments in ([], ["help"], ["--help"]):
+        return "help", False, None
+    if arguments[:1] in (["inventory"], ["plan"]) and arguments[1:] in ([], ["--json"]):
+        return arguments[0], len(arguments) == 2, None
+    if arguments[:1] == ["doctor"]:
+        remaining = arguments[1:]
+        json_output = remaining[:1] == ["--json"]
+        if json_output:
+            remaining = remaining[1:]
+        if not remaining:
+            return "doctor", json_output, "current"
+        if len(remaining) == 2 and remaining[0] == "--section" and remaining[1] in DOCTORS:
+            return "doctor", json_output, remaining[1]
+    raise AidError("unsupported_arguments")
+
+
+def catalog(raw):
+    require(type(raw) is bytes and 0 < len(raw) <= MAX_CATALOG, "invalid_catalog")
+    def pairs(rows):
+        value = {}
+        for key, item in rows:
+            require(key not in value, "invalid_catalog")
+            value[key] = item
+        return value
+    try:
+        value = json.loads(raw.decode("utf-8", "strict"), object_pairs_hook=pairs)
+    except (ValueError, UnicodeError, RecursionError):
+        raise AidError("invalid_catalog") from None
+    require(type(value) is dict and set(value) == {"schema", "kind", "complete", "items"}
+        and type(value["schema"]) is int and value["schema"] == 1
+        and value["kind"] == "DECLARED_CAPABILITY_CATALOG" and value["complete"] is False
+        and type(value["items"]) is list and len(value["items"]) <= 128, "invalid_catalog")
+    seen = set()
+    for item in value["items"]:
+        require(type(item) is dict and set(item) == {
+            "id", "owner", "versionPolicy", "source", "doctorSection", "lifecycle"}, "invalid_catalog")
+        for key in ("id", "owner", "versionPolicy", "source", "lifecycle"):
+            text = item[key]
+            require(type(text) is str and 0 < len(text) <= 256
+                and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9 ._:/()+,;-]*", text) is not None, "invalid_catalog")
+        require(re.fullmatch(r"[a-z0-9]+(?:-[a-z0-9]+)*", item["id"]) is not None
+            and item["id"] not in seen and (item["doctorSection"] is None
+                or type(item["doctorSection"]) is str and item["doctorSection"] in DOCTORS), "invalid_catalog")
+        seen.add(item["id"])
+    return value
+
+
+def declared(command, value):
+    result = {"schema": 1, "command": command, "scope": "DECLARED_ONLY",
+        "freshObservation": False, "installedStateChecked": False, "sourceAcceptanceChecked": False,
+        "readOnly": True, "systemMutationsPerformed": False, "catalog": value}
+    if command == "plan":
+        result.update(workflow=list(WORKFLOW), executablePlan=False)
+    return result
+
+
+class Native:
+    def __init__(self):
+        self.uid = os.getuid()
+        self.home = pwd.getpwuid(self.uid).pw_dir
+        self.root = self.home + "/AIDev/control"
+        script = str(Path(__file__).absolute())
+        require(self.uid > 0 and script == self.root + "/bin/aid"
+            and os.path.realpath(script) == script and os.path.realpath(self.root) == self.root,
+            "noncanonical_source")
+        source, root = os.lstat(script), os.lstat(self.root)
+        require(stat.S_ISREG(source.st_mode) and stat.S_ISDIR(root.st_mode)
+            and source.st_uid == self.uid and root.st_uid == self.uid
+            and not (source.st_mode | root.st_mode) & 0o022, "noncanonical_source")
+
+    def read_catalog(self):
+        path = self.root + "/manifests/aid-catalog.json"
+        require(os.path.realpath(path) == path, "invalid_catalog")
+        descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
+        try:
+            facts = os.fstat(descriptor)
+            require(stat.S_ISREG(facts.st_mode) and facts.st_uid == self.uid and not facts.st_mode & 0o022
+                and 0 < facts.st_size <= MAX_CATALOG, "invalid_catalog")
+            chunks, count = [], 0
+            while count <= MAX_CATALOG:
+                block = os.read(descriptor, min(8192, MAX_CATALOG + 1 - count))
+                if not block:
+                    break
+                chunks.append(block)
+                count += len(block)
+            require(count == facts.st_size and count <= MAX_CATALOG, "invalid_catalog")
+            return b"".join(chunks)
+        finally:
+            os.close(descriptor)
+
+    def doctor(self, section):
+        require(type(section) is str and section in DOCTORS, "unsupported_arguments")
+        target, *options = DOCTORS[section]
+        argv = ("/usr/bin/python3", self.root + "/" + target, *options)
+        os.chdir(self.root)
+        # This is a transparent read-only facade, not an isolation boundary.
+        # GUI-bundled CLIs may use TERM to select CLI mode; stripping the caller
+        # environment changes their behavior even for a version-only probe.
+        os.execv("/usr/bin/python3", argv)
+        raise AidError("doctor_exec_failed")  # A successful execv never returns.
+
+
+def main(arguments=None, *, adapter_factory=Native, emit=print):
+    try:
+        command, json_output, section = parse(sys.argv[1:] if arguments is None else arguments)
+    except AidError:
+        emit("aid: unsupported arguments or lifecycle execution; use aid help")
+        return 2
+    if command == "help":
+        emit(HELP.rstrip())
+        return 0
+    try:
+        adapter = adapter_factory()
+        if command == "doctor":
+            adapter.doctor(section)
+            raise AidError("doctor_exec_failed")
+        result = declared(command, catalog(adapter.read_catalog()))
+    except (AidError, OSError, KeyError):
+        emit(json.dumps({"schema": 1, "status": "UNKNOWN", "reason": "aid_observation_unavailable",
+            "readOnly": True, "systemMutationsPerformed": False}, sort_keys=True))
+        return 1
+    if json_output:
+        emit(json.dumps(result, sort_keys=True, separators=(",", ":")))
+    else:
+        emit("Declared catalog only; incomplete, not fresh state or acceptance evidence.")
+        for item in result["catalog"]["items"]:
+            emit(item["id"] + ": owner=" + item["owner"] + "; policy=" + item["versionPolicy"])
+        if command == "plan":
+            emit("Workflow guidance only; not an actual diff or executable plan.")
+            for step in result["workflow"]:
+                emit(step)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

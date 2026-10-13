@@ -1,0 +1,74 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "wine-runtime-update.schema.json",
+  "type": "object",
+  "required": [
+    "schema",
+    "id",
+    "owner",
+    "overlayPolicySha256",
+    "requiredLaunchAdmissionSha256",
+    "candidateFiles"
+  ],
+  "properties": {
+    "schema": {
+      "type": "integer",
+      "const": 1
+    },
+    "id": {
+      "type": "string",
+      "const": "wine-runtime-update"
+    },
+    "owner": {
+      "type": "string",
+      "const": "control-games-hub"
+    },
+    "overlayPolicySha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "requiredLaunchAdmissionSha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "candidateFiles": {
+      "type": "object",
+      "required": [
+        "winemac-i386.drv",
+        "winemac-x86_64.drv",
+        "wine-source.tar.gz",
+        "source.patch",
+        "build-provenance.json",
+        "LGPL-NOTICE.txt"
+      ],
+      "properties": {
+        "winemac-i386.drv": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "winemac-x86_64.drv": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "wine-source.tar.gz": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "source.patch": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "build-provenance.json": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "LGPL-NOTICE.txt": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        }
+      },
+      "additionalProperties": false
+    }
+  },
+  "additionalProperties": false
+}

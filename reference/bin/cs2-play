@@ -1,0 +1,396 @@
+#!/usr/bin/python3
+"""Launch the control-owned CS2 runtime and its separate Steam prefix."""
+import sys
+sys.dont_write_bytecode = True
+
+import argparse
+import contextlib
+import fcntl
+import hashlib
+import json
+import os
+from pathlib import Path
+import pwd
+import re
+import signal
+import stat
+import subprocess
+
+OWNER = "control-cs2-standalone"
+DLL_OVERRIDES = ("winemenubuilder.exe=;mscoree,mshtml=;"
+                 "gameoverlayrenderer,gameoverlayrenderer64=;"
+                 "dxgi,d3d11,d3d10core,winemetal=b;nvapi64,nvngx=")
+MIN_CRITICAL = {"engine/bin/wine", "engine/bin/wineserver",
+                "engine/lib/wine/x86_64-unix/ntdll.so",
+                "engine/lib/wine/x86_64-unix/winemetal.so",
+                "engine/lib/wine/x86_64-windows/d3d11.dll",
+                "engine/lib/wine/x86_64-windows/dxgi.dll",
+                "engine/lib/wine/x86_64-windows/winemetal.dll",
+                "prepare-pipelines.exe", "SteamSetup.exe"}
+PREFIX_OWNER = {"schemaVersion": 1, "owner": OWNER}
+
+
+class Blocked(ValueError):
+    pass
+
+
+def admission(home,route,goal=None):
+    # Execute exactly the reviewed helper bytes from the stable installed route.
+    path=home/'AIDev/bin/game-launch-admission'
+    for parent in [*reversed(path.parents),path.parent]:
+        facts=parent.lstat()
+        if not stat.S_ISDIR(facts.st_mode) or facts.st_uid not in (0,os.getuid()) or facts.st_mode&0o022:
+            raise RuntimeError('unsafe_admission_directory')
+    fd=os.open(str(path),os.O_RDONLY|os.O_NOFOLLOW|os.O_NONBLOCK)
+    try:
+        facts=os.fstat(fd)
+        if not stat.S_ISREG(facts.st_mode) or facts.st_uid!=os.getuid() or facts.st_nlink!=1 or facts.st_mode&0o022 or facts.st_size>65536:
+            raise RuntimeError('unsafe_admission_helper')
+        with os.fdopen(os.dup(fd),'rb') as stream:raw=stream.read()
+        after=os.fstat(fd)
+        keys=('st_dev','st_ino','st_mode','st_uid','st_nlink','st_size','st_mtime_ns','st_ctime_ns')
+        if any(getattr(facts,k)!=getattr(after,k) for k in keys) or hashlib.sha256(raw).hexdigest()!='f0227b4f9e38671a58d6bbbb8ad86a58354c706d55a99521ee9ce973d4ed5750':
+            raise RuntimeError('admission_helper_changed')
+    finally:os.close(fd)
+    namespace={'__name__':'game_launch_admission','__admission_source':raw}
+    exec(compile(raw,str(path),'exec'),namespace)
+    return namespace['Admission'](home,route,goal)
+
+def require(ok, reason):
+    if not ok:
+        raise Blocked(reason)
+
+
+def safe_directory(path, uid):
+    """Reject redirected directory chains before selecting a Wine prefix."""
+    path = Path(path)
+    require(path.is_absolute() and ".." not in path.parts, "unsafe_path")
+    current = Path(path.anchor)
+    for part in path.parts[1:]:
+        current /= part
+        facts = current.lstat()
+        require(stat.S_ISDIR(facts.st_mode) and facts.st_uid in (0, uid)
+                and not facts.st_mode & 0o022, "unsafe_directory")
+    require(path.lstat().st_uid == uid, "directory_owner")
+
+
+def stable_file_identity(facts):
+    # Reading may update atime. Content/identity and permission changes still fail.
+    return (facts.st_dev, facts.st_ino, facts.st_mode, facts.st_uid, facts.st_gid,
+            facts.st_nlink, facts.st_size, facts.st_mtime_ns, facts.st_ctime_ns)
+
+
+def read_regular(path, uid, limit=None):
+    fd = os.open(str(path), os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    try:
+        before = os.fstat(fd)
+        require(stat.S_ISREG(before.st_mode) and before.st_uid == uid
+                and before.st_nlink == 1 and not before.st_mode & 0o022,
+                "unsafe_file")
+        require(limit is None or before.st_size <= limit, "file_too_large")
+        chunks = []
+        with os.fdopen(os.dup(fd), "rb") as stream:
+            while True:
+                block = stream.read(1024 * 1024)
+                if not block:
+                    break
+                chunks.append(block)
+        require(stable_file_identity(os.fstat(fd)) == stable_file_identity(before), "file_changed")
+        return b"".join(chunks)
+    finally:
+        os.close(fd)
+
+
+def decode(raw):
+    def pairs(rows):
+        result = {}
+        for key, value in rows:
+            require(key not in result, "duplicate_json_key")
+            result[key] = value
+        return result
+    try:
+        value = json.loads(raw.decode("utf-8"), object_pairs_hook=pairs)
+        require(type(value) is dict, "invalid_receipt")
+        return value
+    except (UnicodeError, json.JSONDecodeError, RecursionError):
+        raise Blocked("invalid_receipt") from None
+
+
+class Launcher:
+    def __init__(self, home=None, uid=None):
+        self.uid = os.getuid() if uid is None else uid
+        require(self.uid > 0 and os.getuid() == os.geteuid(), "owner_required")
+        # Production ignores HOME overrides; tests supply a private fixture root.
+        self.home = Path(pwd.getpwuid(self.uid).pw_dir) if home is None else Path(home)
+        self.base = self.home / "Library/Application Support/CS2 Standalone"
+        self.runtime = self.base / "runtime"
+        self.prefix = self.base / "prefix"
+        self.graphics = self.base / "graphics"
+        self.logs = self.base / "logs"
+        self.wine = self.runtime / "engine/bin/wine"
+        self.server = self.runtime / "engine/bin/wineserver"
+        self.steam = self.prefix / "drive_c/Program Files (x86)/Steam/steam.exe"
+        self.helper = self.runtime / "prepare-pipelines.exe"
+
+    def validate_runtime(self):
+        safe_directory(self.runtime, self.uid)
+        receipt = decode(read_regular(self.runtime / ".owner.json", self.uid, 65536))
+        require(type(receipt.get("schemaVersion")) is int
+                and receipt["schemaVersion"] == 1 and receipt.get("owner") == OWNER,
+                "runtime_not_owned")
+        expected = receipt.get("manifestSha256")
+        require(type(expected) is str and re.fullmatch(r"[0-9a-f]{64}", expected),
+                "invalid_manifest_hash")
+        raw = read_regular(self.runtime / ".manifest.json", self.uid, 1024 * 1024)
+        require(hashlib.sha256(raw).hexdigest() == expected, "manifest_changed")
+        manifest = decode(raw)
+        hashes = receipt.get("criticalHashes")
+        require(type(hashes) is dict and MIN_CRITICAL <= set(hashes), "invalid_runtime_hashes")
+        require(manifest.get("criticalHashes") == hashes, "runtime_hash_receipt_changed")
+        tree_hash = manifest.get("expectedRuntimeTreeSha256")
+        require(type(tree_hash) is str and re.fullmatch(r"[0-9a-f]{64}", tree_hash)
+                and receipt.get("runtimeTreeSha256") == tree_hash, "runtime_tree_receipt_changed")
+        for name, digest in hashes.items():
+            require(type(name) is str and name != "" and not name.startswith("/")
+                    and ".." not in Path(name).parts and str(Path(name)) == name
+                    and type(digest) is str and re.fullmatch(r"[0-9a-f]{64}", digest),
+                    "invalid_runtime_hashes")
+            path = self.runtime / name
+            safe_directory(path.parent, self.uid)
+            require(hashlib.sha256(read_regular(path, self.uid)).hexdigest() == digest,
+                    "runtime_changed")
+        require(os.access(self.wine, os.X_OK) and os.access(self.server, os.X_OK),
+                "runtime_not_executable")
+        safe_directory(self.runtime / "engine/lib/wine", self.uid)
+        safe_directory(self.runtime / "Frameworks", self.uid)
+        return receipt
+
+    def validate_prefix(self):
+        safe_directory(self.prefix, self.uid)
+        require(decode(read_regular(self.prefix / ".cs2-prefix-owner.json", self.uid, 4096))
+                == PREFIX_OWNER, "prefix_not_owned")
+
+    def validate_steam_directory(self):
+        """Steam data may be group writable inside the private owned prefix."""
+        self.validate_prefix()
+        fd = os.open(str(self.prefix), os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        try:
+            facts = os.fstat(fd)
+            require(facts.st_uid == self.uid and not facts.st_mode & 0o077,
+                    "prefix_not_private")
+            for part in self.steam.parent.relative_to(self.prefix).parts:
+                child = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                                dir_fd=fd)
+                os.close(fd)
+                fd = child
+                facts = os.fstat(fd)
+                require(stat.S_ISDIR(facts.st_mode) and facts.st_uid == self.uid
+                        and not facts.st_mode & 0o002, "unsafe_steam_directory")
+        finally:
+            os.close(fd)
+
+    def environment(self, hud=False):
+        # Do not inherit another Wine loader, prefix, graphics pack or app hooks.
+        env = {"HOME": str(self.home), "PATH": "/usr/bin:/bin:/usr/sbin:/sbin",
+               "USER": pwd.getpwuid(self.uid).pw_name,
+               "LOGNAME": pwd.getpwuid(self.uid).pw_name, "LANG": "en_US.UTF-8"}
+        env.update({"WINEPREFIX": str(self.prefix), "WINESERVER": str(self.server),
+                    "WINELOADER": str(self.wine),
+                    "WINEDLLPATH": str(self.runtime / "engine/lib/wine"),
+                    "DYLD_FALLBACK_LIBRARY_PATH": str(self.runtime / "Frameworks") + ":/usr/lib",
+                    "WINEDLLOVERRIDES": DLL_OVERRIDES, "WINEDEBUG": "-all",
+                    "WINEMSYNC": "1", "WINEESYNC": "0", "ROSETTA_ADVERTISE_AVX": "1",
+                    "AOELAB_STEAM_SINGLEPROCESS": "1", "DXMT_CS2_EARLY_COMPILE": "1",
+                    "DXMT_SHADER_CACHE_PATH": str(self.graphics / "shader-cache"),
+                    "DXMT_CS2_PIPELINE_CACHE": str(self.graphics / "game-archives"),
+                    "DXMT_CS2_RECIPE_DIR": str(self.graphics / "recipes"),
+                    "MTL_HUD_ENABLED": "1" if hud else "0"})
+        return env
+
+    def active(self, env):
+        """Wine server wait is prefix scoped; a timeout means processes remain."""
+        try:
+            result = subprocess.run([str(self.server), "-w"], env=env,
+                                    stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                                    stderr=subprocess.DEVNULL, timeout=0.5)
+        except subprocess.TimeoutExpired:
+            return True
+        require(result.returncode == 0, "session_probe_failed")
+        return False
+
+    def mkdir(self, path):
+        if not path.exists() and not path.is_symlink():
+            path.mkdir(mode=0o700)
+        safe_directory(path, self.uid)
+
+    def private_file(self, path, truncate=False):
+        flags = os.O_WRONLY | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK
+        flags |= os.O_APPEND
+        fd = os.open(str(path), flags, 0o600)
+        facts = os.fstat(fd)
+        try:
+            require(stat.S_ISREG(facts.st_mode) and facts.st_uid == self.uid
+                    and facts.st_nlink == 1 and not facts.st_mode & 0o077,
+                    "unsafe_private_file")
+        except BaseException:
+            os.close(fd)
+            raise
+        if truncate:
+            os.ftruncate(fd, 0)
+        return os.fdopen(fd, "wb")
+
+    @contextlib.contextmanager
+    def locked(self):
+        with self.private_file(self.base / ".launcher.lock") as handle:
+            try:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                raise Blocked("launcher_busy") from None
+            yield
+
+    def writable_state(self):
+        self.mkdir(self.graphics)
+        for name in ("shader-cache", "game-archives", "recipes"):
+            self.mkdir(self.graphics / name)
+        self.mkdir(self.logs)
+
+    def prewarm(self, env):
+        """Replay free renderer recipes only into this runtime's private caches."""
+        recipes = self.graphics / "recipes"
+        if not any(path.is_file() and not path.is_symlink() for path in recipes.glob("*.recipe")):
+            return "no_recipes"
+        if self.active(env):
+            return "session_active"
+        with self.private_file(self.logs / "prewarm.log", truncate=True) as log:
+            child = subprocess.Popen([str(self.wine), str(self.helper), str(recipes),
+                                      str(self.graphics / "shader-cache")], env=env,
+                                     cwd=str(self.logs), stdin=subprocess.DEVNULL,
+                                     stdout=log, stderr=log, start_new_session=True)
+            try:
+                code = child.wait(timeout=45)
+                return "complete" if code == 0 else "failed"
+            except subprocess.TimeoutExpired:
+                # Only the process group that this invocation created is signalled.
+                self.terminate_child(child)
+                return "timed_out"
+
+    def terminate_child(self, child):
+        for sig in (signal.SIGTERM, signal.SIGKILL):
+            try:
+                os.killpg(child.pid, sig)
+            except ProcessLookupError:
+                pass
+            try:
+                child.wait(timeout=2)
+                return
+            except subprocess.TimeoutExpired:
+                pass
+        raise Blocked("child_stop_failed")
+
+    def setup(self, env):
+        if self.prefix.exists() or self.prefix.is_symlink():
+            self.validate_prefix()
+            require(not self.active(env), "session_active")
+            if self.steam.exists() or self.steam.is_symlink():
+                self.validate_steam_directory()
+                read_regular(self.steam, self.uid, 64 * 1024 * 1024)
+                return {"state": "already_setup"}
+        else:
+            self.mkdir(self.prefix)
+            with self.private_file(self.prefix / ".cs2-prefix-owner.json") as marker:
+                marker.write((json.dumps(PREFIX_OWNER, sort_keys=True) + "\n").encode())
+        self.writable_state()
+        with self.private_file(self.logs / "setup.log", truncate=True) as log:
+            for args in (["wineboot", "--init"], [str(self.runtime / "SteamSetup.exe"), "/S"]):
+                child = subprocess.Popen([str(self.wine)] + args, env=env,
+                                         cwd=str(self.logs), stdin=subprocess.DEVNULL,
+                                         stdout=log, stderr=log, start_new_session=True)
+                try:
+                    code = child.wait(timeout=180)
+                except subprocess.TimeoutExpired:
+                    self.terminate_child(child)
+                    raise Blocked("setup_timed_out") from None
+                require(code == 0, "setup_failed")
+        return {"state": "setup_finished", "login": "owner_action_required"}
+
+    def no_foreign_steam(self):
+        require(not admission(self.home,'cs2').summary()['foreignSteam'], 'foreign_steam_active')
+
+    def launch(self, mode, env, request):
+        self.validate_prefix()
+        self.validate_steam_directory()
+        read_regular(self.steam, self.uid, 64 * 1024 * 1024)
+        request.reconcile()
+        session = request.allow_client()
+        if mode=='play' and session['targetActive']:
+            return {"state": "already_running", "mode": mode, "gameplayVerified": False}
+        self.writable_state()
+        request.begin()
+        prewarm = "not_requested"
+        if mode == "play":
+            try:
+                prewarm = self.prewarm(env)
+            except (OSError, Blocked):
+                prewarm = "unavailable"
+        args = [str(self.wine), str(self.steam), "-cef-disable-gpu"]
+        if mode == "play":
+            args.extend(["-applaunch", "730"])
+        with self.private_file(self.logs / "launch.log") as log:
+            child = subprocess.Popen(args, env=env, cwd=str(self.steam.parent),
+                                     stdin=subprocess.DEVNULL, stdout=log, stderr=log,
+                                     start_new_session=True)
+        request.dispatched([child])
+        return {"state": "launch_dispatched", "mode": mode, "prewarm": prewarm}
+
+    def status(self, env):
+        present = self.prefix.exists() or self.prefix.is_symlink()
+        active = False
+        installed = False
+        if present:
+            self.validate_prefix()
+            active = self.active(env)
+            if self.steam.exists() or self.steam.is_symlink():
+                self.validate_steam_directory()
+                read_regular(self.steam, self.uid, 64 * 1024 * 1024)
+                installed = True
+        return {"state": "ready" if installed else "setup_required", "runtime_owned": True,
+                "prefix_owned": present, "steam_installed": installed, "session_active": active}
+
+    def execute(self, mode, hud=False):
+        self.validate_runtime()
+        env = self.environment(hud)
+        if mode == "status":
+            return self.status(env)
+        with self.locked():
+            if mode == "setup":
+                return self.setup(env)
+            if mode == "stop":
+                self.validate_prefix()
+                result = subprocess.run([str(self.server), "-k"], env=env,
+                                        stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                                        stderr=subprocess.DEVNULL, timeout=10)
+                require(result.returncode == 0, "stop_failed")
+                return {"state": "stop_requested", "session_active": self.active(env)}
+            request = admission(self.home, 'cs2', 'client' if mode=='steam' else 'game')
+            with request.locked():
+                return self.launch(mode, env, request)
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("mode", nargs="?", default="play",
+                        choices=("play", "steam", "setup", "status", "stop"))
+    parser.add_argument("--hud", action="store_true", help="enable the Metal performance HUD")
+    args = parser.parse_args(argv)
+    try:
+        result = Launcher().execute(args.mode, args.hud)
+        print(json.dumps(result, sort_keys=True))
+        return 0
+    except (OSError, Blocked, RuntimeError, subprocess.SubprocessError) as error:
+        reason = str(error) if isinstance(error, (Blocked, RuntimeError)) else type(error).__name__
+        print(json.dumps({"state": "BLOCKED", "reason": reason}, sort_keys=True))
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

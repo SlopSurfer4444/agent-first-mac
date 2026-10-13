@@ -1,0 +1,257 @@
+#!/usr/bin/python3
+"""Exact, user-level installation of the one control-owned Windows routing skill."""
+import sys
+sys.dont_write_bytecode = True
+
+import hashlib
+import json
+import os
+from pathlib import Path
+import pwd
+import re
+import stat
+import subprocess
+
+SOURCE = "skills/manage-windows-host/SKILL.md"
+MANIFEST = "manifests/windows-host-skill.json"
+HELPER = "bin/windows-host-skill"
+NAME = "manage-windows-host"
+RECEIPT = ".control-owner.json"
+LIMIT = 128 * 1024
+EXPECTED = {
+    "schema": 1, "id": NAME, "owner": "control/windows-host-skill",
+    "version": 1, "versionPolicy": "exact-committed-source-sha256",
+    "source": SOURCE, "destination": "~/.codex/skills/manage-windows-host/SKILL.md",
+    "architecture": "architecture-independent", "capabilities": ["instruction-routing-only"],
+    "dataBoundary": "no-credentials-no-remote-configuration",
+    "updatePolicy": "separately-reviewed-successor-no-automatic-overwrite",
+    "removePolicy": "owner-approved-exact-target-restoration",
+    "rollbackPolicy": "owner-approved-exact-target-restoration",
+    "smoke": "windows-host-skill status --json",
+}
+
+
+class Blocked(ValueError):
+    pass
+
+
+def require(value, reason):
+    if value is not True:
+        raise Blocked(reason)
+
+
+def digest(raw):
+    return hashlib.sha256(raw).hexdigest()
+
+
+def decode(raw):
+    def pairs(rows):
+        result = {}
+        for key, value in rows:
+            require(key not in result, "invalid_json")
+            result[key] = value
+        return result
+    try:
+        return json.loads(raw.decode("utf-8"), object_pairs_hook=pairs)
+    except (ValueError, UnicodeError, RecursionError):
+        raise Blocked("invalid_json") from None
+
+
+def directory(path, uid):
+    """Open every absolute component without following any symbolic link."""
+    path = Path(path)
+    require(path.is_absolute() and ".." not in path.parts, "unsafe_directory")
+    fd = os.open("/", os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+    try:
+        for part in path.parts[1:]:
+            child = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=fd)
+            os.close(fd)
+            fd = child
+            facts = os.fstat(fd)
+            require(facts.st_uid in (0, uid) and not facts.st_mode & 0o022, "unsafe_directory")
+        return fd
+    except BaseException:
+        os.close(fd)
+        raise
+
+
+def read_at(fd, name, uid):
+    handle = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC, dir_fd=fd)
+    try:
+        before = os.fstat(handle)
+        require(stat.S_ISREG(before.st_mode) and before.st_uid == uid
+                and before.st_nlink == 1 and not before.st_mode & 0o022
+                and 0 < before.st_size <= LIMIT, "unsafe_file")
+        raw = b""
+        while len(raw) <= LIMIT:
+            block = os.read(handle, min(8192, LIMIT + 1 - len(raw)))
+            if not block:
+                break
+            raw += block
+        after = os.fstat(handle)
+        require(before == after and len(raw) == before.st_size, "file_drift")
+        return raw
+    finally:
+        os.close(handle)
+
+
+def read_file(path, uid):
+    fd = directory(Path(path).parent, uid)
+    try:
+        return read_at(fd, Path(path).name, uid)
+    finally:
+        os.close(fd)
+
+
+class Native:
+    def __init__(self):
+        self.uid = os.getuid()
+        require(self.uid > 0 and self.uid == os.geteuid(), "owner_required")
+        self.home = Path(pwd.getpwuid(self.uid).pw_dir)
+        self.root = self.home / "AIDev/control"
+        require(str(Path(__file__).absolute()) == str(self.root / HELPER), "noncanonical_source")
+        self.mutation_started = False
+
+    def git(self, *args):
+        result = subprocess.run(
+            ["/usr/bin/git", "--no-optional-locks", "-c", "core.fsmonitor=false",
+             "-c", "core.hooksPath=/dev/null", "-C", str(self.root), *args],
+            env={"PATH": "/usr/bin:/bin", "HOME": str(self.home), "LC_ALL": "C",
+                 "GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": "/dev/null",
+                 "GIT_NO_REPLACE_OBJECTS": "1"}, capture_output=True, timeout=15)
+        require(result.returncode == 0 and len(result.stdout) <= LIMIT, "source_git_failed")
+        return result.stdout
+
+    def source(self, expected_commit=None):
+        fd = directory(self.root, self.uid)
+        try:
+            require(os.fstat(fd).st_uid == self.uid, "noncanonical_source")
+        finally:
+            os.close(fd)
+        fd = directory(self.root / ".git", self.uid)
+        os.close(fd)
+        require(self.git("rev-parse", "--show-toplevel").decode().strip() == str(self.root), "noncanonical_source")
+        require(self.git("symbolic-ref", "--short", "HEAD") == b"main\n", "canonical_main_required")
+        require(self.git("status", "--porcelain=v1", "--untracked-files=all") == b"", "source_dirty")
+        commit = self.git("rev-parse", "HEAD").decode().strip()
+        require(re.fullmatch(r"[0-9a-f]{40}", commit) is not None, "invalid_commit")
+        require(expected_commit is None or expected_commit == commit, "commit_mismatch")
+        blobs = {}
+        for name in (SOURCE, MANIFEST, HELPER):
+            raw = read_file(self.root / name, self.uid)
+            require(raw == self.git("show", commit + ":" + name), "source_drift")
+            blobs[name] = raw
+        manifest = decode(blobs[MANIFEST])
+        require(type(manifest) is dict and set(manifest) == set(EXPECTED) | {"sourceSha256"}, "invalid_manifest")
+        for key, value in EXPECTED.items():
+            require(type(manifest[key]) is type(value) and manifest[key] == value, "invalid_manifest")
+        require(manifest["sourceSha256"] == digest(blobs[SOURCE]), "source_hash_mismatch")
+        return commit, blobs[SOURCE]
+
+    def parent(self):
+        fd = directory(self.home / ".codex/skills", self.uid)
+        require(os.fstat(fd).st_uid == self.uid, "destination_owner")
+        return fd
+
+    def state(self, parent, raw):
+        try:
+            fd = os.open(NAME, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=parent)
+        except FileNotFoundError:
+            return "ABSENT"
+        try:
+            facts = os.fstat(fd)
+            require(facts.st_uid == self.uid and stat.S_IMODE(facts.st_mode) == 0o700, "destination_collision")
+            require(set(os.listdir(fd)) == {"SKILL.md", RECEIPT}, "destination_collision")
+            for name in ("SKILL.md", RECEIPT):
+                require(stat.S_IMODE(os.stat(name, dir_fd=fd, follow_symlinks=False).st_mode) == 0o600,
+                        "installed_metadata_drift")
+            require(read_at(fd, "SKILL.md", self.uid) == raw, "installed_drift")
+            receipt = decode(read_at(fd, RECEIPT, self.uid))
+            require(type(receipt) is dict and set(receipt) == {"schema", "owner", "sourceSha256", "sourceCommit"}
+                    and type(receipt["schema"]) is int and receipt["schema"] == 1
+                    and receipt["owner"] == EXPECTED["owner"]
+                    and receipt["sourceSha256"] == digest(raw)
+                    and type(receipt["sourceCommit"]) is str
+                    and re.fullmatch(r"[0-9a-f]{40}", receipt["sourceCommit"]) is not None, "ownership_collision")
+            self.git("merge-base", "--is-ancestor", receipt["sourceCommit"], "HEAD")
+            require(self.git("show", receipt["sourceCommit"] + ":" + SOURCE) == raw, "ownership_collision")
+            return "INSTALLED_EXACT"
+        finally:
+            os.close(fd)
+
+    def write(self, fd, name, raw):
+        handle = os.open(name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600, dir_fd=fd)
+        try:
+            offset = 0
+            while offset < len(raw):
+                count = os.write(handle, raw[offset:])
+                require(count > 0, "write_failed")
+                offset += count
+            os.fsync(handle)
+        finally:
+            os.close(handle)
+
+    def run(self, command, expected_commit=None):
+        commit, raw = self.source(expected_commit)
+        parent = self.parent()
+        try:
+            state = self.state(parent, raw)
+            if command == "apply" and state == "ABSENT":
+                require(self.source(expected_commit) == (commit, raw), "source_drift")
+                # No replacement, recursive creation, cleanup, or update. mkdir
+                # is the exclusive first-writer gate; a failed attempt stays visible.
+                os.mkdir(NAME, 0o700, dir_fd=parent)
+                self.mutation_started = True
+                fd = os.open(NAME, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=parent)
+                try:
+                    require(os.fstat(fd).st_uid == self.uid and os.listdir(fd) == [], "destination_collision")
+                    self.write(fd, "SKILL.md", raw)
+                    receipt = {"schema": 1, "owner": EXPECTED["owner"],
+                               "sourceSha256": digest(raw), "sourceCommit": commit}
+                    self.write(fd, RECEIPT, (json.dumps(receipt, sort_keys=True) + "\n").encode())
+                    os.fsync(fd)
+                finally:
+                    os.close(fd)
+                os.fsync(parent)
+                state = self.state(parent, raw)
+                require(state == "INSTALLED_EXACT", "postcheck_failed")
+            require(self.source(expected_commit) == (commit, raw), "source_drift")
+            # Prove the path still names the held destination parent.
+            check = self.parent()
+            try:
+                require(os.path.samestat(os.fstat(check), os.fstat(parent)), "directory_drift")
+            finally:
+                os.close(check)
+            return {"schema": 1, "command": command, "status": state, "sourceCommit": commit,
+                    "sourceSha256": digest(raw), "changed": self.mutation_started,
+                    "scope": "USER_SKILL_ONLY", "remoteStateChecked": False}
+        finally:
+            os.close(parent)
+
+
+def main(arguments=None, *, adapter_factory=Native, emit=print):
+    arguments = sys.argv[1:] if arguments is None else arguments
+    if arguments in ([], ["help"], ["--help"]):
+        emit("windows-host-skill prepare|status [--json] | apply <exact-commit> [--json]")
+        return 0
+    args = arguments[:-1] if arguments[-1:] == ["--json"] else arguments
+    if not (args in (["prepare"], ["status"]) or len(args) == 2 and args[0] == "apply"
+            and re.fullmatch(r"[0-9a-f]{40}", args[1]) is not None):
+        emit("windows-host-skill: unsupported arguments")
+        return 2
+    adapter = None
+    try:
+        adapter = adapter_factory()
+        result = adapter.run(args[0], args[1] if len(args) == 2 else None)
+        emit(json.dumps(result, sort_keys=True))
+        return 0 if args[0] != "status" or result["status"] == "INSTALLED_EXACT" else 1
+    except (Blocked, OSError, subprocess.SubprocessError):
+        changed = adapter is not None and adapter.mutation_started
+        emit(json.dumps({"schema": 1, "status": "RECOVERY_REQUIRED" if changed else "BLOCKED",
+                         "reason": "skill_lifecycle_verification_failed", "changed": changed,
+                         "scope": "USER_SKILL_ONLY", "remoteStateChecked": False}, sort_keys=True))
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -1,0 +1,10 @@
+{
+  "publicReferenceOnly": true,
+  "warning": "Sanitized historical example. Not installation authority or current inventory.",
+  "example": {
+    "id": "wine-runtime-update",
+    "overlayPolicySha256": "4a51aec0b383319319b014c59b59c38025710d914b70469422d29f20ff0d5d3c",
+    "requiredLaunchAdmissionSha256": "f0227b4f9e38671a58d6bbbb8ad86a58354c706d55a99521ee9ce973d4ed5750",
+    "schema": 1
+  }
+}

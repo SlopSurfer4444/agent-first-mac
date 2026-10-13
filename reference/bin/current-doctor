@@ -1,0 +1,787 @@
+#!/usr/bin/python3
+"""Explicit post-Phase5 sentinel admission; no import-time work or old replay.
+
+The reviewed local source is the bootstrap boundary. Injected Git observations
+must describe the real current tree and the fixed predecessor, never a filtered
+tree passed to the old doctor. Native adapters and their admission belong to
+the coordinator. Importing this module performs no runtime observation.
+"""
+
+import sys
+sys.dont_write_bytecode = True
+
+import importlib.machinery
+import json
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT))
+D = importlib.machinery.SourceFileLoader(
+    "sentinel_historical_doctor", str(ROOT / "bin/phase5-current-doctor")).load_module()
+from lib import config_transition_source as configurations
+from lib import current_source_admission as current_sources
+from lib import vendor_compatibility_probe as probe
+
+BASE = "63eb5f1bab58b0ee8af8b0037967ad51ea84fc34"
+BRANCH = "codex/vendor-compatibility-sentinel"
+PHASE5_ACCEPTANCE = "evidence/phase-5/acceptance.json"
+PHASE5_SHA256 = "66b3a9ef3027d80daecad8f87d84fe7dc74c005f631499a86404feecbe4d4b45"
+ACCEPTANCE = "evidence/post-phase5-sentinel/acceptance.json"
+EVIDENCE_PREFIX = "evidence/post-phase5-sentinel/"
+ROUTERS = frozenset(("ARCHITECTURE.md", "AGENTS.md", "README.md"))
+REQUIRED = frozenset(("bin/current-doctor", "tests/test_current_doctor.py",
+                      "docs/post-phase5-sentinel-admission.md"))
+ROLES = frozenset(("capabilityProbe", "finalReview"))
+EXPOSURE_BASE = "fe7c091d42c3baff305764354b1b8f71eac72e6f"
+EXPOSURE_BRANCH = "codex/vendor-sentinel-sessionstart"
+EXPOSURE_ACCEPTANCE = "evidence/sessionstart-exposure/acceptance.json"
+EXPOSURE_EVIDENCE = "evidence/sessionstart-exposure/"
+SENTINEL_SHA256 = "402c489e2eac91de108881e2e3af548905460de465e0ab09fd45d9b07b31b9fc"
+EXPOSURE_ADDITIONS = frozenset(("manifests/sessionstart-exposure.json", "bin/aid-sessionstart",
+    "tests/test_sessionstart_exposure.py", "docs/vendor-sentinel-sessionstart.md",
+    "docs/vendor-sentinel-sessionstart-admission.md"))
+EXPOSURE_ENGINES = frozenset(("bin/current-doctor", "tests/test_current_doctor.py"))
+EXPOSURE_REPLACEMENTS = ROUTERS | EXPOSURE_ENGINES
+AUTHORITY = D.AUTHORITY + ("modelTaskAuthorized", "schedulerAuthorized", "l4Allowed")
+STAGES = frozenset(("arguments", "git", "historical", "acceptance", "source",
+                    "exposure", "configuration", "sentinel", "runtime", "final-recheck", "close", "native-unbound"))
+REASONS = frozenset(("source_changed", "fixture_invalid", "signature_invalid",
+    "cli_identity_invalid", "command_failed", "schema_output_invalid",
+    "capabilities_incompatible", "process_unsettled", "probe_failed"))
+require, digest, oid = D.require, D.digest, D.oid
+
+
+def row(value):
+    require(type(value) is dict and set(value) == {"sha256", "mode"}
+            and D.hex_value(value["sha256"], 64)
+            and type(value["mode"]) is str and value["mode"] in ("100644", "100755"))
+    return value
+
+
+def rows(value):
+    require(type(value) is dict and len(value) <= 512)
+    for path, item in value.items():
+        require(D.relative(path))
+        row(item)
+    return value
+
+
+def phase5(raw):
+    require(type(raw) is bytes and digest(raw) == PHASE5_SHA256)
+    return D.acceptance(raw)  # pure parser only; never D.run/native
+
+
+def acceptance(raw):
+    """Strict, bounded new-record parser; parsing alone is not acceptance."""
+    value = D.R.strict_json(raw)
+    require(type(value) is dict and set(value) == {
+        "schema", "kind", "status", "predecessorCommit", "phase5AcceptanceSHA256",
+        "reviewedHead", "sources", "evidence", "routers", "checks", "sentinelAccepted",
+        *AUTHORITY})
+    require(type(value["schema"]) is int and value["schema"] == 1
+            and type(value["kind"]) is str and value["kind"] == "POST_PHASE5_VENDOR_SENTINEL"
+            and type(value["status"]) is str and value["status"] == "ACCEPTED_VENDOR_SENTINEL"
+            and value["predecessorCommit"] == BASE
+            and value["phase5AcceptanceSHA256"] == PHASE5_SHA256
+            and D.hex_value(value["reviewedHead"], 40)
+            and value["sentinelAccepted"] is True
+            and all(value[key] is False for key in AUTHORITY))
+    sources, evidence = rows(value["sources"]), rows(value["evidence"])
+    require(REQUIRED <= set(sources) and not (set(sources) & set(evidence))
+            and ACCEPTANCE not in sources | evidence
+            and all(not p.startswith("evidence/") for p in sources)
+            and all(p.startswith(EVIDENCE_PREFIX) for p in evidence))
+    routers = value["routers"]
+    require(type(routers) is dict and set(routers) <= ROUTERS)
+    for change in routers.values():
+        require(type(change) is dict and set(change) == {"before", "after"})
+        row(change["before"])
+        row(change["after"])
+        require(change["before"] != change["after"])
+    checks = value["checks"]
+    require(type(checks) is dict and set(checks) == ROLES)
+    for item in checks.values():
+        require(type(item) is dict and set(item) == {"status", "evidence"}
+                and type(item["status"]) is str and item["status"] == "PASS"
+                and type(item["evidence"]) is str and item["evidence"] in evidence)
+    return value
+
+
+def delta(predecessor, candidate):
+    """Only additions and three named routing replacements, never deletion."""
+    D.tree(predecessor)
+    D.tree(candidate)
+    require(PHASE5_ACCEPTANCE in predecessor and REQUIRED <= set(candidate)
+            and ACCEPTANCE not in predecessor)
+    require(all(p in candidate and (candidate[p] == item or p in ROUTERS)
+                for p, item in predecessor.items()))
+    added = set(candidate) - set(predecessor) - {ACCEPTANCE}
+    changed = {p for p in ROUTERS if candidate.get(p) != predecessor.get(p)}
+    require(all(p in predecessor and p in candidate for p in changed))
+    require(all(candidate[p][0] in ("100644", "100755") for p in added | changed))
+    require(all(not p.startswith("evidence/") or p.startswith(EVIDENCE_PREFIX) for p in added))
+    return added, changed
+
+
+def verify_acceptance(raw, *, phase5_raw, predecessor, current, meta):
+    """Pure exact real-tree/topology check, not a fabricated old D snapshot.
+
+The trusted adapter obtains predecessor from BASE, and acceptance metadata
+from the sole path-history commit on actual HEAD. The fixed BASE plus exact
+old receipt is the already independently accepted historical trust anchor.
+"""
+    old = phase5(phase5_raw)
+    value = acceptance(raw)
+    D.tree(current)
+    require(type(meta) is dict and set(meta) == {
+        "commits", "parents", "identity", "changes", "tree"})
+    require(type(meta["commits"]) is tuple and len(meta["commits"]) == 1
+            and D.hex_value(meta["commits"][0], 40)
+            and type(meta["parents"]) is tuple and meta["parents"] == (value["reviewedHead"],)
+            and all(D.hex_value(p, 40) for p in meta["parents"])
+            and type(meta["identity"]) is tuple and meta["identity"] == D.COORDINATOR
+            and all(type(p) is str for p in meta["identity"])
+            and type(meta["changes"]) is tuple and meta["changes"] == (("A", ACCEPTANCE),)
+            and type(meta["changes"][0]) is tuple
+            and all(type(p) is str for p in meta["changes"][0]))
+    reviewed = D.tree(meta["tree"])
+    require(ACCEPTANCE not in reviewed)
+    added, changed = delta(predecessor, reviewed)
+    require(set(value["sources"]) == {p for p in added if not p.startswith("evidence/")}
+            and set(value["evidence"]) == {p for p in added if p.startswith("evidence/")}
+            and set(value["routers"]) == changed)
+    require(all(current.get(p) == item for p, item in reviewed.items()))
+    require(all(p in reviewed or p == ACCEPTANCE
+                or p.startswith(("docs/", "evidence/")) for p in current))
+    for path, item in (value["sources"] | value["evidence"]).items():
+        require(reviewed[path][0] == item["mode"])
+    for path, change in value["routers"].items():
+        require(change["before"] == {"mode": predecessor[path][0], "sha256": old["sources"][path]}
+                and change["after"]["mode"] == reviewed[path][0])
+    require(predecessor[PHASE5_ACCEPTANCE] == ("100644", oid(phase5_raw))
+            and current.get(PHASE5_ACCEPTANCE) == predecessor[PHASE5_ACCEPTANCE]
+            and current.get(ACCEPTANCE) == ("100644", oid(raw)))
+    return value
+
+
+def exposure_included(branch, current):
+    return (branch == EXPOSURE_BRANCH or EXPOSURE_ACCEPTANCE in current
+            or bool(EXPOSURE_ADDITIONS & set(current)))
+
+
+def exposure_acceptance(raw):
+    """One fixed source-only extension, never an arbitrary acceptance chain."""
+    value = D.R.strict_json(raw)
+    require(type(value) is dict and set(value) == {
+        "schema", "kind", "status", "predecessorCommit", "sentinelAcceptanceSHA256",
+        "reviewedHead", "sources", "evidence", "replacements", "checks",
+        "exposureSourceAccepted", *AUTHORITY})
+    require(type(value["schema"]) is int and value["schema"] == 1
+            and value["kind"] == "SESSIONSTART_EXPOSURE"
+            and value["status"] == "ACCEPTED_SOURCE_READY_FOR_APPLY"
+            and value["predecessorCommit"] == EXPOSURE_BASE
+            and value["sentinelAcceptanceSHA256"] == SENTINEL_SHA256
+            and D.hex_value(value["reviewedHead"], 40)
+            and value["exposureSourceAccepted"] is True
+            and all(value[k] is False for k in AUTHORITY))
+    sources, evidence = rows(value["sources"]), rows(value["evidence"])
+    require(set(sources) == EXPOSURE_ADDITIONS and EXPOSURE_ACCEPTANCE not in evidence
+            and all(p.startswith(EXPOSURE_EVIDENCE) for p in evidence))
+    replacements = value["replacements"]
+    require(type(replacements) is dict
+            and EXPOSURE_ENGINES <= set(replacements) <= EXPOSURE_REPLACEMENTS)
+    for change in replacements.values():
+        require(type(change) is dict and set(change) == {"before", "after"})
+        row(change["before"])
+        row(change["after"])
+        require(change["before"] != change["after"])
+    require(type(value["checks"]) is dict and set(value["checks"]) == {"sourceTests", "finalReview"})
+    for check in value["checks"].values():
+        require(type(check) is dict and set(check) == {"status", "evidence"}
+                and check["status"] == "PASS" and type(check["evidence"]) is str
+                and check["evidence"] in evidence)
+    return value
+
+
+def exposure_delta(predecessor, candidate):
+    D.tree(predecessor)
+    D.tree(candidate)
+    require(not (EXPOSURE_ADDITIONS & set(predecessor)) and EXPOSURE_ACCEPTANCE not in predecessor
+            and EXPOSURE_ADDITIONS <= set(candidate))
+    require(all(p in candidate and (candidate[p] == item or p in EXPOSURE_REPLACEMENTS)
+                for p, item in predecessor.items()))
+    added = set(candidate) - set(predecessor) - {EXPOSURE_ACCEPTANCE}
+    changed = {p for p in EXPOSURE_REPLACEMENTS if candidate.get(p) != predecessor.get(p)}
+    require(EXPOSURE_ENGINES <= changed and all(p in predecessor and p in candidate for p in changed)
+            and all(p in EXPOSURE_ADDITIONS or p.startswith(EXPOSURE_EVIDENCE) for p in added)
+            and all(candidate[p][0] in ("100644", "100755") for p in added | changed))
+    return added, changed
+
+
+def verify_exposure(raw, *, predecessor, current, sentinel, meta):
+    """Actual fe7/current trees and the already verified sentinel decision."""
+    value = exposure_acceptance(raw)
+    D.tree(current)
+    require(type(meta) is dict and set(meta) == {"commits", "parents", "identity", "changes", "tree"})
+    require(type(meta["commits"]) is tuple and len(meta["commits"]) == 1
+            and D.hex_value(meta["commits"][0], 40)
+            and type(meta["parents"]) is tuple and meta["parents"] == (value["reviewedHead"],)
+            and all(D.hex_value(p, 40) for p in meta["parents"])
+            and type(meta["identity"]) is tuple and meta["identity"] == D.COORDINATOR
+            and all(type(p) is str for p in meta["identity"])
+            and type(meta["changes"]) is tuple and meta["changes"] == (("A", EXPOSURE_ACCEPTANCE),)
+            and type(meta["changes"][0]) is tuple and all(type(p) is str for p in meta["changes"][0]))
+    reviewed = D.tree(meta["tree"])
+    require(EXPOSURE_ACCEPTANCE not in reviewed)
+    added, changed = exposure_delta(predecessor, reviewed)
+    require(set(value["sources"]) == added - set(value["evidence"])
+            and set(value["evidence"]) == {p for p in added if p.startswith("evidence/")}
+            and set(value["replacements"]) == changed)
+    require(all(current.get(p) == item for p, item in reviewed.items())
+            and all(p in reviewed or p == EXPOSURE_ACCEPTANCE or p.startswith(EXPOSURE_EVIDENCE) for p in current)
+            and all(current[p][0] in ("100644", "100755") for p in set(current) - set(reviewed))
+            and current.get(EXPOSURE_ACCEPTANCE) == ("100644", oid(raw)))
+    previous = sentinel["sources"] | {p: change["after"] for p, change in sentinel["routers"].items()}
+    for p, change in value["replacements"].items():
+        require(change["before"] == previous[p] and change["before"]["mode"] == predecessor[p][0]
+                and change["after"]["mode"] == reviewed[p][0])
+    for p, item in (value["sources"] | value["evidence"]).items():
+        require(reviewed[p][0] == item["mode"])
+    return value
+
+
+def consistent_report(value):
+    """Observation, acceptance, mode and closure implications are independent."""
+    if value["admissionMode"] not in ("historical-review", "current-state"):
+        return False
+    reasons = value["reasonCodes"]
+    if (type(reasons) is not list or len(reasons) > len(REASONS)
+            or any(type(reason) is not str or reason not in REASONS for reason in reasons)
+            or len(set(reasons)) != len(reasons)
+            or reasons and (value["failureStage"] != "sentinel" or value["gitOnly"])):
+        return False
+    h, s, a, i = (value[k] for k in ("historicalPhase5Accepted", "repositoryChecksPassed",
+                                     "sentinelAccepted", "integratedMain"))
+    seen, ready, live, runtime, git_only, settled, closed = (value[k] for k in (
+        "sentinelChecked", "currentSentinelReady", "liveRuntimeChecked", "currentRuntimeReady",
+        "gitOnly", "childSettled", "sourceHandlesClosed"))
+    exposure, exposure_accepted = value["exposureSourceIncluded"], value["exposureSourceAccepted"]
+    configuration, configuration_accepted = (value[k] for k in
+        ("configurationSourceIncluded", "configurationSourceAccepted"))
+    if not all(type(v) is bool for v in (h, s, a, i, seen, ready, live, runtime, git_only, settled, closed,
+                                        exposure, exposure_accepted, configuration, configuration_accepted)):
+        return False
+    admitted = a and (not exposure or exposure_accepted) and (not configuration or configuration_accepted)
+    if (s and not h or a and not h or i and not (a and h)
+            or ready and not (seen and s and h and settled and closed)
+            or runtime and not (live and ready and s and settled and closed)
+            or live and not seen
+            or git_only and (seen or ready or live or runtime)
+            or exposure_accepted and not (exposure and a and h)
+            or configuration_accepted and not (configuration and exposure_accepted and a and h)
+            or i and not admitted or value["exposureStateChecked"] is not False):
+        return False
+    success = h and s and settled and closed and value["failureStage"] is None
+    verdicts = {
+        "PASS": success and admitted and i and seen and ready and not git_only and (not live or runtime),
+        "PREPARED_FOR_INDEPENDENT_REVIEW": success and not i and seen and ready
+            and not git_only and (not live or runtime),
+        "PREPARED_SOURCE_ONLY": success and not admitted and not i and git_only,
+        "GIT_ONLY_VALID": success and admitted and git_only,
+        "NEEDS_REVIEW": True,
+    }
+    return verdicts.get(value["verdict"], False)
+
+
+def report(*, historical=False, source=False, accepted=False, integrated=False,
+           review=False, sentinel=False, sentinel_checked=False, runtime=False,
+           runtime_checked=False, settled=True, closed=True, stage=None, git_only=False,
+           exposure=False, exposure_accepted=False, configuration=False, configuration_accepted=False,
+           reasons=None, admission_mode="historical-review"):
+    require(stage is None or stage in STAGES)
+    require(type(review) is bool)
+    require(reasons is None or type(reasons) is list)
+    admitted = accepted and (not exposure or exposure_accepted) and (not configuration or configuration_accepted)
+    verdict = ("GIT_ONLY_VALID" if git_only and source and admitted else
+               "PREPARED_SOURCE_ONLY" if git_only and source and review else
+               "PASS" if source and admitted and integrated and sentinel and (not runtime_checked or runtime) else
+               "PREPARED_FOR_INDEPENDENT_REVIEW" if source and review and sentinel and (not runtime_checked or runtime) else
+               "NEEDS_REVIEW")
+    if stage is not None or not (settled and closed):
+        verdict = "NEEDS_REVIEW"
+    value = {"schema": 1, "probe": "current-doctor", "scope": "post-phase5-vendor-sentinel",
+        "verdict": verdict, "admissionMode": admission_mode, "historicalPhase5Accepted": historical,
+        "phase5EngineUnchanged": historical and source, "sentinelAccepted": accepted,
+        "exposureSourceIncluded": exposure, "exposureSourceAccepted": exposure_accepted,
+        "configurationSourceIncluded": configuration, "configurationSourceAccepted": configuration_accepted,
+        "exposureStateChecked": False,
+        "integratedMain": integrated, "repositoryChecksPassed": source,
+        "sentinelChecked": sentinel_checked, "currentSentinelReady": sentinel,
+        "liveRuntimeChecked": runtime_checked, "currentRuntimeReady": runtime,
+        "gitOnly": git_only, "childSettled": settled, "sourceHandlesClosed": closed,
+        "failureStage": stage, "reasonCodes": [] if reasons is None else list(reasons),
+        "wholeMachineHealthChecked": False,
+        **{key: False for key in AUTHORITY}}
+    require(consistent_report(value))
+    return value
+
+
+def public_report(value, *, git_only=None):
+    """Do not serialize arbitrary callback/adapter dictionaries as evidence."""
+    require(type(value) is dict and set(value) == set(report()))
+    boolean_keys = set(report()) - {"schema", "probe", "scope", "verdict", "failureStage", "reasonCodes", "admissionMode"}
+    require(all(type(value[k]) is bool for k in boolean_keys)
+            and (value["failureStage"] is None
+                 or type(value["failureStage"]) is str and value["failureStage"] in STAGES))
+    require(consistent_report(value)
+            and (git_only is None or type(git_only) is bool and value["gitOnly"] is git_only))
+    expected = report(historical=value["historicalPhase5Accepted"], source=value["repositoryChecksPassed"],
+        accepted=value["sentinelAccepted"], integrated=value["integratedMain"],
+        review=not value["integratedMain"], sentinel=value["currentSentinelReady"],
+        sentinel_checked=value["sentinelChecked"], runtime=value["currentRuntimeReady"],
+        runtime_checked=value["liveRuntimeChecked"], settled=value["childSettled"],
+        closed=value["sourceHandlesClosed"], stage=value["failureStage"], git_only=value["gitOnly"],
+        exposure=value["exposureSourceIncluded"], exposure_accepted=value["exposureSourceAccepted"],
+        configuration=value["configurationSourceIncluded"], configuration_accepted=value["configurationSourceAccepted"],
+        reasons=value["reasonCodes"], admission_mode=value["admissionMode"])
+    if value["verdict"] == "NEEDS_REVIEW":
+        expected["verdict"] = "NEEDS_REVIEW"
+    require(D.R.integrations._equal(value, expected))
+    return value
+
+
+class Outcome(D.Outcome):
+    def __init__(self):
+        super().__init__()
+        self.sentinel_report = None
+
+    def __repr__(self):
+        return "<private sentinel doctor outcome>"
+
+
+class DoctorError(D.DoctorError):
+    pass
+
+
+def run(*, git, source_factory, budget, canonical_main, git_only=False,
+        sentinel_check=None, runtime_check=None):
+    """Injected source-only or sentinel route; optional readiness stays explicit.
+
+source_factory(path, absent=False) returns an owned accepted SourceFile.
+Sentinel results have exact status (PASS/NEEDS_REVIEW), childSettled and
+sourceHandlesClosed fields; additional private bounded details are not consumed
+or serialized here. Runtime results use unchanged R.public's exact schema.
+    Sentinel is called as sentinel_check(budget, source_guard=verify_current).
+    Its per-command guard physically rechecks the held real-tree-bound sources,
+    not a fabricated Git state or a budget-only promise. Full actual Git state
+    is checked before/after the callback, never recursively during launch.
+    All callbacks share the caller's budget. No native operation is selected here.
+"""
+    outcome = Outcome()
+    stage, failure_stage = "arguments", None
+    reasons = []
+    historical = source_ok = accepted = integrated = review = False
+    exposure = exposure_accepted = False
+    configuration = configuration_accepted = False
+    sentinel = sentinel_checked = runtime = runtime_checked = False
+    settled = source_closed = callback_closed = True
+    pending_callback = False
+    state = None
+    admission_mode = "historical-review"
+
+    def failure(error):
+        nonlocal failure_stage, settled, callback_closed, pending_callback
+        outcome.errors.append(error)
+        outcome.primary = D.R.earliest(outcome.primary, error)
+        if failure_stage is None:
+            failure_stage = stage
+        # Only the known probe exception's closed reason class may escape.
+        # Its message, diagnostics, outputs, paths and owners remain private.
+        reason = getattr(error, "reason_class", None) if type(error) is probe.ProbeError else None
+        if (stage == "sentinel" and failure_stage == "sentinel"
+                and type(reason) is str and reason in REASONS and reason not in reasons):
+            reasons.append(reason)
+        owner = getattr(error, "private_owner", None)
+        if pending_callback:
+            # Only the callback currently entered may close its provisional
+            # uncertainty. Exact proof does not promote its failure to PASS.
+            retained = getattr(error, "retained_sources", ())
+            if (getattr(error, "child_settled", None) is True
+                    and getattr(error, "settlement_failed", None) is False
+                    and getattr(error, "source_handles_closed", None) is True
+                    and owner is None and outcome.private_owner is None
+                    and type(retained) is tuple and not retained):
+                settled = callback_closed = True
+            pending_callback = False
+        if outcome.private_owner is None and owner is not None:
+            outcome.private_owner = owner
+        if owner is not None or getattr(error, "settlement_failed", False) is not False:
+            settled = False
+        if getattr(error, "source_handles_closed", True) is not True:
+            callback_closed = False
+
+    def bind(path, item, expected=None, absent=False):
+        nonlocal source_closed
+        source_closed = False
+        held = source_factory(path, absent=absent)
+        outcome.sources.append(held)
+        source_closed = True
+        require(held.verify() is True)
+        if not absent:
+            require(type(held.data) is bytes and item[0] in ("100644", "100755")
+                    and oid(held.data) == item[1] and held.digest == digest(held.data)
+                    and bool(held.stamp[4] & 0o111) == (item[0] == "100755")
+                    and (expected is None or held.digest == expected))
+        return held
+
+    def verify_current():
+        nonlocal source_ok
+        try:
+            require(source_ok)
+            budget.check()
+            for held in outcome.sources:
+                require(held.verify() is True)
+            return True
+        except BaseException:
+            source_ok = False
+            raise
+
+    try:
+        require(type(git_only) is bool and type(canonical_main) is bool
+                and callable(source_factory)
+                and (sentinel_check is None or callable(sentinel_check))
+                and (runtime_check is None or callable(runtime_check))
+                and (git_only or callable(sentinel_check)))
+        budget.check()
+        stage = "git"
+        state = git.state()
+        if "currentAdmission" in state:
+            admission_mode = "current-state"
+            require(set(state) == {"head", "branch", "clean", "tree", "currentAdmission"})
+            require(state["branch"] == "main" and canonical_main and state["clean"] is True)
+            current = D.tree(state["tree"])
+            stage = "configuration"
+            config_admission = current_sources.admit(state["currentAdmission"], state["head"], current)
+            stage = "source"
+            for path, item in current.items():
+                bind(path, item)
+            for path in config_admission["absent"]:
+                bind(path, None, absent=True)
+            historical = accepted = exposure = exposure_accepted = True
+            configuration = configuration_accepted = integrated = source_ok = True
+        else:
+            state_keys = {"head", "branch", "clean", "baseAncestor", "linear", "tree", "baseTree"}
+            require(type(state) is dict)
+            configuration = "configuration" in state
+            if configuration:
+                state_keys.add("configuration")
+            require(set(state) in (state_keys, state_keys | {"exposure"}))
+            require(D.hex_value(state["head"], 40) and type(state["branch"]) is str
+                    and (state["branch"] in (BRANCH, EXPOSURE_BRANCH, "main")
+                         or configuration and state["branch"].startswith("codex/")) and state["clean"] is True
+                    and state["baseAncestor"] is True and state["linear"] is True)
+            review = state["branch"] != "main"
+            require(review or canonical_main)
+            current, predecessor = D.tree(state["tree"]), D.tree(state["baseTree"])
+            exposure = exposure_included(state["branch"], current)
+            require(set(state) == (state_keys | {"exposure"} if exposure else state_keys))
+            sentinel_tree = current
+            exposure_tree = current
+            if configuration:
+                stage = "configuration"
+                config_admission = configurations.admit(state["configuration"], state["head"], current, review=review)
+                configuration_accepted = config_admission["accepted"]
+                exposure_tree = D.tree(state["configuration"]["anchorTree"])
+                require(exposure)
+            if exposure:
+                require(configuration or state["branch"] in (EXPOSURE_BRANCH, "main"))
+                observation = state["exposure"]
+                require(type(observation) is dict and set(observation) == {"head", "predecessorCommit", "ancestor", "linear", "tree"}
+                        and observation["head"] == state["head"] and observation["predecessorCommit"] == EXPOSURE_BASE
+                        and observation["ancestor"] is True and observation["linear"] is True)
+                sentinel_tree = D.tree(observation["tree"])
+            stage = "historical"
+            old_held = bind(PHASE5_ACCEPTANCE, current.get(PHASE5_ACCEPTANCE), PHASE5_SHA256)
+            old = phase5(old_held.data)
+            require(predecessor.get(PHASE5_ACCEPTANCE) == ("100644", oid(old_held.data))
+                    and current[PHASE5_ACCEPTANCE] == predecessor[PHASE5_ACCEPTANCE])
+            historical = True  # accepted fixed predecessor; not fresh engine health
+            stage = "acceptance"
+            receipt = bind(ACCEPTANCE, current.get(ACCEPTANCE), absent=ACCEPTANCE not in current)
+            if ACCEPTANCE in current:
+                if exposure:
+                    require(receipt.digest == SENTINEL_SHA256 and current[ACCEPTANCE] == sentinel_tree.get(ACCEPTANCE))
+                parsed = acceptance(receipt.data)
+                meta = git.acceptance(parsed["reviewedHead"])
+                value = verify_acceptance(receipt.data, phase5_raw=old_held.data,
+                    predecessor=predecessor, current=sentinel_tree, meta=meta)
+                selected = value["sources"] | value["evidence"]
+                replacements = {p: v["after"] for p, v in value["routers"].items()}
+            else:
+                require(review)
+                added, changed = delta(predecessor, current)
+                selected = {p: {"mode": current[p][0], "sha256": None} for p in added}
+                replacements = {p: {"mode": current[p][0], "sha256": None} for p in changed}
+            if exposure:
+                require(ACCEPTANCE in current)
+                accepted = True  # the actual fe7 sentinel decision remains historical fact
+                stage = "exposure"
+                exposure_receipt = bind(EXPOSURE_ACCEPTANCE, current.get(EXPOSURE_ACCEPTANCE),
+                                        absent=EXPOSURE_ACCEPTANCE not in current)
+                if EXPOSURE_ACCEPTANCE in current:
+                    parsed = exposure_acceptance(exposure_receipt.data)
+                    extension = verify_exposure(exposure_receipt.data, predecessor=sentinel_tree, current=exposure_tree,
+                        sentinel=value, meta=git.exposure_acceptance(parsed["reviewedHead"]))
+                    additions = extension["sources"] | extension["evidence"]
+                    changes = {p: change["after"] for p, change in extension["replacements"].items()}
+                else:
+                    require(state["branch"] == EXPOSURE_BRANCH)
+                    added, changed = exposure_delta(sentinel_tree, current)
+                    additions = {p: {"mode": current[p][0], "sha256": None} for p in added}
+                    changes = {p: {"mode": current[p][0], "sha256": None} for p in changed}
+                selected.update(additions)
+                replacements.update(changes)
+            stage = "source"
+            # All retained Phase5 source/evidence plus the exact new closure stay
+            # held across callbacks. Router replacements belong only to new intent.
+            if configuration:
+                # Bind the COMPLETE newly reviewed physical tree, not old hashes
+                # assigned to changed payloads. Historical checks used actual Git
+                # anchor trees above; immutable evidence is enforced by the chain.
+                for path, item in current.items():
+                    if path not in (PHASE5_ACCEPTANCE, ACCEPTANCE, EXPOSURE_ACCEPTANCE):
+                        bind(path, item)
+                for path in config_admission["absent"]:
+                    bind(path, None, absent=True)
+            else:
+                for path, expected in (old["sources"] | old["evidence"]).items():
+                    require(path in predecessor and path in current)
+                    if path not in replacements:
+                        require(current[path] == predecessor[path])
+                        bind(path, current[path], expected)
+                for path, item in (selected | replacements).items():
+                    require(current[path][0] == item["mode"])
+                    bind(path, current[path], item["sha256"])
+            source_ok = True
+            accepted = ACCEPTANCE in current
+            exposure_accepted = exposure and EXPOSURE_ACCEPTANCE in current
+            integrated = (accepted and (not exposure or exposure_accepted)
+                and (not configuration or configuration_accepted) and not review and canonical_main)
+        if not git_only:
+            budget.check()
+            stage, settled, callback_closed = "sentinel", False, False
+            pending_callback = True
+            value = sentinel_check(budget, source_guard=verify_current)
+            pending_callback = False
+            outcome.sentinel_report = value
+            if (type(value) is dict and type(value.get("status")) is str
+                    and value["status"] in ("PASS", "NEEDS_REVIEW")
+                    and type(value.get("childSettled")) is bool
+                    and type(value.get("sourceHandlesClosed")) is bool):
+                settled, callback_closed = value["childSettled"], value["sourceHandlesClosed"]
+                sentinel_checked = True
+            require(sentinel_checked and value["status"] == "PASS" and settled and callback_closed)
+            sentinel = True
+            if runtime_check is not None:
+                budget.check()
+                stage, settled, callback_closed = "runtime", False, False
+                pending_callback = True
+                value = runtime_check(budget)
+                pending_callback = False
+                outcome.runtime_report = value
+                if type(value) is dict:
+                    expected = D.R.public(value.get("verdict"), observed=value.get("observedTargets"),
+                        settled=value.get("childSettled"), stage=value.get("failureStage"))
+                    if (value.get("verdict") in ("ready", "needs-review")
+                            and type(value.get("observedTargets")) is int
+                            and 0 <= value["observedTargets"] <= 8
+                            and type(value.get("childSettled")) is bool
+                            and D.R.integrations._equal(value, expected)):
+                        settled = value["childSettled"]
+                        # R.public has no handle-closure field. Its exact ready
+                        # return establishes successful closure; a nonpass does
+                        # not prove that every R-local handle was closed.
+                        callback_closed = value["verdict"] == "ready"
+                        runtime_checked = True
+                require(type(value) is dict and D.R.integrations._equal(value, D.R.public("ready", observed=8)))
+                runtime = True
+    except BaseException as error:
+        failure(error)
+    finally:
+        stage = "final-recheck"
+        for held in outcome.sources:
+            try:
+                require(held.verify() is True)
+            except BaseException as error:
+                source_ok = False
+                failure(error)
+        if state is not None and settled:
+            try:
+                require(git.state() == state)
+            except BaseException as error:
+                source_ok = False
+                failure(error)
+        stage = "close"
+        for held in reversed(outcome.sources):
+            try:
+                held.close()
+            except BaseException as error:
+                source_closed = False
+                failure(error)
+        try:
+            budget.check()
+        except BaseException as error:
+            source_ok = False
+            failure(error)
+    closed = source_closed and callback_closed
+    if not (source_ok and closed and settled):
+        sentinel = runtime = False
+    outcome.public = report(historical=historical, source=source_ok, accepted=accepted,
+        integrated=integrated, review=review, sentinel=sentinel, sentinel_checked=sentinel_checked,
+        runtime=runtime, runtime_checked=runtime_checked, settled=settled, closed=closed,
+        stage=failure_stage, git_only=git_only is True, exposure=exposure, exposure_accepted=exposure_accepted,
+        configuration=configuration, configuration_accepted=configuration_accepted and historical and exposure_accepted,
+        reasons=reasons, admission_mode=admission_mode)
+    if outcome.primary is not None:
+        outcome.public["verdict"] = "NEEDS_REVIEW"
+        if isinstance(outcome.primary, (KeyboardInterrupt, SystemExit)):
+            outcome.primary.doctor_outcome = outcome
+            outcome.primary.private_owner = outcome.private_owner
+            outcome.primary.settlement_failed = not settled
+            raise outcome.primary from None
+        raise DoctorError(outcome) from None
+    return outcome.public
+
+
+class NativeGit(D.NativeGit):
+    """Actual predecessor/new-receipt reads over the unchanged command owner.
+
+Reuse only fixed _read/_text/_tree transport mechanics, not D.state/run or
+modified historical constants. No arbitrary command argument entry point.
+"""
+    def state(self):
+        head = self._text("rev-parse", "--verify", "HEAD")
+        require(D.hex_value(head, 40))
+        current = self._tree(head)
+        if current_sources.included(current) and not getattr(self, "audit_history", False):
+            return {"head": head, "branch": self._text("symbolic-ref", "--quiet", "--short", "HEAD"),
+                "clean": self._read("status", "--porcelain=v1", "-z", "--untracked-files=all")[1] == b"",
+                "tree": current, "currentAdmission": current_sources.observe(self, head, current)}
+        value = {"head": head, "branch": self._text("symbolic-ref", "--quiet", "--short", "HEAD"),
+            "clean": self._read("status", "--porcelain=v1", "-z", "--untracked-files=all")[1] == b"",
+            "baseAncestor": self._read("merge-base", "--is-ancestor", BASE, head, allow_one=True)[0] == 0,
+            "linear": self._read("rev-list", "--merges", BASE + ".." + head)[1] == b"",
+            "tree": self._tree(head), "baseTree": self._tree(BASE)}
+        if exposure_included(value["branch"], value["tree"]):
+            value["exposure"] = self.exposure(head)
+        from lib import config_transition_git
+        value["configuration"] = config_transition_git.observe(self, head, value["tree"])
+        return value
+
+    def exposure(self, head):
+        require(D.hex_value(head, 40))
+        return {"head": head, "predecessorCommit": EXPOSURE_BASE,
+            "ancestor": self._read("merge-base", "--is-ancestor", EXPOSURE_BASE, head, allow_one=True)[0] == 0,
+            "linear": self._read("rev-list", "--merges", EXPOSURE_BASE + ".." + head)[1] == b"",
+            "tree": self._tree(EXPOSURE_BASE)}
+
+    def acceptance(self, reviewed):
+        return self._acceptance(ACCEPTANCE, reviewed)
+
+    def exposure_acceptance(self, reviewed):
+        return self._acceptance(EXPOSURE_ACCEPTANCE, reviewed)
+
+    def _acceptance(self, path, reviewed):
+        require(type(path) is str and path in (ACCEPTANCE, EXPOSURE_ACCEPTANCE))
+        require(D.hex_value(reviewed, 40))
+        commits = tuple(self._text("log", "--format=%H", "HEAD", "--", path).splitlines())
+        require(len(commits) == 1 and D.hex_value(commits[0], 40))
+        commit = commits[0]
+        metadata = self._text("show", "-s", "--format=%P%x00%an%x00%ae%x00%cn%x00%ce", commit).split("\0")
+        require(len(metadata) == 5)
+        change = self._read("diff-tree", "--no-commit-id", "--name-status", "-r", "-z", commit)[1]
+        require(change == b"A\0" + path.encode("ascii") + b"\0")
+        return {"commits": commits, "parents": tuple(metadata[0].split()),
+                "identity": tuple(metadata[1:]), "changes": (("A", path),),
+                "tree": self._tree(reviewed)}
+
+
+def native(git_only, *, audit_history=False):
+    """Lazy, explicit root-owned adapter; no native operation at import time."""
+    require(type(git_only) is bool)
+    adapter = importlib.import_module("lib.current_doctor_native")
+    return (adapter.native(sys.modules[__name__], git_only, audit_history=True) if audit_history
+            else adapter.native(sys.modules[__name__], git_only))
+
+
+def main(arguments=None, *, operation=None, emit=print):
+    """Native glue is explicit and separately admitted; tests inject operation."""
+    args = sys.argv[1:] if arguments is None else arguments
+    if (type(args) is not list or any(type(arg) is not str for arg in args)
+            or len(set(args)) != len(args) or any(arg not in ("--json", "--git-only", "--audit-history") for arg in args)):
+        value, status, args = report(stage="arguments"), 2, ["--json"]
+    else:
+        returned = None
+        requested_git_only = "--git-only" in args
+        try:
+            operation = native if operation is None else operation
+            returned = (operation(requested_git_only, audit_history=True) if "--audit-history" in args
+                        else operation(requested_git_only))
+            value = public_report(returned, git_only=requested_git_only)
+            status = 0 if value["verdict"] in ("PASS", "GIT_ONLY_VALID", "PREPARED_SOURCE_ONLY",
+                                                "PREPARED_FOR_INDEPENDENT_REVIEW") else 1
+        except DoctorError as error:
+            try:
+                value, status = public_report(error.outcome.public, git_only=requested_git_only), 1
+            except Exception as validation:
+                outcome = Outcome()
+                outcome.primary, outcome.errors = error, [error, validation]
+                outcome.private_owner = error.private_owner
+                outcome.runtime_report = error.outcome.public
+                outcome.public = report(stage="arguments", settled=False, closed=False, git_only=requested_git_only)
+                raise DoctorError(outcome) from None
+            if error.settlement_failed or value["sourceHandlesClosed"] is not True:
+                raise
+        except (KeyboardInterrupt, SystemExit):
+            raise
+        except Exception as error:
+            # An unexpected adapter error or malformed return is not evidence
+            # that its constructors/children closed. Retain its private value.
+            outcome = Outcome()
+            outcome.primary, outcome.errors = error, [error]
+            outcome.private_owner = getattr(error, "private_owner", None)
+            outcome.runtime_report = returned
+            outcome.public = report(stage="arguments", settled=False, closed=False, git_only=requested_git_only)
+            raise DoctorError(outcome) from None
+    human = ("Current vendor sentinel: " + value["verdict"] + "; runtime checked=" +
+             str(value["liveRuntimeChecked"]).lower())
+    if value["failureStage"] is not None:
+        human += "; failure stage=" + value["failureStage"]
+    if value["reasonCodes"]:
+        human += "; reason=" + ",".join(value["reasonCodes"])
+        if "fixture_invalid" in value["reasonCodes"]:
+            human += "; isolated fixture validation failed; inspect probe fixture metadata, not owner configuration"
+        else:
+            human += "; diagnose the reported boundary before a custom control mutation"
+    emit(json.dumps(value, sort_keys=True, separators=(",", ":")) if "--json" in args else human)
+    return status
+
+
+def entry():
+    try:
+        return main()
+    except (DoctorError, KeyboardInterrupt, SystemExit) as error:
+        outcome = getattr(error, "outcome", getattr(error, "doctor_outcome", None))
+        value = outcome.public if outcome is not None else report(stage="arguments", settled=False)
+        print(json.dumps(value, sort_keys=True, separators=(",", ":")))
+        code = (130 if isinstance(error, KeyboardInterrupt) else
+                error.code if isinstance(error, SystemExit) and type(error.code) is int
+                and 1 <= error.code <= 255 else 1)
+        stopped = SystemExit(code)
+        stopped.doctor_outcome, stopped.private_owner = outcome, getattr(error, "private_owner", None)
+        stopped.settlement_failed = value["childSettled"] is not True
+        raise stopped from None
+
+
+if __name__ == "__main__":
+    raise SystemExit(entry())

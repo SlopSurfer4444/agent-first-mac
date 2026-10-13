@@ -1,0 +1,340 @@
+#!/usr/bin/python3
+from __future__ import annotations
+
+import argparse
+import json
+import os
+from pathlib import Path
+import re
+import selectors
+import subprocess
+import sys
+
+
+ROOT = Path(__file__).resolve().parents[1]
+PROFILE = "codex-windows-host-ssh-remote-control-isolation"
+BRANCH = "codex/codex-windows-host-ssh-connector"
+POLICY = ROOT / "policy/windows/codex-windows-host-ssh-remote-control-isolation.ps1"
+COMPAT = ROOT / "bin/codex-windows-host-ssh-stdio-compat"
+FLAG = "CODEX_INTERNAL_APP_SERVER_REMOTE_CONTROL_DISABLED"
+SKIP_FLAG = "CODEX_SSH_SKIP_APP_SERVER_BOOT"
+COMMIT_RE = re.compile(r"^[0-9a-f]{40}$")
+
+
+class ContractError(RuntimeError):
+    pass
+
+
+def run(argv: list[str], *, input_text: str | None = None,
+        timeout: float = 20, check: bool = False) -> subprocess.CompletedProcess:
+    result = subprocess.run(
+        argv,
+        input=input_text,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        timeout=timeout,
+        check=False,
+    )
+    if check and result.returncode != 0:
+        raise ContractError(f"command_failed:{Path(argv[0]).name}")
+    return result
+
+
+def git(*args: str) -> str:
+    return run(["/usr/bin/git", "-C", str(ROOT), *args], check=True).stdout.strip()
+
+
+def require_exact_commit(expected: str) -> None:
+    if not COMMIT_RE.fullmatch(expected):
+        raise ContractError("invalid_commit")
+    if git("rev-parse", "--show-toplevel") != str(ROOT):
+        raise ContractError("wrong_control_root")
+    if git("rev-parse", "--abbrev-ref", "HEAD") != BRANCH:
+        raise ContractError("wrong_task_branch")
+    if git("rev-parse", "HEAD") != expected:
+        raise ContractError("commit_mismatch")
+    if git("status", "--porcelain=v1", "--untracked-files=all"):
+        raise ContractError("dirty_worktree")
+
+
+def parse_single_json(output: str) -> dict[str, object]:
+    lines = [line.strip().lstrip("\ufeff") for line in output.splitlines()
+             if line.strip()]
+    if len(lines) != 1:
+        raise ContractError("unexpected_remote_output")
+    try:
+        payload = json.loads(lines[0])
+    except json.JSONDecodeError as exc:
+        raise ContractError("invalid_remote_json") from exc
+    if not isinstance(payload, dict) or payload.get("profile") != PROFILE:
+        raise ContractError("invalid_remote_result")
+    return payload
+
+
+def remote_action(action: str, commit: str = "") -> dict[str, object]:
+    if action not in {"prepare", "apply", "doctor", "rollback"}:
+        raise ContractError("invalid_remote_action")
+    if commit and not COMMIT_RE.fullmatch(commit):
+        raise ContractError("invalid_commit")
+    source = (
+        f"$Action = '{action}'\n"
+        f"$ExpectedCommit = '{commit}'\n"
+        + POLICY.read_text()
+    )
+    result = run([
+        "/usr/bin/ssh", "-T", "-o", "BatchMode=yes",
+        "-o", "ConnectTimeout=8", "windows-host",
+        "powershell.exe", "-NoLogo", "-NoProfile", "-NonInteractive",
+        "-ExecutionPolicy", "Bypass", "-Command", "-",
+    ], input_text=source, timeout=45)
+    payload = parse_single_json(result.stdout)
+    if result.returncode != 0 or payload.get("verdict") != "PASS":
+        reason = payload.get("reason")
+        safe_reason = reason if isinstance(reason, str) and re.fullmatch(
+            r"[a-z0-9_]+", reason) else "remote_action_failed"
+        raise ContractError(f"remote_{action}:{safe_reason}")
+    return payload
+
+
+def compatibility_doctor_passes() -> bool:
+    result = run([str(COMPAT), "doctor", "--json"], timeout=30)
+    if result.returncode != 0:
+        return False
+    try:
+        payload = json.loads(result.stdout)
+    except json.JSONDecodeError:
+        return False
+    return payload.get("verdict") == "PASS"
+
+
+def session_flags_state() -> str:
+    command = (
+        f"rc=${{{FLAG}:-}}; skip=${{{SKIP_FLAG}:-}}; "
+        "if [ \"$rc\" = 1 ] && [ \"$skip\" = true ]; then "
+        "printf session_flags=exact; "
+        "elif [ \"$rc\" = 1 ] && [ -z \"$skip\" ]; then "
+        "printf session_flags=legacy; "
+        "elif [ -z \"$rc\" ] && [ -z \"$skip\" ]; then "
+        "printf session_flags=absent; "
+        "else printf session_flags=conflict; fi"
+    )
+    result = run([
+        "/usr/bin/ssh", "-T", "-o", "BatchMode=yes",
+        "-o", "ConnectTimeout=8", "windows-host", command,
+    ], timeout=15)
+    if result.returncode != 0:
+        return "unavailable"
+    if result.stdout == "session_flags=exact":
+        return "exact"
+    if result.stdout == "session_flags=legacy":
+        return "legacy"
+    if result.stdout == "session_flags=absent":
+        return "absent"
+    if result.stdout == "session_flags=conflict":
+        return "conflict"
+    return "unexpected"
+
+
+def remote_control_disabled_probe(*, inject_flag: bool) -> bool:
+    initialize = json.dumps({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "initialize",
+        "params": {
+            "clientInfo": {
+                "name": "bounded-remote-control-isolation-probe",
+                "version": "1",
+            },
+            "capabilities": {"experimentalApi": True},
+        },
+    }, separators=(",", ":")) + "\n"
+    initialized = json.dumps({
+        "jsonrpc": "2.0", "method": "initialized", "params": {}
+    }, separators=(",", ":")) + "\n"
+    status = json.dumps({
+        "jsonrpc": "2.0", "id": 2,
+        "method": "remoteControl/status/read", "params": {},
+    }, separators=(",", ":")) + "\n"
+    prefix = f"{FLAG}=1 " if inject_flag else ""
+    # The remote awk emits only the enum status. Installation, environment,
+    # account, host, request, and server identifiers never enter this process.
+    remote_command = (
+        f"{prefix}codex app-server --listen stdio:// 2>/dev/null | "
+        "awk 'index($0,\"\\\"id\\\":2\") { "
+        "if (match($0,/\\\"status\\\":\\\"[^\\\"]+\\\"/)) "
+        "print substr($0,RSTART,RLENGTH); exit }'"
+    )
+    process = subprocess.Popen(
+        [
+            "/usr/bin/ssh", "-T", "-o", "BatchMode=yes",
+            "-o", "ConnectTimeout=8", "windows-host", remote_command,
+        ],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        text=True,
+        bufsize=1,
+    )
+    selector = selectors.DefaultSelector()
+    try:
+        assert process.stdin is not None and process.stdout is not None
+        process.stdin.write(initialize + initialized + status)
+        process.stdin.flush()
+        selector.register(process.stdout, selectors.EVENT_READ)
+        events = selector.select(timeout=12)
+        if not events:
+            return False
+        return process.stdout.readline(128).strip() == '"status":"disabled"'
+    finally:
+        selector.close()
+        if process.poll() is None:
+            process.terminate()
+            try:
+                process.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait(timeout=2)
+
+
+def preflight() -> dict[str, object]:
+    remote = remote_action("prepare")
+    facts = {
+        "profile": PROFILE,
+        "base_stdio_compat_doctor_pass": compatibility_doctor_passes(),
+        "remote_service_running": remote.get("service_running") is True,
+        "remote_startup_automatic": remote.get("startup_automatic") is True,
+        "remote_syntax_pass": remote.get("syntax_pass") is True,
+        "remote_block_state": remote.get("block_state"),
+        "remote_receipt_state": remote.get("receipt_state"),
+        "inline_remote_control_isolation_probe": remote_control_disabled_probe(
+            inject_flag=True
+        ),
+        "session_flags_state": session_flags_state(),
+    }
+    ownership_valid = (
+        (facts["remote_block_state"] == "absent"
+         and facts["remote_receipt_state"] == "absent")
+        or (facts["remote_block_state"] in {
+            "legacy_exact", "split_exact", "exact"
+        }
+            and facts["remote_receipt_state"] == "exact")
+    )
+    facts["verdict"] = "PASS" if (
+        facts["base_stdio_compat_doctor_pass"]
+        and facts["remote_service_running"]
+        and facts["remote_startup_automatic"]
+        and facts["remote_syntax_pass"]
+        and facts["inline_remote_control_isolation_probe"]
+        and ownership_valid
+        and facts["session_flags_state"] in {"absent", "legacy", "exact"}
+    ) else "BLOCKED"
+    return facts
+
+
+def postcheck() -> dict[str, object]:
+    remote = remote_action("doctor")
+    session_state = session_flags_state()
+    facts = {
+        "profile": PROFILE,
+        "base_stdio_compat_doctor_pass": compatibility_doctor_passes(),
+        "remote_service_running": remote.get("service_running") is True,
+        "remote_startup_automatic": remote.get("startup_automatic") is True,
+        "remote_syntax_pass": remote.get("syntax_pass") is True,
+        "remote_block_exact": remote.get("block_state") == "exact",
+        "remote_receipt_exact": remote.get("receipt_state") == "exact",
+        "session_remote_control_flag_exact": session_state == "exact",
+        "session_bootstrap_skip_exact": session_state == "exact",
+        "session_remote_control_disabled": remote_control_disabled_probe(
+            inject_flag=False
+        ),
+    }
+    facts["verdict"] = "PASS" if all(
+        value for key, value in facts.items()
+        if key not in {"profile", "verdict"}
+    ) else "BLOCKED"
+    return facts
+
+
+def apply(commit: str) -> dict[str, object]:
+    require_exact_commit(commit)
+    facts = preflight()
+    if facts.get("verdict") != "PASS":
+        raise ContractError("preflight_blocked")
+    result = remote_action("apply", commit)
+    try:
+        checked = postcheck()
+    except ContractError:
+        checked = {"profile": PROFILE, "verdict": "BLOCKED"}
+    if checked.get("verdict") == "PASS":
+        checked["apply_noop"] = result.get("apply_noop") is True
+        checked["receipt_rebound"] = result.get("receipt_rebound") is True
+        return checked
+    if result.get("apply_noop") is True:
+        raise ContractError("noop_postcheck_failed_state_preserved")
+    try:
+        remote_action("rollback")
+    except ContractError as exc:
+        raise ContractError("postapply_failed_rollback_failed") from exc
+    raise ContractError("postapply_failed_rolled_back")
+
+
+def rollback() -> dict[str, object]:
+    result = remote_action("rollback")
+    restored_legacy = result.get("rollback") == "legacy_restored"
+    facts = {
+        "profile": PROFILE,
+        "base_stdio_compat_doctor_pass": compatibility_doctor_passes(),
+        "session_flags_restored": session_flags_state() == (
+            "legacy" if restored_legacy else "absent"
+        ),
+    }
+    facts["verdict"] = "PASS" if all(
+        value for key, value in facts.items()
+        if key not in {"profile", "verdict"}
+    ) else "BLOCKED"
+    return facts
+
+
+def emit(payload: dict[str, object], as_json: bool) -> None:
+    if as_json:
+        print(json.dumps(payload, sort_keys=True, separators=(",", ":")))
+        return
+    for key in sorted(payload):
+        value = payload[key]
+        if isinstance(value, bool):
+            value = str(value).lower()
+        print(f"{key}={value}")
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser()
+    subparsers = parser.add_subparsers(dest="command", required=True)
+    prepare_parser = subparsers.add_parser("prepare")
+    prepare_parser.add_argument("--json", action="store_true")
+    apply_parser = subparsers.add_parser("apply")
+    apply_parser.add_argument("--commit", required=True)
+    apply_parser.add_argument("--json", action="store_true")
+    doctor_parser = subparsers.add_parser("doctor")
+    doctor_parser.add_argument("--json", action="store_true")
+    rollback_parser = subparsers.add_parser("rollback")
+    rollback_parser.add_argument("--json", action="store_true")
+    args = parser.parse_args()
+    try:
+        if args.command == "prepare":
+            payload = preflight()
+        elif args.command == "apply":
+            payload = apply(args.commit)
+        elif args.command == "doctor":
+            payload = postcheck()
+        else:
+            payload = rollback()
+        emit(payload, args.json)
+        return 0 if payload.get("verdict") == "PASS" else 1
+    except (ContractError, OSError, subprocess.SubprocessError) as exc:
+        print(f"blocked={exc}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

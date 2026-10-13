@@ -1,0 +1,26 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "repositories": {
+      "items": {
+        "additionalProperties": false,
+        "properties": {
+          "adoptedCommit": {"pattern": "^[0-9a-f]{40}$", "type": "string"},
+          "canonicalRoot": {"pattern": "^\\$HOME/AIDev/(control|repos/[A-Za-z0-9][A-Za-z0-9._-]*(/[A-Za-z0-9][A-Za-z0-9._-]*)*|worktrees/[A-Za-z0-9][A-Za-z0-9._-]*(/[A-Za-z0-9][A-Za-z0-9._-]*)*)$", "type": "string"},
+          "id": {"pattern": "^[a-z0-9][a-z0-9-]*$", "type": "string"},
+          "provenance": {"enum": ["reviewed-control", "reviewed-clone"]},
+          "route": {"const": "trusted"},
+          "trust": {"enum": ["trusted-control", "trusted-repo"]}
+        },
+        "required": ["id", "canonicalRoot", "provenance", "adoptedCommit", "trust", "route"],
+        "type": "object"
+      },
+      "minItems": 1,
+      "type": "array"
+    },
+    "schema": {"const": 1}
+  },
+  "required": ["schema", "repositories"],
+  "type": "object"
+}

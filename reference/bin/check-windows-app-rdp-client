@@ -1,0 +1,67 @@
+#!/usr/bin/python3
+"""Static validator for the Windows App macOS lifecycle."""
+
+import json
+from pathlib import Path
+import re
+
+
+ROOT = Path(__file__).resolve().parent.parent
+
+
+def require(condition, name):
+    if not condition:
+        raise RuntimeError(name)
+
+
+def main():
+    manifest = json.loads((ROOT / "manifests/windows-app-rdp-client.json").read_text())
+    module = (ROOT / "darwin/windows-app.nix").read_text()
+    doctor = (ROOT / "bin/windows-app-rdp-client-doctor").read_text()
+    flake = (ROOT / "flake.nix").read_text()
+
+    require(manifest["profile"] == "windows-app-rdp-client", "profile")
+    require(manifest["profileActive"] is True, "active")
+    require(manifest["source"]["sha256"] ==
+            "47052e0aba8d5b2ad9a5468349f72bee317b69c07300a40ccadefb96050b1251",
+            "checksum")
+    require(manifest["source"]["installerTeamIdentifier"] == "UBF8T346G9",
+            "installer_team")
+    require(manifest["application"]["bundleIdentifier"] ==
+            "com.microsoft.rdc.macos", "bundle")
+    require(manifest["networkBoundary"]["transport"] ==
+            "RDP over Tailscale only", "transport")
+    require(manifest["networkBoundary"]["publicRdpExposureAllowed"] is False,
+            "public_exposure")
+    require(manifest["dataBoundary"]["windowsCredentialsStoredInGitOrEvidence"]
+            is False, "credential_boundary")
+    require("./darwin/windows-app.nix" in flake, "flake_import")
+    for needle in (
+        "name = \"WindowsApp-11.3.8.pkg\";",
+        "sha256-RwUuCrqNWyrZpUaDSfcr7jF7acBzAKQMyt77lgULElE=",
+        "Developer ID Installer: Microsoft Corporation (UBF8T346G9)",
+        "Notarization: trusted",
+        "/usr/sbin/installer -pkg \"$pkg\" -target /",
+        "com.microsoft.rdc.macos",
+        "UBF8T346G9",
+    ):
+        require(needle in module, "module_" + re.sub(r"[^a-z0-9]+", "_", needle.lower()))
+    for forbidden in ("~/Library", "$HOME", "Keychain", "security delete", "defaults write"):
+        require(forbidden not in module, "forbidden_" + forbidden)
+    require("credentialsInspected\": False" in doctor, "doctor_credentials")
+    require("rdpBookmarkInspected\": False" in doctor, "doctor_bookmark")
+
+    print(json.dumps({
+        "schema": 1,
+        "result": "pass",
+        "profile": manifest["profile"],
+        "systemMutationsPerformed": False,
+    }, indent=2, sort_keys=True))
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except Exception as error:
+        print(json.dumps({"result": "fail", "reason": str(error)}, sort_keys=True))
+        raise SystemExit(1)

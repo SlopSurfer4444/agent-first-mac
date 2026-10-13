@@ -1,0 +1,248 @@
+"""Private launch admission only: no stop, auth reads, install or GUI actions."""
+import contextlib,fcntl,hashlib,json,os,pwd,re,secrets,stat,subprocess,tempfile,time
+from pathlib import Path
+
+class Blocked(RuntimeError): pass
+
+def require(ok,reason):
+    if not ok: raise Blocked(reason)
+
+def directory(path):
+    for current in [*reversed(path.parents),path]:
+        facts=current.lstat()
+        require(stat.S_ISDIR(facts.st_mode) and facts.st_uid in (0,os.getuid())
+                and not facts.st_mode&0o022,'unsafe_admission_directory')
+    require(path.lstat().st_uid==os.getuid() and not path.lstat().st_mode&0o022,'admission_directory_owner')
+
+def regular(path,limit=65536):
+    directory(path.parent)
+    fd=os.open(str(path),os.O_RDONLY|os.O_NOFOLLOW|os.O_NONBLOCK)
+    try:
+        facts=os.fstat(fd)
+        require(stat.S_ISREG(facts.st_mode) and facts.st_uid==os.getuid()
+                and facts.st_nlink==1 and not facts.st_mode&0o022 and facts.st_size<=limit,'unsafe_admission_file')
+        with os.fdopen(os.dup(fd),'rb') as stream: raw=stream.read()
+        after=os.fstat(fd)
+        keys=('st_dev','st_ino','st_mode','st_uid','st_nlink','st_size','st_mtime_ns','st_ctime_ns')
+        require(all(getattr(facts,k)==getattr(after,k) for k in keys),'admission_file_changed')
+        return raw
+    finally:os.close(fd)
+
+def decode(raw):
+    def unique(rows):
+        result={}
+        for key,value in rows:
+            require(key not in result,'invalid_admission_record');result[key]=value
+        return result
+    try: value=json.loads(raw.decode('utf-8'),object_pairs_hook=unique)
+    except (ValueError,UnicodeError,RecursionError):raise Blocked('invalid_admission_record') from None
+    require(type(value) is dict,'invalid_admission_record');return value
+
+class Admission:
+    def __init__(self,home,route,goal=None):
+        self.home=Path(home);self.route=route
+        require(route in ('cs2','ds3','prince','steam'),'invalid_launch_route')
+        self.goal=('client' if route in ('prince','steam') else 'game') if goal is None else goal
+        require(self.goal in ('client','game'),'invalid_launch_goal')
+        self.state=self.home/'AIDev/state';self.pending=self.state/'game-launch-pending.json'
+
+    @contextlib.contextmanager
+    def locked(self):
+        directory(self.state)
+        fd=os.open(str(self.state/'games-hub.lock'),os.O_CREAT|os.O_RDWR|os.O_NOFOLLOW|os.O_NONBLOCK,0o600)
+        try:
+            facts=os.fstat(fd)
+            require(stat.S_ISREG(facts.st_mode) and facts.st_uid==os.getuid()
+                    and facts.st_nlink==1 and not facts.st_mode&0o077,'unsafe_launch_lock')
+            try:fcntl.flock(fd,fcntl.LOCK_EX|fcntl.LOCK_NB)
+            except BlockingIOError:raise Blocked('launcher_busy') from None
+            yield self
+        finally:os.close(fd)
+
+    def record(self):
+        if not self.pending.exists() and not self.pending.is_symlink():return None
+        value=decode(regular(self.pending,4096))
+        require(set(value)=={'schema','route','phase','children','request','goal'} and type(value['schema']) is int
+                and value['schema']==1 and value['route'] in ('cs2','ds3','prince','steam')
+                and value['phase'] in ('prepared','dispatched','confirmed') and value['goal'] in ('client','game') and type(value['children']) is list
+                and len(value['children'])<=2 and all(type(pid) is int and pid>1 for pid in value['children'])
+                and len(set(value['children']))==len(value['children'])
+                and type(value['request']) is str and re.fullmatch('[0-9a-f]{32}',value['request'])
+                and (value['phase']=='prepared' or len(value['children'])>=1)
+                and (value['phase']!='prepared' or value['children']==[]),'invalid_admission_record')
+        return value
+
+    def publish(self,value):
+        if self.pending.exists() or self.pending.is_symlink():self.record()
+        fd,name=tempfile.mkstemp(prefix='.game-launch-pending-',dir=str(self.state))
+        try:
+            with os.fdopen(fd,'wb') as stream:
+                stream.write((json.dumps(value,sort_keys=True)+'\n').encode());stream.flush();os.fsync(stream.fileno())
+            os.replace(name,self.pending)
+        finally:
+            if os.path.exists(name):os.unlink(name)
+
+    def paths(self,route=None):
+        route=self.route if route is None else route
+        base=self.home/'Library/Application Support'
+        if route=='cs2':
+            prefix=base/'CS2 Standalone/prefix'
+            client=prefix/'drive_c/Program Files (x86)/Steam/steam.exe'
+            target=client.parent/'steamapps/common/Counter-Strike Global Offensive/game/bin/win64/cs2.exe'
+        elif route=='ds3':
+            prefix=base/'Adapted Games DS3/profiles/ds3'
+            client=prefix/'drive_c/Program Files (x86)/Steam/steam.exe'
+            target=client.parent/'steamapps/common/DARK SOULS III/Game/DarkSoulsIII.exe'
+        else:
+            prefix=base/'Adapted Games/profiles/prince'
+            client=prefix/('drive_c/Program Files (x86)/Ubisoft/Ubisoft Game Launcher/upc.exe' if route=='prince'
+                           else 'drive_c/Program Files (x86)/Steam/steam.exe')
+            target=client
+        return client,target
+
+    def processes(self):
+        # macOS comm supplies executable identity; argv is never read or parsed.
+        result=subprocess.run(['/bin/ps','-U',str(os.getuid()),'-o','pid=,comm='],capture_output=True,timeout=5)
+        require(result.returncode==0 and len(result.stdout)<=4*1024*1024,'process_probe_failed')
+        rows=result.stdout.decode('utf-8','strict').splitlines();require(len(rows)<20000,'process_limit')
+        seen=set();commands=[]
+        for row in rows:
+            match=re.fullmatch(r'\s*([0-9]+)\s+(.+?)\s*',row)
+            require(match is not None,'process_identity_unavailable')
+            pid=int(match[1]);require(pid>0 and pid not in seen,'process_identity_unavailable')
+            seen.add(pid);commands.append((pid,match[2]))
+        return commands
+
+    def summary(self,route=None,processes=None,goal=None):
+        client,target=self.paths(route)
+        if (self.goal if goal is None else goal)=='client':target=client
+        processes=self.processes() if processes is None else processes
+        exact={command for _,command in processes}
+        own_steam=self.paths('steam')[0] if (self.route if route is None else route)=='prince' else client
+        windows_steam=[command for _,command in processes if re.search(r'(?i)(?:^|[/\\])steam\.exe$',command)
+                       or command.lower().strip('[]()')=='steam.exe']
+        return {'clientActive':str(client) in exact,'targetActive':str(target) in exact,
+                'steamActive':str(own_steam) in exact,
+                'foreignSteam':any(command!=str(own_steam) for command in windows_steam)}
+
+    def allow_client(self):
+        summary=self.summary()
+        require(not summary['foreignSteam'],'foreign_steam_active')
+        # Server activity without a known exact client remains ambiguous.
+        if not summary['clientActive'] and not summary['targetActive'] and not summary['steamActive']:
+            require(not self.active(self.route),'profile_active')
+        return summary
+
+    def reconcile(self):
+        previous=self.record()
+        if previous is None:return
+        if previous['phase']=='confirmed':self.pending.unlink();return
+        if previous['phase']=='prepared':raise Blocked('pending_launch_unconfirmed')
+        if self.summary(previous['route'],goal=previous['goal'])['targetActive']:
+            self.pending.unlink();return
+        for pid in previous['children']:
+            try:os.kill(pid,0)
+            except ProcessLookupError:continue
+            except PermissionError:raise Blocked('pending_launch_unconfirmed') from None
+            raise Blocked('launch_in_progress')
+        require(not self.active(previous['route']),'profile_active')
+        self.recover()
+
+    def begin(self):
+        self.reconcile()
+        self.publish({'schema':1,'route':self.route,'phase':'prepared','children':[],
+                      'request':secrets.token_hex(16),'goal':self.goal})
+
+    def dispatched(self,children):
+        value=self.record()
+        require(value and value['route']==self.route and value['phase']=='prepared','admission_request_changed')
+        require(1<=len(children)<=2 and all(type(child.pid) is int and child.pid>1 for child in children)
+                and len({child.pid for child in children})==len(children),'invalid_child_identity')
+        value.update(phase='dispatched',children=[child.pid for child in children]);self.publish(value)
+        self.start_watch(value['request'])
+
+    def start_watch(self,request):
+        # One transient bounded observer records a target milestone after the
+        # resolver exits. It owns no game, stop signal, service or game profile.
+        source=globals().get('__admission_source')
+        require(type(source) is bytes and len(source)<=65536,'admission_observer_source_missing')
+        environment={'HOME':str(self.home),'PATH':'/usr/bin:/bin:/usr/sbin:/sbin','LANG':'en_US.UTF-8'}
+        try:
+            subprocess.Popen(['/usr/bin/python3','-I','-c',source.decode('utf-8'),'watch',request],env=environment,cwd=str(self.home),
+                             stdin=subprocess.DEVNULL,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,start_new_session=True)
+        except OSError:pass  # Reservation stays unresolved; no duplicate retry.
+
+    def watch(self,request,timeout=190):
+        deadline=time.monotonic()+timeout
+        while time.monotonic()<deadline:
+            try:
+                with self.locked():
+                    value=self.record()
+                    if value is None or value['request']!=request or value['phase']!='dispatched':return
+                    if self.summary(value['route'],goal=value['goal'])['targetActive']:
+                        value['phase']='confirmed';self.publish(value);return
+            except Blocked as error:
+                if str(error)!='launcher_busy':return
+            except (OSError,UnicodeError,subprocess.SubprocessError):return
+            time.sleep(0.25)
+
+    def active(self,route):
+        base=self.home/'Library/Application Support'
+        if route=='cs2':
+            root=base/'CS2 Standalone';runtime=root/'runtime';prefix=root/'prefix'
+            raw=regular(runtime/'.manifest.json');manifest=decode(raw);receipt=decode(regular(runtime/'.owner.json'))
+            require(receipt.get('owner')=='control-cs2-standalone' and receipt.get('criticalHashes')==manifest.get('criticalHashes'),'admission_owner_mismatch')
+            hashes=manifest.get('criticalHashes')
+        else:
+            root=base/('Adapted Games DS3' if route=='ds3' else 'Adapted Games')
+            runtime=root/'runtime';prefix=root/('profiles/ds3' if route=='ds3' else 'profiles/prince')
+            raw=regular(root/'manifest.json');manifest=decode(raw);receipt=decode(regular(root/'receipt.json'))
+            expected='control-ds3-marshal-fix' if route=='ds3' else 'control-games-hub'
+            require(manifest.get('owner')==expected and receipt.get('owner')==expected,'admission_owner_mismatch')
+            hashes=manifest.get('sourceCriticalHashes' if route=='ds3' else 'criticalHashes')
+        require(hashlib.sha256(raw).hexdigest()==receipt.get('manifestSha256'),'admission_manifest_changed')
+        require(type(hashes) is dict,'admission_server_unbound')
+        expected=hashes.get('engine/bin/wineserver')
+        require(type(expected) is str and re.fullmatch('[0-9a-f]{64}',expected),'admission_server_unbound')
+        server=runtime/'engine/bin/wineserver'
+        require(hashlib.sha256(regular(server,64*1024*1024)).hexdigest()==expected,'admission_server_changed')
+        directory(prefix)
+        user=pwd.getpwuid(os.getuid()).pw_name
+        env={'HOME':str(self.home),'USER':user,'LOGNAME':user,'PATH':'/usr/bin:/bin:/usr/sbin:/sbin','LANG':'en_US.UTF-8',
+             'WINEPREFIX':str(prefix),'WINESERVER':str(server),'WINELOADER':str(runtime/'engine/bin/wine'),
+             'WINEDLLPATH':str(runtime/'engine/lib/wine'),
+             'DYLD_FALLBACK_LIBRARY_PATH':str(runtime/'Frameworks')+':/usr/lib',
+             'WINEMSYNC':'1','WINEESYNC':'0','WINEDEBUG':'-all','ROSETTA_ADVERTISE_AVX':'1'}
+        try:
+            result=subprocess.run([str(server),'-w'],env=env,stdin=subprocess.DEVNULL,
+                                  stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,timeout=0.25)
+        except subprocess.TimeoutExpired:return True
+        require(result.returncode==0,'session_probe_failed');return False
+
+    def recover(self):
+        value=self.record()
+        if value is None:return {'state':'NO_PENDING_LAUNCH'}
+        for pid in value['children']:
+            try:os.kill(pid,0)
+            except ProcessLookupError:continue
+            except PermissionError:raise Blocked('pending_launch_unconfirmed') from None
+            raise Blocked('launch_in_progress')
+        # No clock expiry or PID absence alone establishes safety.
+        for route in ('cs2','ds3','prince'):
+            require(not self.active(route),'profile_active')
+        processes=self.processes()
+        for _,command in processes:
+            name=Path(command).name.lower().strip('[]()')
+            require(name not in ('wine','wine64','wineserver','wine-preloader','wine64-preloader')
+                    and not name.endswith('.exe'),'pending_launch_unconfirmed')
+        # Recheck the immutable record after the bounded process observations.
+        require(self.record()==value,'admission_request_changed');self.pending.unlink()
+        return {'state':'PENDING_LAUNCH_RECOVERED','gameplayVerified':False}
+
+if __name__=='__main__':
+    import sys
+    try:
+        require(len(sys.argv)==3 and sys.argv[1]=='watch' and re.fullmatch('[0-9a-f]{32}',sys.argv[2]),'usage')
+        home=Path(pwd.getpwuid(os.getuid()).pw_dir)
+        Admission(home,'prince').watch(sys.argv[2])
+    except (OSError,Blocked,UnicodeError,subprocess.SubprocessError):sys.exit(1)

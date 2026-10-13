@@ -1,0 +1,884 @@
+#!/usr/bin/python3
+"""Standalone, read-only current-generation readiness. Never apply/capture.
+
+No Store, allocation, transaction dispatch, model request or old gate is invoked.
+Catalog/CLI reads may exercise normal runtime auth/cache/network read behavior;
+all guarded local changes invalidate this operation. Observed boundaries do not
+promise continuous exclusion, provider-state custody or future execution rights.
+Run only the reviewed source under an external finite deadline: synchronous
+Popen and kernel calls cannot be interrupted by a cooperative Python deadline.
+An unresolved child remains attached to a private exception, including numeric
+SystemExit at the terminal boundary. JSON is NOT an ownership-transfer or
+recovery mechanism: a standalone process exit cannot preserve its Python handle
+in another process. Unresolved ownership requires external reconciliation and
+stops readiness/retry; this executable never claims such recovery occurred.
+"""
+
+import sys
+sys.dont_write_bytecode = True
+
+import hashlib
+import importlib.machinery
+import json
+import os
+from pathlib import Path
+import pwd
+import re
+import stat
+import time
+from types import SimpleNamespace
+
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT))
+from lib import phase5_runtime_capture as capture
+from lib import phase5_runtime_integrations as integrations
+from lib import phase5_runtime_legacy as legacy
+from lib import phase5_runtime_targets as targets
+from lib import phase5_plugin_catalog as catalog
+from lib.phase5_current_runtime import classify
+from lib.phase5_runtime_paths import OwnedParent, _close_all
+from vendor.tomli import loads as toml_loads
+
+APP = integrations.APP_RESOURCES
+BUNDLE = "/Applications/ChatGPT.app"
+CLI = APP + "/codex"
+MAX_OUTPUT = 4 * 1024 * 1024
+MAX_SOURCE = 512 * 1024 * 1024
+AGGREGATE_SECONDS = 90.0
+COMMAND_SECONDS = 8.0
+READ_FLAGS = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC
+STAGES = frozenset(("target-read", "history-read", "source-bind", "signature", "version",
+                    "integration-source", "mcp", "catalog", "admission", "final-recheck", "cleanup"))
+
+
+def safe_stage(value):
+    return value if type(value) is str and value in STAGES else None
+
+
+class ReadinessError(Exception):
+    def __init__(self, *, private_owner=None, stage=None):
+        self.private_owner = private_owner
+        self.settlement_failed = private_owner is not None
+        self.stage = safe_stage(stage)
+        super().__init__("current_readiness_required")
+
+
+def earliest(primary, error):
+    """Keep the first interruption, otherwise the first ordinary failure."""
+    if isinstance(primary, (KeyboardInterrupt, SystemExit)):
+        return primary
+    if primary is None or isinstance(error, (KeyboardInterrupt, SystemExit)):
+        return error
+    return primary
+
+
+def require(value):
+    if value is not True:
+        raise ReadinessError()
+
+
+def strict_json(raw):
+    def pairs(items):
+        result = {}
+        for key, value in items:
+            require(key not in result)
+            result[key] = value
+        return result
+    def constant(_):
+        raise ReadinessError()
+    require(type(raw) is bytes and len(raw) <= MAX_OUTPUT)
+    return json.loads(raw.decode("utf-8", "strict"), object_pairs_hook=pairs,
+                      parse_constant=constant)
+
+
+class Budget:
+    def __init__(self, seconds=AGGREGATE_SECONDS, *, clock=time.monotonic):
+        self.clock = clock
+        self.end = clock() + seconds
+
+    def check(self):
+        require(self.clock() < self.end)
+
+    def command(self, maximum):
+        remaining = min(maximum, self.end - self.clock())
+        require(remaining > 2.0)
+        return remaining
+
+
+def command_read(arguments, environment, budget, *, session_factory=catalog._Session):
+    """Fixed read commands; reuse the reviewed direct-Popen settlement owner.
+
+The new code only drains nonblocking raw pipes (shared 4 MiB cap), not another
+RPC protocol. Cleanup never signals a process group or an already reaped child.
+"""
+    allowed = (
+        (CLI, "--version"), (CLI, "mcp", "list", "--json"),
+        ("/usr/bin/codesign", "-dvv", BUNDLE),
+        ("/usr/bin/codesign", "-dr", "-", BUNDLE),
+        ("/usr/bin/codesign", "--verify", "--deep", "--strict", BUNDLE),
+        ("/usr/sbin/spctl", "--assess", "--type", "execute", BUNDLE),
+    )
+    require(type(arguments) in (list, tuple)
+            and all(type(value) in (str, type(Path("/"))) for value in arguments))
+    argv = tuple(str(value) for value in arguments)
+    require(argv in allowed)
+    require(type(environment) is dict and integrations._path(environment.get("HOME"))
+            and integrations._equal(environment, {
+                "HOME": environment["HOME"], "CODEX_HOME": environment["HOME"] + "/.codex",
+                "LANG": "C", "LC_ALL": "C", "PATH": "/usr/bin:/bin:/usr/sbin:/sbin", "SHELL": "/bin/zsh"}))
+    duration = budget.command(COMMAND_SECONDS)
+    deadline = time.monotonic() + duration
+    owner = session_factory(deadline - 2.0)
+    primary, output, size = None, {"stdout": bytearray(), "stderr": bytearray()}, 0
+    try:
+        owner.start(argv, environment, catalog.subprocess.Popen)
+        owner.streams["stdin"].close()
+        while owner.eof != {"stdout", "stderr"} or owner.process.poll() is None:
+            budget.check()
+            require(time.monotonic() < deadline - 2.0)
+            for key, _ in owner.selector.select(min(0.05, max(0, deadline - 2.0 - time.monotonic()))):
+                name = key.data
+                require(name in output)
+                try:
+                    chunk = os.read(owner.streams[name].fileno(), min(65536, MAX_OUTPUT + 1 - size))
+                except BlockingIOError:
+                    continue
+                if not chunk:
+                    owner.eof.add(name)
+                    owner.selector.unregister(owner.streams[name])
+                    continue
+                size += len(chunk)
+                require(size <= MAX_OUTPUT)
+                output[name].extend(chunk)
+        result = SimpleNamespace(returncode=owner.process.returncode,
+            stdout=bytes(output["stdout"]).decode("utf-8", "strict"),
+            stderr=bytes(output["stderr"]).decode("utf-8", "strict"))
+    except BaseException as error:
+        primary = error
+    settled, problem = owner.close(deadline, True)
+    interruption = primary if isinstance(primary, (KeyboardInterrupt, SystemExit)) else owner.interruption
+    if interruption is not None:
+        interruption.private_owner = owner if not settled else None
+        interruption.settlement_failed = not settled
+        raise interruption from None
+    if primary is not None or not settled or problem:
+        raise ReadinessError(private_owner=owner if not settled else None) from None
+    budget.check()
+    return result
+
+
+def file_stamp(facts):
+    return tuple(getattr(facts, key) for key in (
+        "st_dev", "st_ino", "st_uid", "st_gid", "st_mode", "st_nlink", "st_size",
+        "st_mtime_ns", "st_ctime_ns", "st_flags"))
+
+
+class SourceFile:
+    """Held file FD, bounded streamed bytes/hash, and rebound complete chain.
+
+Directory chains are opened one at a time to avoid one full chain per source
+remaining open. Their identities are retained and compared on every recheck;
+the leaf file descriptor remains held until close. No path fallback or symlink.
+"""
+    def __init__(self, path, root, uid, budget, *, keep=True, absent=False, syscalls=os, opener=OwnedParent.open):
+        self.path, self.root, self.uid = str(path), str(root), uid
+        self.budget, self.os, self.opener, self.keep = budget, syscalls, opener, keep
+        self.absent = absent
+        self.fds = []
+        try:
+            with opener(str(Path(path).parent), self.root, uid, syscalls=syscalls) as parent:
+                self.chain = tuple(parent._identities)
+                if absent:
+                    self.stamp, self.data, self.digest = None, None, "absent"
+                    self._check_absent(parent)
+                    return
+                descriptor = syscalls.open(Path(path).name, READ_FLAGS, dir_fd=parent.descriptor)
+                self.fds.append(descriptor)
+                self.stamp = file_stamp(syscalls.fstat(descriptor))
+                self.data, self.digest = self._read(parent)
+        except BaseException:
+            self.close()
+            raise
+
+    def _check_absent(self, parent):
+        self.budget.check()
+        parent.verify()
+        require(tuple(parent._identities) == self.chain)
+        try:
+            self.os.stat(Path(self.path).name, dir_fd=parent.descriptor, follow_symlinks=False)
+        except FileNotFoundError:
+            parent.verify()
+            return
+        raise ReadinessError()
+
+    def _read(self, parent):
+        self.budget.check()
+        descriptor = self.fds[0]
+        facts = self.os.fstat(descriptor)
+        maximum = MAX_OUTPUT if self.keep else MAX_SOURCE
+        require(stat.S_ISREG(facts.st_mode) and facts.st_uid == self.uid
+                and facts.st_nlink == 1 and not facts.st_mode & 0o022
+                and not facts.st_mode & 0o7000
+                and 0 <= facts.st_size <= maximum and file_stamp(facts) == self.stamp)
+        parent.verify()
+        self.os.lseek(descriptor, 0, os.SEEK_SET)
+        digest, chunks, size = hashlib.sha256(), [], 0
+        while True:
+            self.budget.check()
+            block = self.os.read(descriptor, min(65536, maximum + 1 - size))
+            if not block:
+                break
+            size += len(block)
+            require(size <= maximum)
+            digest.update(block)
+            if self.keep:
+                chunks.append(block)
+        named = self.os.stat(Path(self.path).name, dir_fd=parent.descriptor, follow_symlinks=False)
+        require(file_stamp(self.os.fstat(descriptor)) == self.stamp
+                and file_stamp(named) == self.stamp and size == facts.st_size
+                and tuple(parent._identities) == self.chain)
+        parent.verify()
+        return b"".join(chunks) if self.keep else None, digest.hexdigest()
+
+    def verify(self):
+        with self.opener(str(Path(self.path).parent), self.root, self.uid, syscalls=self.os) as parent:
+            require(tuple(parent._identities) == self.chain)
+            if self.absent:
+                self._check_absent(parent)
+                return True
+            value, digest = self._read(parent)
+            require(value == self.data and digest == self.digest)
+        return True
+
+    def close(self):
+        _close_all(self.os, self.fds)
+
+
+def public(verdict, *, observed=0, settled=True, stage=None):
+    return {"schema": 1, "probe": "phase5-current-readiness", "verdict": verdict,
+            "observedTargets": observed, "reasonCodes": [] if verdict == "ready" else ["current_readiness_required"],
+            "failureStage": None if verdict == "ready" else safe_stage(stage) or "admission",
+            "childSettled": settled, "executionAdmission": False, "liveAdmission": False,
+            "configMutationAuthorized": False, "trustMutationAuthorized": False,
+            "phase5Accepted": False, "phase6Allowed": False, "cleanupPerformed": False}
+
+
+# Reviewed observation-generation bindings, NOT permanent vendor floors. New
+# source generations need a focused source review; mismatch concerns this call.
+ASAR_HASH = "64fc2f27d2dddfa968acfacbe5e4e0328071bdc406351ff4a7d18f0b4692c83d"
+BUNDLE_MARKER_HASH = "68444ff3da0665515beed427257bf8645a529d6773b32be34187e3cb2a9759a1"
+CLI_HASH = "a30ec314bbd0e3721632234d07db7c99855db3b9f1e32dbe8c791947f07e7629"
+BROWSER_HASH = "953706b76083dd4067958dee7668c4b88beb26122d6262fa60cb79ff7e6abbb1"
+VISUALIZE_HASH = "be82c4e573ffe2fc0921a10f49eb690ce6f7c8a06acffb2789600be677720d05"
+COMPUTER_SKILL_HASH = "aa25ae60e43b3b9af40aff50004ee35944733e4955068d3c8e3924cbd6d8bef6"
+CUA_RESOURCES = ("banner.js", "js-tool-description.md", "browser-description.md", "computer-description.md",
+                 "js-output-description.md", "js-reset.md", "server-instructions.md")
+CONTRACT_HASH = "f58a5bad25b4335a4ec9798d211ed83c89a0552245837eb7a992cbdddbc6bb82"
+GUIDANCE_HASH = "5954036d4b254618872fb0cc4de298389eadf136972b6ebd2ade45eee62246ed"
+CURATED_REF = "1e285826e604f66f7208f7ac4dba0fe8341d1f57"
+CURATED_POINTER_HASH = "81adb43b5cda0c4fe681ede994807a8ad181685e7bcf24d71da704c55ca81789"
+CURATED_CATALOG_HASH = "7745d50ef3456d84fbdae9a7b5f7d73f5f5d52bddad6ce011e35b310e5fdef75"
+CURATED = {
+    "google-calendar": ("1.2.6", "5c98ee2ad45f0928d16ded60345ecf726a79d1c62bb25e57bcadd21032b9d247"),
+    "google-drive": ("0.1.15", "ffdad3ab0faca457d1f61f1a89cbe1a34ed6e120757f960e64afd05bb6e80434"),
+    "slack": ("0.1.7", "ffffb1fbf76d34c03d46288ed4f5cb5cbdb6ceb8a7e91d2c58f87b95595341bd"),
+}
+PRIMARY_REF = "26.905.11957"  # independently supplied provider skill catalog
+REMOTE_POLICIES = {"github": ("ON_INSTALL", "AVAILABLE"),
+                   **{name: ("ON_USE", "INSTALLED_BY_DEFAULT") for name in (
+                       "deep-research-work", "openai-templates", "plugin-management")}}
+MANAGED = {
+    "global-agents": "codex/current-global-AGENTS.md",
+    "quarantine-profile": "codex/quarantine.config.toml",
+    "hooks-definition": "codex/hooks.json",
+    "hook-router": "codex/hooks/phase5-contract.py",
+    "skill-definition": "skills/manage-workstation/SKILL.md",
+    "skill-metadata": "skills/manage-workstation/agents/openai.yaml",
+    "quarantine-launcher": "bin/codex-quarantine",
+}
+SOURCE_CLOSURE = (
+    "bin/phase5-current-readiness", "bin/phase5-preflight", "bin/phase5-apply-transaction",
+    "lib/phase5_runtime_capture.py", "lib/phase5_runtime_session.py", "lib/phase5_runtime_transition.py",
+    "lib/phase5_runtime_backend.py", "lib/phase5_runtime_paths.py", "lib/phase5_runtime_targets.py",
+    "lib/phase5_runtime_legacy.py", "lib/phase5_runtime_integrations.py", "lib/phase5_plugin_catalog.py",
+    "lib/phase5_current_runtime.py", "lib/phase5_runtime_compositions.py",
+    "vendor/tomli/__init__.py", "vendor/tomli/_parser.py", "vendor/tomli/_re.py", "vendor/tomli/_types.py",
+    "docs/phase-5-current-integration-sources.md",
+)
+
+
+def selected_marketplace(value, marketplace, names):
+    """Descriptive envelope extras are inert; selected source routes are exact."""
+    require(type(value) is dict and value.get("name") == marketplace and type(value.get("plugins")) is list)
+    selected = {}
+    for row in value["plugins"]:
+        require(type(row) is dict)
+        name = row.get("name")
+        require(type(name) is str)
+        if name in names:
+            require(name not in selected and integrations._equal(
+                row.get("source"), {"source": "local", "path": "./plugins/" + name}))
+            selected[name] = row
+    require(set(selected) == set(names))
+    return selected
+
+
+def installed_rows(value, home):
+    marketplaces, errors, rows = catalog._catalog_rows(value)
+    require(not errors)
+    expected = set(integrations.LOCAL_PLUGINS) | {
+        name + "@openai-curated-remote" for name in REMOTE_POLICIES}
+    selected = {}
+    roots = {
+        "openai-bundled": home + "/.codex/.tmp/bundled-marketplaces/openai-bundled",
+        "openai-curated": home + "/.codex/.tmp/plugins",
+        "openai-primary-runtime": home + "/.cache/codex-runtimes/codex-primary-runtime/plugins/openai-primary-runtime",
+    }
+    for marketplace, row in rows:
+        identity, name = row["id"], row["name"]
+        require(identity in expected and identity == name + "@" + marketplace and identity not in selected)
+        require(row["enabled"] is True and row["installed"] is True)
+        if marketplace == "openai-curated-remote":
+            require(integrations._equal(row["source"], {"type": "remote"})
+                    and row.get("localVersion") is None
+                    and type(row.get("remotePluginId")) is str and bool(row["remotePluginId"])
+                    and type(row.get("version")) is str and bool(row["version"])
+                    and (row["authPolicy"], row["installPolicy"]) == REMOTE_POLICIES[name])
+        else:
+            require(integrations._equal(row["source"], {
+                "type": "local", "path": roots[marketplace] + "/plugins/" + name}))
+            require((row["authPolicy"], row["installPolicy"]) == (
+                "ON_USE" if marketplace == "openai-primary-runtime" else "ON_INSTALL", "AVAILABLE"))
+            require(type(row.get("localVersion")) is str and bool(row["localVersion"]))
+        selected[identity] = row
+    require(set(selected) == expected)
+    # The public schema allows descriptive marketplace metadata. No path from
+    # that envelope is used for I/O; independently expected plugin.source.path
+    # above is the concrete association consumed by this caller.
+    return selected, roots
+
+
+class NativeRuntime:
+    """One operation's private source/file and settled runtime observations."""
+    def __init__(self, home, uid, budget, *, file_factory=SourceFile):
+        self.home, self.uid, self.budget, self.file_factory = home, uid, budget, file_factory
+        self.pins, self.app, self.catalog_bytes, self.effective_bytes = {}, None, None, None
+        self.version, self.environment, self.contract = None, None, None
+        self.preflight = self.transaction = None
+        self.pending_owner = None
+        self.stage = "source-bind"
+
+    def pin(self, path, *, signed=False, keep=True, absent=False, expected=None):
+        path = str(path)
+        if path not in self.pins:
+            require(len(self.pins) < 128)
+            root, uid = (BUNDLE, self.app.bound_metadata[0][2]) if signed else (self.home, self.uid)
+            self.pins[path] = self.file_factory(path, root, uid, self.budget, keep=keep, absent=absent)
+        value = self.pins[path]
+        require(expected is None or value.digest == expected)
+        return value
+
+    def data(self, path):
+        value = self.pins[str(path)].data
+        require(type(value) is bytes)
+        return value
+
+    def json(self, path):
+        return strict_json(self.data(path))
+
+    def _run(self, arguments, environment=None):
+        require(environment is None or environment == self.environment)
+        self.verify()
+        result, primary = None, None
+        try:
+            result = command_read(arguments, self.environment, self.budget)
+        except BaseException as error:
+            self.pending_owner = getattr(error, "private_owner", None)
+            primary = error
+        try:
+            self.verify()
+        except BaseException as error:
+            primary = earliest(primary, error)
+        if primary is not None:
+            raise primary from None
+        return result
+
+    def collect(self):
+        # Only definitions are reused. Never call either historical main/gate.
+        self.preflight = importlib.machinery.SourceFileLoader(
+            "current_readiness_preflight", str(ROOT / "bin/phase5-preflight")).load_module()
+        self.transaction = importlib.machinery.SourceFileLoader(
+            "current_readiness_reader", str(ROOT / "bin/phase5-apply-transaction")).load_module()
+        # Use the accepted bundle observation, with the accepted pop-before-close
+        # cleanup helper for this caller's owned descriptors on interruption too.
+        class AppObservation(self.preflight._AppBundleObservation):
+            def close(self):
+                _close_all(os, self.descriptors)
+        self.preflight._AppBundleObservation = AppObservation
+        self.environment = self.transaction.clean_environment(self.home, self.home + "/.codex")
+        require(set(self.environment) == {"HOME", "CODEX_HOME", "LANG", "LC_ALL", "PATH", "SHELL"})
+        self.hook_records = {slot: digest for _, slot, digest in self.transaction.HOOK_TRUST_RECORDS}
+        self.app = self.preflight._AppBundleObservation(Path(BUNDLE))
+        require(self.app.bound_metadata[0][2] in (0, self.uid))
+        for relative in SOURCE_CLOSURE:
+            self.pin(ROOT / relative)
+        self.pin(ROOT / "manifests/codex-contract.json", expected=CONTRACT_HASH)
+        self.contract = self.json(ROOT / "manifests/codex-contract.json")
+        for relative in MANAGED.values():
+            self.pin(ROOT / relative)
+        self.pin(ROOT / MANAGED["global-agents"], expected=GUIDANCE_HASH)
+        self.pin(APP + "/app.asar", signed=True, keep=False, expected=ASAR_HASH)
+        for relative in ("codex", "cua_node/bin/node", "cua_node/bin/node_repl"):
+            value = self.pin(APP + "/" + relative, signed=True, keep=False,
+                             expected=CLI_HASH if relative == "codex" else None)
+            require(bool(value.stamp[4] & 0o111) and not value.stamp[4] & 0o7000)
+        def signing_command(arguments, environment=None):
+            value = self._run(arguments, environment)
+            # Existing attestation intentionally consumes combined diagnostics;
+            # codesign writes identity/designated lines on stderr, not stdout.
+            return SimpleNamespace(returncode=value.returncode, stdout=value.stdout + value.stderr)
+        self.preflight.run = signing_command  # finite adapter, never old run()
+        self.stage = "signature"
+        self.version = self.preflight.app_attestation(self.contract)
+        require(type(self.version) is str)
+        self.stage = "version"
+        version = self._run([CLI, "--version"])
+        require(version.returncode == 0 and not version.stderr
+                and self.preflight.version_at_or_above(version.stdout.strip(), self.contract["cli"]["observedVersion"]))
+        self.stage = "integration-source"
+        self._open_sources()
+        self.verify()
+        self.stage = "mcp"
+        response = self._run([CLI, "mcp", "list", "--json"])
+        require(response.returncode == 0 and not response.stderr)
+        self.effective_bytes = response.stdout.encode("utf-8")
+        require(type(strict_json(self.effective_bytes)) is list)
+        self.stage = "catalog"
+        try:
+            captured = catalog.collect_private_catalog(
+                [CLI, "app-server", "--listen", "stdio://"], self.environment,
+                timeout_seconds=self.budget.command(catalog.MAX_DEADLINE_SECONDS))
+        except BaseException as error:
+            self.pending_owner = getattr(error, "private_owner", None)
+            raise
+        require(captured["transport"]["childReaped"] is True and captured["transport"]["stderrEmpty"] is True)
+        self.catalog_bytes = json.dumps(captured, ensure_ascii=True, separators=(",", ":")).encode("ascii")
+        require(len(self.catalog_bytes) <= MAX_OUTPUT)
+        self.verify()
+        self.stage = "integration-source"
+        self.facts()  # independently validate associations before exposing callbacks
+
+    def _open_sources(self):
+        codex = self.home + "/.codex"
+        signed = APP + "/plugins/openai-bundled"
+        bundled = codex + "/.tmp/bundled-marketplaces/openai-bundled"
+        curated = codex + "/.tmp/plugins"
+        primary = self.home + "/.cache/codex-runtimes/codex-primary-runtime/plugins/openai-primary-runtime"
+        self.pin(signed + "/.agents/plugins/marketplace.json", signed=True)
+        self.pin(signed + "/.bundle-id", signed=True, expected=BUNDLE_MARKER_HASH)
+        self.pin(bundled + "/.agents/plugins/marketplace.json")
+        self.pin(bundled + "/.materialization-key")
+        self.pin(curated + "/.agents/plugins/marketplace.json", expected=CURATED_CATALOG_HASH)
+        self.pin(codex + "/.tmp/plugins.sha", expected=CURATED_POINTER_HASH)
+        self.pin(primary + "/.agents/plugins/marketplace.json")
+        material = self.json(bundled + "/.materialization-key")
+        require(type(material) is dict and type(material.get("plugins")) is list)
+        refs = {}
+        for row in material["plugins"]:
+            require(type(row) is dict and set(row) == {"name", "version"}
+                    and type(row["name"]) is str and row["name"] not in refs
+                    and type(row["version"]) is str)
+            refs[row["name"]] = row["version"]
+        self.roots = {}
+        for identity in sorted(integrations.LOCAL_PLUGINS):
+            name, marketplace = identity.split("@")
+            ref = (refs.get(name) if marketplace == "openai-bundled" else
+                   CURATED_REF[:8] if marketplace == "openai-curated" else PRIMARY_REF)
+            require(type(ref) is str and re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", ref) is not None)
+            root = codex + "/plugins/cache/" + marketplace + "/" + name + "/" + ref
+            self.roots[identity] = root
+            source = {"openai-bundled": bundled, "openai-curated": curated, "openai-primary-runtime": primary}[marketplace]
+            self.pin(source + "/plugins/" + name + "/.codex-plugin/plugin.json")
+            self.pin(root + "/.codex-plugin/plugin.json")
+            if marketplace == "openai-bundled":
+                self.pin(signed + "/plugins/" + name + "/.codex-plugin/plugin.json", signed=True)
+        for name in ("computer-use", "computer-history", "unified-computer-use"):
+            self.pin(signed + "/plugins/" + name + "/.mcp.json", signed=True,
+                     expected=integrations.REVIEWED_SOURCE_HASHES[name + "/.mcp.json"])
+            self.pin(self.roots[name + "@openai-bundled"] + "/.mcp.json")
+            # Gi renders only the installed unified MCP definition. Other
+            # materialized MCP definitions retain their signed source bytes.
+            self.pin(bundled + "/plugins/" + name + "/.mcp.json")
+            suffix = "/scripts/launch.mjs" if name == "unified-computer-use" else "/bin/computer-use-client-launcher"
+            key = "unified-computer-use/scripts/launch.mjs" if name == "unified-computer-use" else "computer-use-client-launcher"
+            expected = integrations.REVIEWED_SOURCE_HASHES[key]
+            self.pin(signed + "/plugins/" + name + suffix, signed=True, expected=expected)
+            self.pin(bundled + "/plugins/" + name + suffix, expected=expected)
+            self.pin(self.roots[name + "@openai-bundled"] + suffix, expected=expected)
+        self.pin(signed + "/plugins/browser/scripts/browser-service.mjs", signed=True, expected=BROWSER_HASH)
+        self.pin(self.roots["browser@openai-bundled"] + "/scripts/browser-service.mjs", expected=BROWSER_HASH)
+        for resource in CUA_RESOURCES:
+            suffix = "/resources/" + resource
+            self.pin(signed + "/plugins/unified-computer-use" + suffix, signed=True)
+            self.pin(bundled + "/plugins/unified-computer-use" + suffix)
+            self.pin(self.roots["unified-computer-use@openai-bundled"] + suffix)
+        for name, source_suffix, target_suffix, digest in (
+            ("visualize", "/skills/visualize/SKILL.md", "/skills/visualize/SKILL.md", VISUALIZE_HASH),
+            ("computer-use", "/.codex-plugin/computer-use-node-repl.md", "/skills/computer-use/SKILL.md", COMPUTER_SKILL_HASH),
+        ):
+            self.pin(signed + "/plugins/" + name + source_suffix, signed=True, expected=digest)
+            self.pin(bundled + "/plugins/" + name + target_suffix, expected=digest)
+            installed = self.roots[name + "@openai-bundled"]
+            self.pin(installed + (source_suffix if name == "computer-use" else target_suffix), expected=digest)
+            if name == "computer-use":
+                # Signed Ete suppresses exactly this installed legacy skill
+                # when Gi supplies the computer surface. Keep its source and
+                # materialized skill; facts + the matcher must prove that mode.
+                self.pin(installed + "/skills/computer-use", absent=True)
+        # Ka's selected live-disabled variant removes this one declared surface.
+        # Check exact absence; no recursive scan or deletion is performed.
+        self.pin(bundled + "/plugins/visualize/skills/live", absent=True)
+        self.pin(self.roots["visualize@openai-bundled"] + "/skills/live", absent=True)
+
+    @property
+    def effective(self):
+        return strict_json(self.effective_bytes)
+
+    def facts(self):
+        require(type(self.catalog_bytes) is bytes and type(self.version) is str)
+        captured = strict_json(self.catalog_bytes)
+        rows, marketplaces = installed_rows(captured["installed"], self.home)
+        _, errors, vertical = catalog._catalog_rows(captured["vertical"])
+        require(not errors and not vertical)
+        signed = APP + "/plugins/openai-bundled"
+        marker = self.data(signed + "/.bundle-id")
+        require(hashlib.sha256(marker).hexdigest() == BUNDLE_MARKER_HASH)
+        # cte reads the signed marketplace marker as UTF-8 and trims it. This
+        # reviewed generation is ASCII UUID + LF, so Python/JS trim coincide.
+        bundle_id = marker.decode("utf-8", "strict").strip()
+        require(re.fullmatch(r"[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}", bundle_id) is not None)
+        bundled_names = {name.split("@")[0] for name in integrations.LOCAL_PLUGINS if name.endswith("@openai-bundled")}
+        selected_marketplace(self.json(signed + "/.agents/plugins/marketplace.json"), "openai-bundled", bundled_names)
+        for marketplace, source in marketplaces.items():
+            names = {key.split("@")[0] for key in integrations.LOCAL_PLUGINS if key.endswith("@" + marketplace)}
+            selected_marketplace(self.json(source + "/.agents/plugins/marketplace.json"), marketplace, names)
+        require(self.data(self.home + "/.codex/.tmp/plugins.sha").strip() == CURATED_REF.encode("ascii"))
+        material = self.json(marketplaces["openai-bundled"] + "/.materialization-key")
+        require(set(material) == {"version", "appVersion", "bundleId", "marketplaceName",
+            "computerUseSkillVariant", "computerUseAudioEnabled", "liveVisualizationSkillVariant",
+            "visualizeSkillContentHash", "plugins"})
+        require(type(material["version"]) is int and material["version"] == 1
+                and material["appVersion"] == self.version and material["bundleId"] == bundle_id
+                and material["marketplaceName"] == "openai-bundled"
+                and material["computerUseSkillVariant"] == "node-repl" and material["computerUseAudioEnabled"] is False
+                and material["liveVisualizationSkillVariant"] == "live-disabled"
+                and material["visualizeSkillContentHash"] == VISUALIZE_HASH)
+        refs = {row["name"]: row["version"] for row in material["plugins"]}
+        require(list(refs) == sorted(refs))
+        for identity, root in self.roots.items():
+            name, marketplace = identity.split("@")
+            source_path = marketplaces[marketplace] + "/plugins/" + name + "/.codex-plugin/plugin.json"
+            source, cached = self.json(source_path), self.json(root + "/.codex-plugin/plugin.json")
+            require(integrations._equal(source, cached) and source.get("name") == name)
+            if marketplace == "openai-bundled":
+                expected = self.json(signed + "/plugins/" + name + "/.codex-plugin/plugin.json")
+                if name in ("computer-use", "visualize"):
+                    expected["bundledContentVariant"] = "node-repl" if name == "computer-use" else "live-disabled"
+                require(integrations._equal(source, expected) and rows[identity]["localVersion"] == refs[name])
+                require(refs[name] == (self.version if name in ("browser", "chrome", "unified-computer-use") else source["version"]))
+            elif marketplace == "openai-curated":
+                version, digest = CURATED[name]
+                require(source["version"] == version and rows[identity]["localVersion"] == version
+                        and self.pins[source_path].digest == digest)
+            else:
+                require(source["version"] == PRIMARY_REF and rows[identity]["localVersion"] == PRIMARY_REF)
+        for name in ("computer-use", "computer-history", "unified-computer-use"):
+            expected = self.data(signed + "/plugins/" + name + "/.mcp.json")
+            require(self.data(marketplaces["openai-bundled"] + "/plugins/" + name + "/.mcp.json") == expected)
+            if name != "unified-computer-use":
+                require(self.data(self.roots[name + "@openai-bundled"] + "/.mcp.json") == expected)
+        for resource in CUA_RESOURCES:
+            suffix = "/resources/" + resource
+            expected = self.data(signed + "/plugins/unified-computer-use" + suffix)
+            require(self.data(marketplaces["openai-bundled"] + "/plugins/unified-computer-use" + suffix) == expected
+                    and self.data(self.roots["unified-computer-use@openai-bundled"] + suffix) == expected)
+        rendered = self.json(self.roots["unified-computer-use@openai-bundled"] + "/.mcp.json")
+        require(type(rendered) is dict and set(rendered) == {"mcpServers"}
+                and type(rendered["mcpServers"]) is dict and set(rendered["mcpServers"]) == {"cua_repl"})
+        cua = rendered["mcpServers"]["cua_repl"]
+        require(type(cua) is dict and cua.get("enabled") is True
+                and type(cua.get("env")) is dict
+                and cua["env"].get("CUA_REPL_ENABLED_SURFACES") == "browser,computer")
+        computer_root = self.roots["computer-use@openai-bundled"]
+        require(self.pins[computer_root + "/skills/computer-use"].absent is True
+                and self.pins[computer_root + "/skills/computer-use"].digest == "absent"
+                and self.pins[computer_root + "/.codex-plugin/computer-use-node-repl.md"].digest == COMPUTER_SKILL_HASH)
+        # This source association is not admission by absence: connected()
+        # still matches actual config and effective MCP against this rendering.
+        history = [row for row in self.effective if type(row) is dict and row.get("name") == "computer-history"]
+        history_root = self.roots["computer-history@openai-bundled"]
+        # Preserve the current runtime's exact root-relative '.' emission;
+        # the independently bound source fact itself stays canonical.
+        require(len(history) == 1 and history[0]["transport"]["cwd"] == history_root + "/."
+                and self.environment["CODEX_HOME"] == self.home + "/.codex")
+        generation = hashlib.sha256("\n".join(path + "=" + pin.digest
+            for path, pin in sorted(self.pins.items())).encode("utf-8") + self.catalog_bytes + self.effective_bytes).hexdigest()
+        return {"generation": generation, "home": self.home, "app_version": self.version,
+                "plugin_roots": dict(self.roots), "source_hashes": dict(integrations.REVIEWED_SOURCE_HASHES),
+                "rendered_cua": rendered["mcpServers"]["cua_repl"], "history_cwd_root": history_root}
+
+    def admit_sources(self, facts):
+        self.verify()
+        require(integrations._equal(facts, self.facts()))
+        return True
+
+    def same_generation(self, facts):
+        return self.admit_sources(facts)
+
+    def final_attest(self):
+        # Reassess the complete signed bundle after collection; named metadata
+        # of a few files alone cannot seal unobserved signed module contents.
+        require(self.preflight.app_attestation(self.contract) == self.version)
+        return self.verify()
+
+    def admit_managed(self, images):
+        expected = {item["source"]: item["sha256"] for item in self.contract["generatedFiles"]}
+        for identity, relative in MANAGED.items():
+            source = self.pins[str(ROOT / relative)]
+            require(source.digest == (GUIDANCE_HASH if identity == "global-agents" else expected[relative])
+                    and images[identity].data == source.data)
+        return True
+
+    def verify(self):
+        self.budget.check()
+        require(self.pending_owner is None)
+        if self.app is not None:
+            self.app.recheck()
+        for pin in self.pins.values():
+            require(pin.verify() is True)
+        self.budget.check()
+        return True
+
+    def close(self):
+        first = None
+        for pin in reversed(tuple(self.pins.values())):
+            try:
+                pin.close()
+            except BaseException as error:
+                first = earliest(first, error)
+        if self.app is not None:
+            try:
+                self.app.close()
+            except BaseException as error:
+                first = earliest(first, error)
+        if first is not None:
+            raise first
+
+
+def admit_current_round(images, *, home, runtime, metadata_empty, recheck_dependencies):
+    """One pure admission calculation inside full physical dependency brackets.
+
+The matcher callbacks below compare detached source facts, NOT the filesystem.
+Only this wrapper's full before/after dependency checks establish its physical
+generation. No matcher result escapes before the final bracket. Native commands,
+capture and mutation boundaries elsewhere retain their existing exact checks.
+facts() derives from held bytes in memory: capture one baseline, then rederive
+once at the end to reject changed cached catalog/effective/source inputs too.
+There is no cross-round cache and no change to the generic matcher contract.
+"""
+    primary, baseline, config, hooks = None, None, None, None
+    candidate = offered = offered_facts = projections = matched = None
+    try:
+        require(recheck_dependencies() is True)
+        require(set(images) == set(capture.TARGET_IDS) and all(metadata_empty.values()))
+        require(runtime.admit_managed(images) is True)
+        config = images["config"].data
+        hooks = integrations._snapshot(runtime.hook_records)
+        document = toml_loads(config.decode("utf-8", "strict"))
+        baseline = integrations._snapshot(runtime.facts())
+        candidate = integrations._snapshot([
+            document.get("plugins", {}), document.get("mcp_servers", {}), runtime.effective])
+        offered, offered_facts = integrations._snapshot(candidate), integrations._snapshot(baseline)
+
+        def same_snapshot(facts):
+            require(integrations._equal(integrations._snapshot(facts), baseline, mapping_order=True))
+            return True
+
+        matched = integrations.match_integrations(
+            *offered, sources=offered_facts,
+            admit_sources=same_snapshot, recheck_generation=same_snapshot)
+        require(not matched.reason)
+        projections = integrations._snapshot([matched.plugins, matched.mcp])
+        classified = classify(config, control_root=home + "/AIDev/control",
+            hook_source=home + "/.codex/hooks.json", hook_records=hooks,
+            admitted_plugins=matched.plugins, admitted_mcp=matched.mcp)
+        require(classified["verdict"] == "ready")
+    except BaseException as error:
+        primary = error
+    finally:
+        # Always perform the physical postcheck, even after a failed precheck
+        # or interrupted pure calculation. Preserve the earliest interruption.
+        try:
+            require(recheck_dependencies() is True)
+        except BaseException as error:
+            primary = earliest(primary, error)
+        try:
+            if baseline is not None:
+                require(integrations._equal(integrations._snapshot(runtime.facts()), baseline,
+                                            mapping_order=True))
+                require(images["config"].data == config
+                        and integrations._equal(integrations._snapshot(runtime.hook_records), hooks))
+            if candidate is not None:
+                require(integrations._equal(integrations._snapshot(offered), candidate, mapping_order=True)
+                        and integrations._equal(integrations._snapshot(offered_facts), baseline, mapping_order=True))
+            if projections is not None:
+                require(integrations._equal(integrations._snapshot([matched.plugins, matched.mcp]), projections,
+                                            mapping_order=True))
+        except BaseException as error:
+            primary = earliest(primary, error)
+    if primary is not None:
+        raise primary from None
+    return True
+
+
+def connected(home, uid, *, runtime_factory, target_observer=targets.observe,
+              legacy_observer=legacy.observe, budget=None):
+    """Native defaults only at the entry point; injected observers are test seams."""
+    budget = Budget() if budget is None else budget
+    runtime = held_targets = held_legacy = None
+    result, primary, pending_owner = public("needs-review"), None, None
+    stage, failure_stage = "target-read", None
+
+    def failure(error):
+        nonlocal result, primary, pending_owner, failure_stage
+        owner = getattr(error, "private_owner", None)
+        if owner is None and runtime is not None:
+            owner = getattr(runtime, "pending_owner", None)
+        if pending_owner is None and owner is not None:
+            pending_owner = owner
+        if failure_stage is None:
+            failure_stage = safe_stage(getattr(error, "stage", None)) or stage
+            if stage == "source-bind" and runtime is not None:
+                failure_stage = safe_stage(getattr(runtime, "stage", None)) or failure_stage
+        primary = earliest(primary, error)
+        result = public("needs-review", settled=pending_owner is None, stage=failure_stage)
+    try:
+        budget.check()
+        held_targets = target_observer(home, uid)
+        stage = "history-read"
+        held_legacy = legacy_observer(home, uid)
+        stage = "source-bind"
+        runtime = runtime_factory(home, uid, budget)
+        runtime.collect()
+
+        def dependencies():
+            budget.check()
+            require(held_targets.verify() is True and held_legacy.verify() is True)
+            require(runtime.verify() is True)
+            return True
+
+        def admit_current(images):
+            return admit_current_round(images, home=home, runtime=runtime,
+                metadata_empty=held_targets.metadata_empty, recheck_dependencies=dependencies)
+
+        stage = "admission"
+        checked = capture.readiness(held_targets.bindings, held_legacy.receipt,
+            held_legacy.physical_before, held_legacy.physical_after,
+            admit_current=admit_current, recheck_dependencies=dependencies)
+        require(checked["verdict"] == "ready")
+        stage = "final-recheck"
+        require(runtime.final_attest() is True)
+        require(dependencies() is True)
+        result = public("ready", observed=checked["observedTargets"])
+    except BaseException as error:
+        failure(error)
+    finally:
+        # Final aggregate observations also on failures. Release every owner even
+        # when one close raises; the earliest interruption is never suppressed.
+        stage = "final-recheck"
+        for held in (held_targets, held_legacy, runtime):
+            if held is not None:
+                try:
+                    require(held.verify() is True)
+                except BaseException as error:
+                    failure(error)
+        stage = "cleanup"
+        for held in (runtime, held_legacy, held_targets):
+            if held is not None:
+                try:
+                    held.close()
+                except BaseException as error:
+                    failure(error)
+        try:
+            budget.check()
+        except BaseException as error:
+            failure(error)
+    if isinstance(primary, (KeyboardInterrupt, SystemExit)):
+        primary.readiness_stage = failure_stage
+        if pending_owner is not None:
+            primary.private_owner = pending_owner
+            primary.settlement_failed = True
+        raise primary from None
+    if pending_owner is not None:
+        # Do not turn a live _Session into a public boolean then abandon it.
+        # This exception is private; its message contains no process/input data.
+        raise ReadinessError(private_owner=pending_owner, stage=failure_stage) from None
+    return result
+
+
+def main():
+    if sys.argv[1:]:
+        print(json.dumps(public("needs-review"), separators=(",", ":")))
+        return 2
+    try:
+        uid = os.getuid()
+        home = pwd.getpwuid(uid).pw_dir
+        require(integrations._path(home) and str(Path(home)) == home and os.getcwd() == str(ROOT))
+        result = connected(home, uid, runtime_factory=NativeRuntime)
+    except Exception as error:
+        owner = getattr(error, "private_owner", None)
+        if owner is not None:
+            raise ReadinessError(private_owner=owner, stage=getattr(error, "stage", None)) from None
+        result = public("needs-review", stage=getattr(error, "stage", None) or "target-read")
+    print(json.dumps(result, sort_keys=True, separators=(",", ":")))
+    return 0 if result["verdict"] == "ready" else 1
+
+
+def entry(main_function=main):
+    """Redaction only at the terminal boundary; internal interrupts propagate."""
+    try:
+        status = main_function()
+    except ReadinessError as error:
+        print(json.dumps(public("needs-review", settled=error.private_owner is None, stage=error.stage),
+                         sort_keys=True, separators=(",", ":")))
+        if error.private_owner is not None:
+            stopped = SystemExit(1)
+            stopped.private_owner, stopped.settlement_failed = error.private_owner, True
+            stopped.readiness_stage = error.stage
+            raise stopped from None
+        status = 1
+    except KeyboardInterrupt as error:
+        print(json.dumps(public("needs-review", settled=getattr(error, "private_owner", None) is None,
+                                stage=getattr(error, "readiness_stage", None)),
+                         sort_keys=True, separators=(",", ":")))
+        if getattr(error, "private_owner", None) is not None:
+            stopped = SystemExit(130)
+            stopped.private_owner, stopped.settlement_failed = error.private_owner, True
+            stopped.readiness_stage = safe_stage(getattr(error, "readiness_stage", None))
+            raise stopped from None
+        status = 130
+    except SystemExit as error:
+        # Preserve numeric termination without printing a private object/string.
+        if getattr(error, "private_owner", None) is not None:
+            if type(error.code) is int:
+                raise
+            stopped = SystemExit(0 if error.code is None else 1)
+            stopped.private_owner, stopped.settlement_failed = error.private_owner, True
+            stopped.readiness_stage = safe_stage(getattr(error, "readiness_stage", None))
+            raise stopped from None
+        status = error.code if type(error.code) is int else 0 if error.code is None else 1
+    return status
+
+
+if __name__ == "__main__":
+    raise SystemExit(entry())

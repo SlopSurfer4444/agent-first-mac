@@ -1,0 +1,426 @@
+#!/usr/bin/python3
+"""Read-only Phase 5 successor doctor; historical acceptance is not authority.
+
+The local reviewed program is the bootstrap trust boundary, not a self-signature.
+Git and runtime children reuse the accepted direct-child process owners. There
+is no apply, model task, old validator, replay, retry, or persistent attempt log.
+Cooperative deadlines cannot bound synchronous kernel/Popen calls; an external
+finite owner remains necessary where a hard wall-clock boundary is required.
+"""
+
+import sys
+sys.dont_write_bytecode = True
+
+import hashlib
+import importlib.machinery
+import json
+import os
+from pathlib import Path
+import pwd
+import re
+from types import SimpleNamespace
+
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT))
+R = importlib.machinery.SourceFileLoader("phase5_doctor_readiness", str(ROOT / "bin/phase5-current-readiness")).load_module()
+from lib import phase5_probe_process as process
+
+BASE = "96d11eba6f89e080281f5e6faf91c60bd65e0a66"
+BRANCH = "codex/phase5-current-runtime-successor"
+ACCEPTANCE = "evidence/phase-5/acceptance.json"
+COORDINATOR = ("Agent-First Mac Coordinator", "coordinator@agent-first-mac.invalid") * 2
+MUTABLE_BASE = frozenset(("ARCHITECTURE.md", "AGENTS.md", "README.md",
+                          "bin/phase5-preflight", "bin/phase5-apply-transaction"))
+REQUIRED = frozenset(R.SOURCE_CLOSURE) | frozenset(R.MANAGED.values()) | frozenset((
+    "manifests/codex-contract.json", "lib/phase5_probe_process.py",
+    "bin/phase5-current-doctor", "tests/test_phase5_current_doctor.py",
+    "docs/phase-5-current-doctor.md", "ARCHITECTURE.md", "AGENTS.md", "README.md"))
+ROLES = frozenset(("captureNoop", "rollbackReturn", "discovery", "trustedTask",
+    "quarantineCapabilities", "quarantineIsolation", "finalCurrentReadiness",
+    "phase4PreIntegration", "finalReview"))
+AUTHORITY = ("executionAdmission", "liveAdmission", "configMutationAuthorized",
+             "trustMutationAuthorized", "rootAuthorized", "phase6Allowed")
+STAGES = frozenset(("arguments", "git", "acceptance", "source", "runtime", "final-recheck", "close"))
+
+
+def require(value):
+    if value is not True:
+        raise ValueError("current_doctor_required") from None
+
+
+def digest(raw):
+    return hashlib.sha256(raw).hexdigest()
+
+
+def oid(raw):
+    return hashlib.sha1(b"blob " + str(len(raw)).encode("ascii") + b"\0" + raw).hexdigest()
+
+
+def hex_value(value, size):
+    return type(value) is str and re.fullmatch("[0-9a-f]{%d}" % size, value) is not None
+
+
+def relative(value):
+    return (type(value) is str and 0 < len(value) <= 1024
+            and re.fullmatch(r"[A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.-]+)*", value) is not None
+            and all(part not in (".", "..") for part in value.split("/")))
+
+
+def tree(value):
+    require(type(value) is dict and 0 < len(value) <= 10000)
+    for path, row in value.items():
+        require(relative(path) and type(row) is tuple and len(row) == 2
+                and row[0] in ("100644", "100755", "120000")
+                and type(row[0]) is str and hex_value(row[1], 40))
+    return value
+
+
+def hashes(value):
+    require(type(value) is dict and 0 < len(value) <= 512)
+    require(all(relative(path) and hex_value(sha, 64) for path, sha in value.items()))
+    return value
+
+
+def acceptance(raw):
+    value = R.strict_json(raw)
+    require(type(value) is dict and set(value) == {
+        "schema", "phase", "status", "baseCommit", "reviewedHead", "sources",
+        "evidence", "checks", "phase5Accepted", *AUTHORITY})
+    require(type(value["schema"]) is int and value["schema"] == 1
+            and type(value["phase"]) is int and value["phase"] == 5
+            and type(value["status"]) is str and value["status"] == "ACCEPTED_CURRENT_RUNTIME"
+            and value["baseCommit"] == BASE and hex_value(value["reviewedHead"], 40)
+            and value["phase5Accepted"] is True
+            and all(value[key] is False for key in AUTHORITY))
+    sources, evidence = hashes(value["sources"]), hashes(value["evidence"])
+    require(not (set(sources) & set(evidence)) and ACCEPTANCE not in sources | evidence)
+    require(all(not path.startswith("evidence/") for path in sources)
+            and all(path.startswith("evidence/phase-5/") for path in evidence))
+    checks = value["checks"]
+    require(type(checks) is dict and set(checks) == ROLES)
+    for row in checks.values():
+        require(type(row) is dict and set(row) == {"status", "evidence"}
+                and type(row["status"]) is str and row["status"] == "PASS"
+                and type(row["evidence"]) is str and row["evidence"] in evidence)
+    # These are the independent coordinator's adjudications of bound evidence,
+    # not new parsers that promote model prose or replay spent native probes.
+    return value
+
+
+def report(*, historical=False, source=False, live=False, ready=False,
+           review=False, settled=True, closed=True, stage=None, git_only=False):
+    verdict = ("GIT_ONLY_VALID" if git_only and source else
+               "PASS" if historical and not review and source and live and ready else
+               "PREPARED_FOR_INDEPENDENT_REVIEW" if review and source and (git_only or ready) else
+               "NEEDS_REVIEW")
+    return {"schema": 1, "probe": "phase5-current-doctor", "verdict": verdict,
+            "historicalPhase5Accepted": historical, "acceptedSourceCurrent": historical and source,
+            "integratedMain": historical and not review,
+            "repositoryChecksPassed": source, "liveRuntimeChecked": live,
+            "currentRuntimeReady": ready, "gitOnly": git_only, "childSettled": settled,
+            "sourceHandlesClosed": closed, "failureStage": stage,
+            "wholeMachineHealthChecked": False, "phase4LiveChecked": False,
+            **{key: False for key in AUTHORITY}}
+
+
+class Outcome:
+    """Private in-process custody; never serialize or print its fields."""
+    def __init__(self):
+        self.sources, self.errors = [], []
+        self.primary = self.private_owner = self.public = None
+        self.runtime_report = None
+
+    def __repr__(self):
+        return "<private current doctor outcome>"
+
+
+class DoctorError(Exception):
+    def __init__(self, outcome):
+        self.outcome = outcome
+        self.private_owner = outcome.private_owner
+        self.settlement_failed = outcome.public["childSettled"] is not True
+        super().__init__("current_doctor_required")
+
+
+def run(*, git, source_factory, runtime_check, budget, canonical_main, git_only=False):
+    """Injected read-only seams; source_factory returns an owned SourceFile.
+
+No default native operation. Source handles stay held across exactly one fresh
+readiness call. Failure retains original errors and unresolved direct owners in
+DoctorError.outcome; the earliest KeyboardInterrupt/SystemExit remains exact.
+"""
+    outcome = Outcome()
+    stage, failure_stage = "arguments", None
+    historical = source_ok = live = ready = review = False
+    settled = closed = True
+    state = None
+
+    def failure(error):
+        nonlocal failure_stage, settled
+        outcome.errors.append(error)
+        outcome.primary = R.earliest(outcome.primary, error)
+        if failure_stage is None:
+            failure_stage = stage
+        owner = getattr(error, "private_owner", None)
+        if outcome.private_owner is None and owner is not None:
+            outcome.private_owner = owner
+        if owner is not None or getattr(error, "settlement_failed", False) is not False:
+            settled = False
+
+    def bind(path, row, expected=None, absent=False):
+        nonlocal closed
+        closed = False  # constructor failure never proves successful closure
+        held = source_factory(path, absent=absent)
+        outcome.sources.append(held)
+        closed = True
+        require(held.verify() is True)
+        if not absent:
+            require(type(held.data) is bytes and row[0] in ("100644", "100755")
+                    and oid(held.data) == row[1] and held.digest == digest(held.data)
+                    and bool(held.stamp[4] & 0o111) == (row[0] == "100755")
+                    and (expected is None or held.digest == expected))
+        return held
+
+    try:
+        require(type(git_only) is bool and type(canonical_main) is bool
+                and callable(source_factory) and callable(runtime_check))
+        budget.check()
+        stage = "git"
+        state = git.state()
+        require(type(state) is dict and set(state) == {
+            "head", "branch", "clean", "baseAncestor", "linear", "tree", "baseTree"})
+        require(hex_value(state["head"], 40) and state["branch"] in (BRANCH, "main")
+                and type(state["branch"]) is str and state["clean"] is True
+                and state["baseAncestor"] is True and state["linear"] is True)
+        current, baseline = tree(state["tree"]), tree(state["baseTree"])
+        require(all(current.get(path) == row for path, row in baseline.items() if path not in MUTABLE_BASE))
+        review = state["branch"] == BRANCH
+        require(review or canonical_main)
+        stage = "acceptance"
+        record = bind(ACCEPTANCE, current.get(ACCEPTANCE), absent=ACCEPTANCE not in current)
+        if ACCEPTANCE in current:
+            value = acceptance(record.data)
+            meta = git.acceptance(value["reviewedHead"])
+            require(type(meta) is dict and set(meta) == {"commits", "parents", "identity", "changes", "tree"})
+            require(type(meta["commits"]) is tuple and len(meta["commits"]) == 1
+                    and hex_value(meta["commits"][0], 40)
+                    and type(meta["parents"]) is tuple and all(hex_value(p, 40) for p in meta["parents"])
+                    and meta["parents"] == (value["reviewedHead"],)
+                    and type(meta["identity"]) is tuple and all(type(p) is str for p in meta["identity"])
+                    and meta["identity"] == COORDINATOR
+                    and type(meta["changes"]) is tuple and len(meta["changes"]) == 1
+                    and type(meta["changes"][0]) is tuple
+                    and all(type(p) is str for p in meta["changes"][0])
+                    and meta["changes"] == (("A", ACCEPTANCE),))
+            reviewed = tree(meta["tree"])
+            require(ACCEPTANCE not in reviewed)
+            changed = {path for path, row in reviewed.items() if baseline.get(path) != row}
+            require(set(value["sources"]) == REQUIRED | {p for p in changed if not p.startswith("evidence/")})
+            require(set(value["evidence"]) == {p for p in changed if p.startswith("evidence/")})
+            require(all(reviewed.get(path) == row for path, row in baseline.items() if path not in MUTABLE_BASE))
+            # Unbound executable/source additions can change Python resolution.
+            # Descendants may add evidence/docs, not silently replace the engine.
+            require(all(reviewed.get(path) == row or path == ACCEPTANCE
+                        or (path not in reviewed and path.startswith(("docs/", "evidence/")))
+                        for path, row in current.items()))
+            # Historical validity is set only after every declared record/blob
+            # relationship passes. Runtime drift later does not rewrite history.
+            stage = "source"
+            for path, expected in (value["sources"] | value["evidence"]).items():
+                require(current.get(path) == reviewed.get(path) and path in reviewed)
+                bind(path, reviewed[path], expected)
+            historical = True
+        else:
+            require(review)
+            stage = "source"
+            changed = {p for p, row in current.items() if baseline.get(p) != row}
+            for path in sorted(REQUIRED | changed):
+                require(path in current)
+                bind(path, current[path])
+        source_ok = True
+        if not git_only:
+            stage, settled = "runtime", False
+            value = runtime_check(budget)
+            outcome.runtime_report = value
+            # Only the accepted caller's closed report can establish settlement;
+            # malformed returns or exceptions after entry remain unconfirmed.
+            if type(value) is dict:
+                expected = R.public(value.get("verdict"), observed=value.get("observedTargets"),
+                    settled=value.get("childSettled"), stage=value.get("failureStage"))
+                if (value.get("verdict") in ("ready", "needs-review")
+                        and type(value.get("observedTargets")) is int
+                        and 0 <= value["observedTargets"] <= 8
+                        and type(value.get("childSettled")) is bool
+                        and R.integrations._equal(value, expected)):
+                    settled = value["childSettled"]
+                    live = True
+            require(type(value) is dict and R.integrations._equal(value, R.public("ready", observed=8)))
+            ready = True
+    except BaseException as error:
+        failure(error)
+    finally:
+        stage = "final-recheck"
+        for held in outcome.sources:
+            try:
+                require(held.verify() is True)
+            except BaseException as error:
+                source_ok = False
+                failure(error)
+        if state is not None and settled:
+            try:
+                require(git.state() == state)
+            except BaseException as error:
+                source_ok = False
+                failure(error)
+        stage = "close"
+        for held in reversed(outcome.sources):
+            try:
+                held.close()
+            except BaseException as error:
+                closed = False
+                failure(error)
+        try:
+            budget.check()
+        except BaseException as error:
+            failure(error)
+    if outcome.primary is not None:
+        ready = False
+    outcome.public = report(historical=historical, source=source_ok, live=live, ready=ready,
+        review=review, settled=settled, closed=closed, stage=failure_stage, git_only=git_only)
+    if outcome.primary is not None:
+        outcome.public["verdict"] = "NEEDS_REVIEW"
+        if isinstance(outcome.primary, (KeyboardInterrupt, SystemExit)):
+            outcome.primary.doctor_outcome = outcome
+            outcome.primary.private_owner = outcome.private_owner
+            outcome.primary.settlement_failed = not settled
+            raise outcome.primary from None
+        raise DoctorError(outcome) from None
+    return outcome.public
+
+
+class NativeGit:
+    """Fixed local Git read surface over the existing bounded command owner."""
+    PREFIX = ("/usr/bin/git", "--no-pager", "--no-optional-locks", "--no-replace-objects",
+              "-c", "core.fsmonitor=false", "-c", "core.hooksPath=/dev/null",
+              "-c", "core.untrackedCache=false", "-c", "core.quotePath=true")
+
+    def __init__(self, home, root, budget):
+        self.root, self.budget = root, budget
+        self.environment = {"HOME": home, "PATH": "/usr/bin:/bin:/usr/sbin:/sbin",
+            "LANG": "C", "LC_ALL": "C", "GIT_CONFIG_NOSYSTEM": "1",
+            "GIT_CONFIG_GLOBAL": "/dev/null", "GIT_TERMINAL_PROMPT": "0",
+            "GIT_OPTIONAL_LOCKS": "0", "GIT_NO_LAZY_FETCH": "1"}
+
+    def _read(self, *args, allow_one=False):
+        # Only private methods below construct args. No CLI/user command passthrough.
+        launch = SimpleNamespace(argv=self.PREFIX + args, cwd=self.root,
+                                 environment=dict(self.environment))
+        expected = (launch.argv, launch.cwd, dict(launch.environment))
+        def admit(value):
+            require((value.argv, value.cwd, value.environment) == expected)
+            self.budget.check()
+            return True
+        result = process.command(launch, self.budget, 8.0, admit_launch=admit,
+            catalog=R.catalog, process_factory=R.catalog.subprocess.Popen)
+        require(type(result.returncode) is int and result.returncode in ((0, 1) if allow_one else (0,))
+                and result.stderr == b"")
+        return result.returncode, result.stdout
+
+    def _text(self, *args):
+        return self._read(*args)[1].decode("utf-8", "strict").rstrip("\n")
+
+    def _tree(self, commit):
+        require(hex_value(commit, 40))
+        raw = self._read("ls-tree", "-rz", "--full-tree", commit)[1]
+        rows = {}
+        require(raw.endswith(b"\0"))
+        for item in raw[:-1].split(b"\0"):
+            header, name = item.split(b"\t", 1)
+            mode, kind, object_id = header.decode("ascii").split(" ")
+            path = name.decode("utf-8", "strict")
+            require(kind == "blob" and path not in rows)
+            rows[path] = mode, object_id
+        return tree(rows)
+
+    def state(self):
+        head = self._text("rev-parse", "--verify", "HEAD")
+        require(hex_value(head, 40))
+        return {"head": head, "branch": self._text("symbolic-ref", "--quiet", "--short", "HEAD"),
+            "clean": self._read("status", "--porcelain=v1", "-z", "--untracked-files=all")[1] == b"",
+            "baseAncestor": self._read("merge-base", "--is-ancestor", BASE, head, allow_one=True)[0] == 0,
+            "linear": self._read("rev-list", "--merges", BASE + ".." + head)[1] == b"",
+            "tree": self._tree(head), "baseTree": self._tree(BASE)}
+
+    def acceptance(self, reviewed):
+        require(hex_value(reviewed, 40))
+        commits = tuple(self._text("log", "--format=%H", "HEAD", "--", ACCEPTANCE).splitlines())
+        require(len(commits) == 1 and hex_value(commits[0], 40))
+        commit = commits[0]
+        metadata = self._text("show", "-s", "--format=%P%x00%an%x00%ae%x00%cn%x00%ce", commit).split("\0")
+        require(len(metadata) == 5)
+        change = self._read("diff-tree", "--no-commit-id", "--name-status", "-r", "-z", commit)[1]
+        require(change == b"A\0" + ACCEPTANCE.encode("ascii") + b"\0")
+        return {"commits": commits, "parents": tuple(metadata[0].split()),
+                "identity": tuple(metadata[1:]), "changes": (("A", ACCEPTANCE),),
+                "tree": self._tree(reviewed)}
+
+
+def native(git_only):
+    uid = os.getuid()
+    home = pwd.getpwuid(uid).pw_dir
+    require(type(uid) is int and uid > 0 and R.integrations._path(home)
+            and os.getcwd() == str(ROOT))
+    budget = R.Budget()
+    return run(git=NativeGit(home, str(ROOT), budget), budget=budget,
+        source_factory=lambda path, absent=False: R.SourceFile(ROOT / path, home, uid, budget, absent=absent),
+        runtime_check=lambda shared: R.connected(home, uid, budget=shared, runtime_factory=R.NativeRuntime),
+        canonical_main=str(ROOT) == home + "/AIDev/control", git_only=git_only)
+
+
+def main(arguments=None, *, operation=native, emit=print):
+    args = sys.argv[1:] if arguments is None else arguments
+    if (type(args) is not list or any(type(arg) is not str for arg in args)
+            or len(set(args)) != len(args) or any(arg not in ("--json", "--git-only") for arg in args)):
+        value, status = report(stage="arguments"), 2
+        args = ["--json"]
+    else:
+        try:
+            value = operation("--git-only" in args)
+            status = 0 if value["verdict"] in ("PASS", "GIT_ONLY_VALID", "PREPARED_FOR_INDEPENDENT_REVIEW") else 1
+        except DoctorError as error:
+            value, status = error.outcome.public, 1
+            if error.settlement_failed or value["sourceHandlesClosed"] is not True:
+                stopped = SystemExit(1)
+                stopped.doctor_outcome, stopped.private_owner = error.outcome, error.private_owner
+                stopped.settlement_failed = error.settlement_failed
+                raise stopped from None
+        except (KeyboardInterrupt, SystemExit):
+            raise
+        except Exception:
+            value, status = report(stage="arguments"), 1
+    emit(json.dumps(value, sort_keys=True, separators=(",", ":")) if "--json" in args else
+         "Phase 5 current-runtime doctor: " + value["verdict"] +
+         "; historical acceptance=" + str(value["historicalPhase5Accepted"]).lower() +
+         "; runtime checked=" + str(value["liveRuntimeChecked"]).lower() +
+         "; current ready=" + str(value["currentRuntimeReady"]).lower())
+    return status
+
+
+def entry():
+    try:
+        return main()
+    except (KeyboardInterrupt, SystemExit) as error:
+        outcome = getattr(error, "doctor_outcome", None)
+        value = outcome.public if outcome is not None else report(stage="arguments", settled=False)
+        print(json.dumps(value, sort_keys=True, separators=(",", ":")))
+        code = (130 if isinstance(error, KeyboardInterrupt) else
+                error.code if type(error.code) is int and 1 <= error.code <= 255 else 1)
+        stopped = SystemExit(code)
+        stopped.doctor_outcome = outcome
+        stopped.private_owner = getattr(error, "private_owner", None)
+        stopped.settlement_failed = value["childSettled"] is not True
+        raise stopped from None
+
+
+if __name__ == "__main__":
+    raise SystemExit(entry())

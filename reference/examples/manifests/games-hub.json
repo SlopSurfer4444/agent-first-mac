@@ -1,0 +1,39 @@
+{
+  "publicReferenceOnly": true,
+  "warning": "Sanitized historical example. Not installation authority or current inventory.",
+  "example": {
+    "controllerOverlay": {
+      "libgtm-controller-SDL2.dylib": "42eab1e41a3e860e974bebfd5c92c8e09fb965634a63ae72923f3cef9e11bd74",
+      "winebus.so": "c4bb6b0f6eae702490c74d17263b068c4ebf66e4af990d8b7f2fae21a8d7cfb3"
+    },
+    "criticalHashes": {
+      "engine/bin/wine": "f4106b05ed558db00eaf4db93adb7955068001c314bcaa7d276b42f75520ab93",
+      "engine/bin/wineserver": "30f6ecf980f0784c97ca963b1fe8b2461f1ddc9d8aef05db7d3b5852d52acd0d",
+      "engine/lib/wine/i386-windows/winemac.drv": "70b5be2168411e76e1d6103d6750cd760034caf1b6ea160a144212ef00ad588a",
+      "engine/lib/wine/x86_64-unix/libgtm-controller-SDL2.dylib": "42eab1e41a3e860e974bebfd5c92c8e09fb965634a63ae72923f3cef9e11bd74",
+      "engine/lib/wine/x86_64-unix/ntdll.so": "2821162854bf0d3072333ec77cc6464fca15b2e1e9bfd195f15a1ab70df1ea49",
+      "engine/lib/wine/x86_64-unix/winebus.so": "c4bb6b0f6eae702490c74d17263b068c4ebf66e4af990d8b7f2fae21a8d7cfb3",
+      "engine/lib/wine/x86_64-unix/winemetal.so": "5e38be88867deb7b56833e28e2cf9e59188dee779ba323adbcb428eb31dfd540",
+      "engine/lib/wine/x86_64-windows/d3d11.dll": "032dc8ee989648f31f15be15b7a478c043ff528134a461f4b0e3029fb3d114f5",
+      "engine/lib/wine/x86_64-windows/dxgi.dll": "fc58aae0aba511a1ec4d2417e5bba6adb888bb14315d0f59cccdfd27f670d544",
+      "engine/lib/wine/x86_64-windows/winemac.drv": "e84ea6b0007221a33957e83ddf9151291ea3a4b709e619530d70bc5ad30cc1d2"
+    },
+    "destination": "~/Library/Application Support/Adapted Games",
+    "fontPathCount": 6,
+    "id": "games-hub",
+    "profilePolicy": "Private opaque APFS copy of owner working profile, no hardlinks; retain source for recovery. No credentials/save contents inspected, printed, committed or copied into Nix.",
+    "provenance": "Accepted standalone LGPL Wine and MIT DXMT/support runtime; exact signed GameToMac build87 Controllers EngineOverlay two-file controller backend with corresponding ControllerRuntime sources. No vendor GUI/helper/trial state.",
+    "remove": "Exact owned shortcut/resolver removal only; preserve profile and saves.",
+    "resolver": "~/AIDev/bin/games-play",
+    "rollback": "Archive owned hub after stopping only its prefix; retain source data and exact prior CS2.",
+    "runtimeOverlayPolicySha256": "4a51aec0b383319319b014c59b59c38025710d914b70469422d29f20ff0d5d3c",
+    "schema": 1,
+    "shortcuts": "~/Games",
+    "sourceTrees": {
+      "controllerSources": "5a9a9cb02d27417aea24782c2a1052050aedd281e53aedb26ca0009130de4133",
+      "standalone": "d7e4eb6165ae562c6ba811d0dbc186cdb77e98813d07d93f34237953032f6f50"
+    },
+    "version": 1,
+    "versionPolicy": "Runtime exact reviewed hashes; Steam/Ubisoft own product updates."
+  }
+}

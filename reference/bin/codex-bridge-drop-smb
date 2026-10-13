@@ -1,0 +1,542 @@
+#!/usr/bin/python3
+from __future__ import annotations
+
+import argparse
+import json
+import os
+from pathlib import Path
+import re
+import secrets
+import socket
+import stat
+import subprocess
+import sys
+import tempfile
+
+
+ROOT = Path(__file__).resolve().parents[1]
+PROFILE = "codex-bridge-drop-smb"
+BRANCH = "codex/codex-bridge-drop-automount"
+TUNNEL_LABEL = "com.aidev.codex-bridge.smb-tunnel"
+AUTOMOUNT_LABEL = "com.aidev.codex-bridge.smb-automount"
+TUNNEL_PLIST = (
+    Path.home() / "Library" / "LaunchAgents" / f"{TUNNEL_LABEL}.plist"
+)
+AUTOMOUNT_PLIST = (
+    Path.home() / "Library" / "LaunchAgents" / f"{AUTOMOUNT_LABEL}.plist"
+)
+AUTOMOUNT_SOURCE = ROOT / "darwin" / "codex-bridge-drop-automount.sh"
+AUTOMOUNT_STORE_RE = re.compile(
+    r"^/nix/store/[0-9a-z]{32}-codex-bridge-drop-automount/"
+    r"bin/codex-bridge-drop-automount$"
+)
+MOUNT_POINT = "/Volumes/CodexBridgeDrop"
+AUTOMOUNT_STATE_DIR = (
+    Path.home() / "Library" / "Application Support"
+    / "com.aidev.codex-bridge-drop"
+)
+AUTOMOUNT_PAUSE_MARKER = AUTOMOUNT_STATE_DIR / "automount-paused"
+LOCAL_HOST = "127.0.0.1"
+LOCAL_PORT = 14445
+REMOTE_FORWARD = "127.0.0.1:14445:127.0.0.1:445"
+COMMIT_RE = re.compile(r"^[0-9a-f]{40}$")
+PROGRAM_ARGUMENTS = [
+    "/usr/bin/ssh",
+    "-N",
+    "-T",
+    "-o",
+    "BatchMode=yes",
+    "-o",
+    "ExitOnForwardFailure=yes",
+    "-o",
+    "ServerAliveInterval=30",
+    "-o",
+    "ServerAliveCountMax=3",
+    "-L",
+    REMOTE_FORWARD,
+    "windows-host",
+]
+
+
+class ContractError(RuntimeError):
+    pass
+
+
+def run(
+    argv: list[str],
+    *,
+    input_text: str | None = None,
+    timeout: float = 30,
+) -> subprocess.CompletedProcess:
+    arguments: dict[str, object] = {
+        "args": argv,
+        "text": True,
+        "stdout": subprocess.PIPE,
+        "stderr": subprocess.PIPE,
+        "timeout": timeout,
+        "check": False,
+    }
+    if input_text is None:
+        arguments["stdin"] = subprocess.DEVNULL
+    else:
+        arguments["input"] = input_text
+    return subprocess.run(**arguments)
+
+
+def checked(argv: list[str], *, timeout: float = 30) -> str:
+    result = run(argv, timeout=timeout)
+    if result.returncode != 0:
+        raise ContractError(f"command_failed:{Path(argv[0]).name}")
+    return result.stdout
+
+
+def git(*args: str) -> str:
+    return checked(["/usr/bin/git", "-C", str(ROOT), *args]).strip()
+
+
+def require_exact_commit(expected: str) -> None:
+    if not COMMIT_RE.fullmatch(expected):
+        raise ContractError("invalid_commit")
+    if git("rev-parse", "--show-toplevel") != str(ROOT):
+        raise ContractError("wrong_control_root")
+    if git("rev-parse", "--abbrev-ref", "HEAD") != BRANCH:
+        raise ContractError("wrong_task_branch")
+    if git("rev-parse", "HEAD") != expected:
+        raise ContractError("commit_mismatch")
+    if git("status", "--porcelain=v1", "--untracked-files=all"):
+        raise ContractError("dirty_worktree")
+
+
+def strict_ssh_passes() -> bool:
+    result = run(
+        [
+            "/usr/bin/ssh",
+            "-T",
+            "-o",
+            "BatchMode=yes",
+            "-o",
+            "ConnectTimeout=8",
+            "windows-host",
+            "printf bridge_drop_ssh=pass",
+        ],
+        timeout=15,
+    )
+    return result.returncode == 0 and result.stdout == "bridge_drop_ssh=pass"
+
+
+def remote_smb_loopback_passes() -> bool:
+    result = run(
+        [
+            "/usr/bin/ssh",
+            "-T",
+            "-o",
+            "BatchMode=yes",
+            "-o",
+            "ConnectTimeout=8",
+            "-W",
+            "127.0.0.1:445",
+            "windows-host",
+        ],
+        timeout=15,
+    )
+    return result.returncode == 0
+
+
+def local_port_open() -> bool:
+    try:
+        with socket.create_connection((LOCAL_HOST, LOCAL_PORT), timeout=3):
+            return True
+    except OSError:
+        return False
+
+
+def expected_tunnel_plist() -> dict[str, object]:
+    return {
+        "KeepAlive": True,
+        "Label": TUNNEL_LABEL,
+        "ProcessType": "Background",
+        "ProgramArguments": PROGRAM_ARGUMENTS,
+        "RunAtLoad": True,
+        "StandardErrorPath": "/dev/null",
+        "StandardOutPath": "/dev/null",
+        "ThrottleInterval": 15,
+    }
+
+
+def read_plist(path: Path) -> dict[str, object] | None:
+    if not path.is_file() or path.is_symlink():
+        return None
+    observed_stat = path.stat()
+    if observed_stat.st_uid != os.getuid():
+        return None
+    if stat.S_IMODE(observed_stat.st_mode) & 0o022:
+        return None
+    result = run(
+        ["/usr/bin/plutil", "-convert", "json", "-o", "-", str(path)],
+        timeout=10,
+    )
+    if result.returncode != 0:
+        return None
+    try:
+        observed = json.loads(result.stdout)
+    except json.JSONDecodeError:
+        return None
+    return observed if isinstance(observed, dict) else None
+
+
+def tunnel_plist_exact() -> bool:
+    return read_plist(TUNNEL_PLIST) == expected_tunnel_plist()
+
+
+def automount_program() -> Path | None:
+    observed = read_plist(AUTOMOUNT_PLIST)
+    if observed is None:
+        return None
+    arguments = observed.get("ProgramArguments")
+    if not isinstance(arguments, list) or len(arguments) != 1:
+        return None
+    program = arguments[0]
+    if not isinstance(program, str) or not AUTOMOUNT_STORE_RE.fullmatch(program):
+        return None
+    candidate = Path(program)
+    if not candidate.is_file() or candidate.is_symlink():
+        return None
+    candidate_stat = candidate.stat()
+    if candidate_stat.st_uid != 0 or stat.S_IMODE(candidate_stat.st_mode) & 0o222:
+        return None
+    try:
+        if candidate.read_bytes() != AUTOMOUNT_SOURCE.read_bytes():
+            return None
+    except OSError:
+        return None
+    expected = {
+        "Label": AUTOMOUNT_LABEL,
+        "ProcessType": "Background",
+        "ProgramArguments": [program],
+        "RunAtLoad": True,
+        "StandardErrorPath": "/dev/null",
+        "StandardOutPath": "/dev/null",
+        "StartInterval": 60,
+    }
+    return candidate if observed == expected else None
+
+
+def automount_plist_exact() -> bool:
+    return automount_program() is not None
+
+
+def label_loaded(label: str) -> bool:
+    result = run(
+        ["/bin/launchctl", "print", f"gui/{os.getuid()}/{label}"],
+        timeout=10,
+    )
+    return result.returncode == 0
+
+
+def automount_state_valid() -> bool:
+    state_dir = AUTOMOUNT_STATE_DIR
+    marker = AUTOMOUNT_PAUSE_MARKER
+    if not state_dir.exists() and not state_dir.is_symlink():
+        return not marker.exists() and not marker.is_symlink()
+    if not state_dir.is_dir() or state_dir.is_symlink():
+        return False
+    state_stat = state_dir.stat()
+    if state_stat.st_uid != os.getuid():
+        return False
+    if stat.S_IMODE(state_stat.st_mode) != 0o700:
+        return False
+    if not marker.exists() and not marker.is_symlink():
+        return True
+    if not marker.is_file() or marker.is_symlink():
+        return False
+    marker_stat = marker.stat()
+    return (
+        marker_stat.st_uid == os.getuid()
+        and stat.S_IMODE(marker_stat.st_mode) == 0o600
+        and marker_stat.st_size == 0
+    )
+
+
+def finder_mount_active() -> bool:
+    result = run(["/sbin/mount"], timeout=10)
+    return (
+        result.returncode == 0
+        and f" on {MOUNT_POINT} " in result.stdout
+    )
+
+
+def automount_probe() -> bool:
+    program = automount_program()
+    if program is None:
+        return False
+    result = run([str(program)], timeout=30)
+    return result.returncode == 0 and finder_mount_active()
+
+
+def launchd_pid() -> int | None:
+    result = run(
+        ["/bin/launchctl", "print", f"gui/{os.getuid()}/{TUNNEL_LABEL}"],
+        timeout=10,
+    )
+    if result.returncode != 0 or "state = running" not in result.stdout:
+        return None
+    matches = re.findall(r"(?m)^\s*pid = ([0-9]+)\s*$", result.stdout)
+    if len(matches) != 1:
+        return None
+    return int(matches[0])
+
+
+def listener_owned_by(pid: int) -> bool:
+    result = run(
+        [
+            "/usr/sbin/lsof",
+            "-nP",
+            "-a",
+            "-p",
+            str(pid),
+            f"-iTCP:{LOCAL_PORT}",
+            "-sTCP:LISTEN",
+            "-Fpn",
+        ],
+        timeout=10,
+    )
+    if result.returncode != 0:
+        return False
+    lines = {line.strip() for line in result.stdout.splitlines() if line.strip()}
+    return f"p{pid}" in lines and f"n{LOCAL_HOST}:{LOCAL_PORT}" in lines
+
+
+def process_is_ssh(pid: int) -> bool:
+    result = run(["/bin/ps", "-p", str(pid), "-o", "comm="], timeout=10)
+    if result.returncode != 0:
+        return False
+    return result.stdout.strip() == "/usr/bin/ssh"
+
+
+def managed_state() -> str:
+    pid = launchd_pid()
+    tunnel_exact = (
+        tunnel_plist_exact()
+        and label_loaded(TUNNEL_LABEL)
+        and pid is not None
+        and process_is_ssh(pid)
+        and listener_owned_by(pid)
+        and local_port_open()
+    )
+    exact = (
+        tunnel_exact
+        and automount_plist_exact()
+        and label_loaded(AUTOMOUNT_LABEL)
+        and automount_state_valid()
+    )
+    if exact:
+        return "exact"
+    legacy_tunnel_only = (
+        tunnel_exact
+        and not AUTOMOUNT_PLIST.exists()
+        and not AUTOMOUNT_PLIST.is_symlink()
+        and not label_loaded(AUTOMOUNT_LABEL)
+        and automount_state_valid()
+    )
+    if legacy_tunnel_only:
+        return "legacy_tunnel_only"
+    if (
+        not TUNNEL_PLIST.exists()
+        and not TUNNEL_PLIST.is_symlink()
+        and not AUTOMOUNT_PLIST.exists()
+        and not AUTOMOUNT_PLIST.is_symlink()
+        and not label_loaded(TUNNEL_LABEL)
+        and not label_loaded(AUTOMOUNT_LABEL)
+        and pid is None
+        and not local_port_open()
+    ):
+        return "absent"
+    return "conflict"
+
+
+def sftp_probe() -> bool:
+    token = secrets.token_hex(12)
+    remote = f"/C:/CodexBridgeDrop/.aidev-sftp-{token}"
+    expected = secrets.token_bytes(32)
+    with tempfile.TemporaryDirectory(prefix="codex-bridge-sftp-") as temporary:
+        source = Path(temporary) / "source"
+        returned = Path(temporary) / "returned"
+        source.write_bytes(expected)
+        batch = (
+            f"put {source} {remote}\n"
+            f"get {remote} {returned}\n"
+            f"rm {remote}\n"
+        )
+        result = run(
+            [
+                "/usr/bin/sftp",
+                "-q",
+                "-b",
+                "-",
+                "-o",
+                "BatchMode=yes",
+                "-o",
+                "ConnectTimeout=8",
+                "windows-host",
+            ],
+            input_text=batch,
+            timeout=30,
+        )
+        if result.returncode != 0:
+            run(
+                [
+                    "/usr/bin/sftp",
+                    "-q",
+                    "-b",
+                    "-",
+                    "-o",
+                    "BatchMode=yes",
+                    "-o",
+                    "ConnectTimeout=8",
+                    "windows-host",
+                ],
+                input_text=f"rm {remote}\n",
+                timeout=15,
+            )
+            return False
+        return returned.is_file() and returned.read_bytes() == expected
+
+
+def preflight() -> dict[str, object]:
+    state = managed_state()
+    facts: dict[str, object] = {
+        "profile": PROFILE,
+        "strict_ssh_pass": strict_ssh_passes(),
+        "remote_smb_loopback_pass": remote_smb_loopback_passes(),
+        "managed_state": state,
+        "local_listener_state_valid": (
+            (state == "absent" and not local_port_open())
+            or (state in {"exact", "legacy_tunnel_only"} and local_port_open())
+        ),
+        "firewall_mutation_count": 0,
+        "tailscale_policy_mutation_count": 0,
+        "identifiers_emitted": False,
+    }
+    facts["verdict"] = (
+        "PASS"
+        if facts["strict_ssh_pass"]
+        and facts["remote_smb_loopback_pass"]
+        and state in {"absent", "exact", "legacy_tunnel_only"}
+        and facts["local_listener_state_valid"]
+        and not facts["identifiers_emitted"]
+        else "BLOCKED"
+    )
+    return facts
+
+
+def doctor() -> dict[str, object]:
+    state = managed_state()
+    facts: dict[str, object] = {
+        "profile": PROFILE,
+        "managed_launchagent_pass": state == "exact",
+        "automount_launchagent_pass": automount_plist_exact(),
+        "automount_pause_state_pass": automount_state_valid(),
+        "finder_automount_pass": automount_probe(),
+        "localhost_tunnel_pass": local_port_open(),
+        "strict_ssh_pass": strict_ssh_passes(),
+        "remote_smb_loopback_pass": remote_smb_loopback_passes(),
+        "bounded_sftp_probe_pass": sftp_probe(),
+        "firewall_mutation_count": 0,
+        "tailscale_policy_mutation_count": 0,
+        "identifiers_emitted": False,
+    }
+    facts["verdict"] = (
+        "PASS"
+        if all(
+            bool(value)
+            for key, value in facts.items()
+            if key
+            not in {
+                "profile",
+                "verdict",
+                "firewall_mutation_count",
+                "tailscale_policy_mutation_count",
+                "identifiers_emitted",
+            }
+        )
+        and facts["firewall_mutation_count"] == 0
+        and facts["tailscale_policy_mutation_count"] == 0
+        and not facts["identifiers_emitted"]
+        else "BLOCKED"
+    )
+    return facts
+
+
+def current_system_target() -> str:
+    target = Path("/run/current-system")
+    if not target.is_symlink():
+        raise ContractError("current_system_target_unavailable")
+    return os.readlink(target)
+
+
+def apply(commit: str) -> dict[str, object]:
+    require_exact_commit(commit)
+    before = preflight()
+    if before.get("verdict") != "PASS":
+        raise ContractError("preflight_blocked")
+    before_target = current_system_target()
+    result = run(
+        [
+            "/usr/bin/sudo",
+            "-n",
+            "/usr/local/libexec/aid-admin",
+            "apply-system",
+            commit,
+        ],
+        timeout=1800,
+    )
+    if result.returncode != 0:
+        raise ContractError("typed_apply_failed")
+    checked = doctor()
+    if checked.get("verdict") != "PASS":
+        raise ContractError("postapply_failed_exact_rollback_commit_required")
+    checked["apply_noop"] = (
+        before.get("managed_state") == "exact"
+        and current_system_target() == before_target
+    )
+    return checked
+
+
+def emit(payload: dict[str, object], as_json: bool) -> None:
+    if as_json:
+        print(json.dumps(payload, sort_keys=True, separators=(",", ":")))
+        return
+    for key in sorted(payload):
+        value = payload[key]
+        if isinstance(value, bool):
+            value = str(value).lower()
+        print(f"{key}={value}")
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser()
+    subparsers = parser.add_subparsers(dest="command", required=True)
+    prepare_parser = subparsers.add_parser("prepare")
+    prepare_parser.add_argument("--json", action="store_true")
+    apply_parser = subparsers.add_parser("apply")
+    apply_parser.add_argument("--commit", required=True)
+    apply_parser.add_argument("--json", action="store_true")
+    doctor_parser = subparsers.add_parser("doctor")
+    doctor_parser.add_argument("--json", action="store_true")
+    args = parser.parse_args()
+    try:
+        if args.command == "prepare":
+            payload = preflight()
+        elif args.command == "apply":
+            payload = apply(args.commit)
+        else:
+            payload = doctor()
+        emit(payload, args.json)
+        return 0 if payload.get("verdict") == "PASS" else 1
+    except (ContractError, OSError, subprocess.SubprocessError) as error:
+        print(f"blocked={error}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

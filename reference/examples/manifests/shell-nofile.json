@@ -1,0 +1,21 @@
+{
+  "publicReferenceOnly": true,
+  "warning": "Sanitized historical example. Not installation authority or current inventory.",
+  "example": {
+    "schema": 1,
+    "id": "shell-nofile",
+    "target": "~/.zshrc",
+    "versionPolicy": "reviewed immutable source",
+    "architecture": "macOS zsh, architecture independent",
+    "softLimitFloor": 4096,
+    "hardLimitChanged": false,
+    "payloadSha256": "861084c98f783cdd965f70e9690200a23089e4f04b204dfe337379678801ee11",
+    "capabilities": [
+      "raise soft open-file limit in new interactive zsh sessions when permitted by existing hard limit"
+    ],
+    "removePolicy": "exact receipt and target match required",
+    "rollback": "bin/shell-nofile rollback --commit <accepted-main-commit>",
+    "smoke": "fresh interactive zsh soft limit >=4096; hard limit unchanged",
+    "dataBoundary": "only managed startup file and receipt; no existing files adopted"
+  }
+}

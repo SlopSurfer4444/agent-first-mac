@@ -1,0 +1,345 @@
+{
+  "publicReferenceOnly": true,
+  "warning": "Sanitized historical example. Not installation authority or current inventory.",
+  "example": {
+    "schema": 1,
+    "phase": "phase3_permissions_preparation",
+    "authority": {
+      "base_commit": "2fdbd7e7419fc049565f87b29a21b7dd1838a754",
+      "branch": "codex/phase-3-permissions-prep",
+      "verdict_ceiling": "PREPARED_FOR_INDEPENDENT_REVIEW"
+    },
+    "provenance": {
+      "apple_background_tasks": "https://support.apple.com/en-gb/guide/deployment/depdca572563/web",
+      "apple_code_identity": "https://developer.apple.com/documentation/xcode/creating-distribution-signed-code-for-the-mac",
+      "apple_developer_tools": "https://support.apple.com/en-ie/guide/mac-help/mchlc5fb7f9c/mac",
+      "apple_privacy_controls": "https://support.apple.com/en-ca/guide/mac-help/mh43185/mac",
+      "apple_service_management": "https://developer.apple.com/documentation/servicemanagement/smappservice",
+      "openai_chrome": "https://learn.chatgpt.com/docs/chrome-extension",
+      "openai_computer_use": "https://learn.chatgpt.com/docs/computer-use"
+    },
+    "logical_identities": [
+      {
+        "id": "codex_desktop",
+        "class": "canonical_application",
+        "preparation_role": "required_ceremony_identity",
+        "path": "/Applications/ChatGPT.app",
+        "bundle_id": "com.openai.codex",
+        "team_id": "2DC432GLL2",
+        "designated_requirement": "identifier \"com.openai.codex\" and anchor apple generic and certificate 1[field.1.2.840.113635.100.6.2.6] /* exists */ and certificate leaf[field.1.2.840.113635.100.6.1.13] /* exists */ and certificate leaf[subject.OU] = \"2DC432GLL2\"",
+        "version_policy": "exact_observed_retest_on_change",
+        "signature_verification": "deep_strict",
+        "permission_role": "desktop_host_and_tcc_subject"
+      },
+      {
+        "id": "computer_use_runtime",
+        "class": "stable_user_runtime_application",
+        "preparation_role": "required_ceremony_identity",
+        "path": "$HOME/.codex/computer-use/Codex Computer Use.app",
+        "bundle_id": "com.openai.sky.CUAService",
+        "team_id": "2DC432GLL2",
+        "designated_requirement": "identifier \"com.openai.sky.CUAService\" and anchor apple generic and certificate 1[field.1.2.840.113635.100.6.2.6] /* exists */ and certificate leaf[field.1.2.840.113635.100.6.1.13] /* exists */ and certificate leaf[subject.OU] = \"2DC432GLL2\"",
+        "version_policy": "exact_observed_retest_on_change",
+        "signature_verification": "deep_strict",
+        "permission_role": "primary_computer_use_tcc_subject"
+      },
+      {
+        "id": "computer_use_client",
+        "class": "embedded_attribution_component",
+        "preparation_role": "required_attribution_identity",
+        "path": "$HOME/.codex/computer-use/Codex Computer Use.app/Contents/SharedSupport/SkyComputerUseClient.app",
+        "bundle_id": "com.openai.sky.CUAService.cli",
+        "team_id": "2DC432GLL2",
+        "designated_requirement": "identifier \"com.openai.sky.CUAService.cli\" and anchor apple generic and certificate 1[field.1.2.840.113635.100.6.2.6] /* exists */ and certificate leaf[field.1.2.840.113635.100.6.1.13] /* exists */ and certificate leaf[subject.OU] = \"2DC432GLL2\"",
+        "version_policy": "exact_observed_retest_on_change",
+        "signature_verification": "deep_strict",
+        "permission_role": "do_not_grant_separately_without_probe_attribution"
+      },
+      {
+        "id": "computer_use_guardian",
+        "class": "embedded_attribution_component",
+        "preparation_role": "required_attribution_identity",
+        "path": "$HOME/.codex/computer-use/Codex Computer Use.app/Contents/SharedSupport/CUALockScreenGuardian.app",
+        "bundle_id": "com.openai.sky.CUAService.guardian",
+        "team_id": "2DC432GLL2",
+        "designated_requirement": "identifier \"com.openai.sky.CUAService.guardian\" and anchor apple generic and certificate 1[field.1.2.840.113635.100.6.2.6] /* exists */ and certificate leaf[field.1.2.840.113635.100.6.1.13] /* exists */ and certificate leaf[subject.OU] = \"2DC432GLL2\"",
+        "version_policy": "exact_observed_retest_on_change",
+        "signature_verification": "deep_strict",
+        "permission_role": "locked_use_attribution_component"
+      },
+      {
+        "id": "computer_use_installer",
+        "class": "embedded_attribution_component",
+        "preparation_role": "required_attribution_identity",
+        "path": "$HOME/.codex/computer-use/Codex Computer Use.app/Contents/SharedSupport/Codex Computer Use Installer.app",
+        "bundle_id": "com.openai.sky.CUAService.AuthorizationPluginInstaller",
+        "team_id": "2DC432GLL2",
+        "designated_requirement": "identifier \"com.openai.sky.CUAService.AuthorizationPluginInstaller\" and anchor apple generic and certificate 1[field.1.2.840.113635.100.6.2.6] /* exists */ and certificate leaf[field.1.2.840.113635.100.6.1.13] /* exists */ and certificate leaf[subject.OU] = \"2DC432GLL2\"",
+        "version_policy": "exact_observed_retest_on_change",
+        "signature_verification": "deep_strict",
+        "permission_role": "future_owner_authenticated_installer_only"
+      },
+      {
+        "id": "authorization_plugin_embedded",
+        "class": "embedded_authorization_plugin",
+        "preparation_role": "required_attribution_identity",
+        "path": "$HOME/.codex/computer-use/Codex Computer Use.app/Contents/SharedSupport/Codex Computer Use Installer.app/Contents/Resources/CodexComputerUseAuthorizationPlugin.bundle",
+        "bundle_id": "com.openai.sky.CUAService.AuthorizationPlugin",
+        "team_id": "2DC432GLL2",
+        "designated_requirement": "identifier \"com.openai.sky.CUAService.AuthorizationPlugin\" and anchor apple generic and certificate 1[field.1.2.840.113635.100.6.2.6] /* exists */ and certificate leaf[field.1.2.840.113635.100.6.1.13] /* exists */ and certificate leaf[subject.OU] = \"2DC432GLL2\"",
+        "version_policy": "exact_observed_retest_on_change",
+        "signature_verification": "strict",
+        "permission_role": "locked_use_candidate_payload"
+      },
+      {
+        "id": "authorization_plugin_installed",
+        "class": "installed_authorization_plugin",
+        "preparation_role": "required_attribution_identity",
+        "path": "/Library/Security/SecurityAgentPlugins/CodexComputerUseAuthorizationPlugin.bundle",
+        "bundle_id": "com.openai.sky.CUAService.AuthorizationPlugin",
+        "team_id": "2DC432GLL2",
+        "designated_requirement": "identifier \"com.openai.sky.CUAService.AuthorizationPlugin\" and anchor apple generic and certificate 1[field.1.2.840.113635.100.6.2.6] /* exists */ and certificate leaf[field.1.2.840.113635.100.6.1.13] /* exists */ and certificate leaf[subject.OU] = \"2DC432GLL2\"",
+        "version_policy": "exact_observed_retest_on_change",
+        "signature_verification": "strict",
+        "permission_role": "locked_use_installed_payload_revalidation_required"
+      },
+      {
+        "id": "google_chrome",
+        "class": "canonical_application",
+        "preparation_role": "optional_adoption_candidate",
+        "path": "/Applications/Google Chrome.app",
+        "bundle_id": "com.google.Chrome",
+        "team_id": "EQHXZ8M8AV",
+        "designated_requirement": "(identifier \"com.google.Chrome\" or identifier \"com.google.Chrome.beta\" or identifier \"com.google.Chrome.dev\" or identifier \"com.google.Chrome.canary\") and anchor apple generic and certificate 1[field.1.2.840.113635.100.6.2.6] /* exists */ and certificate leaf[field.1.2.840.113635.100.6.1.13] /* exists */ and certificate leaf[subject.OU] = EQHXZ8M8AV",
+        "version_policy": "exact_observed_retest_on_change",
+        "signature_verification": "deep_strict",
+        "permission_role": "future_chrome_extension_host"
+      },
+      {
+        "id": "google_updater",
+        "class": "vendor_background_application",
+        "preparation_role": "optional_adoption_candidate",
+        "path": "$HOME/Library/Application Support/Google/GoogleUpdater/Current/GoogleUpdater.app",
+        "bundle_id": "com.google.GoogleUpdater",
+        "team_id": "EQHXZ8M8AV",
+        "designated_requirement": "identifier \"com.google.GoogleUpdater\" and anchor apple generic and certificate 1[field.1.2.840.113635.100.6.2.6] /* exists */ and certificate leaf[field.1.2.840.113635.100.6.1.13] /* exists */ and certificate leaf[subject.OU] = EQHXZ8M8AV",
+        "version_policy": "rolling_vendor_identity_reattest",
+        "signature_verification": "deep_strict",
+        "permission_role": "chrome_update_lifecycle_attribution"
+      },
+      {
+        "id": "happ_app",
+        "class": "canonical_macos_application",
+        "preparation_role": "optional_adoption_candidate",
+        "path": "/Applications/Happ.app",
+        "bundle_id": "su.ffg.happ",
+        "team_id": "A6NW69KD84",
+        "designated_requirement": "(anchor apple generic and certificate leaf[field.1.2.840.113635.100.6.1.9] /* exists */ or anchor apple generic and certificate 1[field.1.2.840.113635.100.6.2.6] /* exists */ and certificate leaf[field.1.2.840.113635.100.6.1.13] /* exists */ and certificate leaf[subject.OU] = A6NW69KD84) and identifier \"su.ffg.happ\"",
+        "version_policy": "exact_observed_retest_on_change",
+        "signature_verification": "deep_strict",
+        "permission_role": "vpn_application_lifecycle_identity",
+        "app_store_item_id": "6504287215"
+      },
+      {
+        "id": "happ_tunnel_extension",
+        "class": "embedded_network_extension",
+        "preparation_role": "optional_adoption_candidate",
+        "path": "/Applications/Happ.app/Contents/PlugIns/Tunnel.appex",
+        "bundle_id": "su.ffg.happ.tunnel",
+        "team_id": "A6NW69KD84",
+        "designated_requirement": "(anchor apple generic and certificate leaf[field.1.2.840.113635.100.6.1.9] /* exists */ or anchor apple generic and certificate 1[field.1.2.840.113635.100.6.2.6] /* exists */ and certificate leaf[field.1.2.840.113635.100.6.1.13] /* exists */ and certificate leaf[subject.OU] = A6NW69KD84) and identifier \"su.ffg.happ.tunnel\"",
+        "version_policy": "exact_observed_retest_on_change",
+        "signature_verification": "strict",
+        "permission_role": "vpn_network_extension_lifecycle_identity"
+      },
+      {
+        "id": "amnezia_app",
+        "class": "canonical_ios_style_wrapper_inner_application",
+        "preparation_role": "optional_adoption_candidate",
+        "path": "/Applications/AmneziaVPN.app/Wrapper/AmneziaVPN.app",
+        "bundle_id": "org.amnezia.AmneziaVPN",
+        "team_id": "X7UJ388FXK",
+        "designated_requirement": "anchor apple generic and certificate leaf[field.1.2.840.113635.100.6.1.3] /* exists */ and identifier \"org.amnezia.AmneziaVPN\"",
+        "version_policy": "exact_observed_retest_on_change",
+        "signature_verification": "strict",
+        "permission_role": "vpn_application_lifecycle_identity",
+        "architecture_class": "arm64_ios_style_wrapper"
+      },
+      {
+        "id": "amnezia_network_extension",
+        "class": "embedded_network_extension",
+        "preparation_role": "optional_adoption_candidate",
+        "path": "/Applications/AmneziaVPN.app/Wrapper/AmneziaVPN.app/PlugIns/AmneziaVPNNetworkExtension.appex",
+        "bundle_id": "org.amnezia.AmneziaVPN.network-extension",
+        "team_id": "X7UJ388FXK",
+        "designated_requirement": "anchor apple generic and certificate leaf[field.1.2.840.113635.100.6.1.3] /* exists */ and identifier \"org.amnezia.AmneziaVPN.network-extension\"",
+        "version_policy": "exact_observed_retest_on_change",
+        "signature_verification": "strict",
+        "permission_role": "vpn_network_extension_lifecycle_identity"
+      }
+    ],
+    "identity_relationships": [
+      {
+        "id": "locked_use_payload_version_alignment",
+        "left": "authorization_plugin_installed",
+        "operator": "same_version",
+        "right": "authorization_plugin_embedded",
+        "effect": "locked_use_blocked_until_vendor_supported_owner_ceremony_and_reattestation"
+      }
+    ],
+    "capabilities": [
+      {
+        "id": "macos_tcc.full_disk_access_codex",
+        "plane": "macos_tcc",
+        "requirement": "required_phase3",
+        "rationale": "Allow the desktop host to perform explicitly requested workflows in protected owner locations; this does not grant root, Keychain, screen, or UI control.",
+        "responsible_identity": "codex_desktop",
+        "safe_preflight": "identity_only_no_permission_state_read",
+        "future_probe": "Create a non-sensitive prepared file in each declared protected test location, stat it, and delete only that prepared file.",
+        "restart": "Restart ChatGPT/Codex once after all macOS privacy changes.",
+        "revoke": "Turn off only the attested identity in Full Disk Access, restart it, and rerun the prepared-file probe expecting denial.",
+        "reattestation": "Any bundle ID, Team ID, designated requirement, canonical path, or major-version change."
+      },
+      {
+        "id": "macos_tcc.accessibility_computer_use",
+        "plane": "macos_tcc",
+        "requirement": "required_phase3",
+        "rationale": "Computer Use needs Accessibility to inspect UI structure and click, type, and navigate.",
+        "responsible_identity": "computer_use_runtime",
+        "safe_preflight": "identity_only_no_ax_request",
+        "future_probe": "Read a harmless test app accessibility tree, click one test control, and type a fixed non-secret string.",
+        "restart": "Restart the Computer Use component through its supported product lifecycle after all privacy changes.",
+        "revoke": "Turn off Codex Computer Use in Accessibility and rerun the test-app probe expecting denial.",
+        "reattestation": "Any responsible identity or attribution change, or a failed prompt-free repetition."
+      },
+      {
+        "id": "macos_tcc.screen_recording_computer_use",
+        "plane": "macos_tcc",
+        "requirement": "required_phase3",
+        "rationale": "Computer Use needs Screen Recording to observe target application pixels.",
+        "responsible_identity": "computer_use_runtime",
+        "safe_preflight": "identity_only_no_capture_preflight",
+        "future_probe": "Capture only a prepared non-sensitive test window and verify a redacted boolean result.",
+        "restart": "Restart the Computer Use component once after all privacy changes.",
+        "revoke": "Turn off Codex Computer Use in Screen & System Audio Recording and rerun the test-window probe expecting denial.",
+        "reattestation": "Any responsible identity or attribution change, macOS major update, or failed repetition."
+      },
+      {
+        "id": "macos_tcc.input_monitoring_computer_use",
+        "plane": "macos_tcc",
+        "requirement": "conditional_not_baseline",
+        "rationale": "Input Monitoring is unnecessary for baseline Computer Use unless a measured passive global-input requirement remains after Accessibility works.",
+        "responsible_identity": "computer_use_runtime",
+        "safe_preflight": "not_requested_or_observed",
+        "future_probe": "Only after a documented feature failure, test the smallest passive-input behavior without recording input content.",
+        "restart": "Only if the future measured requirement needs it.",
+        "revoke": "Turn off the exact identity in Input Monitoring and confirm baseline Computer Use still passes.",
+        "reattestation": "Any proposal to add this capability requires new evidence and owner authority."
+      },
+      {
+        "id": "macos_tcc.conditional_data_and_app_controls",
+        "plane": "macos_tcc",
+        "requirement": "conditional_not_baseline",
+        "rationale": "Files & Folders, Removable Volumes, Local Network, App Management, and Automation are granted only for a named workflow and actual responsible identity or sender-receiver pair.",
+        "responsible_identity": "codex_desktop",
+        "safe_preflight": "not_requested_or_observed",
+        "future_probe": "Use prepared files, a disposable signed test app, a local test endpoint, or one harmless named Automation receiver query.",
+        "restart": "Only where the product or macOS requires it.",
+        "revoke": "Remove the exact category or sender-receiver approval and rerun only its bounded negative probe.",
+        "reattestation": "New workflow, receiver, responsible identity, or lifecycle owner."
+      },
+      {
+        "id": "computer_use.product_allowlist",
+        "plane": "computer_use_product_allowlist",
+        "requirement": "required_phase3",
+        "rationale": "macOS TCC does not authorize target apps inside the Computer Use product policy.",
+        "responsible_identity": "computer_use_runtime",
+        "safe_preflight": "not_observed_without_product_session_read",
+        "future_probe": "Use one prepared test app twice; the second run must be prompt-free and must not target Terminal or ChatGPT.",
+        "restart": "Start a new task after policy changes; restart only if current product guidance requires it.",
+        "revoke": "Remove the exact app from Always-allowed apps and confirm the next attempt asks or denies.",
+        "reattestation": "Allowlist change, Computer Use update, or unexpected prompt."
+      },
+      {
+        "id": "chrome.extension_domain_and_history",
+        "plane": "chrome_extension_domain_history",
+        "requirement": "conditional_not_baseline",
+        "rationale": "Chrome extension connection, per-domain access, and browser-history access are separate from macOS TCC and from each other.",
+        "responsible_identity": "google_chrome",
+        "safe_preflight": "profile_and_session_not_read",
+        "future_probe": "Verify Connected in the selected profile, use one reviewed public test host twice, and do not request browser history.",
+        "restart": "Start a new task; restart Chrome and ChatGPT only if connection remains unavailable.",
+        "revoke": "Remove the host from the allowlist or disable the extension; keep profile, sessions, and history intact.",
+        "reattestation": "Extension ID or publisher change, profile change, domain-policy change, or disconnected state."
+      },
+      {
+        "id": "background.google_updater",
+        "plane": "background_and_authorization_helper",
+        "requirement": "adoption_candidate_only",
+        "rationale": "The signed Google updater is the observed Chrome lifecycle component; ownership or channel must not change during Phase 3 preparation.",
+        "responsible_identity": "google_updater",
+        "safe_preflight": "exact_launch_label_and_identity_health",
+        "future_probe": "Read-only vendor update health and version check without triggering an update.",
+        "restart": "None.",
+        "revoke": "Future Chrome adoption plan must use the vendor-supported lifecycle and preserve the browser profile.",
+        "reattestation": "Updater identity, label, channel, or Chrome owner decision changes."
+      },
+      {
+        "id": "locked_use.authorization_plugin",
+        "plane": "background_and_authorization_helper",
+        "requirement": "planned_not_enabled_or_tested",
+        "rationale": "Locked Use is a narrow future unattended-GUI capability and requires an Apple authorization plug-in plus an active trusted Computer Use turn.",
+        "responsible_identity": "authorization_plugin_installed",
+        "safe_preflight": "identity_and_version_relationship_only",
+        "future_probe": "After vendor-supported reconciliation and owner approval, verify one active trusted turn temporarily unlocks, covers all displays, and relocks on local input.",
+        "restart": "Follow the vendor flow only after the installed and embedded identities are re-attested.",
+        "revoke": "Disable Locked Use in product settings and use the vendor-supported authorization plug-in removal path; verify ordinary screen lock remains.",
+        "reattestation": "Installed and embedded versions differ now; reconcile through the vendor flow before any test, and repeat after every plug-in identity or version change."
+      },
+      {
+        "id": "developer_tools.privacy_and_security",
+        "plane": "developer_tools",
+        "requirement": "required_phase3",
+        "rationale": "Developer Tools privacy approval and DevToolsSecurity policy are distinct from TCC file and UI grants and from root authority.",
+        "responsible_identity": "codex_desktop",
+        "safe_preflight": "developer_group_and_devtoolssecurity_status_only",
+        "future_probe": "Build and run a harmless local test program and perform an Apple-signed debugger probe twice without an authorization prompt.",
+        "restart": "Restart the developer host only if macOS requests it.",
+        "revoke": "Disable the exact Developer Tools app entry and restore DevToolsSecurity through an owner-authenticated maintenance action, then confirm the debugger probe no longer silently succeeds.",
+        "reattestation": "Developer host identity, selected developer directory, or macOS major version changes."
+      },
+      {
+        "id": "vpn.inventory_adoption",
+        "plane": "vpn_inventory_adoption",
+        "requirement": "adoption_candidates_only",
+        "rationale": "Happ and AmneziaVPN are installed VPN adoption candidates; Happ is attested, while Amnezia remains blocked by strict signature and Gatekeeper health without inspecting profiles, credentials, or network state.",
+        "responsible_identity": null,
+        "safe_preflight": "exact_app_and_network_extension_identity_signature_gatekeeper_receipt_and_architecture_only",
+        "future_probe": "A separately authorized Phase 7 adoption must identify the current owner and supported lifecycle, preserve a fallback network path, and test connection and rollback without retaining profiles or credentials.",
+        "restart": "None in Phase 3.",
+        "revoke": "Future removal or extension revocation must follow the separately reviewed vendor lifecycle and preserve network recovery.",
+        "reattestation": "Any app, extension, Team, designated requirement, version, receipt, signature, Gatekeeper, owner, channel, or network-extension change."
+      },
+      {
+        "id": "phase4.aid_admin",
+        "plane": "future_phase4_root_authority",
+        "requirement": "future_phase4_only",
+        "rationale": "Root/admin authority is independent of TCC and is intentionally outside Phase 3 preparation.",
+        "responsible_identity": null,
+        "safe_preflight": "not_present_not_probed",
+        "future_probe": "Phase 4 must deny unknown input, validate fixed executables, pass a non-interactive status probe, and prove audit and rollback.",
+        "restart": "Not applicable.",
+        "revoke": "Use the future emergency disable path from the Phase 4 contract.",
+        "reattestation": "Every broker binary, policy, sudoers, or control-commit change."
+      }
+    ],
+    "preflight_status_vocabulary": [
+      "verified_identity",
+      "absent",
+      "mismatch",
+      "safely_observed",
+      "unknown_requires_ceremony_probe",
+      "blocked"
+    ]
+  }
+}

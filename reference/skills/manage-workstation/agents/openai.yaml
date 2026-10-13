@@ -1,0 +1,4 @@
+interface:
+  display_name: "Manage Workstation"
+  short_description: "Manage workstation lifecycle changes safely"
+  default_prompt: "Use $manage-workstation to plan and verify this workstation lifecycle change."

@@ -1,0 +1,308 @@
+#!/usr/bin/python3
+"""Read-only live doctor for the managed AmneziaVPN desktop lifecycle."""
+
+import json
+from pathlib import Path
+import plistlib
+import re
+import subprocess
+import sys
+
+
+ROOT = Path(__file__).resolve().parent.parent
+MANIFEST = ROOT / "manifests/amnezia-desktop.json"
+
+
+def command(argv, timeout=None):
+    return subprocess.run(argv, text=True, stdout=subprocess.PIPE,
+                          stderr=subprocess.STDOUT, check=False, timeout=timeout)
+
+
+def plist_value(plist, key):
+    result = command(["/usr/bin/plutil", "-extract", key, "raw", "-o", "-",
+                      str(plist)])
+    return result.stdout.strip() if result.returncode == 0 else None
+
+
+def bundle_value(bundle, key):
+    return plist_value(bundle / "Contents/Info.plist", key)
+
+
+def team_id(path):
+    result = command(["/usr/bin/codesign", "-d", "--verbose=4", str(path)])
+    match = re.search(r"^TeamIdentifier=([^\n]+)$", result.stdout, re.MULTILINE)
+    return match.group(1) if match else None
+
+
+def sha256(path):
+    result = command(["/usr/bin/shasum", "-a", "256", str(path)])
+    return result.stdout.split()[0] if result.returncode == 0 else None
+
+
+def dock_application_urls():
+    result = command(["/usr/bin/defaults", "export", "com.apple.dock", "-"])
+    if result.returncode != 0:
+        return None
+    try:
+        dock = plistlib.loads(result.stdout.encode())
+    except Exception:
+        return None
+    return [item.get("tile-data", {}).get("file-data", {}).get("_CFURLString")
+            for item in dock.get("persistent-apps", [])]
+
+
+def revision_observation():
+    """Consume bounded source-alignment evidence, never a replacement for health."""
+    unknown = {"state": "UNKNOWN", "compatible": False, "revisionExact": False,
+               "sourceRevision": None, "installedRevision": None, "sourceAdmissionMode": None}
+    def unique(pairs):
+        value = {}
+        for key, item in pairs:
+            if key in value:
+                raise ValueError("duplicate key")
+            value[key] = item
+        return value
+    try:
+        # The helper owns a 180s cooperative budget including its command cleanup.
+        # Never preempt it with this doctor's shorter ordinary-command timeout.
+        result = command([sys.executable, str(ROOT / "bin/system-revision-status"), "--json"], timeout=200)
+        if result.returncode != 0 or len(result.stdout) > 16384:
+            return unknown
+        value = json.loads(result.stdout, object_pairs_hook=unique)
+        if type(value) is not dict or type(value.get("schema")) is not int or value["schema"] != 1:
+            return unknown
+        if not all(value.get(key) is True for key in (
+                "compatible", "sourceAccepted", "installedCommitAccepted",
+                "systemInputsEqual", "childSettled", "sourceHandlesClosed", "readOnly")):
+            return unknown
+        if value.get("systemMutationsPerformed") is not False:
+            return unknown
+        source, installed = value.get("sourceRevision"), value.get("installedRevision")
+        if not all(type(item) is str and re.fullmatch(r"[0-9a-f]{40}", item)
+                   and item != "0" * 40 for item in (source, installed)):
+            return unknown
+        admission = value.get("sourceAdmissionMode")
+        if type(admission) is not str or admission not in ("historical-review", "current-state"):
+            return unknown
+        current_state = admission == "current-state"
+        exact = source == installed
+        expected = "CURRENT_REVISION" if exact else (
+            "CURRENT_CONTROL_ONLY_SUCCESSOR" if current_state else "ACCEPTED_CONTROL_ONLY_SUCCESSOR")
+        reason = (("exact_admitted_revision" if current_state else "exact_accepted_revision") if exact
+                  else ("current_system_inputs_unchanged" if current_state else "reviewed_system_inputs_unchanged"))
+        if value.get("reason") != reason:
+            return unknown
+        if value.get("state") != expected or value.get("revisionExact") is not exact:
+            return unknown
+        return {"state": expected, "compatible": True, "revisionExact": exact,
+                "sourceRevision": source, "installedRevision": installed, "sourceAdmissionMode": admission}
+    except (ValueError, TypeError, OSError, AttributeError, subprocess.SubprocessError):
+        return unknown
+
+
+def main():
+    mode = sys.argv[1:] or ["--manifest"]
+    if mode not in (["--manifest"], ["--prestate"], ["--target"], ["--absent"]):
+        raise RuntimeError("usage")
+    revision = revision_observation()
+    if not revision["compatible"]:
+        print(json.dumps({"schema": 1, "result": "fail",
+            "checks": {"configuration_revision": False},
+            "problems": ["configuration_revision"],
+            "configurationRevisionStatus": revision, "componentChecksRun": False,
+            "readOnly": True, "systemMutationsPerformed": False,
+            "vpnConfigurationInspected": False}, sort_keys=True))
+        raise SystemExit(1)
+    manifest = json.loads(MANIFEST.read_text())
+    state = {"--prestate": "legacy", "--target": "desktop", "--absent": "absent"}.get(
+        mode[0], manifest["desiredState"])
+    if state not in ("legacy", "desktop", "absent"):
+        raise RuntimeError("manifest_state")
+    active = state == "desktop"
+    checks = {}
+    problems = []
+
+    def check(name, condition):
+        checks[name] = bool(condition)
+        if not condition:
+            problems.append(name)
+
+    check("configuration_revision", revision["compatible"])
+
+    canonical = Path(manifest["application"]["path"])
+    legacy = Path(manifest["target"]["legacyBackupPath"])
+    daemon = Path(manifest["service"]["plist"])
+    marker = Path(manifest["target"]["marker"])
+
+    if state != "absent":
+        check("rosetta", Path("/Library/Apple/usr/share/rosetta/rosetta").is_file())
+        scutil = command(["/usr/sbin/scutil", "--nc", "list"])
+        check("fallback_vpn_connected", scutil.returncode == 0 and
+              re.search(r"Connected.*su\.ffg\.happ", scutil.stdout) is not None)
+        check("dns", command(["/usr/bin/dscacheutil", "-q", "host", "-a", "name",
+                              "example.com"]).returncode == 0)
+        check("https", command(["/usr/bin/curl", "--silent", "--show-error",
+                                "--max-time", "10", "--output", "/dev/null",
+                                "https://example.com/"]).returncode == 0)
+
+    if state == "absent":
+        retired = Path(manifest["absence"]["retiredPayloadPath"])
+        support = Path(manifest["absence"]["systemSupportPath"])
+        dock_urls = dock_application_urls()
+        check("desktop_application_absent", not canonical.exists() and not canonical.is_symlink())
+        check("legacy_application_absent", not legacy.exists() and not legacy.is_symlink())
+        check("desktop_daemon_absent", not daemon.exists() and not daemon.is_symlink())
+        check("desktop_marker_absent", not marker.exists() and not marker.is_symlink())
+        check("desktop_service_absent", command([
+            "/bin/launchctl", "print", "system/AmneziaVPN-service"]).returncode != 0)
+        check("desktop_service_process_absent", command([
+            "/usr/bin/pgrep", "-f",
+            "^/Applications/AmneziaVPN.app/Contents/MacOS/AmneziaVPN-service([[:space:]]|$)"]).returncode == 1)
+        listeners = command(["/usr/sbin/netstat", "-anv", "-p", "tcp"])
+        check("desktop_listener_absent", listeners.returncode == 0 and not any(
+            "LISTEN" in line and re.search(r"[\.:]5959\s", line)
+            for line in listeners.stdout.splitlines()))
+        check("desktop_dock_tile_absent", dock_urls is not None and not any(
+            url in ("/Applications/AmneziaVPN.app", "file:///Applications/AmneziaVPN.app/")
+            for url in dock_urls))
+        check("system_support_absent", not support.exists() and not support.is_symlink())
+        try:
+            retired_stat = retired.stat()
+            check("retired_directory", retired.is_dir() and not retired.is_symlink() and
+                  retired_stat.st_uid == 0 and retired_stat.st_gid == 0 and
+                  retired_stat.st_mode & 0o777 == 0o755 and
+                  {p.name for p in retired.iterdir()} == {
+                      "AmneziaVPN.app", "AmneziaVPN.plist", "managed-version"})
+        except OSError:
+            check("retired_directory", False)
+        retired_app = retired / "AmneziaVPN.app"
+        retired_daemon = retired / "AmneziaVPN.plist"
+        retired_marker = retired / "managed-version"
+        app = manifest["application"]
+        check("retired_app_identity", not retired_app.is_symlink() and
+              retired_app.is_dir() and
+              bundle_value(retired_app, "CFBundleIdentifier") == app["bundleIdentifier"] and
+              bundle_value(retired_app, "CFBundleShortVersionString") == app["bundleVersion"] and
+              team_id(retired_app) == app["teamIdentifier"] and
+              command(["/usr/bin/codesign", "--verify", "--deep", "--strict",
+                       str(retired_app)]).returncode == 0 and
+              sha256(retired_app / "Contents/MacOS/AmneziaVPN-service") == app["serviceSha256"] and
+              sha256(retired_app / "Contents/Resources/AmneziaVPN.plist") == app["resourcePlistSha256"])
+        service = manifest["service"]
+        check("retired_daemon_identity", not retired_daemon.is_symlink() and
+              retired_daemon.is_file() and
+              plist_value(retired_daemon, "Label") == service["label"] and
+              plist_value(retired_daemon, "ProgramArguments.0") == service["program"] and
+              plist_value(retired_daemon, "Sockets.Listeners.SockNodeName") == service["socketAddress"] and
+              plist_value(retired_daemon, "Sockets.Listeners.SockServiceName") == str(service["socketPort"]) and
+              sha256(retired_daemon) == manifest["absence"]["daemonSha256"])
+        try:
+            check("retired_marker_identity", not retired_marker.is_symlink() and
+                  retired_marker.read_text().strip() ==
+                  app["bundleVersion"] + "|" + manifest["source"]["sha256"])
+        except OSError:
+            check("retired_marker_identity", False)
+    elif not active:
+        prestate = manifest["prestate"]
+        nested = canonical / prestate["nestedApplicationPath"]
+        check("legacy_application_present", canonical.is_dir())
+        check("legacy_bundle_id", plist_value(nested / "Info.plist", "CFBundleIdentifier") ==
+              prestate["bundleIdentifier"])
+        check("legacy_version", plist_value(
+            nested / "Info.plist", "CFBundleShortVersionString") ==
+              prestate["bundleVersion"])
+        check("legacy_team", team_id(nested) == prestate["teamIdentifier"])
+        check("legacy_binary", sha256(nested / "AmneziaVPN") ==
+              prestate["binarySha256"])
+        check("legacy_info_plist", sha256(nested / "Info.plist") ==
+              prestate["infoPlistSha256"])
+        check("legacy_signature_prestate_recorded",
+              prestate["strictCodeSignatureValid"] is False)
+        check("legacy_backup_absent", not legacy.exists())
+        check("desktop_daemon_absent", not daemon.exists())
+        check("desktop_marker_absent", not marker.exists())
+        check("desktop_service_absent", command([
+            "/bin/launchctl", "print", "system/AmneziaVPN-service"]).returncode != 0)
+    else:
+        app = manifest["application"]
+        check("desktop_application_present", canonical.is_dir())
+        check("desktop_bundle_id", bundle_value(canonical, "CFBundleIdentifier") ==
+              app["bundleIdentifier"])
+        check("desktop_version", bundle_value(canonical, "CFBundleShortVersionString") ==
+              app["bundleVersion"])
+        check("desktop_team", team_id(canonical) == app["teamIdentifier"])
+        check("desktop_architecture", "x86_64" in command([
+            "/usr/bin/file", str(canonical / "Contents/MacOS/AmneziaVPN")]).stdout)
+        check("desktop_codesign", command(["/usr/bin/codesign", "--verify", "--deep",
+                                           "--strict", str(canonical)]).returncode == 0)
+        check("desktop_gatekeeper", command(["/usr/sbin/spctl", "--assess", "--type",
+                                             "execute", str(canonical)]).returncode == 0)
+        check("desktop_service_binary", sha256(
+            canonical / "Contents/MacOS/AmneziaVPN-service") == app["serviceSha256"])
+        check("desktop_resource_plist", sha256(
+            canonical / "Contents/Resources/AmneziaVPN.plist") ==
+            app["resourcePlistSha256"])
+
+        check("legacy_backup_absent", not legacy.exists())
+        dock_urls = dock_application_urls()
+        desktop_dock_urls = [] if dock_urls is None else [
+            url for url in dock_urls
+            if url in ("/Applications/AmneziaVPN.app",
+                       "file:///Applications/AmneziaVPN.app/")]
+        check("desktop_dock_tile", len(desktop_dock_urls) == 1)
+        check("widget_extension_absent",
+              not any(canonical.rglob("*.appex")))
+
+        service = manifest["service"]
+        check("daemon_present", daemon.is_file())
+        check("daemon_label", plist_value(daemon, "Label") == service["label"])
+        check("daemon_program", plist_value(daemon, "ProgramArguments.0") ==
+              service["program"])
+        check("daemon_address", plist_value(daemon, "Sockets.Listeners.SockNodeName") ==
+              service["socketAddress"])
+        check("daemon_port", plist_value(daemon, "Sockets.Listeners.SockServiceName") ==
+              str(service["socketPort"]))
+        try:
+            daemon_stat = daemon.stat()
+            check("daemon_permissions", daemon_stat.st_uid == 0 and
+                  daemon_stat.st_gid == 0 and daemon_stat.st_mode & 0o777 == 0o644)
+        except OSError:
+            check("daemon_permissions", False)
+        expected_marker = app["bundleVersion"] + "|" + manifest["source"]["sha256"]
+        try:
+            check("managed_marker", marker.read_text().strip() == expected_marker)
+        except OSError:
+            check("managed_marker", False)
+        check("desktop_service_loaded", command([
+            "/bin/launchctl", "print", "system/AmneziaVPN-service"]).returncode == 0)
+        listeners = command(["/usr/sbin/netstat", "-anv", "-p", "tcp"])
+        lines = [line for line in listeners.stdout.splitlines()
+                 if "LISTEN" in line and re.search(r"[\.:]5959\s", line)]
+        check("desktop_listener_present", listeners.returncode == 0 and bool(lines))
+        check("desktop_listener_loopback_only", bool(lines) and all(
+            re.search(r"\s127\.0\.0\.1\.5959\s", line) for line in lines))
+
+    final_revision = revision_observation()
+    check("configuration_revision_stable", final_revision == revision)
+    check("configuration_revision_final", final_revision["compatible"])
+    print(json.dumps({
+        "schema": 1,
+        "result": "pass" if not problems else "fail",
+        "profileActive": active,
+        "desiredState": state,
+        "configurationRevisionStatus": final_revision,
+        "checks": checks,
+        "problems": sorted(problems),
+        "readOnly": True,
+        "systemMutationsPerformed": False,
+        "vpnConfigurationInspected": False,
+    }, indent=2, sort_keys=True))
+    raise SystemExit(0 if not problems else 1)
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except Exception as error:
+        print(json.dumps({"result": "fail", "reason": str(error)}, sort_keys=True))
+        raise SystemExit(1)

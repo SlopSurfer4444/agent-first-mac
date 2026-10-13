@@ -1,0 +1,193 @@
+#!/usr/bin/python3
+"""Build the exact protected main target without activation and write one scratch receipt."""
+
+import hashlib
+import json
+import os
+from pathlib import Path
+import pwd
+import re
+import stat
+import subprocess
+import sys
+
+
+CONTROL_COMMIT = "217602def502f515f5c0c554f1d4c1d0aaabcb26"
+POLICY_SHA256 = "2555b3f0ed1f75cd26bc41af6512ecc30d444ba1b0113458f72efcfccc304225"
+NIX = "/nix/var/nix/profiles/default/bin/nix"
+NIX_STORE = "/nix/var/nix/profiles/default/bin/nix-store"
+GIT = "/usr/bin/git"
+STORE = Path("/nix/store")
+PROFILE_ROOT = Path("/nix/var/nix/profiles")
+
+
+def require(condition, reason):
+    if not condition:
+        raise RuntimeError(reason)
+
+
+def run(argv, *, cwd, env):
+    return subprocess.run([str(value) for value in argv], cwd=cwd, env=env, text=True,
+                          stdout=subprocess.PIPE, stderr=subprocess.STDOUT, check=False)
+
+
+def checked(argv, *, cwd, env):
+    result = run(argv, cwd=cwd, env=env)
+    require(result.returncode == 0,
+            f"command_failed_{Path(str(argv[0])).name}: {result.stdout[-1200:]}")
+    return result.stdout.strip()
+
+
+def store_snapshot():
+    return {path.name for path in STORE.iterdir()}
+
+
+def store_digest(values):
+    return hashlib.sha256("\n".join(sorted(values)).encode()).hexdigest()
+
+
+def generation_snapshot():
+    values = {}
+    for path in PROFILE_ROOT.glob("system-*-link"):
+        if re.fullmatch(r"system-[1-9][0-9]{0,8}-link", path.name):
+            values[path.name] = os.readlink(path)
+    current_profile = os.readlink(PROFILE_ROOT / "system")
+    current_system = os.readlink("/run/current-system")
+    return values, current_profile, current_system
+
+
+def strict_revision(path):
+    supplied = path / "darwin-version.json"
+    facts = supplied.lstat()
+    if stat.S_ISLNK(facts.st_mode):
+        destination = os.readlink(supplied)
+        require(re.fullmatch(
+            r"/nix/store/[0-9abcdfghijklmnpqrsvwxyz]{32}-darwin-version\.json",
+            destination) is not None, "revision_link_class")
+        supplied = Path(destination)
+        facts = supplied.lstat()
+    require(stat.S_ISREG(facts.st_mode) and facts.st_uid == 0 and facts.st_mode & 0o022 == 0,
+            "revision_immutable")
+
+    def unique_object(pairs):
+        value = {}
+        for key, item in pairs:
+            require(key not in value, "revision_duplicate_key")
+            value[key] = item
+        return value
+
+    value = json.loads(supplied.read_text(), object_pairs_hook=unique_object)
+    require(set(value) == {"configurationRevision", "darwinLabel", "darwinRevision",
+                           "nixpkgsRevision"}, "revision_schema")
+    require(value["configurationRevision"] == CONTROL_COMMIT, "revision_commit")
+    return True
+
+
+def main():
+    require(sys.argv[1:] == [], "usage")
+    home = Path.home().resolve(strict=True)
+    control = home / "AIDev/control"
+    owner = pwd.getpwuid(os.getuid())
+    require(Path(owner.pw_dir).resolve(strict=True) == home, "owner_home")
+    git_environment = {
+        "HOME": "/var/empty", "LANG": "C", "LC_ALL": "C", "PATH": "/usr/bin:/bin",
+        "GIT_ATTR_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": "/dev/null",
+        "GIT_CONFIG_NOSYSTEM": "1", "GIT_EXTERNAL_DIFF": "", "GIT_OPTIONAL_LOCKS": "0",
+        "GIT_PAGER": "cat", "GIT_TERMINAL_PROMPT": "0",
+    }
+    git_prefix = [GIT, "--no-optional-locks", "-c", f"safe.directory={control}",
+                  "-c", "core.fsmonitor=false", "-c", "core.hooksPath=/dev/null",
+                  "-c", "diff.external=", "-C", control]
+    require(checked([*git_prefix, "rev-parse", "HEAD"], cwd=control,
+                    env=git_environment) == CONTROL_COMMIT, "control_head")
+    require(checked([*git_prefix, "branch", "--show-current"], cwd=control,
+                    env=git_environment) == "main", "control_branch")
+    require(checked([*git_prefix, "status", "--porcelain", "--untracked-files=normal"],
+                    cwd=control, env=git_environment) == "", "control_dirty")
+    tree = checked([*git_prefix, "rev-parse", CONTROL_COMMIT + "^{tree}"],
+                   cwd=control, env=git_environment)
+    require(re.fullmatch(r"[0-9a-f]{40}", tree) is not None, "control_tree")
+
+    store_before = store_snapshot()
+    generations_before = generation_snapshot()
+    build_environment = {
+        "AID_BOOTSTRAP_HOME": str(home), "AID_BOOTSTRAP_USER": owner.pw_name,
+        "HOME": str(home), "LANG": "C", "LC_ALL": "C", "PATH": "/usr/bin:/bin",
+        "TMPDIR": "/tmp",
+    }
+    output = checked([
+        NIX, "build", "--impure", "--no-link", "--print-out-paths",
+        "--no-write-lock-file",
+        ".#darwinConfigurations.bootstrap-with-homebrew.system",
+    ], cwd=control, env=build_environment)
+    paths = [line for line in output.splitlines() if line.startswith("/nix/store/")]
+    require(len(paths) == 1 and re.fullmatch(
+        r"/nix/store/[0-9abcdfghijklmnpqrsvwxyz]{32}-darwin-system-[A-Za-z0-9._+-]{1,96}",
+        paths[0]) is not None, "build_output")
+    target = Path(paths[0])
+    facts = target.stat()
+    require(target.is_dir() and facts.st_uid == 0 and facts.st_mode & 0o022 == 0,
+            "target_immutable")
+    require(run([NIX_STORE, "--verify-path", target], cwd=control,
+                env=build_environment).returncode == 0, "target_verify")
+    nar_hash = checked([NIX_STORE, "--query", "--hash", target], cwd=control,
+                       env=build_environment)
+    require(re.fullmatch(r"sha256:[0-9abcdfghijklmnpqrsvwxyz]{52}", nar_hash) is not None,
+            "target_nar_hash")
+    require(strict_revision(target), "configuration_revision")
+
+    store_after = store_snapshot()
+    generations_after = generation_snapshot()
+    new_store = store_after - store_before
+    require(generations_after == generations_before, "generation_or_current_system_mutated")
+    require(len(generations_after[0]) >= 2, "rollback_generation_unavailable")
+
+    scratch = home / "AIDev/scratch/phase-4-install-bundle-review"
+    scratch.mkdir(parents=True, exist_ok=True, mode=0o700)
+    scratch.chmod(0o700)
+    receipt = scratch / (CONTROL_COMMIT + ".json")
+    require(not receipt.exists() and not receipt.is_symlink(), "scratch_receipt_exists")
+    value = {
+        "controlCommit": CONTROL_COMMIT,
+        "controlTree": tree,
+        "policyHash": POLICY_SHA256,
+        "reviewed": True,
+        "schema": 1,
+        "targetSystemNarHash": nar_hash,
+        "targetSystemPath": str(target),
+    }
+    temporary = receipt.with_suffix(".json.new")
+    require(not temporary.exists(), "scratch_temporary_exists")
+    temporary.write_text(json.dumps(value, indent=2, sort_keys=True) + "\n")
+    temporary.chmod(0o400)
+    os.replace(temporary, receipt)
+    directory_fd = os.open(scratch, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        os.fsync(directory_fd)
+    finally:
+        os.close(directory_fd)
+
+    print(json.dumps({
+        "schema": 1,
+        "result": "pass",
+        "controlCommit": CONTROL_COMMIT,
+        "configurationRevisionMatches": True,
+        "generationStateUnchanged": True,
+        "narHash": nar_hash,
+        "newStorePathsCount": len(new_store),
+        "newStorePathsDigest": store_digest(new_store),
+        "previousGenerationAvailable": True,
+        "profileOrCurrentSystemMutation": False,
+        "rawStorePathRetainedInGitOrEvidence": False,
+        "scratchReceiptWritten": True,
+        "scratchReceiptPathEmitted": False,
+        "storeRootOwnedImmutable": True,
+    }, indent=2, sort_keys=True))
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except Exception as error:
+        print(json.dumps({"result": "fail", "reason": str(error)}, sort_keys=True))
+        raise SystemExit(1)

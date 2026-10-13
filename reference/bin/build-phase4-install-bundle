@@ -1,0 +1,286 @@
+#!/usr/bin/python3
+"""Build two clean candidates and emit one bounded immutable Phase 4 review bundle."""
+
+import hashlib
+import json
+import os
+from pathlib import Path
+import pwd
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+
+
+ROOT = Path(__file__).resolve().parents[1]
+DEFAULT_OUTPUT = ROOT / "install-bundles/phase-4/aid-admin"
+CONTROL_BASE = "217602def502f515f5c0c554f1d4c1d0aaabcb26"
+PREPARATION_HEAD = "82a30bd70ee1a693489127bb097adc511aadffe0"
+MIGRATION_AUTHORIZATION = "39f8a257da2181076d1e0cbb29d3a9ef1ddb6aaf"
+MIGRATION_MULTICALL_CORRECTION = "a68079a5539755b26e9051e5cea98a57e236d5b9"
+ACCEPTED_PREAPPLY_HEAD = "2d4241978d830902711c023c28e0d35f52ca5815"
+CORRECTION_MARKER = "CHECKPOINT_PHASE4_MULTICALL_EXECUTION_CORRECTION_REVIEW"
+TEMPLATE = ROOT / "policy/sudoers.d/agent-first-mac-aid-admin"
+APPLY_POLICY = ROOT / "policy/aid-admin-apply-policy.json"
+SOURCE_FILES = (
+    "Package.swift",
+    "Sources/AidAdminApply/main.swift",
+    "Sources/AidAdminBootstrap/main.swift",
+    "Sources/AidAdminBootstrapCore/AidAdminBootstrapCore.swift",
+    "Sources/AidAdminCore/AidAdminCore.swift",
+    "bin/build-phase4-install-bundle",
+    "bin/check-phase4-install-bundle",
+    "policy/aid-admin-apply-policy.json",
+    "policy/sudoers.d/agent-first-mac-aid-admin",
+    "tests/AidAdminBootstrapTests/AidAdminBootstrapTests.swift",
+    "tests/AidAdminCoreTests/AidAdminCoreTests.swift",
+)
+
+
+def require(condition, reason):
+    if not condition:
+        raise RuntimeError(reason)
+
+
+def run(argv, cwd=ROOT):
+    result = subprocess.run([str(value) for value in argv], cwd=cwd, text=True,
+                            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, check=False,
+                            env={"HOME": str(Path.home()), "LANG": "C", "LC_ALL": "C",
+                                 "PATH": "/usr/bin:/bin", "TMPDIR": tempfile.gettempdir()})
+    require(result.returncode == 0,
+            f"command_failed_{Path(str(argv[0])).name}: {result.stdout[-1200:]}")
+    return result.stdout
+
+
+def digest(path):
+    value = hashlib.sha256()
+    with path.open("rb") as stream:
+        while chunk := stream.read(65536):
+            value.update(chunk)
+    return value.hexdigest()
+
+
+def pin(path):
+    return {"sha256": digest(path), "size": path.stat().st_size}
+
+
+def behavior(path, cases):
+    result = []
+    environment = {"HOME": "/var/empty", "LANG": "C", "LC_ALL": "C",
+                   "PATH": "/usr/bin:/bin", "TMPDIR": "/var/empty",
+                   "SECRET_TOKEN": "must-not-appear"}
+    for arguments in cases:
+        process = subprocess.run([str(path), *arguments], text=True, stdout=subprocess.PIPE,
+                                 stderr=subprocess.STDOUT, check=False, env=environment)
+        require(process.returncode != 0, f"negative_case_accepted_{arguments}")
+        require("must-not-appear" not in process.stdout, "environment_leak")
+        result.append({"arguments": arguments, "exit": process.returncode,
+                       "output": process.stdout})
+    return result
+
+
+def clean_build(scratch):
+    run(["/usr/bin/swift", "build", "-c", "release", "--scratch-path", scratch])
+    bin_path = Path(run(["/usr/bin/swift", "build", "-c", "release", "--show-bin-path",
+                         "--scratch-path", scratch]).strip())
+    broker = bin_path / "aid-admin-apply"
+    bootstrap = bin_path / "aid-admin-bootstrap"
+    require(broker.is_file() and bootstrap.is_file(), "release_candidate_missing")
+    return broker, bootstrap
+
+
+def architecture(path):
+    output = run(["/usr/bin/file", "-b", path]).strip()
+    require("Mach-O 64-bit executable arm64" in output, "candidate_architecture")
+    return "arm64-darwin"
+
+
+def write_json(path, value, mode=0o444):
+    path.write_text(json.dumps(value, indent=2, sort_keys=True) + "\n")
+    path.chmod(mode)
+
+
+def main():
+    args = sys.argv[1:]
+    require(args in ([], ["--output", args[1]] if len(args) == 2 else []), "usage")
+    output = Path(args[1]).resolve() if args else DEFAULT_OUTPUT
+    require(not output.exists(), "output_already_exists")
+    output.parent.mkdir(parents=True, exist_ok=True)
+    scratch_a = Path(tempfile.mkdtemp(prefix="aid-admin-install-build-a."))
+    scratch_b = Path(tempfile.mkdtemp(prefix="aid-admin-install-build-b."))
+    try:
+        broker_a, bootstrap_a = clean_build(scratch_a)
+        broker_b, bootstrap_b = clean_build(scratch_b)
+        broker_cases = [
+            [], ["unknown"], ["install-pkg"], ["doctor-root", "extra"],
+            ["apply-system"], ["apply-system", "abc"],
+            ["apply-system", "A" * 40], ["apply-system", "a" * 40 + ";id"],
+            ["apply-system", "../../" + "a" * 40], ["apply-system", "$(id)"],
+            ["apply-system", "a" * 40, "extra"], ["apply-system", "a" * 40],
+            ["doctor-root", "--json"],
+        ]
+        bootstrap_cases = [[], ["unknown"], ["install"], ["install", "extra"]]
+        require(behavior(broker_a, broker_cases) == behavior(broker_b, broker_cases),
+                "broker_behavior_drift")
+        require(behavior(bootstrap_a, bootstrap_cases) == behavior(bootstrap_b, bootstrap_cases),
+                "bootstrap_behavior_drift")
+        require(architecture(broker_a) == architecture(broker_b) == "arm64-darwin",
+                "broker_architecture_drift")
+        require(architecture(bootstrap_a) == architecture(bootstrap_b) == "arm64-darwin",
+                "bootstrap_architecture_drift")
+
+        output.mkdir(mode=0o755)
+        broker = output / "aid-admin"
+        bootstrap = output / "aid-admin-bootstrap"
+        policy = output / "aid-admin-policy.json"
+        template = output / "agent-first-mac-aid-admin.sudoers-template"
+        shutil.copyfile(broker_a, broker)
+        shutil.copyfile(bootstrap_a, bootstrap)
+        shutil.copyfile(APPLY_POLICY, policy)
+        shutil.copyfile(TEMPLATE, template)
+        broker.chmod(0o555)
+        bootstrap.chmod(0o555)
+        policy.chmod(0o444)
+        template.chmod(0o444)
+
+        owner = pwd.getpwuid(os.getuid())
+        require(re.fullmatch(r"[a-z_][a-z0-9_-]{0,31}", owner.pw_name) is not None,
+                "unsafe_live_owner_identity")
+        rendered = template.read_text().replace("@@AGENT_OWNER@@", owner.pw_name).encode()
+        require(b"@@AGENT_OWNER@@" not in rendered and b"NOPASSWD: ALL" not in rendered,
+                "rendered_sudoers_contract")
+        rendered_pin = {"sha256": hashlib.sha256(rendered).hexdigest(), "size": len(rendered)}
+
+        inputs = output / "install-inputs.json"
+        write_json(inputs, {
+            "artifactSet": "phase4-aid-admin-install-bundle-v1",
+            "bootstrap": pin(bootstrap),
+            "broker": pin(broker),
+            "policy": pin(policy),
+            "renderedSudoers": rendered_pin,
+            "schema": 1,
+            "sudoersTemplate": pin(template),
+        })
+
+        launcher = output / "launch-owner-authenticated-install.zsh"
+        inputs_pin = pin(inputs)
+        launcher.write_text(
+            "#!/bin/zsh\n"
+            "set -eu\n"
+            "script_path=\"${0:A}\"\n"
+            "bundle_dir=\"${script_path:h}\"\n"
+            "owner_name=\"$(/usr/bin/id -un)\"\n"
+            "owner_uid=\"$(/usr/bin/id -u)\"\n"
+            "exec /usr/bin/sudo -k -- \"${bundle_dir}/aid-admin-bootstrap\" install "
+            "\"${bundle_dir}/aid-admin\" \"${bundle_dir}/aid-admin-policy.json\" "
+            "\"${bundle_dir}/agent-first-mac-aid-admin.sudoers-template\" "
+            f"\"${{bundle_dir}}/install-inputs.json\" {inputs_pin['sha256']} "
+            f"{inputs_pin['size']} \"${{owner_name}}\" \"${{owner_uid}}\" "
+            "\"name:${owner_name}\"\n"
+        )
+        launcher.chmod(0o555)
+
+        swift_version = run(["/usr/bin/swift", "--version"]).splitlines()[0]
+        review = output / "review-manifest.json"
+        write_json(review, {
+            "acceptedBases": {
+                "acceptedPreparationHead": PREPARATION_HEAD,
+                "acceptedInstalledRootPreapplyHead": ACCEPTED_PREAPPLY_HEAD,
+                "controlMain": CONTROL_BASE,
+                "migrationOwnerAuthorization": MIGRATION_AUTHORIZATION,
+                "migrationMulticallCorrection": MIGRATION_MULTICALL_CORRECTION,
+                "phase2": "PASS",
+                "phase3": "PASS",
+                "acceptedLevel": "L2",
+            },
+            "architecture": "arm64-darwin",
+            "artifactSet": "phase4-aid-admin-install-bundle-v1",
+            "artifacts": {
+                "bootstrap": {"path": "aid-admin-bootstrap", **pin(bootstrap),
+                              "modeClass": "executable-not-group-or-world-writable"},
+                "broker": {"path": "aid-admin", **pin(broker),
+                           "modeClass": "executable-not-group-or-world-writable"},
+                "installInputs": {"path": "install-inputs.json", **pin(inputs),
+                                  "modeClass": "non-executable-not-group-or-world-writable"},
+                "policy": {"path": "aid-admin-policy.json", **pin(policy),
+                           "modeClass": "non-executable-not-group-or-world-writable"},
+                "sudoersTemplate": {"path": "agent-first-mac-aid-admin.sudoers-template",
+                                    **pin(template),
+                                    "modeClass": "non-executable-not-group-or-world-writable"},
+            },
+            "buildProvenance": {
+                "buildA": {"bootstrap": pin(bootstrap_a), "broker": pin(broker_a)},
+                "buildB": {"bootstrap": pin(bootstrap_b), "broker": pin(broker_b)},
+                "bootstrapBehaviorCases": len(bootstrap_cases),
+                "behaviorIdentical": True,
+                "brokerBehaviorCases": len(broker_cases),
+                "commands": [
+                    "/usr/bin/swift build -c release --scratch-path <clean-a>",
+                    "/usr/bin/swift build -c release --scratch-path <clean-b>",
+                ],
+                "selectedBuild": "A",
+                "sourceBase": CONTROL_BASE,
+                "sourceFileSHA256": {path: digest(ROOT / path) for path in SOURCE_FILES},
+                "swift": swift_version,
+            },
+            "commandSurface": ["doctor-root", "apply-system <40-lowercase-hex-control-commit>"],
+            "futureLauncher": {"path": launcher.name, **pin(launcher),
+                               "modeClass": "executable-not-group-or-world-writable",
+                               "standardSudoOnly": True, "expectedPasswordPrompts": 1,
+                               "ownerFieldsAreAssertionsOnly": True},
+            "gates": {"applyGateAccepted": True, "preparationOnly": False,
+                      "liveApplyRetryAuthorized": False, "reinstallAuthorized": False,
+                      "phase4PassClaimed": False, "l3Claimed": False,
+                      "phase5Authorized": False},
+            "installPaths": {
+                "/etc/agent-first-mac/aid-admin-install.json": "0400",
+                "/etc/agent-first-mac/aid-admin-policy.json": "0444",
+                "/etc/sudoers.d/agent-first-mac-aid-admin": "0440",
+                "/usr/local/libexec/aid-admin": "0555",
+                "/var/db/agent-first-mac/staging": "0700",
+                "/var/log/agent-first-mac/aid-admin": "0700",
+            },
+            "privacy": {"environmentRetained": False, "hostnameRetained": False,
+                        "ownerIdentityRetained": False, "ownerUIDRetained": False,
+                        "rawStorePathRetained": False, "secretsRetained": False},
+            "multicallExecution": {
+                "applets": ["nix-env", "nix-store"],
+                "canonicalCommonBinaryValidationPreserved": True,
+                "dispatchUsesImmutableAppletSibling": True,
+                "exactAppletBasenamePreserved": True,
+                "gitAndActivationDispatchUnchanged": True,
+                "liveNixEnvExecuted": False,
+                "wrongNestedOrDriftingSiblingRejected": True,
+            },
+            "renderedSudoers": {
+                **rendered_pin,
+                "bytesRetained": False,
+                "directInvocationWithoutSudoProvenanceRejected": True,
+                "exactOwnerBound": True,
+                "identityAuthority": "standard-sudo-provenance-plus-canonical-passwd",
+                "requestFieldsAreAssertionsOnly": True,
+                "visudoRequired": True,
+            },
+            "rollback": {"exactPriorAbsentOrInstalledState": True,
+                         "recursiveAuditOrGenerationDeletion": False},
+            "reviewMarker": CORRECTION_MARKER,
+            "schema": 1,
+            "verdict": "CORRECTION_PREPARED_FOR_INDEPENDENT_REVIEW",
+        })
+        print(json.dumps({
+            "result": "pass", "output": "install-bundles/phase-4/aid-admin",
+            "broker_sha256": digest(broker), "bootstrap_sha256": digest(bootstrap),
+            "review_manifest_sha256": digest(review), "owner_identity_retained": False,
+        }, sort_keys=True))
+    finally:
+        shutil.rmtree(scratch_a, ignore_errors=True)
+        shutil.rmtree(scratch_b, ignore_errors=True)
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except Exception as error:
+        print(json.dumps({"result": "fail", "reason": str(error)}, sort_keys=True))
+        raise SystemExit(1)

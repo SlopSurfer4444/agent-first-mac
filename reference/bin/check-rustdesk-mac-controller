@@ -1,0 +1,61 @@
+#!/usr/bin/python3
+"""Static validator for the RustDesk outbound Mac controller lifecycle."""
+
+import json
+from pathlib import Path
+
+
+ROOT = Path(__file__).resolve().parent.parent
+
+
+def require(condition, reason):
+    if not condition:
+        raise RuntimeError(reason)
+
+
+def main():
+    manifest = json.loads((ROOT / "manifests/rustdesk-mac-controller.json").read_text())
+    module = (ROOT / "darwin/rustdesk-controller.nix").read_text()
+    flake = (ROOT / "flake.nix").read_text()
+    doctor = (ROOT / "bin/rustdesk-mac-controller-doctor").read_text()
+
+    require(manifest["profile"] == "rustdesk-mac-controller", "profile")
+    require(manifest["source"]["sha256"] ==
+            "0cd498e3f99c878bfa3c54996089b9671fdd15aee5d1ac160444841f95ea01bc",
+            "checksum")
+    require(manifest["application"]["teamIdentifier"] == "HZF9JMC8YN", "team")
+    require(manifest["roleBoundary"]["macRole"] == "outbound controller only",
+            "role")
+    require(manifest["roleBoundary"]["macScreenRecordingRequired"] is False,
+            "screen_recording")
+    require(manifest["dataBoundary"]["passwordStoredInGitOrEvidence"] is False,
+            "password_boundary")
+    require("./darwin/rustdesk-controller.nix" in flake, "flake_import")
+    for needle in (
+        "rustdesk-1.4.6-aarch64.dmg",
+        "sha256-DNSY4/mch4v6PFSZYIm5Zx/dFa7l0awWBESEH5XqAbw=",
+        "com.carriez.rustdesk",
+        "HZF9JMC8YN",
+        "hdiutil attach -readonly -nobrowse -noverify",
+        "/usr/bin/ditto",
+    ):
+        require(needle in module, "module_" + needle)
+    for forbidden in ("tccutil", "defaults write", "--password", "--config", "$HOME"):
+        require(forbidden not in module, "forbidden_" + forbidden)
+    require("userConfigInspected\": False" in doctor, "doctor_config")
+    require("permissionsInspected\": False" in doctor, "doctor_permissions")
+
+    print(json.dumps({
+        "schema": 1,
+        "result": "pass",
+        "profile": manifest["profile"],
+        "systemMutationsPerformed": False,
+    }, indent=2, sort_keys=True))
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except Exception as error:
+        print(json.dumps({"result": "fail", "reason": str(error)}, sort_keys=True))
+        raise SystemExit(1)

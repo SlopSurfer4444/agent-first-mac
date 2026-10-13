@@ -1,0 +1,313 @@
+#!/usr/bin/python3
+"""Build and migrate four fixed Finder apps; no command starts a game."""
+import sys
+sys.dont_write_bytecode = True
+import fcntl, hashlib, importlib.machinery, importlib.util, json, os, plistlib, pwd, re, shutil, stat, subprocess, tempfile
+from pathlib import Path
+HOME = Path(pwd.getpwuid(os.getuid()).pw_dir)
+HERE = Path(__file__).resolve().parent.parent
+CONTROL = HOME/'AIDev/control'
+HUB = HOME/'Library/Application Support/Adapted Games'
+DS3 = HOME/'Library/Application Support/Adapted Games DS3'
+MANIFEST = 'manifests/game-app-launchers.json'
+NAMES = {'CS2.app':('games-play','cs2'), 'Prince — Ubisoft Connect.app':('games-play','prince'), 'Steam — другие игры.app':('games-play','steam'), 'Dark Souls III.app':('ds3-play','play')}
+FILES = {'Contents/Info.plist':0o600,'Contents/MacOS/launcher':0o700,'Contents/Resources/Game.icns':0o600}
+COMMANDS = {'CS2.command':('games-play','cs2'), 'Prince — Ubisoft Connect.command':('games-play','prince'), 'Steam — другие игры.command':('games-play','steam'), 'Dark Souls III.command':('ds3-play','play'), 'Stop Dark Souls III.command':('ds3-play','stop')}
+
+def need(ok,reason):
+    if not ok: raise RuntimeError(reason)
+
+def digest(data): return hashlib.sha256(data).hexdigest()
+def pinned(s): return type(s) is str and re.fullmatch('[0-9a-f]{64}',s) is not None
+
+def safe_dir(p):
+    for x in [*reversed(p.parents),p]:
+        s=x.lstat(); need(stat.S_ISDIR(s.st_mode) and s.st_uid in (0,os.getuid()) and not s.st_mode & 0o002,'unsafe_directory')
+
+def regular(p):
+    safe_dir(p.parent); s=p.lstat()
+    need(stat.S_ISREG(s.st_mode) and s.st_uid in (0,os.getuid()) and s.st_nlink == 1 and not s.st_mode & 0o022 and s.st_size <= 32*1024*1024,'unsafe_file')
+    return s
+
+def sha(p): regular(p); return digest(p.read_bytes())
+def load(p):
+    regular(p); need(p.stat().st_size <= 128*1024,'metadata_limit')
+    def unique(rows):
+        d={}
+        for k,v in rows: need(k not in d,'duplicate_key'); d[k]=v
+        return d
+    return json.loads(p.read_bytes(),object_pairs_hook=unique)
+def jb(value): return (json.dumps(value,indent=2,ensure_ascii=False)+'\n').encode()
+def run(args):
+    p=subprocess.run([str(v) for v in args],capture_output=True,timeout=120)
+    need(p.returncode == 0,'command_failed_'+Path(args[0]).name)
+    return p.stdout
+
+ERROR_POLICY = 'manifests/game-app-launcher-errors.json'
+
+def policy(path=None):
+    if path is None: path = ERROR_POLICY if (HERE/ERROR_POLICY).exists() else MANIFEST
+    m=load(HERE/path)
+    need(m.get('schema') == 1 and type(m.get('schema')) is int and m.get('owner') == 'control-game-app-launchers','policy_identity')
+    need(set(m['apps']) == set(NAMES),'app_inventory')
+    for i,(name,route) in enumerate(NAMES.items(),1):
+        row=m['apps'][name]
+        need(row['route'] == list(route) and row['routeNumber'] == i and type(row['routeNumber']) is int,'route_drift')
+        need(type(row['iconSource']) is str and row['iconSource'].startswith(('~/','/Applications/')) and '..' not in Path(row['iconSource']).parts and pinned(row['iconSha256']),'icon_policy')
+    return m
+
+def policy_digest(m): return digest(jb(m))
+
+def policy_for_digest(value):
+    for path in (ERROR_POLICY,MANIFEST):
+        if (HERE/path).exists() and sha(HERE/path) == value: return policy(path)
+    raise RuntimeError('unknown_app_policy')
+
+def image(p):
+    if not p.exists() and not p.is_symlink(): return None
+    if p.is_dir() and not p.is_symlink():
+        safe_dir(p); rows={}
+        for q in sorted(p.rglob('*')):
+            if q.is_dir() and not q.is_symlink(): safe_dir(q); continue
+            s=regular(q); rows[str(q.relative_to(p))]={'sha256':sha(q),'mode':s.st_mode & 0o777}
+        need(set(rows) == set(FILES),'bundle_inventory')
+        need(all(rows[k]['mode'] == v for k,v in FILES.items()),'bundle_mode')
+        need({str(q.relative_to(p)) for q in p.rglob('*') if q.is_dir()} == {'Contents','Contents/MacOS','Contents/Resources'},'bundle_directories')
+        return {'kind':'app','files':rows}
+    s=regular(p); return {'kind':'file','sha256':sha(p),'mode':s.st_mode & 0o777}
+
+def bundle_inventory(candidate):
+    return {name:image(candidate/name)['files'] for name in NAMES}
+
+def build(destination):
+    m=policy(); safe_dir(destination.parent); need(not destination.exists() and not destination.is_symlink(),'candidate_collision')
+    destination.mkdir(mode=0o700)
+    try:
+        for name,row in m['apps'].items():
+            icon=Path(row['iconSource'].replace('~',str(HOME),1))
+            need(sha(icon) == row['iconSha256'],'icon_source_drift')
+            app=destination/name
+            for directory in ('Contents/MacOS','Contents/Resources'): (app/directory).mkdir(parents=True,mode=0o700)
+            executable=app/'Contents/MacOS/launcher'
+            run(['/usr/bin/clang','-x','objective-c','-fobjc-arc','-Os','-framework','AppKit','-DGAME_ROUTE='+str(row['routeNumber']),HERE/'bin/game-app-launcher.m','-o',executable])
+            executable.chmod(0o700)
+            info={'CFBundleName':name[:-4], 'CFBundleDisplayName':name[:-4], 'CFBundleIdentifier':'local.control.games.'+row['route'][1], 'CFBundleExecutable':'launcher','CFBundleIconFile':'Game.icns','CFBundlePackageType':'APPL','CFBundleVersion':'1','CFBundleShortVersionString':'1.0','LSUIElement':True,'NSHighResolutionCapable':True}
+            (app/'Contents/Info.plist').write_bytes(plistlib.dumps(info,sort_keys=True)); (app/'Contents/Info.plist').chmod(0o600)
+            output=app/'Contents/Resources/Game.icns'
+            if icon.suffix.lower() == '.exe':
+                extracted=destination/'extracted.ico'
+                run(['/usr/bin/python3',HERE/'bin/game-app-extract-icon',icon,extracted])
+                icon=extracted
+            if icon.suffix.lower() == '.icns': shutil.copyfile(icon,output)
+            else:
+                with tempfile.TemporaryDirectory(prefix='game-icon-',dir=destination) as scratch:
+                    iconset=Path(scratch)/'Game.iconset'; iconset.mkdir(mode=0o700)
+                    for size in (16,32,128,256,512):
+                        for scale in (1,2):
+                            pixels=size*scale; filename='icon_'+str(size)+'x'+str(size)+('@2x' if scale==2 else '')+'.png'
+                            run(['/usr/bin/sips','-s','format','png','-z',str(pixels),str(pixels),icon,'--out',iconset/filename])
+                    run(['/usr/bin/iconutil','-c','icns',iconset,'-o',output])
+            output.chmod(0o600)
+            if (destination/'extracted.ico').exists(): (destination/'extracted.ico').unlink()
+        result={'schema':1,'sourceSha256':sha(HERE/'bin/game-app-launcher.m'),'apps':bundle_inventory(destination)}
+        (destination/'build.json').write_bytes(jb(result)); (destination/'build.json').chmod(0o600)
+        return dict(state='BUILT_SOURCE_ONLY',gameStarted=False,liveStateChanged=False,**result)
+    except Exception:
+        # Build remains private for inspection on failure.
+        raise
+
+def candidate_check(candidate,m):
+    safe_dir(candidate)
+    need(set(p.name for p in candidate.iterdir()) == set(NAMES)|{'build.json'},'candidate_inventory')
+    report=load(candidate/'build.json')
+    need(report == {'schema':1,'sourceSha256':sha(HERE/'bin/game-app-launcher.m'),'apps':m['builtApps']},'candidate_binding')
+    need(bundle_inventory(candidate) == m['builtApps'],'candidate_drift')
+
+def module(name):
+    loader=importlib.machinery.SourceFileLoader('app_migration_'+name.replace('-','_'),str(HERE/'bin'/name))
+    spec=importlib.util.spec_from_loader(loader.name,loader); out=importlib.util.module_from_spec(spec);loader.exec_module(out)
+    return out
+
+def source_gate(commit):
+    need(HERE == CONTROL and Path(__file__).absolute() == CONTROL/'bin/game-app-launchers','canonical_source_required')
+    need(type(commit) is str and re.fullmatch('[0-9a-f]{40}',commit),'invalid_commit')
+    def exact():
+        git=['/usr/bin/git','-c','core.hooksPath=/dev/null','-C',CONTROL]
+        need(run(git+['rev-parse','HEAD']).decode().strip() == commit and run(git+['branch','--show-current']).decode().strip() == 'main' and not run(git+['status','--porcelain']),'clean_exact_main_required')
+    exact(); report=json.loads(run([CONTROL/'bin/current-doctor','--json']))
+    need(report.get('verdict') == 'PASS' and all(report.get(k) is True for k in ('configurationSourceAccepted','currentSentinelReady','integratedMain')) and report.get('gitOnly') is False,'fresh_accepted_doctor_required'); exact()
+
+def targets():
+    out={'hub-receipt':HUB/'receipt.json','ds3-lifecycle':DS3/'ds3-runtime','ds3-receipt':DS3/'receipt.json','readme':HOME/'Games/README.txt'}
+    out.update({'command-'+str(i):HOME/'Games'/name for i,name in enumerate(COMMANDS)})
+    out.update({'app-'+str(i):HOME/'Games'/name for i,name in enumerate(NAMES)})
+    return out
+
+def copy_image(src,dst):
+    need(not dst.exists() and not dst.is_symlink(),'copy_collision')
+    if src.is_dir(): shutil.copytree(src,dst)
+    else: shutil.copyfile(src,dst); dst.chmod(src.stat().st_mode & 0o777)
+
+def write_image(p,data,mode=0o600): p.write_bytes(data); p.chmod(mode)
+
+def verify_apps(m):
+    need(bundle_inventory(HOME/'Games') == m['builtApps'],'installed_app_drift')
+    for name in list(COMMANDS)+['Dark Souls III - 1080p.command']:
+        p=HOME/'Games'/name; need(not p.exists() and not p.is_symlink(),'legacy_shortcut_collision')
+    return True
+
+def status():
+    m=policy_for_digest(load(DS3/'receipt.json').get('appPolicySha256')); hub=module('games-hub'); ds3=module('ds3-runtime')
+    hub.status(); dm,dr=ds3.verify_installed(); ds3.verify_borderless()
+    need(dm.get('singleLauncher') is True,'follow_upgrade_required')
+    verify_apps(m)
+    hr=load(HUB/'receipt.json')
+    need(hr.get('appLaunchers') == {k:v for k,v in m['builtApps'].items() if k != 'Dark Souls III.app'} and dr.get('appLaunchers') == {'Dark Souls III.app':m['builtApps']['Dark Souls III.app']},'app_receipt_drift')
+    need(dr.get('appPolicySha256') == policy_digest(m) == hr.get('appPolicySha256'),'installed_policy_drift')
+    need(sha(DS3/'ds3-runtime') == sha(HERE/'bin/ds3-runtime'),'installed_lifecycle_drift')
+    need(sha(HOME/'Games/README.txt') == sha(HERE/'docs/game-app-launchers-README.txt'),'readme_drift')
+    return {'state':'GAME_APPS_INSTALLED','sourcePolicyCurrent':policy_digest(m) == policy_digest(policy()),'gameStarted':False,'gameplayVerified':False}
+
+def journal_check(transaction,which=None):
+    safe_dir(transaction); journal=load(transaction/'transaction.json'); mapped=targets()
+    need(set(journal) == set(mapped),'transaction_schema')
+    for key,target in mapped.items():
+        row=journal[key]; need(set(row) == {'before','after'},'transaction_schema')
+        for side in ('before','after'):
+            need(image(transaction/(key+'.'+side)) == row[side],'backup_drift')
+        observed=image(target)
+        need(observed == row[which] if which else observed in (row['before'],row['after']),'transaction_target_drift')
+    return journal
+
+def transaction_binding(transaction,m,commit):
+    journal=load(transaction/'transaction.json')
+    def file_image(data,mode=0o600): return {'kind':'file','sha256':digest(data),'mode':mode}
+    for i,(name,(resolver,arg)) in enumerate(COMMANDS.items()):
+        raw=('#!/bin/zsh\nexec "$HOME/AIDev/bin/'+resolver+'" '+arg+'\n').encode()
+        need(journal['command-'+str(i)] == {'before':file_image(raw,0o700),'after':None},'transaction_command_binding')
+    for i,name in enumerate(NAMES):
+        need(journal['app-'+str(i)] == {'before':None,'after':{'kind':'app','files':m['builtApps'][name]}},'transaction_app_binding')
+    for key,source,pin,mode in (('readme','docs/game-app-launchers-README.txt','previousReadmeSha256',0o600),('ds3-lifecycle','bin/ds3-runtime','previousDs3LifecycleSha256',0o700)):
+        need(journal[key] == {'before':{'kind':'file','sha256':m[pin],'mode':mode},'after':file_image((HERE/source).read_bytes(),mode)},'transaction_file_binding')
+    for key,names in (('hub-receipt',[n for n in NAMES if n != 'Dark Souls III.app']),('ds3-receipt',['Dark Souls III.app'])):
+        before=load(transaction/(key+'.before')); after=load(transaction/(key+'.after'))
+        need(not any(k in before for k in ('appLaunchers','appPolicySha256','appCommit')),'transaction_receipt_preimage')
+        expected=dict(before,appLaunchers={n:m['builtApps'][n] for n in names},appPolicySha256=policy_digest(m),appCommit=commit)
+        if key == 'ds3-receipt':
+            need(before.get('lifecycleSha256') == m['previousDs3LifecycleSha256'],'transaction_previous_lifecycle')
+            expected['lifecycleSha256']=sha(HERE/'bin/ds3-runtime')
+        need(after == expected,'transaction_receipt_relation')
+        need(journal[key] == {'before':file_image((transaction/(key+'.before')).read_bytes()),'after':file_image(jb(after))},'transaction_receipt_binding')
+
+def replace_image(src,target,expected):
+    safe_dir(target.parent); need(image(target) == expected,'transaction_target_changed')
+    replacement=image(src)
+    if replacement == expected: return
+    if replacement is None:
+        if expected['kind'] == 'app':
+            # Atomic removal preserves recovery after a crash; keep retired
+            # bundles with this private transaction rather than partially delete.
+            safe_dir(src.parent)
+            retired=Path(tempfile.mkdtemp(prefix='retired-app-',dir=src.parent))
+            need(image(target) == expected,'transaction_target_changed')
+            os.rename(target,retired/'app')
+        else: target.unlink()
+    else:
+        need(replacement['kind'] != 'app' or expected is None,'app_replacement_conflict')
+        scratch=Path(tempfile.mkdtemp(prefix='.game-app-stage-',dir=target.parent))
+        try:
+            staged=scratch/'payload'; copy_image(src,staged)
+            need(image(staged) == replacement and image(target) == expected,'staging_drift')
+            os.replace(staged,target)
+        finally: shutil.rmtree(scratch)
+
+def restore(transaction):
+    journal=journal_check(transaction)
+    for key,target in reversed(list(targets().items())):
+        observed=image(target); need(observed in (journal[key]['before'],journal[key]['after']),'transaction_target_changed')
+        replace_image(transaction/(key+'.before'),target,observed)
+    journal_check(transaction,'before')
+
+def install(commit,candidate):
+    source_gate(commit); m=policy(); candidate_check(candidate,m)
+    hub=module('games-hub'); ds3=module('ds3-runtime')
+    hub.status(); dm,dr=ds3.verify_installed(); ds3.verify_borderless()
+    need(dm.get('singleLauncher') is True,'follow_upgrade_required')
+    if 'appLaunchers' in dr:
+        need(dr.get('appPolicySha256') == policy_digest(m),'native_app_update_required')
+        status(); return dict(state='GAME_APPS_INSTALLED',changed=False,gameStarted=False)
+    ds3.inactive(ds3.ROOT/'runtime',ds3.PREFIX)
+    need(sha(DS3/'ds3-runtime') == m['previousDs3LifecycleSha256'],'previous_lifecycle_drift')
+    need(sha(HOME/'Games/README.txt') == m['previousReadmeSha256'],'readme_preimage_drift')
+    fallback=HOME/'Games/Dark Souls III - 1080p.command'
+    need(not fallback.exists() and not fallback.is_symlink(),'follow_upgrade_required')
+    for name,(resolver,arg) in COMMANDS.items():
+        p=HOME/'Games'/name
+        need(image(p)['kind'] == 'file' and p.read_bytes() == ('#!/bin/zsh\nexec "$HOME/AIDev/bin/'+resolver+'" '+arg+'\n').encode(),'shortcut_preimage_drift')
+    for name in NAMES: need(image(HOME/'Games'/name) is None,'app_collision')
+    hr=load(HUB/'receipt.json'); need('appLaunchers' not in hr,'partial_app_state')
+    hr.update(appLaunchers={k:v for k,v in m['builtApps'].items() if k != 'Dark Souls III.app'},appPolicySha256=policy_digest(m),appCommit=commit)
+    dr.update(appLaunchers={'Dark Souls III.app':m['builtApps']['Dark Souls III.app']},appPolicySha256=policy_digest(m),appCommit=commit,lifecycleSha256=sha(HERE/'bin/ds3-runtime'))
+    transaction=HUB/('.game-app-launchers-'+commit)
+    if transaction.exists() or transaction.is_symlink():
+        journal=journal_check(transaction,'before'); mapped=targets()
+        need(journal['ds3-lifecycle']['after'] == {'kind':'file','sha256':sha(HERE/'bin/ds3-runtime'),'mode':0o700}, 'return_lifecycle_drift')
+        need(load(transaction/'hub-receipt.after') == hr and load(transaction/'ds3-receipt.after') == dr, 'return_receipt_drift')
+        for i,name in enumerate(NAMES): need(journal['app-'+str(i)]['after'] == image(candidate/name), 'return_app_drift')
+    else:
+        pending=Path(tempfile.mkdtemp(prefix='.game-app-prepared-',dir=HUB))
+        mapped=targets(); journal={}
+        for key,target in mapped.items():
+            before=image(target)
+            if before is not None: copy_image(target,pending/(key+'.before'))
+            journal[key]={'before':before,'after':None}
+        for key,data,mode in [('hub-receipt',jb(hr),0o600),('ds3-receipt',jb(dr),0o600),('ds3-lifecycle',(HERE/'bin/ds3-runtime').read_bytes(),0o700),('readme',(HERE/'docs/game-app-launchers-README.txt').read_bytes(),0o600)]: write_image(pending/(key+'.after'),data,mode)
+        for i,name in enumerate(NAMES): copy_image(candidate/name,pending/('app-'+str(i)+'.after'))
+        for key in mapped: journal[key]['after']=image(pending/(key+'.after'))
+        write_image(pending/'transaction.json',jb(journal))
+        os.rename(pending,transaction)
+    transaction_binding(transaction,m,commit)
+    journal_check(transaction,'before'); ds3.inactive(ds3.ROOT/'runtime',ds3.PREFIX); source_gate(commit)
+    try:
+        for key,target in mapped.items(): replace_image(transaction/(key+'.after'),target,journal[key]['before'])
+        journal_check(transaction,'after'); status()
+    except Exception:
+        restore(transaction)
+        raise
+    return {'state':'GAME_APPS_INSTALLED','changed':True,'gameStarted':False,'gameplayVerified':False}
+
+def rollback(commit,apply_commit):
+    source_gate(commit); need(type(apply_commit) is str and re.fullmatch('[0-9a-f]{40}',apply_commit),'invalid_apply_commit')
+    transaction=HUB/('.game-app-launchers-'+apply_commit)
+    m=policy_for_digest(load(transaction/'hub-receipt.after').get('appPolicySha256'))
+    journal=journal_check(transaction); transaction_binding(transaction,m,apply_commit)
+    # Bind retained recovery objects to the reviewed candidate, not arbitrary journal claims.
+    need(journal['ds3-lifecycle']['before']['sha256'] == m['previousDs3LifecycleSha256'] and journal['readme']['before']['sha256'] == m['previousReadmeSha256'],'rollback_identity')
+    need(load(transaction/'hub-receipt.after')['appPolicySha256'] == policy_digest(m) and load(transaction/'ds3-receipt.after')['appCommit'] == apply_commit,'rollback_policy')
+    # The interrupted transaction can legitimately have a new lifecycle and an
+    # old receipt (or vice versa). journal_check binds both independently.
+    # Attest the unchanged server directly instead of requiring a paired receipt.
+    ds3=module('ds3-runtime'); baseline=ds3.manifest(DS3/'manifest.json')
+    need(sha(DS3/'runtime/engine/bin/wineserver') == baseline['sourceCriticalHashes']['engine/bin/wineserver'], 'rollback_server_drift')
+    ds3.inactive(ds3.ROOT/'runtime',ds3.PREFIX)
+    restore(transaction); module('games-hub').status(); ds3.verify_installed(); ds3.verify_borderless()
+    return {'state':'GAME_APPS_ROLLED_BACK','gameStarted':False,'dataDeleted':False}
+
+def main():
+    os.umask(0o077); args=sys.argv[1:]
+    if len(args) == 2 and args[0] == 'build': result=build(Path(args[1]))
+    else:
+        safe_dir(HOME/'AIDev/state')
+        fd=os.open(HOME/'AIDev/state/games-hub.lock',os.O_CREAT|os.O_RDWR|os.O_NOFOLLOW,0o600)
+        s=os.fstat(fd); need(stat.S_ISREG(s.st_mode) and s.st_uid == os.getuid() and s.st_nlink == 1 and not s.st_mode & 0o022,'unsafe_lock')
+        with os.fdopen(fd,'w') as lock:
+            fcntl.flock(lock,fcntl.LOCK_EX|fcntl.LOCK_NB)
+            if len(args) == 3 and args[0] == 'install': result=install(args[1],Path(args[2]))
+            elif len(args) == 3 and args[0] == 'rollback': result=rollback(args[1],args[2])
+            elif args == ['status']: result=status()
+            else: raise RuntimeError('usage: game-app-launchers build OUTPUT | install COMMIT CANDIDATE | rollback COMMIT APPLY_COMMIT | status')
+    print(json.dumps(result,ensure_ascii=False))
+if __name__ == '__main__':
+    try: main()
+    except Exception as e:
+        print(json.dumps({'state':'BLOCKED','reason':str(e) if type(e) is RuntimeError else type(e).__name__})); sys.exit(1)

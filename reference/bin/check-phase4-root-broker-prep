@@ -1,0 +1,799 @@
+#!/usr/bin/python3
+"""Fail-closed validator for the corrected standalone Phase 4 preparation."""
+
+import hashlib
+import importlib.machinery
+import importlib.util
+import json
+import os
+from pathlib import Path
+import re
+import shutil
+import stat
+import subprocess
+import sys
+import tempfile
+
+
+ROOT = Path(__file__).resolve().parents[1]
+BASE = "471b5df9e7e0901f837e502644da61e948d9822b"
+PRIOR_IMPLEMENTATION = "bcefca6cdc79be3b223db08ff56c3823dcac6d10"
+PRIOR_EVIDENCE = "cea27508f43e7b12456e20c79b315a54ab451a70"
+PRIOR_CORRECTIVE_IMPLEMENTATION = "57110cbb5ab18d2df0b3c62633e533327793caef"
+PRIOR_CORRECTIVE_EVIDENCE = "5bf3fe421e7ccf980a7f249cfbcfb980f8305700"
+PRIOR_REVISION_IMPLEMENTATION = "3bc0fd6d47073f95910361588f24668cea9e0f84"
+PRIOR_REVISION_EVIDENCE = "06d34567cfc46ff8a3a5ede398900e61d88bf64c"
+PRIOR_LIVE_LAYOUT_IMPLEMENTATION = "17f3e62397d61abc08d6188fb4342fa7bc4ec77c"
+PRIOR_LIVE_LAYOUT_EVIDENCE = "c3c9ed72181375e886438f7707a60f51d365e2d9"
+PRIOR_STATUS_IMPLEMENTATION = "ed0f50691519da8b58d6092e40f42101b0d91320"
+PRIOR_STATUS_EVIDENCE = "25cc19bcadb784b2d0ed54c289aaa71df96e6674"
+BRANCH = "codex/phase-4-root-broker-prep"
+MARKER = "CHECKPOINT_PHASE4_PREPARATION_CORRECTED_REVIEW"
+ACCEPTED_APPLIED_INTENT = "432dfd719b53fff8a3fdf3dca45549a1e6f668e8"
+INTEGRATED_VERDICT_CORRECTIVE_SCOPE = {"bin/check-phase4-root-broker-prep"}
+INTEGRATED_VERDICT_EVIDENCE_SCOPE = {
+    "evidence/phase-4/integrated-verdict-correction.json"
+}
+ACCEPTANCE_SCOPE = {"evidence/phase-4/preparation-acceptance.json"}
+
+
+def require(condition, message):
+    if not condition:
+        raise RuntimeError(message)
+
+
+def run(argv, *, cwd=ROOT, env=None):
+    return subprocess.run(
+        [str(value) for value in argv], cwd=cwd, env=env, text=True,
+        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, check=False,
+    )
+
+
+def checked(argv, *, cwd=ROOT, env=None):
+    result = run(argv, cwd=cwd, env=env)
+    require(result.returncode == 0,
+            f"command_failed_{Path(str(argv[0])).name}: {result.stdout[-1200:]}")
+    return result.stdout
+
+
+def git(*args):
+    return checked(["/usr/bin/git", *args]).strip()
+
+
+def git_at(directory, *args):
+    return checked(["/usr/bin/git", *args], cwd=directory).strip()
+
+
+def digest(path):
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def validate_policy():
+    path = ROOT / "policy/aid-admin-policy.json"
+    data = path.read_bytes()
+    policy = json.loads(data)
+    require(set(policy) == {"allowedCommands", "apply", "audit", "control", "environment",
+                            "executables", "installedPaths", "preparationOnly", "schema"},
+            "policy_top_level_keys")
+    require(policy["schema"] == 2 and policy["preparationOnly"] is True,
+            "policy_preparation_header")
+    require(policy["allowedCommands"] == ["apply-system", "doctor-root"], "policy_commands")
+    require(policy["apply"] == {
+        "activationArguments": ["--switch-generation"],
+        "applyGateAccepted": False,
+        "profilePath": "/nix/var/nix/profiles/system",
+        "receiptSuffix": "AIDev/state/phase-4/apply-receipts",
+        "rollbackArguments": ["--switch-generation"],
+        "storeRoot": "/nix/store",
+    }, "policy_apply_gate")
+    require(policy["control"] == {
+        "expectedBranch": "main", "provenanceRule": "local-reviewed-main-exact-head",
+        "repositoryRule": "caller-home-relative", "repositorySuffix": "AIDev/control",
+        "requireClean": True, "requireExactHead": True,
+    }, "policy_control")
+    require(policy["executables"] == {
+        "activation": "/run/current-system/sw/bin/darwin-rebuild", "git": "/usr/bin/git",
+        "nixEnv": "/nix/var/nix/profiles/default/bin/nix-env",
+        "nixStore": "/nix/var/nix/profiles/default/bin/nix-store",
+    }, "policy_executables")
+    require(policy["installedPaths"] == {
+        "attestation": "/etc/agent-first-mac/aid-admin-install.json",
+        "audit": "/var/log/agent-first-mac/aid-admin",
+        "binary": "/usr/local/libexec/aid-admin",
+        "emergencyDisable": "/etc/agent-first-mac/aid-admin.disabled",
+        "policy": "/etc/agent-first-mac/aid-admin-policy.json",
+        "staging": "/var/db/agent-first-mac/staging",
+        "sudoers": "/etc/sudoers.d/agent-first-mac-aid-admin",
+    }, "policy_paths")
+    require(policy["environment"] == {
+        "HOME": "/var/empty", "LANG": "C", "LC_ALL": "C",
+        "PATH": "/usr/bin:/bin", "TMPDIR": "/var/empty",
+    }, "policy_environment")
+    value = hashlib.sha256(data).hexdigest()
+    source = (ROOT / "Sources/AidAdminCore/AidAdminCore.swift").read_text()
+    require(f'compiledPolicySHA256 = "{value}"' in source, "compiled_policy_hash")
+    require(re.search(r"/Users/[A-Za-z0-9._-]+", data.decode()) is None, "policy_private_path")
+    return value
+
+
+def validate_sudoers():
+    path = ROOT / "policy/sudoers.d/agent-first-mac-aid-admin"
+    text = path.read_text()
+    require(text == (
+        "Cmnd_Alias AGENT_FIRST_MAC_AID_ADMIN = /usr/local/libexec/aid-admin\n"
+        "@@AGENT_OWNER@@ ALL=(root) NOPASSWD: AGENT_FIRST_MAC_AID_ADMIN\n"
+    ), "sudoers_exact_template")
+    lowered = text.lower()
+    require("%admin" not in lowered and "%" not in text and "*" not in text,
+            "sudoers_group_or_wildcard")
+    for forbidden in ("nopasswd: all", "/bin/sh", "/bin/zsh", "editor", "brew", "nix",
+                      "darwin-rebuild", "git", "launchctl", "/bin/cp", "/usr/bin/install"):
+        require(forbidden not in lowered, f"sudoers_forbidden_{forbidden}")
+    for principal in ("agentowner", "#12345"):
+        rendered = text.replace("@@AGENT_OWNER@@", principal).encode()
+        with tempfile.NamedTemporaryFile(prefix="aid-admin-sudoers.", delete=False) as temporary:
+            temporary.write(rendered)
+            temporary_path = Path(temporary.name)
+        try:
+            temporary_path.chmod(0o440)
+            output = checked(["/usr/sbin/visudo", "-cf", temporary_path])
+            require("parsed OK" in output, "visudo_output")
+        finally:
+            temporary_path.unlink(missing_ok=True)
+
+
+def validate_static_files():
+    for path in ROOT.rglob("*.json"):
+        if ".build" not in path.parts:
+            json.loads(path.read_text())
+    swift = "\n".join((ROOT / path).read_text() for path in (
+        "Sources/AidAdmin/main.swift", "Sources/AidAdminCore/AidAdminCore.swift"))
+    for forbidden in (r"\bsystem\s*\(", r"\bpopen\s*\(", r"/bin/(?:ba|z)?sh\b", r"\s-c\b"):
+        require(re.search(forbidden, swift) is None, f"swift_shell_interpretation_{forbidden}")
+    require("process.executableURL = URL(fileURLWithPath: executable)" in swift,
+            "direct_process_execution")
+    require("process.environment = environment" in swift, "clean_environment_assignment")
+    for required in ("core.fsmonitor=false", "core.hooksPath=/dev/null", "safe.directory=",
+                     "--no-optional-locks", "target_already_numbered", "rollbackAndVerify",
+                     "installed_artifact_hash_drift", "darwin-version.json",
+                     "configurationRevision", r"duplicate_\(context)_key",
+                     "st_ctimespec", "before.st_mode == after.st_mode",
+                     "before.st_uid == after.st_uid", "darwin_version_link_race",
+                     r"-darwin-version\\.json"):
+        require(required in swift, f"swift_boundary_{required}")
+    operational = "\n".join(
+        path.read_text(errors="ignore") for path in sorted(ROOT.rglob("*"))
+        if path.is_file() and ".git" not in path.parts and ".build" not in path.parts
+        and "tests" not in path.parts and "evidence" not in path.parts
+    )
+    for forbidden in ("Migrate" + "FromWindows", "BEGIN " + "PRIVATE KEY"):
+        require(forbidden not in operational, f"external_or_secret_marker_{forbidden}")
+    require(re.search(r"/Users/[A-Za-z0-9._-]+", operational) is None,
+            "private_absolute_path")
+    require(re.search(r"\b(?:serial|hardware_uuid|machine_uuid)\s*[:=]", operational,
+                      re.IGNORECASE) is None, "stable_identifier")
+    for executable in ("bin/check-phase4-root-broker-prep", "bin/phase4-fixture-operator",
+                       "bin/phase4-installed-attestation", "bin/phase4-root-preflight"):
+        require(os.access(ROOT / executable, os.X_OK), f"not_executable_{executable}")
+    document = (ROOT / "docs/phase-4-root-broker-preparation.md").read_text()
+    for required in (MARKER, "PREPARED_FOR_INDEPENDENT_REVIEW", "preparationOnly=true",
+                     "apply.applyGateAccepted=false", "NOT_INSTALLED_EXPECTED",
+                     "without the agent or broker", "sudoers last", "nix-env",
+                     "authoritative commit-to-closure binding",
+                     "preparation-acceptance.json", "ACCEPTED_PREPARATION",
+                     "synthetic accepted-main"):
+        require(required in document, f"document_{required}")
+    router_requirements = (
+        "review-state: PREPARED_FOR_INDEPENDENT_REVIEW",
+        "integrated-main-state: ACCEPTED_PREPARATION",
+        "root_install_authorized=false",
+        "phase4_pass_claimed=false",
+        "l3_claimed=false",
+        "preparationOnly=true",
+        "applyGateAccepted=false",
+    )
+    routers = {
+        name: (ROOT / name).read_text() for name in ("ARCHITECTURE.md", "AGENTS.md", "README.md")
+    }
+    for name, text in routers.items():
+        for required in router_requirements:
+            require(required in text, f"conditional_router_{name}_{required}")
+    stale_router_phrases = (
+        "merge only on PASS",
+        "Phase 4 work is preparation-only on `codex/phase-4-root-broker-prep`",
+        "This packet may reach only `PREPARED_FOR_INDEPENDENT_REVIEW`",
+    )
+    for stale in stale_router_phrases:
+        require(all(stale not in text for text in routers.values()),
+                f"stale_router_status_{stale}")
+
+
+def validate_preflight():
+    first = checked([ROOT / "bin/phase4-root-preflight", "--json"])
+    second = checked([ROOT / "bin/phase4-root-preflight", "--json"])
+    require(first == second, "preflight_not_byte_identical")
+    value = json.loads(first)
+    require(value["verdict"] == "NOT_INSTALLED_EXPECTED", "live_preflight_unexpected")
+    require(value["read_only"] is True and value["sudo_requested"] is False and
+            value["system_mutations_performed"] is False and
+            value["protected_content_read"] is False, "preflight_mutation_contract")
+    return hashlib.sha256(first.encode()).hexdigest()
+
+
+def stable_stat_equal(before, after):
+    return all(getattr(before, field) == getattr(after, field) for field in (
+        "st_dev", "st_ino", "st_uid", "st_gid", "st_mode", "st_size",
+        "st_mtime_ns", "st_ctime_ns",
+    ))
+
+
+def read_live_immutable_file(path):
+    initial = os.lstat(path)
+    require(stat.S_ISREG(initial.st_mode), "live_revision_target_not_regular")
+    require(initial.st_uid == 0 and initial.st_mode & 0o022 == 0,
+            "live_revision_target_mutable")
+    require(0 < initial.st_size <= 4096, "live_revision_target_size")
+    descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+    try:
+        before = os.fstat(descriptor)
+        require(stable_stat_equal(initial, before), "live_revision_target_open_race")
+        data = b""
+        while len(data) < before.st_size:
+            chunk = os.read(descriptor, before.st_size - len(data))
+            require(bool(chunk), "live_revision_target_short_read")
+            data += chunk
+        require(os.read(descriptor, 1) == b"", "live_revision_target_grew")
+        require(stable_stat_equal(before, os.fstat(descriptor)),
+                "live_revision_target_read_race")
+        return data
+    finally:
+        os.close(descriptor)
+
+
+def strict_live_revision(data):
+    text = data.decode("ascii")
+    require("\\" not in text, "live_revision_escaped_json")
+
+    def unique_object(pairs):
+        value = {}
+        for key, item in pairs:
+            require(key not in value, "live_revision_duplicate_key")
+            value[key] = item
+        return value
+
+    value = json.loads(text, object_pairs_hook=unique_object)
+    expected = {"configurationRevision", "darwinLabel", "darwinRevision", "nixpkgsRevision"}
+    require(isinstance(value, dict) and set(value) == expected, "live_revision_schema")
+    require(all(isinstance(value[key], str) for key in expected), "live_revision_string_values")
+    for key in ("configurationRevision", "darwinRevision", "nixpkgsRevision"):
+        require(re.fullmatch(r"[0-9a-f]{40}", value[key]) is not None,
+                f"live_revision_{key}")
+    require(re.fullmatch(r"[0-9A-Za-z][0-9A-Za-z._+-]{0,95}", value["darwinLabel"])
+            is not None, "live_revision_label")
+    require(value["configurationRevision"] == ACCEPTED_APPLIED_INTENT,
+            "live_revision_accepted_commit_mismatch")
+
+
+def validate_live_revision_layout():
+    revision = Path("/run/current-system/darwin-version.json")
+    link_before = os.lstat(revision)
+    if stat.S_ISREG(link_before.st_mode):
+        data = read_live_immutable_file(revision)
+        layout = "direct_immutable_regular"
+    else:
+        require(stat.S_ISLNK(link_before.st_mode), "live_revision_layout_type")
+        require(link_before.st_uid == 0 and link_before.st_mode & 0o022 == 0,
+                "live_revision_link_mutable")
+        destination = os.readlink(revision)
+        require(re.fullmatch(
+            r"/nix/store/[0-9abcdfghijklmnpqrsvwxyz]{32}-darwin-version\.json",
+            destination) is not None, "live_revision_link_class")
+        target = Path(destination)
+        require(not stat.S_ISLNK(os.lstat(target).st_mode), "live_revision_nested_link")
+        data = read_live_immutable_file(target)
+        link_after = os.lstat(revision)
+        require(stable_stat_equal(link_before, link_after) and
+                os.readlink(revision) == destination, "live_revision_link_race")
+        layout = "one_absolute_immutable_store_link"
+    strict_live_revision(data)
+    return {
+        "accepted_commit_matches": True,
+        "bounded_read": True,
+        "layout_class": layout,
+        "raw_path_retained": False,
+        "strict_four_key_schema": True,
+    }
+
+
+def candidate_behavior(binary):
+    poisoned = os.environ.copy()
+    poisoned.update({"PATH": "/tmp/poison", "SECRET_TOKEN": "must-not-appear"})
+    cases = [
+        [], ["unknown"], ["install-pkg"], ["remove-pkg"], ["reconcile-daemon"],
+        ["developer-tools"], ["software-update"], ["snapshot"],
+        ["doctor-root", "extra"], ["apply-system"], ["apply-system", "abc"],
+        ["apply-system", "A" * 40], ["apply-system", "a" * 40 + ";id"],
+        ["apply-system", "../../" + "a" * 40], ["apply-system", "$(id)"],
+        ["apply-system", "a" * 40, "extra"], ["apply-system", "a" * 40],
+        ["doctor-root", "--json"],
+    ]
+    results = []
+    for arguments in cases:
+        result = run([binary, *arguments], env=poisoned)
+        require(result.returncode != 0, f"negative_cli_accepted_{arguments}")
+        require("must-not-appear" not in result.stdout and "/tmp/poison" not in result.stdout,
+                "poison_leaked")
+        results.append({"arguments": arguments, "exit": result.returncode, "output": result.stdout})
+    return results
+
+
+def load_fixture_operator():
+    path = ROOT / "bin/phase4-fixture-operator"
+    loader = importlib.machinery.SourceFileLoader("phase4_fixture_operator", str(path))
+    specification = importlib.util.spec_from_loader(loader.name, loader)
+    module = importlib.util.module_from_spec(specification)
+    loader.exec_module(module)
+    return module
+
+
+def prepare_bootstrap_inputs(directory, binary, principal="agentowner"):
+    directory.mkdir(parents=True)
+    sources = {
+        "binarySHA256": directory / "aid-admin",
+        "policySHA256": directory / "aid-admin-policy.json",
+        "sudoersTemplateSHA256": directory / "agent-first-mac-aid-admin",
+    }
+    shutil.copyfile(binary, sources["binarySHA256"])
+    shutil.copyfile(ROOT / "policy/aid-admin-policy.json", sources["policySHA256"])
+    shutil.copyfile(ROOT / "policy/sudoers.d/agent-first-mac-aid-admin",
+                    sources["sudoersTemplateSHA256"])
+    sources["binarySHA256"].chmod(0o555)
+    sources["policySHA256"].chmod(0o444)
+    sources["sudoersTemplateSHA256"].chmod(0o444)
+    manifest = directory / "reviewed.json"
+    rendered = sources["sudoersTemplateSHA256"].read_text().replace("@@AGENT_OWNER@@", principal).encode()
+    manifest.write_text(json.dumps({
+        "schema": 1,
+        **{key: digest(path) for key, path in sources.items()},
+        "renderedSudoersSHA256": hashlib.sha256(rendered).hexdigest(),
+    }, indent=2, sort_keys=True) + "\n")
+    manifest.chmod(0o444)
+    return sources, manifest
+
+
+def new_fixture_root():
+    fixture = Path(tempfile.mkdtemp(prefix="aid-admin-fixture."))
+    checked([ROOT / "bin/phase4-fixture-operator", "prepare", fixture])
+    return fixture
+
+
+def validate_fixture_bootstrap(binary):
+    operator = load_fixture_operator()
+    workspace = Path(tempfile.mkdtemp(prefix="aid-admin-bootstrap-tests."))
+    fixtures = []
+    try:
+        sources, manifest = prepare_bootstrap_inputs(workspace / "reviewed", binary)
+        fixture = new_fixture_root()
+        fixtures.append(fixture)
+        checked([ROOT / "bin/phase4-fixture-operator", "bootstrap", fixture,
+                 sources["binarySHA256"], sources["policySHA256"], sources["sudoersTemplateSHA256"],
+                 manifest, "agentowner", "12345", "name:agentowner"])
+        installed = json.loads(checked([ROOT / "bin/phase4-fixture-operator", "status", fixture]))
+        require(installed["checks"] == {
+            "attestation": True, "binary": True, "disabled": False, "policy": True,
+            "sudoers": True, "sudoers_disabled": False,
+        }, "fixture_bootstrap")
+        attestation = json.loads((fixture / "etc/agent-first-mac/aid-admin-install.json").read_text())
+        accepted = workspace / "accepted-installed.json"
+        accepted.write_text(json.dumps({
+            "schema": 1,
+            "binarySHA256": digest(fixture / "usr/local/libexec/aid-admin"),
+            "policySHA256": digest(fixture / "etc/agent-first-mac/aid-admin-policy.json"),
+            "sudoersSHA256": digest(fixture / "etc/sudoers.d/agent-first-mac-aid-admin"),
+        }, indent=2, sort_keys=True) + "\n")
+        external = json.loads(checked([ROOT / "bin/phase4-installed-attestation", "--expected", accepted,
+                                       "--root", fixture]))
+        require(external["verdict"] == "INSTALLED_ARTIFACTS_MATCH_ACCEPTED_HASHES" and
+                all(external["checks"].values()), "external_attestation")
+        require("agentowner" not in json.dumps(external), "external_attestation_identity_leak")
+        require(attestation["agentOwnerIdentity"] == "agentowner", "installed_owner_binding")
+        checked([ROOT / "bin/phase4-fixture-operator", "disable", fixture])
+        disabled = json.loads(checked([ROOT / "bin/phase4-fixture-operator", "status", fixture]))
+        require(disabled["checks"]["disabled"] and disabled["checks"]["sudoers_disabled"] and
+                not disabled["checks"]["sudoers"], "fixture_disable")
+        checked([ROOT / "bin/phase4-fixture-operator", "uninstall", fixture])
+
+        toctou_sources, toctou_manifest = prepare_bootstrap_inputs(workspace / "toctou", binary)
+        original_digest = json.loads(toctou_manifest.read_text())["binarySHA256"]
+        toctou_fixture = new_fixture_root()
+        fixtures.append(toctou_fixture)
+
+        def mutate_original(_staging, _staged):
+            toctou_sources["binarySHA256"].chmod(0o600)
+            toctou_sources["binarySHA256"].write_bytes(b"mutated-after-copy")
+
+        operator.bootstrap(str(toctou_fixture), *(str(toctou_sources[key]) for key in (
+            "binarySHA256", "policySHA256", "sudoersTemplateSHA256")),
+            str(toctou_manifest), "agentowner", "12345", "name:agentowner",
+            after_copy=mutate_original)
+        require(digest(toctou_fixture / "usr/local/libexec/aid-admin") == original_digest,
+                "bootstrap_source_toctou")
+
+        numeric_sources, numeric_manifest = prepare_bootstrap_inputs(
+            workspace / "numeric", binary, principal="#12345")
+        numeric_fixture = new_fixture_root()
+        fixtures.append(numeric_fixture)
+        checked([ROOT / "bin/phase4-fixture-operator", "bootstrap", numeric_fixture,
+                 numeric_sources["binarySHA256"], numeric_sources["policySHA256"],
+                 numeric_sources["sudoersTemplateSHA256"], numeric_manifest,
+                 "agentowner", "12345", "uid:12345"])
+        require((numeric_fixture / "etc/sudoers.d/agent-first-mac-aid-admin").read_text().startswith(
+            "Cmnd_Alias AGENT_FIRST_MAC_AID_ADMIN"), "numeric_sudoers_render")
+
+        corrupt_sources, corrupt_manifest = prepare_bootstrap_inputs(workspace / "corrupt", binary)
+        corrupt_fixture = new_fixture_root()
+        fixtures.append(corrupt_fixture)
+
+        def corrupt_staged(_staging, staged):
+            path = staged["policySHA256"]
+            path.chmod(0o600)
+            path.write_bytes(b"corrupt-staged-copy")
+
+        rejected = False
+        try:
+            operator.bootstrap(str(corrupt_fixture), *(str(corrupt_sources[key]) for key in (
+                "binarySHA256", "policySHA256", "sudoersTemplateSHA256")),
+                str(corrupt_manifest), "agentowner", "12345", "name:agentowner",
+                after_copy=corrupt_staged)
+        except RuntimeError:
+            rejected = True
+        require(rejected, "corrupt_staged_copy_accepted")
+        require(not (corrupt_fixture / "etc/sudoers.d/agent-first-mac-aid-admin").exists(),
+                "sudoers_enabled_after_hash_mismatch")
+
+        for owner, uid, identity in (("%admin", "12345", "name:%admin"),
+                                     ("bad name", "12345", "name:bad name"),
+                                     ("agentowner", "0", "uid:0"),
+                                     ("agentowner", "12345", "name:different"),
+                                     ("agentowner", "12345", "group:admin")):
+            unsafe_fixture = new_fixture_root()
+            fixtures.append(unsafe_fixture)
+            result = run([ROOT / "bin/phase4-fixture-operator", "bootstrap", unsafe_fixture,
+                          sources["binarySHA256"], sources["policySHA256"], sources["sudoersTemplateSHA256"],
+                          manifest, owner, uid, identity])
+            require(result.returncode != 0, f"unsafe_identity_accepted_{identity}")
+            require(not (unsafe_fixture / "etc/sudoers.d/agent-first-mac-aid-admin").exists(),
+                    "unsafe_identity_enabled_sudoers")
+        require(run([ROOT / "bin/phase4-fixture-operator", "status", "/"]).returncode != 0,
+                "fixture_helper_live_root")
+
+        escape_fixture = new_fixture_root()
+        fixtures.append(escape_fixture)
+        outside = workspace / "outside-target"
+        outside.mkdir()
+        (escape_fixture / "etc").symlink_to(outside, target_is_directory=True)
+        escaped = run([ROOT / "bin/phase4-fixture-operator", "bootstrap", escape_fixture,
+                       sources["binarySHA256"], sources["policySHA256"],
+                       sources["sudoersTemplateSHA256"], manifest,
+                       "agentowner", "12345", "name:agentowner"])
+        require(escaped.returncode != 0 and not any(outside.iterdir()), "fixture_symlink_escape")
+    finally:
+        shutil.rmtree(workspace, ignore_errors=True)
+        for fixture in fixtures:
+            shutil.rmtree(fixture, ignore_errors=True)
+
+
+def validate_build_and_tests():
+    scratch_a = Path(tempfile.mkdtemp(prefix="aid-admin-build-a."))
+    scratch_b = Path(tempfile.mkdtemp(prefix="aid-admin-build-b."))
+    tests = Path(tempfile.mkdtemp(prefix="aid-admin-tests."))
+    try:
+        checked(["/usr/bin/swift", "build", "-c", "release", "--scratch-path", scratch_a])
+        checked(["/usr/bin/swift", "build", "-c", "release", "--scratch-path", scratch_b])
+        bin_a = Path(checked(["/usr/bin/swift", "build", "-c", "release", "--show-bin-path",
+                              "--scratch-path", scratch_a]).strip()) / "aid-admin"
+        bin_b = Path(checked(["/usr/bin/swift", "build", "-c", "release", "--show-bin-path",
+                              "--scratch-path", scratch_b]).strip()) / "aid-admin"
+        require(bin_a.is_file() and bin_b.is_file(), "candidate_missing")
+        behavior_a = candidate_behavior(bin_a)
+        behavior_b = candidate_behavior(bin_b)
+        require(behavior_a == behavior_b, "two_build_behavior_drift")
+        output = checked(["/usr/bin/swift", "run", "--scratch-path", tests, "aid-admin-tests"])
+        result_line = next((line for line in output.splitlines() if line.startswith('{"result"')), "")
+        require(json.loads(result_line) == {"result": "pass", "tests": 14}, "swift_fixture_tests")
+        validate_fixture_bootstrap(bin_a)
+        return {"behavior_cases": len(behavior_a), "fixture_tests": 14,
+                "swift": checked(["/usr/bin/swift", "--version"]).splitlines()[0]}
+    finally:
+        shutil.rmtree(scratch_a, ignore_errors=True)
+        shutil.rmtree(scratch_b, ignore_errors=True)
+        shutil.rmtree(tests, ignore_errors=True)
+
+
+def validate_evidence(implementation):
+    value = json.loads((ROOT / "evidence/phase-4/integrated-verdict-correction.json").read_text())
+    require(set(value) == {"schema", "phase", "base", "branch", "prior_commits",
+                           "integrated_verdict_implementation_commit", "build_and_tests",
+                           "compatibility", "defects_corrected", "redaction",
+                           "system_mutations", "rollback", "gate"},
+            "integrated_verdict_evidence_keys")
+    require(value["schema"] == 1 and
+            value["phase"] == "phase4_root_broker_integrated_verdict_correction",
+            "integrated_verdict_evidence_header")
+    require(value["base"] == BASE and value["branch"] == BRANCH and
+            value["prior_commits"] == [PRIOR_IMPLEMENTATION, PRIOR_EVIDENCE,
+                                       PRIOR_CORRECTIVE_IMPLEMENTATION,
+                                       PRIOR_CORRECTIVE_EVIDENCE,
+                                       PRIOR_REVISION_IMPLEMENTATION,
+                                       PRIOR_REVISION_EVIDENCE,
+                                       PRIOR_LIVE_LAYOUT_IMPLEMENTATION,
+                                       PRIOR_LIVE_LAYOUT_EVIDENCE,
+                                       PRIOR_STATUS_IMPLEMENTATION,
+                                       PRIOR_STATUS_EVIDENCE] and
+            value["integrated_verdict_implementation_commit"] == implementation,
+            "integrated_verdict_evidence_provenance")
+    require(value["system_mutations"] == {"performed": False, "root_execution": False,
+            "sudo_or_password_prompt": False, "live_apply": False, "installation": False},
+            "integrated_verdict_evidence_mutations")
+    require(value["gate"] == {"phase4_pass_claimed": False, "l2_remains_claimed": True,
+            "l3_claimed": False, "maximum_verdict": "PREPARED_FOR_INDEPENDENT_REVIEW",
+            "marker": MARKER, "independent_review_required": True},
+            "integrated_verdict_evidence_gate")
+    require(value["rollback"] == {"system_rollback_required": False, "git_revert_only": True,
+            "live_generation_unchanged": True, "fixture_exact_rollback_proven": True,
+            "accepted_generation_deleted": False}, "integrated_verdict_evidence_rollback")
+    for group in ("build_and_tests", "compatibility", "defects_corrected", "redaction"):
+        require(all(value[group].values()), f"integrated_verdict_evidence_{group}")
+
+
+def commit_scope(commit):
+    return set(git("diff-tree", "--no-commit-id", "--name-only", "-r", commit).splitlines())
+
+
+def validate_review_history(reviewed_head):
+    require(git("rev-list", "--count", f"{BASE}..{reviewed_head}") == "12",
+            "corrected_review_history_count")
+    implementation = git("rev-parse", f"{reviewed_head}^")
+    require(git("rev-parse", f"{implementation}^") == PRIOR_STATUS_EVIDENCE,
+            "integrated_verdict_implementation_parent")
+    require(commit_scope(implementation) == INTEGRATED_VERDICT_CORRECTIVE_SCOPE,
+            "integrated_verdict_implementation_scope")
+    require(commit_scope(reviewed_head) == INTEGRATED_VERDICT_EVIDENCE_SCOPE,
+            "integrated_verdict_evidence_scope")
+    validate_evidence(implementation)
+    return implementation
+
+
+def acceptance_value(reviewed_head, **overrides):
+    value = {
+        "schema": 1,
+        "phase": "phase4_root_broker_preparation",
+        "verdict": "ACCEPTED_PREPARATION",
+        "reviewed_task_head": reviewed_head,
+        "review_marker": MARKER,
+        "root_install_authorized": False,
+        "phase4_pass_claimed": False,
+        "l3_claimed": False,
+    }
+    value.update(overrides)
+    return value
+
+
+def strict_acceptance(path, reviewed_head):
+    pairs = json.loads(path.read_text(), object_pairs_hook=lambda value: value)
+    require(isinstance(pairs, list), "acceptance_not_object")
+    value = {}
+    for key, item in pairs:
+        require(isinstance(key, str) and key not in value, "acceptance_duplicate_key")
+        value[key] = item
+    require(set(value) == {"schema", "phase", "verdict", "reviewed_task_head",
+                           "review_marker", "root_install_authorized",
+                           "phase4_pass_claimed", "l3_claimed"}, "acceptance_keys")
+    require(value == acceptance_value(reviewed_head), "acceptance_contract")
+
+
+def validate_integrated_main():
+    require(git("rev-list", "--count", f"{BASE}..HEAD") == "13",
+            "integrated_main_history_count")
+    require(commit_scope("HEAD") == ACCEPTANCE_SCOPE, "acceptance_commit_scope")
+    reviewed_head = git("rev-parse", "HEAD^")
+    implementation = validate_review_history(reviewed_head)
+    strict_acceptance(ROOT / "evidence/phase-4/preparation-acceptance.json", reviewed_head)
+    return implementation, reviewed_head
+
+
+def validate_git(mode):
+    branch = git("branch", "--show-current")
+    require(run(["/usr/bin/git", "merge-base", "--is-ancestor", BASE, "HEAD"]).returncode == 0,
+            "base_not_ancestor")
+    require(run(["/usr/bin/git", "diff", "--check", BASE]).returncode == 0, "diff_check")
+    require(run(["/usr/bin/git", "diff", "--quiet", BASE, "--", "evidence/phase-3"]).returncode == 0,
+            "phase3_evidence_changed")
+    require(git("rev-parse", f"{PRIOR_STATUS_EVIDENCE}^") == PRIOR_STATUS_IMPLEMENTATION and
+            git("rev-parse", f"{PRIOR_STATUS_IMPLEMENTATION}^") == PRIOR_LIVE_LAYOUT_EVIDENCE and
+            git("rev-parse", f"{PRIOR_LIVE_LAYOUT_EVIDENCE}^") ==
+            PRIOR_LIVE_LAYOUT_IMPLEMENTATION and
+            git("rev-parse", f"{PRIOR_LIVE_LAYOUT_IMPLEMENTATION}^") == PRIOR_REVISION_EVIDENCE and
+            git("rev-parse", f"{PRIOR_REVISION_EVIDENCE}^") == PRIOR_REVISION_IMPLEMENTATION and
+            git("rev-parse", f"{PRIOR_REVISION_IMPLEMENTATION}^") == PRIOR_CORRECTIVE_EVIDENCE and
+            git("rev-parse", f"{PRIOR_CORRECTIVE_EVIDENCE}^") == PRIOR_CORRECTIVE_IMPLEMENTATION and
+            git("rev-parse", f"{PRIOR_CORRECTIVE_IMPLEMENTATION}^") == PRIOR_EVIDENCE and
+            git("rev-parse", f"{PRIOR_EVIDENCE}^") == PRIOR_IMPLEMENTATION and
+            git("rev-parse", f"{PRIOR_IMPLEMENTATION}^") == BASE, "prior_history_rewritten")
+    if mode == "contract-only":
+        require(branch == BRANCH, "contract_only_wrong_branch")
+        return None, "review", None
+    require(git("status", "--porcelain") == "", "dirty_worktree")
+    if mode == "implementation":
+        require(branch == BRANCH, "implementation_wrong_branch")
+        require(git("rev-parse", "HEAD^") == PRIOR_STATUS_EVIDENCE,
+                "integrated_verdict_implementation_parent")
+        implementation = git("rev-parse", "HEAD")
+        require(commit_scope(implementation) == INTEGRATED_VERDICT_CORRECTIVE_SCOPE,
+                "integrated_verdict_implementation_scope")
+        return implementation, "review", implementation
+    if branch == BRANCH:
+        reviewed_head = git("rev-parse", "HEAD")
+        implementation = validate_review_history(reviewed_head)
+        repository_state = "review"
+    elif branch == "main":
+        implementation, reviewed_head = validate_integrated_main()
+        repository_state = "integrated_main"
+    else:
+        raise RuntimeError("wrong_branch")
+    if mode == "clone":
+        require(git("remote") == "", "clone_has_remote")
+    return implementation, repository_state, reviewed_head
+
+
+def commit_synthetic_acceptance(directory, reviewed_head, value=None, include=True):
+    checked(["/usr/bin/git", "checkout", "-q", "-b", "main"], cwd=directory)
+    if include:
+        path = directory / "evidence/phase-4/preparation-acceptance.json"
+        path.write_text(json.dumps(value or acceptance_value(reviewed_head), indent=2,
+                                   sort_keys=True) + "\n")
+        checked(["/usr/bin/git", "add", "--", path.relative_to(directory)], cwd=directory)
+    environment = os.environ.copy()
+    environment.update({
+        "GIT_AUTHOR_NAME": "Agent-First Mac Coordinator",
+        "GIT_AUTHOR_EMAIL": "coordinator@agent-first-mac.invalid",
+        "GIT_COMMITTER_NAME": "Agent-First Mac Coordinator",
+        "GIT_COMMITTER_EMAIL": "coordinator@agent-first-mac.invalid",
+    })
+    arguments = ["/usr/bin/git", "-c", "core.hooksPath=/dev/null", "commit", "-q",
+                 "--no-gpg-sign", "-m", "Accept Phase 4 preparation"]
+    if not include:
+        arguments.insert(-2, "--allow-empty")
+    checked(arguments, cwd=directory, env=environment)
+
+
+def validate_integrated_main_matrix(reviewed_head):
+    workspace = Path(tempfile.mkdtemp(prefix="aid-admin-integrated-main."))
+    cases = 0
+
+    def clone(name):
+        destination = workspace / name
+        checked(["/usr/bin/git", "clone", "--no-local", "--quiet", ROOT, destination])
+        checked(["/usr/bin/git", "remote", "remove", "origin"], cwd=destination)
+        require(git_at(destination, "rev-parse", "HEAD") == reviewed_head,
+                "synthetic_clone_reviewed_head")
+        return destination
+
+    def validator(directory):
+        return run([directory / "bin/check-phase4-root-broker-prep", "--git-only"], cwd=directory)
+
+    def rejected(name, value=None, include=True, mutate=None):
+        nonlocal cases
+        directory = clone(name)
+        commit_synthetic_acceptance(directory, reviewed_head, value=value, include=include)
+        if mutate is not None:
+            mutate(directory)
+        require(validator(directory).returncode != 0, f"integrated_negative_accepted_{name}")
+        cases += 1
+
+    try:
+        accepted = clone("accepted")
+        commit_synthetic_acceptance(accepted, reviewed_head)
+        accepted_result = validator(accepted)
+        require(accepted_result.returncode == 0 and
+                json.loads(accepted_result.stdout)["verdict"] == "ACCEPTED_PREPARATION",
+                "synthetic_integrated_main_rejected")
+
+        rejected("missing", include=False)
+        rejected("tampered", value=acceptance_value(reviewed_head, verdict="REJECTED"))
+        rejected("wrong-head", value=acceptance_value(reviewed_head,
+                                                       reviewed_task_head=PRIOR_REVISION_EVIDENCE))
+        rejected("root-claim", value=acceptance_value(reviewed_head,
+                                                       root_install_authorized=True))
+        rejected("phase4-claim", value=acceptance_value(reviewed_head,
+                                                         phase4_pass_claimed=True))
+        rejected("l3-claim", value=acceptance_value(reviewed_head, l3_claimed=True))
+        rejected("dirty", mutate=lambda directory: (directory / "dirty").write_text("dirty\n"))
+
+        def extra(directory):
+            environment = os.environ.copy()
+            environment.update({
+                "GIT_AUTHOR_NAME": "Agent-First Mac Coordinator",
+                "GIT_AUTHOR_EMAIL": "coordinator@agent-first-mac.invalid",
+                "GIT_COMMITTER_NAME": "Agent-First Mac Coordinator",
+                "GIT_COMMITTER_EMAIL": "coordinator@agent-first-mac.invalid",
+            })
+            checked(["/usr/bin/git", "-c", "core.hooksPath=/dev/null", "commit", "-q",
+                     "--allow-empty", "--no-gpg-sign", "-m", "Unexpected history"],
+                    cwd=directory, env=environment)
+
+        rejected("extra-history", mutate=extra)
+        rejected("detached", mutate=lambda directory: checked(
+            ["/usr/bin/git", "checkout", "-q", "--detach"], cwd=directory))
+
+        unexpected = clone("unexpected")
+        checked(["/usr/bin/git", "checkout", "-q", "-b", "topic"], cwd=unexpected)
+        require(validator(unexpected).returncode != 0, "unexpected_branch_accepted")
+        cases += 1
+        return {"accepted_main_cases": 1, "negative_cases": cases}
+    finally:
+        shutil.rmtree(workspace, ignore_errors=True)
+
+
+def validate_compatibility(mode):
+    checked([ROOT / "bin/check-phase2a"])
+    checked(["/usr/bin/git", "fsck", "--full"])
+    if mode in ("review", "clone"):
+        main = Path.home() / "AIDev/control"
+        first = checked([main / "bin/phase2-doctor", "--json"], cwd=main)
+        second = checked([main / "bin/phase2-doctor", "--json"], cwd=main)
+        require(first == second and json.loads(first)["verdict"] == "PASS", "live_main_doctor")
+
+
+def main():
+    args = sys.argv[1:]
+    require(args in ([], ["--contract-only"], ["--implementation"], ["--clone"],
+                     ["--git-only"]), "usage")
+    mode = "review" if not args else args[0].removeprefix("--")
+    implementation, repository_state, reviewed_head = validate_git(mode)
+    if mode == "git-only":
+        print(json.dumps({
+            "repository_state": repository_state,
+            "result": "pass",
+            "reviewed_task_head": reviewed_head,
+            "schema": 1,
+            "verdict": "ACCEPTED_PREPARATION" if repository_state == "integrated_main" else
+                       "PREPARED_FOR_INDEPENDENT_REVIEW",
+        }, indent=2, sort_keys=True))
+        return
+    policy_hash = validate_policy()
+    validate_sudoers()
+    validate_static_files()
+    preflight_hash = validate_preflight()
+    live_layout = validate_live_revision_layout()
+    build = validate_build_and_tests()
+    validate_compatibility(mode)
+    integrated_matrix = None
+    if repository_state == "review" and mode in ("review", "clone"):
+        integrated_matrix = validate_integrated_main_matrix(reviewed_head)
+    print(json.dumps({
+        "schema": 1,
+        "result": "pass",
+        "mode": mode,
+        "repository_state": repository_state,
+        "reviewed_task_head": reviewed_head,
+        "integrated_verdict_implementation_commit": implementation,
+        "policy_sha256": policy_hash,
+        "preflight_sha256": preflight_hash,
+        "live_revision_layout": live_layout,
+        "integrated_main_matrix": integrated_matrix,
+        "build": build,
+        "system_mutations_performed": False,
+        "verdict": "ACCEPTED_PREPARATION" if repository_state == "integrated_main" else
+                   ("PREPARED_FOR_INDEPENDENT_REVIEW" if mode in ("review", "clone") else
+                    ("IMPLEMENTATION_VALID" if mode == "implementation" else "CONTRACT_VALID")),
+        "marker": MARKER,
+    }, indent=2, sort_keys=True))
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except Exception as error:
+        print(json.dumps({"result": "fail", "reason": str(error)}, sort_keys=True))
+        raise SystemExit(1)

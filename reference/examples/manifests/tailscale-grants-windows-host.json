@@ -1,0 +1,79 @@
+{
+  "publicReferenceOnly": true,
+  "warning": "Sanitized historical example. Not installation authority or current inventory.",
+  "example": {
+    "schema": 1,
+    "profile": "tailscale-grants-windows-host",
+    "profileActive": true,
+    "controlPlane": {
+      "product": "Tailscale",
+      "surface": "tailnet policy file in the official admin console"
+    },
+    "runtimeSelectors": {
+      "source": "the sole non-WindowsHost device in the verified two-device tailnet",
+      "destination": "the sole device whose displayed local name is WindowsHost",
+      "selectorMaterialLocation": "Tailscale control plane and transient in-memory apply only"
+    },
+    "targetPolicy": {
+      "replaceOnlyDefaultAllowAllGrant": true,
+      "sourceCount": 1,
+      "destinationCount": 1,
+      "networkCapabilities": [
+        "tcp:22",
+        "tcp:3389",
+        "tcp:21118"
+      ],
+      "preserveTailscaleSshSectionExactly": true,
+      "createTags": false,
+      "retagDevices": false,
+      "enableTailscaleSsh": false,
+      "changeDns": false,
+      "changeRoutes": false,
+      "changeExitNode": false,
+      "changeDeviceApproval": false,
+      "changeSharing": false
+    },
+    "policyTests": {
+      "source": "same exact runtime source selector",
+      "destination": "same exact runtime destination selector",
+      "protocol": "tcp",
+      "acceptPorts": [
+        22,
+        3389,
+        21118
+      ],
+      "denyOneUnlistedPort": true,
+      "saveMustFailClosedOnAnyTestFailure": true
+    },
+    "functionalGates": {
+      "beforeApply": [
+        "strict key-only SSH succeeds",
+        "TCP 3389 listener is reachable",
+        "Tailscale connected doctor passes"
+      ],
+      "afterApply": [
+        "policy save reports success",
+        "strict key-only SSH succeeds",
+        "TCP 3389 listener is reachable",
+        "Tailscale connected doctor passes",
+        "policy contains no allow-all grant"
+      ],
+      "rustDeskPortGate": "policy test must allow TCP 21118 before Windows RustDesk W5 installs or listens"
+    },
+    "rollback": {
+      "trigger": "policy rejection, failed SSH/RDP/Tailscale postcheck, selector drift, or unexpected rule expansion",
+      "method": "restore the exact prestate policy retained only in transient apply memory or use the official configuration-log revert entry",
+      "postchecks": [
+        "strict key-only SSH succeeds",
+        "TCP 3389 listener is reachable",
+        "Tailscale connected doctor passes"
+      ]
+    },
+    "dataBoundary": {
+      "authenticationStateReadOrCopied": false,
+      "browserSessionReadOrCopied": false,
+      "tailscaleProfileReadOrCopied": false,
+      "privateKeysReadOrCopied": false
+    }
+  }
+}

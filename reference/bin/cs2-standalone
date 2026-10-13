@@ -1,0 +1,582 @@
+#!/usr/bin/python3
+"""Reviewed, user-owned CS2 runtime adoption. No vendor launcher execution."""
+import sys
+sys.dont_write_bytecode = True
+import hashlib
+import fcntl
+import json
+import os
+from pathlib import Path
+import plistlib
+import pwd
+import re
+import shutil
+import stat
+import subprocess
+import tarfile
+
+HOME = Path(pwd.getpwuid(os.getuid()).pw_dir)
+CONTROL = HOME / 'AIDev/control'
+ROOT = HOME / 'Library/Application Support/CS2 Standalone'
+DONOR = HOME / 'Library/Application Support/Game Library/Games/cs2'
+STAGE = HOME / 'AIDev/quarantine/cs2-standalone-v1'
+HERE = Path(__file__).resolve().parent.parent
+MANIFEST = 'manifests/cs2-standalone.json'
+OWNER = 'control-cs2-standalone'
+SKIP_LIBS = ('libMVK', 'libMoltenVK', 'libvulkan')
+WINEBUS = 'engine/lib/wine/x86_64-unix/winebus.so'
+CONTROLLER_STAGE = HOME / 'AIDev/quarantine/cs2-controller-v3/winebus.so'
+
+def need(value, reason):
+    if not value:
+        raise RuntimeError(reason)
+
+def sha(path):
+    h = hashlib.sha256()
+    with path.open('rb') as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b''):
+            h.update(chunk)
+    return h.hexdigest()
+
+def directory(path, game_data=False):
+    """Reject symlink or writable-by-others directory components."""
+    path = Path(path)
+    need(path.is_absolute(), 'absolute_path_required')
+    boundaries=(ROOT/'prefix',DONOR/'prefix')
+    if game_data:
+        need(any(path.is_relative_to(b) for b in boundaries),'invalid_data_boundary')
+        private=HOME/'Library'; st=private.lstat()
+        need(stat.S_ISDIR(st.st_mode) and st.st_uid==os.getuid() and not st.st_mode & 0o077,'private_library_required')
+    for part in [*reversed(path.parents), path]:
+        st = part.lstat()
+        need(stat.S_ISDIR(st.st_mode) and st.st_uid in (0, os.getuid())
+             and (not st.st_mode & 0o022 or (game_data and st.st_uid==os.getuid()
+                  and not st.st_mode & 0o002 and any(part.is_relative_to(b) for b in boundaries))
+                  or (part == Path('/Applications') and st.st_uid == 0
+                  and st.st_gid == 80 and st.st_mode & 0o777 == 0o775)), 'unsafe_directory')
+
+def tree(path, allow_links=False, exclude=(), digest_overrides=None):
+    directory(path)
+    rows = []
+    for f in sorted(path.rglob('*')):
+        rel = str(f.relative_to(path))
+        if rel in exclude:
+            continue
+        st = f.lstat()
+        if stat.S_ISLNK(st.st_mode):
+            target = os.readlink(f)
+            need(allow_links and not os.path.isabs(target)
+                 and f.resolve().is_relative_to(path.resolve()) and f.exists(), 'unsafe_link')
+            rows.append([rel, 'link', target])
+        elif stat.S_ISREG(st.st_mode):
+            need(st.st_uid in (0, os.getuid()) and not st.st_mode & 0o022, 'unsafe_file')
+            rows.append([rel, st.st_mode & 0o777,
+                         (digest_overrides or {}).get(rel) or sha(f)])
+        else:
+            need(stat.S_ISDIR(st.st_mode) and st.st_uid in (0,os.getuid())
+                 and not st.st_mode & 0o022, 'unsafe_nested_directory')
+    return hashlib.sha256(json.dumps(rows, separators=(',', ':')).encode()).hexdigest()
+
+def run(args, timeout=180):
+    p = subprocess.run([str(a) for a in args], capture_output=True, timeout=timeout)
+    need(p.returncode == 0, 'command_failed:' + Path(args[0]).name)
+    return p.stdout
+
+def manifest(raw=None):
+    m = json.loads((HERE / MANIFEST).read_text()) if raw is None else controller_json(raw)
+    need(m['schema'] == 1 and m['id'] == 'cs2-standalone'
+         and m['owner'] == OWNER and type(m['version']) is int and m['version'] in (2, 3), 'invalid_manifest')
+    return m
+
+def source_gate(commit):
+    need(os.getuid() != 0 and HERE == CONTROL and Path(__file__).absolute() == CONTROL/'bin/cs2-standalone', 'canonical_user_source_required')
+    def git(*args):
+        return run(['/usr/bin/git', '-c', 'core.hooksPath=/dev/null', '-c', 'core.fsmonitor=false', '-C', CONTROL, *args]).decode().strip()
+    need(re.fullmatch('[0-9a-f]{40}', commit) and git('rev-parse', 'HEAD') == commit
+         and git('branch', '--show-current') == 'main' and not git('status', '--porcelain'), 'clean_exact_main_required')
+    report = json.loads(run([CONTROL/'bin/current-doctor', '--json'], timeout=600))
+    need(report.get('verdict') == 'PASS' and report.get('configurationSourceAccepted') is True
+         and report.get('currentSentinelReady') is True and report.get('integratedMain') is True, 'fresh_accepted_doctor_required')
+    need(git('rev-parse', 'HEAD') == commit and not git('status', '--porcelain'), 'source_changed')
+
+def attest(m):
+    app = Path(m['source']['vendorBundle'])
+    directory(app)
+    info = plistlib.loads((app/'Contents/Info.plist').read_bytes())
+    need(info['CFBundleVersion'] == m['source']['vendorBuild']
+         and info['CFBundleIdentifier'] == 'com.marcibrahim.gamelibrary', 'donor_generation_mismatch')
+    run(['/usr/bin/codesign', '--verify', '--deep', '--strict', app])
+    sig = subprocess.run(['/usr/bin/codesign', '-dv', app], capture_output=True, timeout=30)
+    need(sig.returncode == 0 and ('TeamIdentifier='+m['source']['vendorTeam']).encode() in sig.stderr, 'donor_identity_mismatch')
+    r = app/'Contents/Resources'
+    need(tree(r/'Engine') == m['source']['engineTree'], 'engine_hash_mismatch')
+    need(tree(r/'CS2/EngineOverlay') == m['source']['overlayTree'], 'overlay_hash_mismatch')
+    for name, expected in m['source']['files'].items():
+        need(not (r/name).is_symlink() and sha(r/name) == expected, 'source_hash_mismatch')
+    for name, key in [('Template-1.0.15.tar.xz', 'template'), ('SteamSetup.exe', 'steamInstaller')]:
+        p = DONOR/'downloads'/name
+        directory(p.parent)
+        need(not p.is_symlink() and sha(p) == m['source'][key]['sha256'], 'bootstrap_hash_mismatch')
+    return r
+
+def copy_file(src, dst):
+    need(src.is_file() and not src.is_symlink(), 'regular_source_required')
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    need(not dst.exists() and not dst.is_symlink(), 'destination_collision')
+    shutil.copy2(src, dst)
+
+def prepare():
+    m = manifest()
+    need(m['version']==2,'controller_update_only')
+    r = attest(m)
+    directory(STAGE.parent)
+    need(not STAGE.exists(), 'stage_exists_inspect_before_retry')
+    STAGE.mkdir(mode=0o700)
+    runtime = STAGE/'runtime'
+    runtime.mkdir(mode=0o700)
+    shutil.copytree(r/'Engine', runtime/'engine')
+    for f in (r/'CS2/EngineOverlay').rglob('*'):
+        if f.is_file():
+            shutil.copy2(f, runtime/'engine'/f.relative_to(r/'CS2/EngineOverlay'))
+    framework = runtime/'Frameworks'
+    framework.mkdir()
+    links = json.loads((r/'dependency-links.json').read_text())
+    deps = {v for k,v in links.items() if k.startswith('lib/') and k.count('/') == 1
+            and '/' not in v and not v.startswith(SKIP_LIBS)}
+    prefix = 'Template-1.0.15.app/Contents/Frameworks/'
+    with tarfile.open(DONOR/'downloads/Template-1.0.15.tar.xz') as archive:
+        for name in sorted(deps):
+            member = archive.getmember(prefix+name)
+            need(member.isfile() and 0 < member.size < 100*1024*1024, 'unsafe_dependency_member')
+            with archive.extractfile(member) as source, (framework/name).open('xb') as dest:
+                shutil.copyfileobj(source, dest)
+            (framework/name).chmod(member.mode & 0o755)
+    for rel, name in links.items():
+        if name in deps:
+            target = runtime/'engine'/rel
+            need(not target.exists() and not target.is_symlink(), 'dependency_collision')
+            target.symlink_to(os.path.relpath(framework/name, target.parent))
+            alias=framework/Path(rel).name
+            if alias.name != name and not alias.exists():
+                alias.symlink_to(name)
+    (runtime/'deps').mkdir()
+    (runtime/'deps/Frameworks').symlink_to('../Frameworks')
+    copy_file(r/'CS2/prepare-pipelines.exe', runtime/'prepare-pipelines.exe')
+    copy_file(DONOR/'downloads/SteamSetup.exe', runtime/'SteamSetup.exe')
+    for name in ['Sources/wine-source.tar.gz', 'Sources/CS2Renderer/dxmt-cs2-source.tar.gz',
+                 'Sources/CS2Renderer/prepare-pipelines.cpp', 'Sources/CS2Renderer/build.py',
+                 'Sources/CS2Renderer/build-helper.py', 'Sources/CS2Renderer/LICENSE',
+                 'Sources/RUNTIME-BUILD.md', 'Licenses/Wine-LICENSE.txt', 'Licenses/Wine-LGPL.txt',
+                 'Licenses/DXMT-MIT.txt', 'Licenses/SDL2.txt']:
+        copy_file(r/name, runtime/'sources'/name)
+    copy_file(HERE/MANIFEST, runtime/'.manifest.json')
+    copy_file(HERE/'bin/cs2-play', STAGE/'cs2-play')
+    (STAGE/'cs2-play').chmod(0o755)
+    critical = ['engine/bin/wine', 'engine/bin/wineserver', 'engine/lib/wine/x86_64-unix/ntdll.so',
+                'engine/lib/wine/x86_64-unix/winemetal.so', 'engine/lib/wine/x86_64-windows/d3d11.dll',
+                'engine/lib/wine/x86_64-windows/dxgi.dll', 'engine/lib/wine/x86_64-windows/winemetal.dll',
+                'prepare-pipelines.exe', 'SteamSetup.exe']
+    receipt = {'schemaVersion':1,'owner':OWNER,'manifestSha256':sha(HERE/MANIFEST),
+               'runtimeTreeSha256':tree(runtime, True, ('.owner.json', '.manifest.json')), 'launcherSha256':sha(STAGE/'cs2-play'),
+               'criticalHashes':{k:sha(runtime/k) for k in critical}}
+    (runtime/'.owner.json').write_text(json.dumps(receipt,indent=2)+'\n')
+    attest(m)
+    return {'status':'PREPARED','runtimeBytesVerified':True,'installed':False}
+
+def verify(base):
+    directory(base)
+    need((base/'runtime/.owner.json').is_file() and not (base/'runtime/.owner.json').is_symlink(), 'unsafe_receipt')
+    receipt = json.loads((base/'runtime/.owner.json').read_text())
+    need(receipt['owner'] == OWNER and receipt['schemaVersion'] == 1, 'ownership_mismatch')
+    need(receipt['manifestSha256'] == sha(HERE/MANIFEST) == sha(base/'runtime/.manifest.json'), 'manifest_drift')
+    need(receipt['launcherSha256'] == sha(base/'cs2-play') == sha(HERE/'bin/cs2-play'), 'launcher_drift')
+    need(receipt['runtimeTreeSha256'] == manifest()['expectedRuntimeTreeSha256']
+         == tree(base/'runtime', True, ('.owner.json', '.manifest.json')), 'runtime_drift')
+    need(receipt['criticalHashes'] == manifest()['criticalHashes'], 'critical_hashes_drift')
+    return receipt
+
+def shortcut():
+    return b'#!/bin/sh\nexec /usr/bin/python3 "$HOME/AIDev/bin/cs2-play" play\n'
+
+def verify_resolvers():
+    link=HOME/'AIDev/bin/cs2-play'; desktop=HOME/'Desktop/CS2.command'
+    directory(link.parent); directory(desktop.parent)
+    need(link.is_symlink() and os.readlink(link)==str(ROOT/'cs2-play')
+         and desktop.is_file() and not desktop.is_symlink() and desktop.read_bytes()==shortcut(), 'installed_resolver_drift')
+
+def install(commit):
+    source_gate(commit)
+    link = HOME/'AIDev/bin/cs2-play'
+    desktop = HOME/'Desktop/CS2.command'
+    for parent in [ROOT.parent, link.parent, desktop.parent]:
+        directory(parent)
+    if ROOT.exists():
+        verify(ROOT)
+        need(link.is_symlink() and os.readlink(link) == str(ROOT/'cs2-play')
+             and desktop.is_file() and not desktop.is_symlink() and desktop.read_bytes() == shortcut(), 'installed_resolver_drift')
+        return {'status':'INSTALLED_EXACT','changed':False}
+    need(not ROOT.is_symlink() and not link.exists() and not link.is_symlink()
+         and not desktop.exists() and not desktop.is_symlink(), 'destination_collision')
+    verify(STAGE)
+    ROOT.mkdir(mode=0o700)
+    # Keep incomplete first attempts for explicit recovery; never overwrite them.
+    shutil.copytree(STAGE/'runtime', ROOT/'runtime', symlinks=True)
+    copy_file(STAGE/'cs2-play', ROOT/'cs2-play')
+    verify(ROOT)
+    link.symlink_to(ROOT/'cs2-play')
+    with desktop.open('xb') as f:
+        f.write(shortcut())
+    desktop.chmod(0o755)
+    return {'status':'INSTALLED_EXACT','changed':True}
+
+def update_launcher(commit):
+    source_gate(commit)
+    m=manifest(); previous=m['previousRelease']
+    directory(ROOT); directory(ROOT/'runtime')
+    runtime=ROOT/'runtime'
+    paths=[ROOT/'cs2-play',runtime/'.manifest.json',runtime/'.owner.json']
+    for p in paths:
+        need(p.is_file() and not p.is_symlink() and p.stat().st_uid==os.getuid(), 'unsafe_update_file')
+    old=json.loads(paths[2].read_text())
+    need(type(old) is dict and type(old.get('schemaVersion')) is int
+         and old['schemaVersion']==1 and old.get('owner')==OWNER,'unknown_update_receipt')
+    if old['manifestSha256']==sha(HERE/MANIFEST):
+        verify(ROOT); verify_resolvers(); return {'status':'INSTALLED_EXACT','changed':False}
+    need(old['owner']==OWNER and old['manifestSha256']==previous['manifestSha256']==sha(paths[1])
+         and old['launcherSha256']==previous['launcherSha256']==sha(paths[0]),'unknown_update_prestate')
+    need(old['runtimeTreeSha256']==m['expectedRuntimeTreeSha256']
+         ==tree(runtime,True,('.owner.json','.manifest.json')) and old['criticalHashes']==m['criticalHashes'],'runtime_drift')
+    verify_resolvers()
+    fd=os.open(ROOT/'.launcher.lock',os.O_WRONLY|os.O_CREAT|os.O_NOFOLLOW,0o600)
+    try:
+        st=os.fstat(fd);need(stat.S_ISREG(st.st_mode) and st.st_uid==os.getuid() and st.st_nlink==1 and not st.st_mode & 0o077,'unsafe_lock')
+        fcntl.flock(fd,fcntl.LOCK_EX|fcntl.LOCK_NB)
+        backup=ROOT/'launcher-v1-recovery'
+        need(not backup.exists() and not backup.is_symlink(),'recovery_collision')
+        backup.mkdir(mode=0o700)
+        for name,p in zip(['cs2-play','manifest.json','owner.json'],paths):copy_file(p,backup/name)
+        updated=dict(old);updated['manifestSha256']=sha(HERE/MANIFEST);updated['launcherSha256']=sha(HERE/'bin/cs2-play')
+        for target,data,mode in [(paths[0],(HERE/'bin/cs2-play').read_bytes(),0o755),(paths[1],(HERE/MANIFEST).read_bytes(),0o600),(paths[2],(json.dumps(updated,indent=2)+'\n').encode(),0o600)]:
+            temp=target.with_name(target.name+'.v2-stage')
+            with temp.open('xb') as f:f.write(data)
+            temp.chmod(mode);os.replace(temp,target)
+        verify(ROOT)
+    finally:os.close(fd)
+    return {'status':'INSTALLED_EXACT','changed':True,'priorLauncherRetained':True}
+
+
+def controller_spec():
+    raw,_=read_update_file(HERE/MANIFEST)
+    m=manifest(raw);spec=dict(m.get('controllerUpdate',{}));spec['manifestBytes']=raw
+    need(m['version']==3 and spec.get('preparationOnly') is False,
+         'controller_candidate_not_admitted')
+    for value in [m.get('expectedRuntimeTreeSha256'),spec.get('candidateSha256'),
+                  spec.get('previousWinebusSha256'),spec.get('previousRuntimeTreeSha256'),
+                  spec.get('wineSourceSha256'),m.get('previousRelease',{}).get('ownerSha256')]:
+        need(type(value) is str and re.fullmatch('[0-9a-f]{64}',value), 'invalid_controller_pin')
+    need(spec.get('target')==WINEBUS and spec.get('candidate')=='~/AIDev/quarantine/cs2-controller-v3/winebus.so'
+         and spec['wineSourceSha256']==m['source']['files']['Sources/wine-source.tar.gz']
+         and m['criticalHashes'].get(WINEBUS)==spec['candidateSha256'], 'controller_pin_mismatch')
+    return m,spec
+
+def read_update_file(path):
+    directory(path.parent)
+    fd=os.open(path,os.O_RDONLY|os.O_NOFOLLOW|os.O_NONBLOCK)
+    try:
+        st=os.fstat(fd)
+        need(stat.S_ISREG(st.st_mode) and st.st_uid==os.getuid() and st.st_nlink==1
+             and not st.st_mode & 0o022,'unsafe_update_file')
+        with os.fdopen(os.dup(fd),'rb') as f: data=f.read()
+        after=os.fstat(fd)
+        need((st.st_dev,st.st_ino,st.st_size,st.st_mtime_ns,st.st_ctime_ns)
+             ==(after.st_dev,after.st_ino,after.st_size,after.st_mtime_ns,after.st_ctime_ns), 'update_file_changed')
+        return data,stat.S_IMODE(st.st_mode)
+    finally:os.close(fd)
+
+def controller_json(data):
+    def pairs(rows):
+        result={}
+        for key,value in rows:
+            need(key not in result,'duplicate_json_key');result[key]=value
+        return result
+    value=json.loads(data,object_pairs_hook=pairs)
+    need(type(value) is dict,'unknown_update_receipt')
+    return value
+
+def controller_source_unchanged(commit):
+    def git(*args):
+        return run(['/usr/bin/git','-c','core.hooksPath=/dev/null','-c','core.fsmonitor=false','-C',CONTROL,*args]).decode().strip()
+    need(git('rev-parse','HEAD')==commit and git('branch','--show-current')=='main'
+         and not git('status','--porcelain'),'source_changed')
+
+def data_sha(data):
+    return hashlib.sha256(data).hexdigest()
+
+def controller_paths():
+    runtime=ROOT/'runtime'
+    return {'winebus.so':runtime/WINEBUS,'manifest.json':runtime/'.manifest.json',
+            'owner.json':runtime/'.owner.json'}
+
+def controller_predecessor(m,spec,data):
+    need(data['winebus.so'][1]==0o755 and data['manifest.json'][1]==data['owner.json'][1]==0o600,
+         'controller_prestate_mode_drift')
+    old=controller_json(data['owner.json'][0]); previous=m['previousRelease']
+    need(data_sha(data['owner.json'][0])==previous['ownerSha256'],'controller_receipt_drift')
+    need(type(old) is dict and type(old.get('schemaVersion')) is int
+         and old['schemaVersion']==1 and old.get('owner')==OWNER,'unknown_update_receipt')
+    need(old.get('manifestSha256')==previous['manifestSha256']==data_sha(data['manifest.json'][0])
+         and old.get('launcherSha256')==previous['launcherSha256']==data_sha(read_update_file(ROOT/'cs2-play')[0])
+         ==data_sha(read_update_file(HERE/'bin/cs2-play')[0]),'unknown_update_prestate')
+    prev=controller_json(data['manifest.json'][0])
+    need(type(prev.get('version')) is int and prev['version']==2
+         and prev.get('owner')==OWNER and prev.get('criticalHashes')==old.get('criticalHashes')
+         and old.get('runtimeTreeSha256')==prev.get('expectedRuntimeTreeSha256')
+         ==spec['previousRuntimeTreeSha256']
+         and data_sha(data['winebus.so'][0])==spec['previousWinebusSha256'], 'controller_prestate_drift')
+    expected=dict(prev['criticalHashes']); expected[WINEBUS]=spec['candidateSha256']
+    need(m['criticalHashes']==expected,'controller_critical_scope_changed')
+    return old
+
+def controller_bytes(m,old,candidate,raw_manifest):
+    updated=dict(old); updated.update(manifestSha256=data_sha(raw_manifest),
+        runtimeTreeSha256=m['expectedRuntimeTreeSha256'],criticalHashes=m['criticalHashes'])
+    return {'winebus.so':(candidate,0o755),'manifest.json':(raw_manifest,0o600),
+            'owner.json':((json.dumps(updated,indent=2)+'\n').encode(),0o600)}
+
+def controller_inactive():
+    # Prefix-scoped server wait inspects activity only, never registry/auth/game data.
+    env={'HOME':str(HOME),'PATH':'/usr/bin:/bin:/usr/sbin:/sbin',
+         'WINEPREFIX':str(ROOT/'prefix'),'WINESERVER':str(ROOT/'runtime/engine/bin/wineserver'),
+         'WINELOADER':str(ROOT/'runtime/engine/bin/wine'),
+         'DYLD_FALLBACK_LIBRARY_PATH':str(ROOT/'runtime/Frameworks')+':/usr/lib'}
+    try:
+        result=subprocess.run([str(ROOT/'runtime/engine/bin/wineserver'),'-w'],env=env,
+            stdin=subprocess.DEVNULL,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,timeout=0.5)
+    except subprocess.TimeoutExpired:
+        raise RuntimeError('controller_session_active') from None
+    need(result.returncode==0,'controller_session_probe_failed')
+
+def controller_lock(create=True):
+    directory(ROOT)
+    flags=os.O_NOFOLLOW|os.O_NONBLOCK|(os.O_WRONLY|os.O_CREAT if create else os.O_RDONLY)
+    try:fd=os.open(ROOT/'.launcher.lock',flags,0o600)
+    except FileNotFoundError:
+        if not create:return None
+        raise
+    try:
+        st=os.fstat(fd);need(stat.S_ISREG(st.st_mode) and st.st_uid==os.getuid()
+             and st.st_nlink==1 and not st.st_mode & 0o077,'unsafe_lock')
+        fcntl.flock(fd,fcntl.LOCK_EX|fcntl.LOCK_NB)
+        return fd
+    except BaseException:
+        os.close(fd);raise
+
+def controller_snapshot(paths):
+    read_update_file(ROOT/'cs2-play')
+    return {name:read_update_file(path) for name,path in paths.items()}
+
+def controller_tree(spec, current, recovery=False):
+    digest=data_sha(current['winebus.so'][0])
+    need(digest in (spec['previousWinebusSha256'],spec['candidateSha256'])
+         and current['winebus.so'][1]==0o755,'controller_winebus_drift')
+    excludes=('.owner.json','.manifest.json')
+    if recovery:excludes+=(WINEBUS+'.controller-stage','.owner.json.controller-stage','.manifest.json.controller-stage')
+    need(tree(ROOT/'runtime',True,excludes,
+              {WINEBUS:spec['previousWinebusSha256']})==spec['previousRuntimeTreeSha256'], 'runtime_drift')
+
+def controller_backup(m,spec):
+    backup=ROOT/'controller-v2-recovery';directory(backup)
+    need({p.name for p in backup.iterdir()}=={'winebus.so','manifest.json','owner.json'},'controller_recovery_drift')
+    data={name:read_update_file(backup/name) for name in controller_paths()}
+    old=controller_predecessor(m,spec,data)
+    need(data['winebus.so'][1]==0o755 and all(mode==0o600 for name,(_,mode) in data.items()
+         if name!='winebus.so'),'controller_recovery_mode_drift')
+    return data,old
+
+def controller_exact(m,spec,current):
+    _,old=controller_backup(m,spec)
+    expected=controller_bytes(m,old,current['winebus.so'][0],spec['manifestBytes'])
+    need(current==expected,'controller_exact_receipt_drift')
+    verify(ROOT);verify_resolvers()
+
+def controller_sync_directory(path):
+    fd=os.open(path,os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW)
+    try:os.fsync(fd)
+    finally:os.close(fd)
+
+def controller_replace(target,data,mode):
+    temp=target.with_name(target.name+'.controller-stage')
+    # Unknown interrupted staging is never overwritten.
+    with temp.open('xb') as f:
+        os.fchmod(f.fileno(),mode);f.write(data);f.flush();os.fsync(f.fileno())
+    os.replace(temp,target);controller_sync_directory(target.parent)
+
+def check_controller(commit):
+    source_gate(commit);fd=controller_lock(create=False)
+    try:return check_controller_locked(commit)
+    finally:
+        if fd is not None:os.close(fd)
+
+def check_controller_locked(commit):
+    m,spec=controller_spec();directory(ROOT)
+    paths=controller_paths();current=controller_snapshot(paths)
+    if data_sha(current['manifest.json'][0])==sha(HERE/MANIFEST):
+        controller_exact(m,spec,current);controller_inactive()
+        return {'status':'CONTROLLER_EXACT','changed':False,'dryRun':True}
+    controller_predecessor(m,spec,current);controller_tree(spec,current);verify_resolvers()
+    need(tree(ROOT/'runtime',True,('.owner.json','.manifest.json'),{WINEBUS:spec['candidateSha256']})
+         ==m['expectedRuntimeTreeSha256'],'controller_target_tree_mismatch')
+    candidate,_=read_update_file(CONTROLLER_STAGE)
+    need(data_sha(candidate)==spec['candidateSha256'],'controller_candidate_drift')
+    controller_inactive()
+    backup=ROOT/'controller-v2-recovery'
+    if backup.exists() or backup.is_symlink():controller_backup(m,spec)
+    need(all(not p.with_name(p.name+'.controller-stage').exists()
+             and not p.with_name(p.name+'.controller-stage').is_symlink() for p in paths.values()),'controller_stage_collision')
+    return {'status':'CONTROLLER_UPDATE_READY','changed':False,'dryRun':True}
+
+def update_controller(commit):
+    source_gate(commit);m,spec=controller_spec();fd=controller_lock()
+    try:
+        paths=controller_paths();current=controller_snapshot(paths)
+        if data_sha(current['manifest.json'][0])==sha(HERE/MANIFEST):
+            controller_exact(m,spec,current);controller_inactive()
+            return {'status':'INSTALLED_EXACT','changed':False}
+        old=controller_predecessor(m,spec,current);controller_tree(spec,current);verify_resolvers()
+        need(tree(ROOT/'runtime',True,('.owner.json','.manifest.json'),{WINEBUS:spec['candidateSha256']})
+             ==m['expectedRuntimeTreeSha256'],'controller_target_tree_mismatch')
+        candidate,_=read_update_file(CONTROLLER_STAGE)
+        need(data_sha(candidate)==spec['candidateSha256'],'controller_candidate_drift')
+        after=controller_bytes(m,old,candidate,spec['manifestBytes'])
+        need(all(not p.with_name(p.name+'.controller-stage').exists()
+             and not p.with_name(p.name+'.controller-stage').is_symlink() for p in paths.values()),'controller_stage_collision')
+        controller_inactive()
+        backup=ROOT/'controller-v2-recovery'
+        if backup.exists() or backup.is_symlink():
+            saved,_=controller_backup(m,spec);need(saved==current,'controller_recovery_drift')
+        else:
+            backup.mkdir(mode=0o700)
+            for name,(data,mode) in current.items():
+                with (backup/name).open('xb') as f:
+                    os.fchmod(f.fileno(),mode);f.write(data);f.flush();os.fsync(f.fileno())
+            controller_sync_directory(backup);controller_sync_directory(ROOT)
+            controller_backup(m,spec)
+        controller_inactive()
+        need(controller_snapshot(paths)==current,'controller_prestate_changed')
+        controller_tree(spec,current);controller_source_unchanged(commit)
+        need(read_update_file(HERE/MANIFEST)[0]==spec['manifestBytes'],'controller_source_manifest_changed')
+        for name,target in paths.items():controller_replace(target,*after[name])
+        verify(ROOT);verify_resolvers()
+    finally:os.close(fd)
+    return {'status':'INSTALLED_EXACT','changed':True,'priorControllerRetained':True}
+
+def recover_controller(commit):
+    source_gate(commit);m,spec=controller_spec();fd=controller_lock()
+    try:
+        paths=controller_paths();before,old=controller_backup(m,spec)
+        # Candidate bytes are not needed to restore: recognize their reviewed hash.
+        expected=controller_bytes(m,old,b'',spec['manifestBytes']);current=controller_snapshot(paths)
+        verify_resolvers();stages={}
+        for name,(data,mode) in current.items():
+            new_hash=spec['candidateSha256'] if name=='winebus.so' else data_sha(expected[name][0])
+            need((data_sha(data),mode) in ((data_sha(before[name][0]),before[name][1]),
+                  (new_hash,expected[name][1])),'controller_unknown_partial_state')
+            temp=paths[name].with_name(paths[name].name+'.controller-stage')
+            if temp.exists() or temp.is_symlink():
+                staged,staged_mode=read_update_file(temp)
+                need(data_sha(staged) in (data_sha(before[name][0]),new_hash)
+                     and staged_mode in (0o600,expected[name][1]),'controller_unknown_stage')
+                stages[temp]=(staged,staged_mode)
+        controller_tree(spec,current,recovery=True)
+        controller_inactive()
+        need(controller_snapshot(paths)==current,'controller_prestate_changed');controller_tree(spec,current,recovery=True)
+        need(all(read_update_file(p)==data for p,data in stages.items()),'controller_stage_changed')
+        controller_source_unchanged(commit)
+        need(read_update_file(HERE/MANIFEST)[0]==spec['manifestBytes'],'controller_source_manifest_changed')
+        changed=current!=before
+        for name,target in paths.items():
+            temp=target.with_name(target.name+'.controller-stage')
+            if temp.exists():temp.unlink()
+            if current[name]!=before[name]:controller_replace(target,*before[name])
+        restored=controller_snapshot(paths);need(restored==before,'controller_recovery_failed')
+        controller_predecessor(m,spec,restored);controller_tree(spec,restored)
+    finally:os.close(fd)
+    return {'status':'CONTROLLER_PREVIOUS_RESTORED','changed':changed,'priorControllerRetained':True}
+
+def import_game(commit):
+    source_gate(commit)
+    verify(ROOT)
+    fd=os.open(ROOT/'.launcher.lock',os.O_WRONLY|os.O_CREAT|os.O_NOFOLLOW,0o600)
+    try:
+        st=os.fstat(fd)
+        need(stat.S_ISREG(st.st_mode) and st.st_uid==os.getuid() and st.st_nlink==1
+             and not st.st_mode & 0o077,'unsafe_lock')
+        fcntl.flock(fd,fcntl.LOCK_EX|fcntl.LOCK_NB)
+        return import_game_locked()
+    finally:os.close(fd)
+
+def import_game_locked():
+    steam = ROOT/'prefix/drive_c/Program Files (x86)/Steam'
+    directory(steam, game_data=True)
+    need((steam/'steam.exe').is_file(), 'setup_steam_first')
+    # Do not copy a live update or import into a running destination session.
+    processes = run(['/bin/ps','-axo','command=']).decode(errors='replace').splitlines()
+    for line in processes:
+        if any(str(p) in line for p in [ROOT/'runtime/engine', DONOR/'engine-', ROOT/'prefix', DONOR/'prefix']):
+            need(not any(s in line.lower() for s in ['steam.exe','cs2.exe','wineserver']), 'close_both_steam_sessions_first')
+    src = DONOR/'prefix/drive_c/Program Files (x86)/Steam/steamapps'
+    game = src/'common/Counter-Strike Global Offensive'
+    directory(game, game_data=True)
+    # Reject symlinks/specials without reading game content or account files.
+    def snapshot(folder):
+        result=[]
+        for f in sorted(folder.rglob('*')):
+            st=f.lstat()
+            need(stat.S_ISREG(st.st_mode) or stat.S_ISDIR(st.st_mode), 'unsafe_game_entry')
+            if f.is_file(): result.append((str(f.relative_to(folder)),st.st_size,st.st_mtime_ns))
+        return result
+    before=snapshot(game)
+    need((src/'appmanifest_730.acf').is_file() and not (src/'appmanifest_730.acf').is_symlink(), 'unsafe_game_manifest')
+    raw=(src/'appmanifest_730.acf').read_text()
+    fields={}
+    for k in ['appid','StateFlags','buildid','SizeOnDisk']:
+        values=re.findall(r'"'+k+r'"\s+"([0-9]+)"',raw)
+        need(len(values)==1,'invalid_game_manifest')
+        fields[k]=values[0]
+    need(fields['appid']=='730' and fields['StateFlags']=='4','game_not_fully_installed')
+    apps=steam/'steamapps'
+    apps.mkdir(exist_ok=True)
+    directory(apps, game_data=True)
+    (apps/'common').mkdir(exist_ok=True)
+    directory(apps/'common', game_data=True)
+    target=apps/'common/Counter-Strike Global Offensive'
+    need(not target.exists() and not target.is_symlink() and not (apps/'appmanifest_730.acf').exists(),'game_destination_collision')
+    run(['/bin/cp','-cR',game,target],timeout=1200)
+    need(before==snapshot(game)==snapshot(target),'game_changed_during_copy')
+    data='"AppState"\n{\n'+''.join('\t"'+k+'" "'+v+'"\n' for k,v in fields.items())+'\t"name" "Counter-Strike 2"\n\t"installdir" "Counter-Strike Global Offensive"\n}\n'
+    with (apps/'appmanifest_730.acf').open('x') as f:f.write(data)
+    return {'status':'GAME_FILES_IMPORTED','files':len(before),'logicalBytes':sum(x[1] for x in before),'authCopied':False,'steamVerificationMayBeRequired':True}
+
+def main():
+    os.umask(0o077)
+    need(os.getuid() > 0, 'user_only')
+    args=sys.argv[1:]
+    need(bool(args),'command_required')
+    if args==['prepare']: result=prepare()
+    elif args==['check-stage']: verify(STAGE); result={'status':'PREPARED_VERIFIED'}
+    elif args==['status']:
+        verify(ROOT); verify_resolvers(); result={'status':'INSTALLED_EXACT'}
+    elif len(args)==2 and args[0]=='install': result=install(args[1])
+    elif len(args)==2 and args[0]=='update-launcher': result=update_launcher(args[1])
+    elif len(args)==2 and args[0]=='check-controller': result=check_controller(args[1])
+    elif len(args)==2 and args[0]=='update-controller': result=update_controller(args[1])
+    elif len(args)==2 and args[0]=='recover-controller': result=recover_controller(args[1])
+    elif len(args)==2 and args[0]=='import-game': result=import_game(args[1])
+    else: raise RuntimeError('unsupported_arguments')
+    print(json.dumps(result,sort_keys=True))
+
+if __name__=='__main__':
+    try: main()
+    except Exception as e:
+        print(json.dumps({'status':'BLOCKED','reason':str(e) if isinstance(e,RuntimeError) else type(e).__name__}),file=sys.stderr)
+        sys.exit(1)

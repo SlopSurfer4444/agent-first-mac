@@ -1,0 +1,565 @@
+#!/usr/bin/python3
+from __future__ import annotations
+
+import argparse
+import json
+import mmap
+import os
+from pathlib import Path
+import re
+import selectors
+import subprocess
+import sys
+import tempfile
+import time
+
+
+ROOT = Path(__file__).resolve().parents[1]
+PROFILE = "codex-windows-host-ssh-stdio-compat"
+BRANCH = "codex/codex-windows-host-ssh-connector"
+FLAG = "CODEX_APP_SERVER_FORCE_CLI"
+VALUE = "1"
+REMOTE_CONTROL_FLAG = "CODEX_INTERNAL_APP_SERVER_REMOTE_CONTROL_DISABLED"
+APP = Path("/Applications/ChatGPT.app")
+ASAR = APP / "Contents/Resources/app.asar"
+STATE = Path.home() / "AIDev/state" / PROFILE
+RECEIPT = STATE / "receipt.json"
+COMMIT_RE = re.compile(r"^[0-9a-f]{40}$")
+
+
+class ContractError(RuntimeError):
+    pass
+
+
+def run(argv: list[str], *, input_text: str | None = None,
+        timeout: float = 15, check: bool = False) -> subprocess.CompletedProcess:
+    result = subprocess.run(
+        argv,
+        input=input_text,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        timeout=timeout,
+        check=False,
+    )
+    if check and result.returncode != 0:
+        raise ContractError(f"command_failed:{Path(argv[0]).name}")
+    return result
+
+
+def git(*args: str) -> str:
+    result = run(["/usr/bin/git", "-C", str(ROOT), *args], check=True)
+    return result.stdout.strip()
+
+
+def require_exact_commit(expected: str) -> None:
+    if not COMMIT_RE.fullmatch(expected):
+        raise ContractError("invalid_commit")
+    if git("rev-parse", "--show-toplevel") != str(ROOT):
+        raise ContractError("wrong_control_root")
+    if git("rev-parse", "--abbrev-ref", "HEAD") != BRANCH:
+        raise ContractError("wrong_task_branch")
+    if git("rev-parse", "HEAD") != expected:
+        raise ContractError("commit_mismatch")
+    if git("status", "--porcelain=v1", "--untracked-files=all"):
+        raise ContractError("dirty_worktree")
+
+
+def current_env() -> str:
+    result = run(["/bin/launchctl", "getenv", FLAG])
+    if result.returncode not in (0, 1):
+        raise ContractError("launchctl_getenv_failed")
+    return result.stdout.rstrip("\n")
+
+
+def classify_existing_env(value: str) -> str:
+    if value == "":
+        return "absent"
+    if value == VALUE:
+        return "exact"
+    return "conflict"
+
+
+def app_supports_native_transport() -> bool:
+    if not ASAR.is_file():
+        return False
+    needles = (
+        b"CODEX_APP_SERVER_FORCE_CLI",
+        b"ssh-websocket-v0",
+        b"app-server proxy",
+        b"CODEX_SSH_SKIP_APP_SERVER_BOOT",
+        b"app-server-control.sock",
+    )
+    with ASAR.open("rb") as handle:
+        with mmap.mmap(handle.fileno(), 0, access=mmap.ACCESS_READ) as mapped:
+            return all(mapped.find(needle) >= 0 for needle in needles)
+
+
+def app_signature_valid() -> bool:
+    if not APP.is_dir():
+        return False
+    result = run([
+        "/usr/bin/codesign", "--verify", "--deep", "--strict", str(APP)
+    ], timeout=30)
+    return result.returncode == 0
+
+
+def strict_ssh_doctor_passes() -> bool:
+    # Filter `ssh -G` inside the subprocess so host, user, address, and other
+    # runtime identifiers never enter this process or its output.
+    command = (
+        "/usr/bin/ssh -G windows-host 2>/dev/null | "
+        "/usr/bin/awk '$1 == \"identitiesonly\" || "
+        "$1 == \"passwordauthentication\" || "
+        "$1 == \"kbdinteractiveauthentication\" || "
+        "$1 == \"stricthostkeychecking\" || "
+        "$1 == \"forwardagent\" { print $1 \"=\" $2 }'"
+    )
+    result = run(["/bin/sh", "-c", command])
+    if result.returncode != 0:
+        return False
+    effective = set(result.stdout.splitlines())
+    required = {
+        "identitiesonly=yes",
+        "passwordauthentication=no",
+        "kbdinteractiveauthentication=no",
+        "forwardagent=no",
+    }
+    strict_host_key = bool({
+        "stricthostkeychecking=yes", "stricthostkeychecking=true"
+    } & effective)
+    if not required.issubset(effective) or not strict_host_key:
+        return False
+    smoke = run([
+        "/usr/bin/ssh", "-T", "-o", "BatchMode=yes",
+        "-o", "PasswordAuthentication=no",
+        "-o", "KbdInteractiveAuthentication=no",
+        "windows-host", "printf ssh_smoke=pass",
+    ], timeout=15)
+    return smoke.returncode == 0 and smoke.stdout == "ssh_smoke=pass"
+
+
+def validate_initialize_line(line: str) -> bool:
+    try:
+        payload = json.loads(line)
+    except (TypeError, json.JSONDecodeError):
+        return False
+    if payload.get("id") != 1 or not isinstance(payload.get("result"), dict):
+        return False
+    result = payload["result"]
+    return (
+        result.get("platformFamily") == "windows"
+        and result.get("platformOs") == "windows"
+        and isinstance(result.get("userAgent"), str)
+    )
+
+
+def validate_websocket_upgrade(response: bytes) -> bool:
+    header = response.split(b"\r\n\r\n", 1)[0]
+    lines = header.split(b"\r\n")
+    lowered = {line.lower() for line in lines[1:]}
+    return (
+        bool(lines)
+        and lines[0].startswith(b"HTTP/1.1 101 ")
+        and b"upgrade: websocket" in lowered
+        and b"connection: upgrade" in lowered
+    )
+
+
+def remote_stdio_initialize_passes() -> bool:
+    request = json.dumps({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "initialize",
+        "params": {
+            "clientInfo": {"name": "bounded-compat-probe", "version": "1"},
+            "capabilities": {"experimentalApi": True},
+        },
+    }, separators=(",", ":")) + "\n"
+    initialized = json.dumps({
+        "jsonrpc": "2.0", "method": "initialized", "params": {}
+    }, separators=(",", ":")) + "\n"
+    # `awk` emits only the initialize response and closes the stream, so shell
+    # noise and later notifications (which may carry runtime identifiers)
+    # never enter this process. The selector and process-group cleanup supply
+    # the hard timeout without closing stdin before the server responds.
+    process = subprocess.Popen(
+        [
+            "/usr/bin/ssh", "-T", "-o", "BatchMode=yes",
+            "-o", "PasswordAuthentication=no",
+            "-o", "KbdInteractiveAuthentication=no",
+            "-o", "ConnectTimeout=8", "windows-host",
+            "codex app-server --listen stdio://",
+        ],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        text=True,
+        bufsize=1,
+    )
+    selector = selectors.DefaultSelector()
+    try:
+        assert process.stdin is not None and process.stdout is not None
+        process.stdin.write(request + initialized)
+        process.stdin.flush()
+        selector.register(process.stdout, selectors.EVENT_READ)
+        events = selector.select(timeout=10)
+        if not events:
+            return False
+        deadline = time.monotonic() + 10
+        while events and time.monotonic() < deadline:
+            line = process.stdout.readline(131072)
+            if not line:
+                return False
+            if validate_initialize_line(line):
+                return True
+            events = selector.select(timeout=max(0, deadline - time.monotonic()))
+        return False
+    finally:
+        selector.close()
+        if process.poll() is None:
+            process.terminate()
+            try:
+                process.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait(timeout=2)
+
+
+def remote_native_websocket_handshake_passes() -> bool:
+    handshake = (
+        b"GET /rpc HTTP/1.1\r\n"
+        b"Host: codex-app-server\r\n"
+        b"Upgrade: websocket\r\n"
+        b"Connection: Upgrade\r\n"
+        b"Sec-WebSocket-Key: AQIDBAUGBwgJCgsMDQ4PEA==\r\n"
+        b"Sec-WebSocket-Version: 13\r\n\r\n"
+    )
+    # Exercise the same remote unix-socket plus `app-server proxy` transport
+    # used by the signed desktop app, but in a disposable remote CODEX_HOME.
+    # Remote Control must already be isolated by the reviewed sshd SetEnv
+    # lifecycle. Only the HTTP Upgrade response enters this process; paths,
+    # enrollment data, logs, and stable runtime identifiers do not. The
+    # explicit PID trap and prefix check bound cleanup.
+    remote_script = f'''set -eu
+[ "${{{REMOTE_CONTROL_FLAG}:-}}" = "1" ] || exit 87
+probe_root="${{TMPDIR:-/tmp}}"
+probe_home="$(mktemp -d "$probe_root/codex-native-probe.XXXXXX")"
+case "$probe_home" in
+  "$probe_root"/codex-native-probe.*) ;;
+  *) exit 88 ;;
+esac
+server_pid=""
+cleanup() {{
+  if [ -n "$server_pid" ]; then
+    kill "$server_pid" >/dev/null 2>&1 || true
+    wait "$server_pid" >/dev/null 2>&1 || true
+  fi
+  case "$probe_home" in
+    "$probe_root"/codex-native-probe.*) rm -rf -- "$probe_home" ;;
+  esac
+}}
+trap cleanup EXIT HUP INT TERM
+CODEX_HOME="$probe_home" codex -c features.code_mode_host=true \
+  app-server --listen unix:// >/dev/null 2>&1 &
+server_pid=$!
+attempt=0
+while [ "$attempt" -lt 20 ]; do
+  kill -0 "$server_pid" >/dev/null 2>&1 || exit 89
+  sleep 0.05
+  attempt=$((attempt + 1))
+done
+CODEX_HOME="$probe_home" codex app-server proxy 2>/dev/null
+'''
+    process = subprocess.Popen(
+        [
+            "/usr/bin/ssh", "-T", "-o", "BatchMode=yes",
+            "-o", "PasswordAuthentication=no",
+            "-o", "KbdInteractiveAuthentication=no",
+            "-o", "ConnectTimeout=8", "windows-host", remote_script,
+        ],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        text=False,
+        bufsize=0,
+    )
+    selector = selectors.DefaultSelector()
+    try:
+        assert process.stdin is not None and process.stdout is not None
+        process.stdin.write(handshake)
+        process.stdin.flush()
+        selector.register(process.stdout, selectors.EVENT_READ)
+        response = bytearray()
+        deadline = time.monotonic() + 18
+        while b"\r\n\r\n" not in response and time.monotonic() < deadline:
+            events = selector.select(timeout=max(0, deadline - time.monotonic()))
+            if not events:
+                break
+            chunk = os.read(process.stdout.fileno(), 8192)
+            if not chunk:
+                break
+            response.extend(chunk)
+            if len(response) > 16384:
+                return False
+        return validate_websocket_upgrade(bytes(response))
+    finally:
+        selector.close()
+        if process.poll() is None:
+            process.terminate()
+            try:
+                process.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait(timeout=2)
+
+
+def local_desktop_app_server_is_single() -> bool:
+    result = run([
+        "/bin/ps", "-ww", "-axo", "args=",
+    ])
+    if result.returncode != 0:
+        return False
+    count = 0
+    for line in result.stdout.splitlines():
+        if (
+            "/Applications/ChatGPT.app/Contents/Resources/codex" in line
+            and "features.code_mode_host=true" in line
+            and "app-server" in line
+            and "--analytics-default-enabled" in line
+        ):
+            count += 1
+    return count == 1
+
+
+def receipt_state(receipt: dict[str, object] | None) -> str:
+    if receipt is None:
+        return "absent"
+    if (
+        receipt.get("schema") == 1
+        and receipt.get("previousAbsent") is True
+        and COMMIT_RE.fullmatch(str(receipt.get("commit", "")))
+    ):
+        return "legacy_stdio"
+    if (
+        receipt.get("schema") == 2
+        and receipt.get("mode") == "native_ssh"
+        and receipt.get("previousEnvironment") == "exact"
+        and COMMIT_RE.fullmatch(str(receipt.get("commit", "")))
+        and COMMIT_RE.fullmatch(str(receipt.get("previousReceiptCommit", "")))
+    ):
+        return "native_ssh"
+    return "invalid"
+
+
+def preflight() -> dict[str, object]:
+    environment_state = classify_existing_env(current_env())
+    receipt = load_receipt()
+    owned_state = receipt_state(receipt)
+    facts = {
+        "profile": PROFILE,
+        "app_signature_valid": app_signature_valid(),
+        "native_transport_present": app_supports_native_transport(),
+        "strict_ssh_doctor_pass": strict_ssh_doctor_passes(),
+        "remote_stdio_initialize_pass": remote_stdio_initialize_passes(),
+        "remote_native_websocket_handshake_pass":
+            remote_native_websocket_handshake_passes(),
+        "environment_state": environment_state,
+        "receipt_state": owned_state,
+    }
+    ownership_valid = (
+        (environment_state == "exact" and owned_state == "legacy_stdio")
+        or (environment_state == "absent" and owned_state == "native_ssh")
+    )
+    facts["verdict"] = "PASS" if (
+        facts["app_signature_valid"]
+        and facts["native_transport_present"]
+        and facts["strict_ssh_doctor_pass"]
+        and facts["remote_stdio_initialize_pass"]
+        and facts["remote_native_websocket_handshake_pass"]
+        and ownership_valid
+    ) else "BLOCKED"
+    return facts
+
+
+def load_receipt() -> dict[str, object] | None:
+    if not RECEIPT.exists():
+        return None
+    try:
+        data = json.loads(RECEIPT.read_text())
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ContractError("invalid_receipt") from exc
+    if data.get("schema") not in {1, 2} or data.get("profile") != PROFILE:
+        raise ContractError("invalid_receipt")
+    return data
+
+
+def write_receipt_payload(payload: dict[str, object]) -> None:
+    STATE.mkdir(mode=0o700, parents=True, exist_ok=True)
+    os.chmod(STATE, 0o700)
+    descriptor, staged = tempfile.mkstemp(prefix=".receipt.", dir=STATE)
+    try:
+        with os.fdopen(descriptor, "w") as handle:
+            json.dump(payload, handle, sort_keys=True, separators=(",", ":"))
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.chmod(staged, 0o600)
+        os.replace(staged, RECEIPT)
+    finally:
+        if os.path.exists(staged):
+            os.unlink(staged)
+
+
+def write_native_receipt(commit: str, previous_commit: str) -> None:
+    write_receipt_payload({
+        "schema": 2,
+        "profile": PROFILE,
+        "commit": commit,
+        "mode": "native_ssh",
+        "previousEnvironment": "exact",
+        "previousReceiptCommit": previous_commit,
+        "sessionScoped": True,
+    })
+
+
+def write_legacy_receipt(commit: str) -> None:
+    write_receipt_payload({
+        "schema": 1,
+        "profile": PROFILE,
+        "commit": commit,
+        "previousAbsent": True,
+        "sessionScoped": True,
+    })
+
+
+def apply(commit: str) -> dict[str, object]:
+    require_exact_commit(commit)
+    facts = preflight()
+    if facts["verdict"] != "PASS":
+        raise ContractError("preflight_blocked")
+    state = str(facts["environment_state"])
+    receipt = load_receipt()
+    owned_state = receipt_state(receipt)
+    if state == "absent" and owned_state == "native_ssh":
+        if receipt is None or receipt.get("commit") != commit:
+            raise ContractError("native_state_commit_mismatch")
+        return {"profile": PROFILE, "apply_noop": True,
+                "desktop_restart_required": True, "verdict": "PASS"}
+    if state != "exact" or owned_state != "legacy_stdio" or receipt is None:
+        raise ContractError("unowned_or_inconsistent_prestate")
+    previous_commit = str(receipt.get("commit", ""))
+    result = run(["/bin/launchctl", "unsetenv", FLAG])
+    if result.returncode != 0 or current_env() != "":
+        raise ContractError("launchctl_unsetenv_failed")
+    try:
+        write_native_receipt(commit, previous_commit)
+    except Exception:
+        restored = run(["/bin/launchctl", "setenv", FLAG, VALUE])
+        if restored.returncode != 0 or current_env() != VALUE:
+            raise ContractError("receipt_write_failed_restore_failed")
+        raise
+    return {"profile": PROFILE, "apply_noop": False,
+            "desktop_restart_required": True, "verdict": "PASS"}
+
+
+def doctor() -> dict[str, object]:
+    receipt = load_receipt()
+    facts = preflight()
+    facts.update({
+        "native_mode_receipt": receipt_state(receipt) == "native_ssh",
+        "receipt_commit_valid": bool(
+            receipt and COMMIT_RE.fullmatch(str(receipt.get("commit", "")))
+        ),
+        "desktop_restart_required_after_apply": True,
+    })
+    facts["verdict"] = "PASS" if (
+        facts["verdict"] == "PASS"
+        and facts["environment_state"] == "absent"
+        and facts["native_mode_receipt"]
+        and facts["receipt_commit_valid"]
+    ) else "BLOCKED"
+    return facts
+
+
+def runtime_doctor() -> dict[str, object]:
+    facts = doctor()
+    facts["single_local_desktop_app_server"] = \
+        local_desktop_app_server_is_single()
+    facts["verdict"] = "PASS" if (
+        facts["verdict"] == "PASS"
+        and facts["single_local_desktop_app_server"]
+    ) else "BLOCKED"
+    return facts
+
+
+def rollback() -> dict[str, object]:
+    receipt = load_receipt()
+    if receipt is None:
+        raise ContractError("receipt_missing")
+    if receipt_state(receipt) != "native_ssh":
+        raise ContractError("rollback_previous_state_unknown")
+    previous_commit = str(receipt.get("previousReceiptCommit", ""))
+    if not COMMIT_RE.fullmatch(previous_commit):
+        raise ContractError("rollback_receipt_commit_invalid")
+    if current_env() != "":
+        raise ContractError("rollback_refuses_environment_drift")
+    result = run(["/bin/launchctl", "setenv", FLAG, VALUE])
+    if result.returncode != 0 or current_env() != VALUE:
+        run(["/bin/launchctl", "unsetenv", FLAG])
+        raise ContractError("launchctl_setenv_failed")
+    try:
+        write_legacy_receipt(previous_commit)
+    except Exception:
+        run(["/bin/launchctl", "unsetenv", FLAG])
+        raise
+    return {"profile": PROFILE, "rollback": "complete",
+            "desktop_restart_required": True, "verdict": "PASS"}
+
+
+def emit(payload: dict[str, object], as_json: bool) -> None:
+    if as_json:
+        print(json.dumps(payload, sort_keys=True, separators=(",", ":")))
+        return
+    for key in sorted(payload):
+        value = payload[key]
+        if isinstance(value, bool):
+            value = str(value).lower()
+        print(f"{key}={value}")
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser()
+    subparsers = parser.add_subparsers(dest="command", required=True)
+    prepare_parser = subparsers.add_parser("prepare")
+    prepare_parser.add_argument("--json", action="store_true")
+    apply_parser = subparsers.add_parser("apply")
+    apply_parser.add_argument("--commit", required=True)
+    apply_parser.add_argument("--json", action="store_true")
+    doctor_parser = subparsers.add_parser("doctor")
+    doctor_parser.add_argument("--json", action="store_true")
+    runtime_doctor_parser = subparsers.add_parser("runtime-doctor")
+    runtime_doctor_parser.add_argument("--json", action="store_true")
+    rollback_parser = subparsers.add_parser("rollback")
+    rollback_parser.add_argument("--json", action="store_true")
+    args = parser.parse_args()
+    try:
+        if args.command == "prepare":
+            payload = preflight()
+        elif args.command == "apply":
+            payload = apply(args.commit)
+        elif args.command == "doctor":
+            payload = doctor()
+        elif args.command == "runtime-doctor":
+            payload = runtime_doctor()
+        else:
+            payload = rollback()
+        emit(payload, args.json)
+        return 0 if payload.get("verdict") == "PASS" else 1
+    except (ContractError, OSError, subprocess.SubprocessError) as exc:
+        print(f"blocked={exc}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

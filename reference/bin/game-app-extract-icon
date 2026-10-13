@@ -1,0 +1,113 @@
+#!/usr/bin/env python3
+"""Extract the first Windows icon group from a PE file without executing it."""
+
+import argparse
+from pathlib import Path
+import struct
+
+
+def extract_icon(data):
+    def read(fmt, offset):
+        size = struct.calcsize(fmt)
+        if offset < 0 or offset + size > len(data):
+            raise ValueError("truncated PE resource")
+        return struct.unpack_from(fmt, data, offset)
+
+    if data[:2] != b"MZ":
+        raise ValueError("input is not a PE executable")
+    pe, = read("<I", 0x3C)
+    if data[pe:pe + 4] != b"PE\0\0":
+        raise ValueError("invalid PE signature")
+    sections, = read("<H", pe + 6)
+    optional_size, = read("<H", pe + 20)
+    optional = pe + 24
+    magic, = read("<H", optional)
+    if magic not in (0x10B, 0x20B):
+        raise ValueError("unsupported PE optional header")
+    directory = optional + (96 if magic == 0x10B else 112)
+    if directory + 24 > optional + optional_size:
+        raise ValueError("missing PE resource directory")
+    resource_rva, resource_size = read("<II", directory + 16)
+    if not resource_rva or not resource_size:
+        raise ValueError("PE has no resources")
+    table = optional + optional_size
+
+    def rva_offset(rva, size):
+        for index in range(sections):
+            virtual_size, virtual, raw_size, raw = read("<IIII", table + index * 40 + 8)
+            delta = rva - virtual
+            if 0 <= delta and delta + size <= raw_size:
+                offset = raw + delta
+                if offset + size > len(data):
+                    raise ValueError("resource exceeds input length")
+                return offset
+        raise ValueError("resource RVA is outside PE sections")
+
+    base = rva_offset(resource_rva, resource_size)
+
+    def resource_read(fmt, relative):
+        if relative < 0 or relative + struct.calcsize(fmt) > resource_size:
+            raise ValueError("resource directory offset out of bounds")
+        return read(fmt, base + relative)
+
+    def entries(relative):
+        named, ids = resource_read("<HH", relative + 12)
+        return [resource_read("<II", relative + 16 + i * 8) for i in range(named + ids)]
+
+    def descend(target, depth=0):
+        if depth > 4:
+            raise ValueError("excessive resource tree depth")
+        if target & 0x80000000:
+            children = entries(target & 0x7FFFFFFF)
+            if not children:
+                raise ValueError("empty resource directory")
+            return descend(children[0][1], depth + 1)
+        rva, size, _, _ = resource_read("<IIII", target)
+        offset = rva_offset(rva, size)
+        return data[offset:offset + size]
+
+    types = dict(entries(0))
+    if 14 not in types or 3 not in types:
+        raise ValueError("PE has no grouped icon resources")
+    group = descend(types[14])
+    if len(group) < 6:
+        raise ValueError("truncated icon group")
+    reserved, kind, count = struct.unpack_from("<HHH", group)
+    if reserved != 0 or kind != 1 or count == 0 or len(group) < 6 + count * 14:
+        raise ValueError("invalid icon group")
+    if not types[3] & 0x80000000:
+        raise ValueError("invalid icon resource directory")
+    icons = dict(entries(types[3] & 0x7FFFFFFF))
+    offset = 6 + 16 * count
+    headers = []
+    images = []
+    for index in range(count):
+        width, height, colors, zero, planes, bits, size, resource_id = struct.unpack_from(
+            "<BBBBHHIH", group, 6 + index * 14)
+        if resource_id not in icons:
+            raise ValueError("icon group refers to a missing image")
+        payload = descend(icons[resource_id])
+        if len(payload) != size:
+            raise ValueError("icon payload length differs from group")
+        headers.append(struct.pack("<BBBBHHII", width, height, colors, zero,
+                                   planes, bits, size, offset))
+        images.append(payload)
+        offset += size
+    return struct.pack("<HHH", 0, 1, count) + b"".join(headers + images)
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("input", type=Path)
+    parser.add_argument("output", type=Path)
+    args = parser.parse_args()
+    try:
+        icon = extract_icon(args.input.read_bytes())
+        with args.output.open("xb") as target:
+            target.write(icon)
+    except (OSError, ValueError, struct.error) as error:
+        parser.exit(1, f"extract-icon: {error}\n")
+
+
+if __name__ == "__main__":
+    main()

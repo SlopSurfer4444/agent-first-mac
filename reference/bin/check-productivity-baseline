@@ -1,0 +1,189 @@
+#!/usr/bin/python3
+"""Fail-closed static validation for the productivity lifecycle declaration."""
+
+import json
+from pathlib import Path
+import re
+import sys
+
+
+ROOT = Path(__file__).resolve().parent.parent
+MANIFEST = ROOT / "manifests/productivity-baseline.json"
+MODULE = ROOT / "darwin/productivity.nix"
+
+
+def require(condition, reason):
+    if not condition:
+        raise RuntimeError(reason)
+
+
+def main():
+    require(sys.argv[1:] == [], "usage")
+    manifest = json.loads(MANIFEST.read_text())
+    module = MODULE.read_text()
+    flake = (ROOT / "flake.nix").read_text()
+    lock = json.loads((ROOT / "flake.lock").read_text())
+    homebrew = (ROOT / "darwin/homebrew.nix").read_text()
+
+    require(manifest["schema"] == 1, "manifest_schema")
+    require(manifest["profile"] == "m5-air-productivity-baseline", "profile_name")
+    require(type(manifest["profileActive"]) is bool, "profile_active_type")
+    require(type(manifest["fullColorWidgetsActive"]) is bool,
+            "widget_profile_active_type")
+    battery_low_power = manifest["desiredState"]["batteryLowPowerMode"]
+    require(type(battery_low_power) is bool, "battery_low_power_type")
+    require(manifest["desiredState"]["acLowPowerMode"] is False,
+            "ac_low_power_drift")
+    require(manifest["ownerAuthorization"]["liveApplyAuthorized"] is True,
+            "owner_apply_gate")
+    require(manifest["ownerAuthorization"]["phase6Claimed"] is False,
+            "phase6_claim")
+    require(manifest["source"]["revision"] ==
+            "76fe02659c00bef75e12fbfdd45ca665115e9302", "nixpkgs_revision")
+    require(lock["nodes"]["nixpkgs"]["locked"]["rev"] ==
+            manifest["source"]["revision"], "lock_revision_drift")
+
+    expected_apps = {
+        "IINA": ("iina", "1.4.2", "IINA.app", "com.colliderli.iina", "67CQ77V27R"),
+        "Keka": ("keka", "1.6.0", "Keka.app", "com.aone.keka", "4FG648TM2A"),
+        "LocalSend": ("localsend-preserved", "1.17.0", "LocalSend.app",
+                      "org.localsend.localsendApp", "3W7H4PYMCV"),
+        "Raycast": ("raycast", "1.104.17", "Raycast.app", "com.raycast.macos",
+                    "SY64MV22J9"),
+        "Shottr": ("shottr", "1.9.1", "Shottr.app", "cc.ffitch.shottr",
+                   "2Y683PRQWN"),
+    }
+    require(len(manifest["applications"]) == len(expected_apps), "application_count")
+    actual_apps = {
+        app["name"]: (app["attribute"], app["version"], app["bundleName"],
+                      app["bundleIdentifier"], app["teamIdentifier"])
+        for app in manifest["applications"]
+    }
+    require(actual_apps == expected_apps, "application_identity_drift")
+    require(manifest["applications"][2]["darwinSourceHash"] ==
+            "sha256-/fGkLuE+uf3WrpTcWIOYHooJWZ51i94j9uZ3xPq1yTw=",
+            "localsend_source_hash")
+
+    flag = re.search(r"productivityProfileEnabled = (true|false);", module)
+    require(flag is not None, "profile_flag_missing")
+    require((flag.group(1) == "true") == manifest["profileActive"],
+            "profile_flag_manifest_drift")
+    widget_flag = re.search(r"fullColorWidgetsEnabled = (true|false);", module)
+    require(widget_flag is not None, "widget_profile_flag_missing")
+    require((widget_flag.group(1) == "true") == manifest["fullColorWidgetsActive"],
+            "widget_profile_flag_manifest_drift")
+    battery_flag = re.search(r"batteryLowPowerEnabled = (true|false);", module)
+    require(battery_flag is not None, "battery_low_power_flag_missing")
+    require((battery_flag.group(1) == "true") ==
+            manifest["desiredState"]["batteryLowPowerMode"],
+            "battery_low_power_flag_manifest_drift")
+
+    required_module_fragments = [
+        "pkgs.iina", "pkgs.keka", "pkgs.localsend.overrideAttrs",
+        "pkgs.raycast", "pkgs.shottr", "dontFixup = true;",
+        "/usr/bin/ditto \"LocalSend.app\"",
+        "[ \"keka\" \"raycast\" \"shottr\" ]",
+        "networking.applicationFirewall", "enableStealthMode",
+        "AppleIconAppearanceTheme = \"RegularAutomatic\";", "autohide = false;",
+        "wvous-br-corner = 14;",
+        "EnableStandardClickToShowDesktop = true;",
+        "CustomUserPreferences.\"com.apple.widgets\".widgetAppearance",
+        "if fullColorWidgetsEnabled then 1 else 0;",
+        "AppleInterfaceStyleSwitchesAutomatically", "InitialKeyRepeat",
+        "KeyRepeat", "TrackpadThreeFingerDrag", "EnableTilingByEdgeDrag",
+        "EnableTiledWindowMargins", "Pictures/Screenshots",
+        "/usr/bin/pmset -b lowpowermode", "/usr/bin/pmset -c lowpowermode 0",
+    ]
+    for fragment in required_module_fragments:
+        require(fragment in module, "module_contract_missing")
+
+    require("./darwin/productivity.nix" in flake, "flake_module_import")
+    for forbidden in ["/Users/example-user", "BEGIN PRIVATE KEY", "oauth_token", "access_token"]:
+        require(forbidden not in module and forbidden not in MANIFEST.read_text(),
+                "forbidden_repository_material")
+
+    for empty_declaration in ["taps = [ ];", "brews = [ ];", "casks = [ ];",
+                              "masApps = { };"]:
+        require(empty_declaration in homebrew, "homebrew_not_empty")
+
+    require(manifest["permissions"]["automaticGrantAllowed"] is False,
+            "automatic_tcc_grant")
+    require(manifest["desiredState"]["iconAppearance"] == "RegularAutomatic",
+            "icon_appearance_drift")
+    require(manifest["desiredState"]["dockAutohide"] is False,
+            "dock_autohide_drift")
+    require(manifest["prestate"]["bottomRightHotCorner"] == "Quick Note" and
+            manifest["prestate"]["bottomRightHotCornerRaw"] == 14,
+            "hot_corner_prestate_drift")
+    require(manifest["desiredState"]["bottomRightHotCorner"] == "Quick Note" and
+            manifest["desiredState"]["bottomRightHotCornerRaw"] == 14,
+            "hot_corner_target_drift")
+    require(manifest["desiredState"]["clickWallpaperToShowDesktop"] is True,
+            "click_wallpaper_desktop_target_drift")
+    require(manifest["prestate"]["widgetAppearance"] == "Automatic" and
+            manifest["prestate"]["widgetAppearanceRaw"] == 0,
+            "widget_prestate_drift")
+    require(manifest["desiredState"]["widgetAppearance"] == "Never" and
+            manifest["desiredState"]["widgetAppearanceRaw"] == 1,
+            "widget_target_drift")
+    runtime = manifest["ownerRuntimePreferences"]
+    require(type(runtime["lowPowerMode"]) is str and
+            runtime["lowPowerMode"] == ("Only on Battery" if battery_low_power else "Never") and
+            runtime["chargeLimitPercent"] == 90,
+            "battery_runtime_preferences")
+    require(runtime["approvedLoginItems"] == ["Raycast", "Shottr"],
+            "approved_login_items")
+    require(runtime["hotkeys"] == {
+        "raycastLauncher": "Option+Space",
+        "raycastClipboardHistory": "Option+V",
+        "raycastEmojiSearch": "Option+E",
+        "raycastWindowLeft": "Control+Option+Left",
+        "raycastWindowRight": "Control+Option+Right",
+        "raycastWindowMaximize": "Control+Option+Return",
+        "raycastWindowCenter": "Control+Option+C",
+        "shottrFullscreen": "Command+Shift+1",
+        "shottrArea": "Command+Shift+2",
+        "shottrInstantTextRecognition": "Control+Option+Command+O",
+    }, "runtime_hotkeys")
+    require(runtime["shottrCaptureBehavior"] == {
+        "afterAreaCrop": "Editor",
+        "afterScreenshot": ["Show", "Copy"],
+        "automaticSave": False,
+    }, "shottr_capture_behavior")
+    require(runtime["systemConveniences"] == {
+        "showBatteryPercentageInMenuBar": True,
+        "bottomRightHotCorner": "Quick Note",
+        "clickWallpaperToShowDesktop": True,
+    }, "system_conveniences")
+    require(runtime["approvedPrivacyGrants"] == {
+        "Raycast": ["Accessibility"],
+        "Shottr": ["Screen Recording"],
+        "LocalSend": ["Local Network only if requested by macOS"],
+    }, "approved_privacy_grants")
+    require(runtime["withheldRaycastGrants"] ==
+            ["Calendars", "Contacts", "Files and Folders"],
+            "raycast_privacy_boundary")
+    require(runtime["timeMachineDestinationConfigured"] is False,
+            "time_machine_boundary")
+    require(manifest["rollback"]["userDataMutation"] is False,
+            "rollback_user_data")
+
+    print(json.dumps({
+        "schema": 1,
+        "result": "pass",
+        "profileActive": manifest["profileActive"],
+        "fullColorWidgetsActive": manifest["fullColorWidgetsActive"],
+        "applicationCount": len(expected_apps),
+        "homebrewPayloadCount": 0,
+        "floatingInputsAllowed": False,
+        "automaticPermissionGrantAllowed": False,
+        "batteryLowPowerMode": manifest["desiredState"]["batteryLowPowerMode"],
+    }, indent=2, sort_keys=True))
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except Exception as error:
+        print(json.dumps({"result": "fail", "reason": str(error)}, sort_keys=True))
+        raise SystemExit(1)

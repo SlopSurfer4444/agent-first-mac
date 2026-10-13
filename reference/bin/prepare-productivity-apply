@@ -1,0 +1,238 @@
+#!/usr/bin/python3
+"""Build, verify, and receipt one exact clean-main productivity target."""
+
+import hashlib
+import importlib.machinery
+import json
+import os
+from pathlib import Path
+import pwd
+import re
+import stat
+import subprocess
+import sys
+
+
+NIX = "/nix/var/nix/profiles/default/bin/nix"
+NIX_STORE = "/nix/var/nix/profiles/default/bin/nix-store"
+GIT = "/usr/bin/git"
+POLICY = Path("/etc/agent-first-mac/aid-admin-policy.json")
+EXPECTED_POLICY_SHA256 = "2555b3f0ed1f75cd26bc41af6512ecc30d444ba1b0113458f72efcfccc304225"
+
+
+def require(condition, reason):
+    if not condition:
+        raise RuntimeError(reason)
+
+
+def run(argv, *, cwd, env):
+    return subprocess.run([str(value) for value in argv], cwd=cwd, env=env,
+                          text=True, stdout=subprocess.PIPE,
+                          stderr=subprocess.STDOUT, check=False)
+
+
+def checked(argv, *, cwd, env):
+    result = run(argv, cwd=cwd, env=env)
+    require(result.returncode == 0,
+            f"command_failed_{Path(str(argv[0])).name}: {result.stdout[-1200:]}")
+    return result.stdout.strip()
+
+
+def generation_snapshot():
+    profile_root = Path("/nix/var/nix/profiles")
+    generations = {
+        path.name: os.readlink(path)
+        for path in profile_root.glob("system-*-link")
+        if re.fullmatch(r"system-[1-9][0-9]{0,8}-link", path.name)
+    }
+    return generations, os.readlink(profile_root / "system"), os.readlink("/run/current-system")
+
+
+def plist_value(bundle, key, *, cwd, env):
+    return checked(["/usr/bin/plutil", "-extract", key, "raw", "-o", "-",
+                    bundle / "Contents/Info.plist"], cwd=cwd, env=env)
+
+
+def team_identifier(bundle, *, cwd, env):
+    output = checked(["/usr/bin/codesign", "-d", "--verbose=4", bundle],
+                     cwd=cwd, env=env)
+    match = re.search(r"^TeamIdentifier=([^\n]+)$", output, re.MULTILINE)
+    require(match is not None, "team_identifier_missing")
+    return match.group(1)
+
+
+def fresh_doctor(control, commit, git_prefix, *, env):
+    """Require the full fresh sentinel before build and receipt preparation."""
+    doctor = importlib.machinery.SourceFileLoader(
+        "productivity_current_doctor", str(control / "bin/current-doctor")).load_module()
+    output = checked([control / "bin/current-doctor", "--json"], cwd=control, env=env)
+    value = doctor.public_report(doctor.D.R.strict_json(output.encode()), git_only=False)
+    require(value["verdict"] == "PASS" and value["integratedMain"] is True
+            and value["currentSentinelReady"] is True, "fresh_sentinel_required")
+    require(checked([*git_prefix, "rev-parse", "HEAD"], cwd=control, env=env) == commit
+            and checked([*git_prefix, "branch", "--show-current"], cwd=control, env=env) == "main"
+            and checked([*git_prefix, "status", "--porcelain", "--untracked-files=all"],
+                        cwd=control, env=env) == "", "source_drift")
+
+
+def reviewed_target(control, *, env):
+    """The broker's reviewed:true field still promises actual target review."""
+    doctor = importlib.machinery.SourceFileLoader(
+        "productivity_reviewed_doctor", str(control / "bin/current-doctor")).load_module()
+    output = checked([control / "bin/current-doctor", "--git-only", "--audit-history", "--json"],
+                     cwd=control, env=env)
+    value = doctor.public_report(doctor.D.R.strict_json(output.encode()), git_only=True)
+    require(value["verdict"] == "GIT_ONLY_VALID" and value["integratedMain"] is True
+            and value["admissionMode"] == "historical-review", "independently_reviewed_target_required")
+
+
+def main():
+    require(len(sys.argv) == 2 and re.fullmatch(r"[0-9a-f]{40}", sys.argv[1]), "usage")
+    commit = sys.argv[1]
+    home = Path.home().resolve(strict=True)
+    root = Path(__file__).resolve().parent.parent
+    control = (home / "AIDev/control").resolve(strict=True)
+    require(root == control, "must_run_from_canonical_control")
+    owner = pwd.getpwuid(os.getuid())
+    require(os.getuid() != 0 and Path(owner.pw_dir).resolve(strict=True) == home,
+            "owner_identity")
+
+    git_env = {
+        "HOME": "/var/empty", "LANG": "C", "LC_ALL": "C", "PATH": "/usr/bin:/bin",
+        "GIT_ATTR_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": "/dev/null",
+        "GIT_CONFIG_NOSYSTEM": "1", "GIT_EXTERNAL_DIFF": "",
+        "GIT_OPTIONAL_LOCKS": "0", "GIT_PAGER": "cat", "GIT_TERMINAL_PROMPT": "0",
+    }
+    git_prefix = [GIT, "--no-optional-locks", "-c", f"safe.directory={control}",
+                  "-c", "core.fsmonitor=false", "-c", "core.hooksPath=/dev/null",
+                  "-c", "diff.external=", "-C", control]
+    require(checked([*git_prefix, "rev-parse", "HEAD"], cwd=control, env=git_env) == commit,
+            "control_head")
+    require(checked([*git_prefix, "branch", "--show-current"], cwd=control,
+                    env=git_env) == "main", "control_branch")
+    require(checked([*git_prefix, "status", "--porcelain", "--untracked-files=normal"],
+                    cwd=control, env=git_env) == "", "control_dirty")
+    tree = checked([*git_prefix, "rev-parse", commit + "^{tree}"], cwd=control,
+                   env=git_env)
+    require(re.fullmatch(r"[0-9a-f]{40}", tree) is not None, "control_tree")
+
+    manifest = json.loads((control / "manifests/productivity-baseline.json").read_text())
+    build_env = {
+        "AID_BOOTSTRAP_HOME": str(home), "AID_BOOTSTRAP_USER": owner.pw_name,
+        "HOME": str(home), "LANG": "C", "LC_ALL": "C", "PATH": "/usr/bin:/bin",
+        "TMPDIR": "/tmp",
+    }
+    checked([control / "bin/check-productivity-baseline"], cwd=control, env=build_env)
+    checked([GIT, "diff", "--check", commit + "^", commit], cwd=control, env=git_env)
+    require(not checked(["/opt/homebrew/bin/brew", "list", "--formula"], cwd=control,
+                        env=build_env), "homebrew_formula_drift")
+    require(not checked(["/opt/homebrew/bin/brew", "list", "--cask"], cwd=control,
+                        env=build_env), "homebrew_cask_drift")
+
+    before = generation_snapshot()
+    reviewed_target(control, env=build_env)
+    fresh_doctor(control, commit, git_prefix, env=build_env)
+    output = checked([
+        NIX, "build", "--impure", "--no-link", "--print-out-paths",
+        "--no-write-lock-file",
+        ".#darwinConfigurations.bootstrap-with-homebrew.system",
+    ], cwd=control, env=build_env)
+    paths = [line for line in output.splitlines() if line.startswith("/nix/store/")]
+    require(len(paths) == 1 and re.fullmatch(
+        r"/nix/store/[0-9abcdfghijklmnpqrsvwxyz]{32}-darwin-system-[A-Za-z0-9._+-]{1,96}",
+        paths[0]) is not None, "build_output")
+    target = Path(paths[0])
+    facts = target.stat()
+    require(target.is_dir() and facts.st_uid == 0 and facts.st_mode & 0o022 == 0,
+            "target_immutable")
+    require(run([NIX_STORE, "--verify-path", target], cwd=control,
+                env=build_env).returncode == 0, "target_verify")
+    nar_hash = checked([NIX_STORE, "--query", "--hash", target], cwd=control,
+                       env=build_env)
+    require(re.fullmatch(r"sha256:[0-9abcdfghijklmnpqrsvwxyz]{52}", nar_hash) is not None,
+            "target_nar_hash")
+
+    revision = json.loads((target / "darwin-version.json").resolve(strict=True).read_text())
+    require(revision["configurationRevision"] == commit, "configuration_revision")
+    require(generation_snapshot() == before, "build_mutated_generation")
+
+    applications = (target / "Applications").resolve(strict=True)
+    for app in manifest["applications"]:
+        bundle = applications / app["bundleName"]
+        if not manifest["profileActive"]:
+            require(not bundle.exists(), "prestate_application_present")
+            continue
+        require(bundle.is_dir(), "target_application_missing")
+        require(plist_value(bundle, "CFBundleIdentifier", cwd=control, env=build_env) ==
+                app["bundleIdentifier"], "bundle_identifier_drift")
+        require(plist_value(bundle, "CFBundleShortVersionString", cwd=control, env=build_env) ==
+                app["version"], "bundle_version_drift")
+        require(team_identifier(bundle, cwd=control, env=build_env) ==
+                app["teamIdentifier"], "bundle_team_drift")
+        require(run(["/usr/bin/codesign", "--verify", "--deep", "--strict", bundle],
+                    cwd=control, env=build_env).returncode == 0, "bundle_codesign")
+        require(run(["/usr/sbin/spctl", "--assess", "--type", "execute", bundle],
+                    cwd=control, env=build_env).returncode == 0, "bundle_gatekeeper")
+
+    policy_bytes = POLICY.read_bytes()
+    policy_hash = hashlib.sha256(policy_bytes).hexdigest()
+    require(policy_hash == EXPECTED_POLICY_SHA256, "installed_policy_hash")
+    fresh_doctor(control, commit, git_prefix, env=build_env)
+    receipt_dir = home / "AIDev/state/phase-4/apply-receipts"
+    receipt_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+    receipt_dir.chmod(0o700)
+    receipt = receipt_dir / (commit + ".json")
+    require(not receipt.exists() and not receipt.is_symlink(), "receipt_exists")
+    value = {
+        "controlCommit": commit,
+        "controlTree": tree,
+        "policyHash": policy_hash,
+        "reviewed": True,
+        "schema": 1,
+        "targetSystemNarHash": nar_hash,
+        "targetSystemPath": str(target),
+    }
+    temporary = receipt.with_suffix(".json.new")
+    require(not temporary.exists() and not temporary.is_symlink(), "temporary_exists")
+    descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o400)
+    try:
+        data = (json.dumps(value, indent=2, sort_keys=True) + "\n").encode()
+        os.write(descriptor, data)
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+    os.replace(temporary, receipt)
+    directory_descriptor = os.open(receipt_dir, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        os.fsync(directory_descriptor)
+    finally:
+        os.close(directory_descriptor)
+
+    receipt_facts = receipt.stat()
+    require(stat.S_ISREG(receipt_facts.st_mode) and receipt_facts.st_uid == os.getuid() and
+            receipt_facts.st_mode & 0o777 == 0o400, "receipt_metadata")
+    require(generation_snapshot() == before, "receipt_prep_mutated_generation")
+
+    print(json.dumps({
+        "schema": 1,
+        "result": "pass",
+        "controlCommit": commit,
+        "profileActive": manifest["profileActive"],
+        "builtApplicationCount": len(manifest["applications"])
+            if manifest["profileActive"] else 0,
+        "configurationRevisionMatches": True,
+        "closureVerified": True,
+        "signatureAndGatekeeperVerified": True,
+        "generationStateUnchanged": True,
+        "narHash": nar_hash,
+        "receiptWrittenOutsideRepository": True,
+        "rawStorePathRetainedInRepository": False,
+    }, indent=2, sort_keys=True))
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except Exception as error:
+        print(json.dumps({"result": "fail", "reason": str(error)}, sort_keys=True))
+        raise SystemExit(1)

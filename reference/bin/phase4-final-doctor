@@ -1,0 +1,1813 @@
+#!/usr/bin/python3
+"""Read-only final Phase 4 doctor for review and accepted standalone main."""
+
+import hashlib
+import contextlib
+import contextvars
+import enum
+import json
+import os
+from pathlib import Path
+import re
+import stat
+import subprocess
+import sys
+import tempfile
+
+
+ROOT = Path(__file__).resolve().parents[1]
+PRIVATE_RUNTIME_BRANCH = "codex/phase-5-private-current-runtime-reconciliation"
+REVIEW_BRANCH = "codex/phase-4-root-broker-install-apply"
+DESCENDANT_REVIEW_BRANCH = "codex/phase-5-codex-contract-prep"
+APPLY_BUNDLE_REVIEW_BRANCH = "codex/phase-5-codex-contract-apply"
+FINALIZATION_BASE = "4387f044ea407186508bc0cb1838059e97826ac1"
+ACCEPTED_REVIEWED_HEAD = "372ae8538358079130c078c0c855d806094e9f5f"
+ACCEPTANCE_COMMIT = "448626030776911a94f50ea95e984153dc16b353"
+PHASE5_ACCEPTANCE_COMMIT = "a192a98a0c92a64b2e3bd710282efec8d367ea50"
+FIRST_COMPATIBILITY_EVIDENCE_COMMIT = (
+    "e0f3a339cd39642bc4e631957f562bd4c981466c"
+)
+CONTROL_COMMIT = "217602def502f515f5c0c554f1d4c1d0aaabcb26"
+MARKER = "CHECKPOINT_PHASE4_FINAL_INTEGRATION_REVIEW"
+REVIEW_VERDICT = "PHASE4_FINAL_INTEGRATION_PREPARED_FOR_INDEPENDENT_REVIEW"
+ACCEPTED_LEVEL = "L3 Agent-ready"
+ACCEPTANCE = "evidence/phase-4/acceptance.json"
+PREPARATION_EVIDENCE = "evidence/phase-4/final-integration-preparation.json"
+IMPLEMENTATION_SCOPE = {
+    "AGENTS.md",
+    "ARCHITECTURE.md",
+    "README.md",
+    "bin/check-phase4-final-probes",
+    "bin/phase4-final-doctor",
+    "docs/phase-4-final-acceptance.md",
+}
+EVIDENCE_SCOPE = {PREPARATION_EVIDENCE}
+ACCEPTANCE_SCOPE = {ACCEPTANCE}
+EXECUTOR_METADATA = [
+    "Agent-First Mac Executor", "executor@agent-first-mac.invalid",
+    "Agent-First Mac Executor", "executor@agent-first-mac.invalid",
+]
+COORDINATOR_METADATA = [
+    "Agent-First Mac Coordinator", "coordinator@agent-first-mac.invalid",
+    "Agent-First Mac Coordinator", "coordinator@agent-first-mac.invalid",
+]
+GIT = [
+    "/usr/bin/git", "-c", "core.fsmonitor=false", "-c", "core.hooksPath=/dev/null",
+]
+_BRIDGE_V52_COMMAND_ENVIRONMENT = contextvars.ContextVar(
+    "bridge_v52_command_environment", default=None)
+CLEAN_ENVIRONMENT = {
+    "HOME": str(Path.home()),
+    "LANG": "C",
+    "LC_ALL": "C",
+    "PATH": "/usr/bin:/bin",
+    "TMPDIR": "/tmp",
+}
+BROKER_SHA256 = "bce4427701a0278ea7941710939fc6e0a2b36abe0f3f487564b228b7283acd8e"
+POLICY_SHA256 = "2555b3f0ed1f75cd26bc41af6512ecc30d444ba1b0113458f72efcfccc304225"
+RECEIPT_SHA256 = "cf5e95fd3bf33fc34794055a80865fde9feaeccac4b271aa30561e42ca30a725"
+TARGET_PATH_SHA256 = "ab0a4216e4dd81dfc10f18cd2d6999e5d73b3c719f8a465852118ae35233ecb7"
+PREVIOUS_PATH_SHA256 = "97b12222d8587afe9b558e15585490c70065f9e4474799a7ea24b1cef5338c6b"
+PHASE3_HASHES = {
+    "evidence/phase-3/acceptance.json":
+        "d56a81ceb671fb7f26f227f391e75b342fd220ddb49517974236fc429e268f90",
+    "evidence/phase-3/ceremony-intent-acceptance.json":
+        "305a6d0d9682c002e934190b331b2177d1a66735a20427b82832025281bc4e95",
+    "evidence/phase-3/permissions-acceptance.json":
+        "d2899ade49ae20b486aacc6750fad128e28f6e7b586f7c0da3b401e756658531",
+    "evidence/phase-3/permissions-apply-verification.json":
+        "e0b436300198a4255d95e460908efbed384f8b8f83ebbe039cf85408310a7c43",
+}
+LIVE_CHECK_KEYS = {
+    "artifactBindings",
+    "auditAndStagingBounded",
+    "emergencyEnabledState",
+    "historicalGeneration3Retained",
+    "genericSudoDenied",
+    "noRelevantProcess",
+    "phase2AcceptedLiveDoctor",
+    "phase3AcceptedEvidence",
+    "previousGenerationAvailable",
+    "rootContractReady",
+    "unknownCommandDenied",
+}
+
+
+def require(condition, reason):
+    if not condition:
+        raise RuntimeError(reason)
+
+
+def run(argv, cwd=ROOT, environment=None):
+    if environment is None:
+        environment = _BRIDGE_V52_COMMAND_ENVIRONMENT.get()
+    return subprocess.run(
+        [str(value) for value in argv], cwd=cwd,
+        env=environment, text=True, stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT, check=False,
+    )
+
+
+def checked(argv, cwd=ROOT, environment=None):
+    result = run(argv, cwd=cwd, environment=environment)
+    require(result.returncode == 0,
+            "command_failed_" + Path(str(argv[0])).name)
+    return result.stdout
+
+
+def git(*arguments, cwd=ROOT):
+    return checked([*GIT, *arguments], cwd=cwd).strip()
+
+
+def git_object_exists(name, *, object_type=None, cwd=ROOT):
+    """Return a closed object-existence result without leaking Git stderr.
+
+    This helper is deliberately the only non-throwing object lookup used by
+    current-main receipt validation.  Callers must not perform ancestry, tree,
+    or policy work until it returns true.
+    """
+    result = run([*GIT, "cat-file", "-e", name], cwd=cwd)
+    if result.returncode != 0:
+        return False
+    if object_type is None:
+        return True
+    probe = run([*GIT, "cat-file", "-t", name], cwd=cwd)
+    return probe.returncode == 0 and probe.stdout.strip() == object_type
+
+
+def digest(path):
+    value = hashlib.sha256()
+    with Path(path).open("rb") as stream:
+        while True:
+            chunk = stream.read(65536)
+            if not chunk:
+                break
+            value.update(chunk)
+    return value.hexdigest()
+
+
+def path_digest(path):
+    return hashlib.sha256(str(path).encode()).hexdigest()
+
+
+def strict_json(path):
+    def unique_object(pairs):
+        value = {}
+        for key, item in pairs:
+            require(isinstance(key, str) and key not in value, "duplicate_json_key")
+            value[key] = item
+        return value
+
+    return json.loads(Path(path).read_text(), object_pairs_hook=unique_object)
+
+
+def strict_json_text(text):
+    def unique_object(pairs):
+        value = {}
+        for key, item in pairs:
+            require(isinstance(key, str) and key not in value, "duplicate_json_key")
+            value[key] = item
+        return value
+
+    return json.loads(text, object_pairs_hook=unique_object)
+
+
+def commit_scope(commit, cwd=ROOT):
+    output = git(
+        "diff-tree", "--no-commit-id", "--name-only", "-r", commit, cwd=cwd
+    )
+    return set(filter(None, output.splitlines()))
+
+
+def commit_metadata(commit, cwd=ROOT):
+    return git(
+        "show", "-s", "--format=%an%n%ae%n%cn%n%ce", commit, cwd=cwd
+    ).splitlines()
+
+
+def validate_preparation_evidence(reviewed_head, implementation):
+    value = strict_json(ROOT / PREPARATION_EVIDENCE)
+    require(set(value) == {
+        "acceptedState", "base", "branch", "conditionalAcceptance",
+        "finalizationImplementationCommit", "gate", "historicalProvenance",
+        "phase", "rollback", "schema", "systemMutations", "tests",
+        "unchangedArtifacts",
+    }, "preparation_evidence_keys")
+    require(value["schema"] == 1 and
+            value["phase"] == "phase4_final_standalone_integration_preparation" and
+            value["base"] == FINALIZATION_BASE and value["branch"] == REVIEW_BRANCH and
+            value["finalizationImplementationCommit"] == implementation,
+            "preparation_evidence_header")
+    require(value["gate"] == {
+        "independentReviewRequired": True,
+        "l3Claimed": False,
+        "marker": MARKER,
+        "maximumVerdict": REVIEW_VERDICT,
+        "phase4PassClaimed": False,
+        "phase5Authorized": False,
+    }, "preparation_evidence_gate")
+    require(value["conditionalAcceptance"] == {
+        "acceptanceCommitFiles": [ACCEPTANCE],
+        "acceptanceCommitMustDirectlyFollowReviewedHead": True,
+        "acceptanceRecordCreatedByExecutor": False,
+        "coordinatorMetadataRequired": True,
+        "integratedBranch": "main",
+        "reviewBranch": REVIEW_BRANCH,
+    }, "preparation_evidence_acceptance")
+    require(value["systemMutations"] == {
+        "applySystem": False,
+        "emergencyAction": False,
+        "generationOrProfile": False,
+        "installedRootOrSystem": False,
+        "performed": False,
+        "sudoPasswordOrInteractivePrompt": False,
+    }, "preparation_evidence_mutations")
+    require(value["historicalProvenance"]["operationalDependency"] is False,
+            "preparation_evidence_external_dependency")
+    require(all(value["tests"].values()), "preparation_evidence_tests")
+    require(value["unchangedArtifacts"] == {
+        "brokerSHA256": BROKER_SHA256,
+        "emergencyArtifactSHA256":
+            "9eb393257a71cf190b2131443eb617f9c17e56adcf5716472558bd9039885cec",
+        "emergencyManifestSHA256":
+            "01b9df839bb9de049207ef4570068b7d336619bf51b0942c89b1d87dcd3748a6",
+        "policySHA256": POLICY_SHA256,
+        "receiptSHA256": RECEIPT_SHA256,
+    }, "preparation_evidence_artifacts")
+    require(run([*GIT, "merge-base", "--is-ancestor", reviewed_head, "HEAD"])
+            .returncode == 0,
+            "preparation_evidence_reviewed_head")
+    return value
+
+
+def validate_review_chain(reviewed_head):
+    implementation = git("rev-parse", reviewed_head + "^")
+    require(git("rev-parse", implementation + "^") == FINALIZATION_BASE,
+            "finalization_parent")
+    require(commit_scope(implementation) == IMPLEMENTATION_SCOPE,
+            "finalization_implementation_scope")
+    require(commit_scope(reviewed_head) == EVIDENCE_SCOPE,
+            "finalization_evidence_scope")
+    require(commit_metadata(implementation) == EXECUTOR_METADATA and
+            commit_metadata(reviewed_head) == EXECUTOR_METADATA,
+            "finalization_commit_metadata")
+    require(git("rev-list", "--count", FINALIZATION_BASE + ".." + reviewed_head) == "2" and
+            git("rev-list", "--merges", FINALIZATION_BASE + ".." + reviewed_head) == "",
+            "finalization_history_shape")
+    validate_preparation_evidence(reviewed_head, implementation)
+    return implementation
+
+
+def validate_acceptance_value(value, reviewed_head, implementation):
+    require(set(value) == {
+        "acceptedOn", "coordinatorReview", "gate", "phase", "reviewMarker",
+        "reviewedFinalizationHead", "reviewedImplementationCommit", "schema",
+        "systemMutationDuringAcceptance",
+    }, "acceptance_keys")
+    require(isinstance(value["acceptedOn"], str) and
+            re.fullmatch(r"[0-9]{4}-[0-9]{2}-[0-9]{2}", value["acceptedOn"]) is not None,
+            "acceptance_date")
+    require(value["schema"] == 1 and value["phase"] == "phase4_typed_root_broker" and
+            value["reviewMarker"] == MARKER and
+            value["reviewedFinalizationHead"] == reviewed_head and
+            value["reviewedImplementationCommit"] == implementation and
+            value["systemMutationDuringAcceptance"] is False,
+            "acceptance_header")
+    require(value["coordinatorReview"] == {
+        "componentValidator": "PASS",
+        "emergencyDisableRecoveryVerified": True,
+        "finalDoctor": "PASS",
+        "liveStateVerified": True,
+        "repositoryContractVerified": True,
+        "selfReportIsAcceptance": False,
+    }, "acceptance_review")
+    require(value["gate"] == {
+        "acceptedLevel": ACCEPTED_LEVEL,
+        "backupDeferredAcceptedRisk": True,
+        "l3Claimed": True,
+        "phase4Complete": True,
+        "phase4PassClaimed": True,
+        "phase5Authorized": False,
+        "verdict": "PASS",
+    }, "acceptance_gate")
+    return value
+
+
+def retained_protected_path(path):
+    if path in {"AGENTS.md", "ARCHITECTURE.md", "README.md"}:
+        return True
+    if (
+        path.startswith("codex/")
+        or path.startswith("docs/phase-5")
+        or path.startswith("evidence/phase-5/")
+        or path.startswith("skills/manage-workstation/")
+        or path
+        in {
+            "bin/check-phase5-prep",
+            "bin/codex-quarantine",
+            "bin/phase5-config-transaction",
+            "bin/phase5-preflight",
+            "bin/phase5-apply-transaction",
+            "manifests/codex-contract.json",
+            "manifests/phase5-apply-bundle.json",
+            "manifests/trusted-repos.json",
+            "manifests/trusted-repos.schema.json",
+            "tests/fixtures/phase5-contract-cases.json",
+            "tests/fixtures/phase5-skill-triggers.json",
+        }
+    ):
+        return True
+    return (
+        path == "Package.swift"
+        or path.startswith("Sources/AidAdmin")
+        or path.startswith("bin/build-phase4")
+        or path.startswith("bin/check-phase4")
+        or path.startswith("bin/phase4")
+        or path.startswith("docs/phase-4")
+        or path.startswith("evidence/phase-4/")
+        or path.startswith("install-bundles/phase-4/")
+        or path.startswith("policy/aid-admin")
+        or path == "policy/sudoers.d/agent-first-mac-aid-admin"
+        or path.startswith("tests/AidAdmin")
+    )
+
+
+def validate_phase5_descendant_baseline():
+    result = run(
+        [ROOT / "bin/check-phase5-prep", "--git-only", "--json"]
+    )
+    try:
+        value = strict_json_text(result.stdout)
+    except (json.JSONDecodeError, TypeError, ValueError) as error:
+        raise RuntimeError("phase5_validator_invalid_output") from error
+    if result.returncode != 0:
+        reason = value.get("error")
+        require(isinstance(reason, str) and bool(reason), "phase5_validator_failed")
+        raise RuntimeError(reason)
+    require(
+        value.get("phase5ApplyAuthorized") is False
+        and value.get("phase5PassClaimed") is False
+        and value.get("phase6Authorized") is False
+        and value.get("preparationOnly") is True
+        and value.get("repositoryState")
+        in {
+            "apply_bundle_integrated",
+            "apply_bundle_review",
+            "correction_review",
+            "integrated_main",
+        },
+        "phase5_validator_contract",
+    )
+    if git("rev-parse", "HEAD") == PHASE5_ACCEPTANCE_COMMIT:
+        return PHASE5_ACCEPTANCE_COMMIT
+    protected_baseline = value.get("protectedBaselineCommit")
+    require(
+        isinstance(protected_baseline, str)
+        and re.fullmatch(r"[0-9a-f]{40}", protected_baseline) is not None
+        and run(
+            [
+                *GIT,
+                "merge-base",
+                "--is-ancestor",
+                protected_baseline,
+                "HEAD",
+            ]
+        ).returncode
+        == 0,
+        "phase5_protected_baseline",
+    )
+    return protected_baseline
+
+
+def validate_accepted_descendant():
+    require(commit_scope(ACCEPTANCE_COMMIT) == ACCEPTANCE_SCOPE,
+            "acceptance_commit_scope")
+    require(commit_metadata(ACCEPTANCE_COMMIT) == COORDINATOR_METADATA,
+            "acceptance_commit_metadata")
+    require(git("rev-parse", ACCEPTANCE_COMMIT + "^") == ACCEPTED_REVIEWED_HEAD,
+            "acceptance_commit_parent")
+    implementation = validate_review_chain(ACCEPTED_REVIEWED_HEAD)
+    committed = git("show", ACCEPTANCE_COMMIT + ":" + ACCEPTANCE)
+    validate_acceptance_value(
+        strict_json_text(committed), ACCEPTED_REVIEWED_HEAD, implementation)
+    require((ROOT / ACCEPTANCE).read_text() == committed + "\n",
+            "acceptance_worktree_drift")
+    require(run([*GIT, "merge-base", "--is-ancestor", ACCEPTANCE_COMMIT, "HEAD"])
+            .returncode == 0, "acceptance_commit_not_ancestor")
+    require(git("rev-list", "--merges", FINALIZATION_BASE + "..HEAD") == "",
+            "accepted_descendant_merge")
+    if git("rev-parse", "HEAD") == ACCEPTANCE_COMMIT:
+        return implementation
+    protected_baseline = validate_phase5_descendant_baseline()
+    changed = set(filter(None, git(
+        "diff", "--name-only", protected_baseline + "..HEAD").splitlines()))
+    protected = sorted(path for path in changed if retained_protected_path(path))
+    require(
+        not protected,
+        "protected_descendant_drift"
+        + (":" + ",".join(protected) if protected else ""),
+    )
+    return implementation
+
+
+def repository_state():
+    require(git("status", "--porcelain=v1", "--untracked-files=all") == "",
+            "dirty_worktree")
+    branch = git("branch", "--show-current")
+    require(branch in {
+                REVIEW_BRANCH,
+                DESCENDANT_REVIEW_BRANCH,
+                APPLY_BUNDLE_REVIEW_BRANCH,
+                "main",
+            },
+            "wrong_or_detached_branch")
+    require(run([*GIT, "merge-base", "--is-ancestor", FINALIZATION_BASE, "HEAD"])
+            .returncode == 0, "finalization_base_not_ancestor")
+    if branch == REVIEW_BRANCH:
+        reviewed_head = git("rev-parse", "HEAD")
+        implementation = validate_review_chain(reviewed_head)
+        require(not (ROOT / ACCEPTANCE).exists(), "acceptance_present_on_review_branch")
+        return {
+            "acceptanceCommitPresent": False,
+            "branch": REVIEW_BRANCH,
+            "implementationCommit": implementation,
+            "repositoryState": "review",
+            "reviewedFinalizationHead": reviewed_head,
+        }
+
+    implementation = validate_accepted_descendant()
+    return {
+        "acceptanceCommitPresent": True,
+        "branch": branch,
+        "implementationCommit": implementation,
+        "repositoryState": (
+            "accepted_main" if branch == "main" else "accepted_descendant_review"
+        ),
+        "reviewedFinalizationHead": ACCEPTED_REVIEWED_HEAD,
+    }
+
+
+def exact_file(path, mode, size, expected_hash=None, owner=None):
+    value = Path(path)
+    facts = value.lstat()
+    required_owner = os.getuid() if owner == "caller" else 0
+    require(stat.S_ISREG(facts.st_mode) and not value.is_symlink() and
+            facts.st_uid == required_owner and stat.S_IMODE(facts.st_mode) == mode and
+            facts.st_size == size, "file_contract_" + value.name)
+    if expected_hash is not None:
+        require(digest(value) == expected_hash, "file_hash_" + value.name)
+    return value
+
+
+def exact_directory(path, mode, size):
+    value = Path(path)
+    facts = value.lstat()
+    require(stat.S_ISDIR(facts.st_mode) and not value.is_symlink() and
+            facts.st_uid == facts.st_gid == 0 and
+            stat.S_IMODE(facts.st_mode) == mode and facts.st_size == size,
+            "directory_contract_" + value.name)
+
+
+def current_main_receipt_file(receipt):
+    """Return an unambiguous receipt path after its filesystem boundary check."""
+    value = Path(receipt)
+    facts = value.lstat()
+    require(stat.S_ISREG(facts.st_mode) and not value.is_symlink() and
+            facts.st_uid == os.getuid() and facts.st_nlink == 1 and
+            stat.S_IMODE(facts.st_mode) == 0o400 and
+            1 <= facts.st_size <= 4096, "current_main_receipt_file")
+    return value
+
+
+def current_main_command_facts(root, unknown, generic, validate):
+    """Derive bounded command facts; fixtures use these exact raw-result paths."""
+    return {
+        "genericSudoDenied": {"trueDenied": generic.returncode != 0,
+                              "validateDenied": validate.returncode != 0},
+        "rootDoctor": {"outputBounded": len(root.stdout.encode()) <= 16384,
+                       "returncode": root.returncode, "value": strict_json_text(root.stdout)},
+        "unknownCommandDenied": {"outputBounded": len(unknown.stdout.encode()) <= 4096,
+                                  "reason": "unknown_command" if unknown.stdout == "aid-admin: rejected: unknown_command\n" else "other",
+                                  "returncode": unknown.returncode},
+    }
+
+
+def current_main_emergency_enabled(paths=None):
+    paths = paths or ["/etc/agent-first-mac/aid-admin.disabled",
+                      "/etc/agent-first-mac/aid-admin.disabled.new",
+                      "/etc/sudoers.d/agent-first-mac-aid-admin.disabled"]
+    return not any(os.path.lexists(path) for path in paths)
+
+
+def current_main_process_names(output):
+    return [Path(item.strip()).name for item in output.splitlines()]
+
+
+def current_main_generation_fact(link, store_root=Path("/nix/store")):
+    """Read one numbered link without treating a bridge symlink as a store target."""
+    link = Path(link)
+    link_facts = link.lstat()
+    raw_target = os.readlink(link)
+    prefix = str(store_root) + "/"
+    component = raw_target[len(prefix):] if raw_target.startswith(prefix) else ""
+    canonical_single_store_object = (bool(component) and "/" not in component and
+                                     component not in {".", ".."} and
+                                     raw_target == prefix + component)
+    direct = Path(raw_target) if canonical_single_store_object else None
+    resolved = link.resolve(strict=True)
+    facts = resolved.lstat()
+    direct_facts = direct.lstat() if direct is not None and os.path.lexists(direct) else None
+    return {"gid": facts.st_gid, "kind": "directory" if stat.S_ISDIR(facts.st_mode) else "other",
+            "mode": stat.S_IMODE(facts.st_mode), "path": str(resolved),
+            "substituted": not (stat.S_ISLNK(link_facts.st_mode) and
+                                  canonical_single_store_object and direct_facts is not None and
+                                  stat.S_ISDIR(direct_facts.st_mode) and not stat.S_ISLNK(direct_facts.st_mode) and
+                                  direct.resolve(strict=True) == resolved),
+            "uid": facts.st_uid}
+
+
+CURRENT_MAIN_FACT_KEYS = {
+    "artifacts", "directories", "emergencyEnabled", "genericSudoDenied",
+    "historicalTargets", "narHash", "phase2Accepted", "phase3Accepted",
+    "processes", "profileTarget", "receipt", "receiptFile", "rootDoctor",
+    "target", "targets", "unknownCommandDenied", "versionFile", "versionLink",
+    "versionValue",
+}
+RUNNER_GATE_CONTROL = "1f8be8188983e08a1f3a47a88917c2c439a456a4"
+RUNNER_GATE_TREE = "62f0c39cded532260e3ef689904d7b348a9af425"
+RUNNER_GATE_OWNER_PARENT = "515f2d8fef374662505a742e754812861d47a08d"
+RUNNER_GATE_OWNER_SCOPE = {"ARCHITECTURE.md", "bin/check-productivity-baseline", "bin/productivity-doctor", "darwin/productivity.nix", "manifests/productivity-baseline.json"}
+
+
+def validate_current_main_facts(facts, control=ROOT, runner_route=False):
+    """Validate bounded, explicit current-generation facts.
+
+    The production doctor gathers these facts from its fixed paths.  The Phase 4
+    matrix feeds the identical validator synthetic facts, so a production
+    comparison cannot silently become a fixture-only assertion.
+    """
+    require(set(facts) == CURRENT_MAIN_FACT_KEYS, "current_main_facts_schema")
+    receipt_file = facts["receiptFile"]
+    require(receipt_file == {"kind": "file", "mode": 0o400, "nlink": 1,
+                             "owner": "caller", "sizeBounded": True,
+                             "symlink": False}, "current_main_receipt_file")
+    receipt = facts["receipt"]
+    require(set(receipt) == {"controlCommit", "controlTree", "policyHash", "reviewed",
+                             "schema", "targetSystemNarHash", "targetSystemPath"} and
+            receipt["schema"] == 1 and receipt["reviewed"] is True and
+            isinstance(receipt["controlCommit"], str) and
+            re.fullmatch(r"[0-9a-f]{40}", receipt["controlCommit"]) is not None and
+            isinstance(receipt["targetSystemNarHash"], str) and
+            1 <= len(receipt["targetSystemNarHash"]) <= 512,
+            "current_main_receipt")
+    base = RUNNER_GATE_CONTROL if runner_route else "a2a607956745ca9a3f85960b3da0b98463a33880"
+    require(git_object_exists(receipt["controlCommit"] + "^{commit}",
+                              object_type="commit", cwd=control) and
+            run([*GIT, "merge-base", "--is-ancestor", base, receipt["controlCommit"]], cwd=control).returncode == 0 and
+            run([*GIT, "merge-base", "--is-ancestor", receipt["controlCommit"], "HEAD"], cwd=control).returncode == 0 and
+            receipt["controlTree"] == git("rev-parse", receipt["controlCommit"] + "^{tree}", cwd=control) and
+            receipt["policyHash"] == POLICY_SHA256,
+            "current_main_receipt_bindings")
+    if runner_route:
+        require(receipt["controlCommit"] == RUNNER_GATE_CONTROL and receipt["controlTree"] == RUNNER_GATE_TREE and
+                git("rev-parse", RUNNER_GATE_CONTROL + "^", cwd=control) == RUNNER_GATE_OWNER_PARENT and
+                commit_scope(RUNNER_GATE_CONTROL, cwd=control) == RUNNER_GATE_OWNER_SCOPE and
+                commit_scope(RUNNER_GATE_OWNER_PARENT, cwd=control) == RUNNER_GATE_OWNER_SCOPE,
+                "runner_gate_owner_receipt_bindings")
+    targets = facts["targets"]
+    require(isinstance(targets, dict) and all(isinstance(number, int) and number > 0
+            for number in targets), "current_main_generations")
+    for number, target in targets.items():
+        require(isinstance(target, dict) and set(target) == {"gid", "kind", "mode", "path", "substituted", "uid"} and
+                target["kind"] == "directory" and target["uid"] == target["gid"] == 0 and
+                target["mode"] & 0o022 == 0 and target["substituted"] is False and
+                isinstance(target["path"], str) and target["path"].startswith("/nix/store/"),
+                "current_main_generation_" + str(number))
+    require(2 in targets and 3 in targets and facts["profileTarget"] == facts["target"]["path"] ==
+            receipt["targetSystemPath"] and facts["target"]["path"] in
+            [item["path"] for item in targets.values()], "current_main_generation")
+    if runner_route:
+        require({2, 3, 20, 21} <= set(targets) and not any(number > 21 for number in targets) and
+                facts["target"] == targets[21] and
+                targets[20]["path"] != targets[21]["path"], "runner_gate_current_generations")
+    historical = facts["historicalTargets"]
+    require(historical == {"generation2PathSHA256": PREVIOUS_PATH_SHA256,
+                           "generation3PathSHA256": TARGET_PATH_SHA256},
+            "current_main_historical_generations")
+    target = facts["target"]
+    require(target == targets[[number for number, item in targets.items()
+                               if item["path"] == facts["profileTarget"]][0]],
+            "current_main_target")
+    link, file = facts["versionLink"], facts["versionFile"]
+    require(link == {"gid": 0, "kind": "symlink", "mode": 0o755, "uid": 0} and
+            file == {"gid": 0, "kind": "file", "modeWritable": False,
+                     "owner": 0, "parent": "/nix/store", "sizeBounded": True},
+            "current_main_version_link")
+    version = facts["versionValue"]
+    sources = strict_json(control / "manifests/package-sources.json")["sources"]
+    darwin, nixpkgs = sources["nix_darwin"]["revision"], sources["nixpkgs"]["revision"]
+    require(set(version) == {"configurationRevision", "darwinLabel", "darwinRevision", "nixpkgsRevision"} and
+            version == {"configurationRevision": receipt["controlCommit"],
+                        "darwinLabel": "26.05." + darwin[:7], "darwinRevision": darwin,
+                        "nixpkgsRevision": nixpkgs}, "current_main_configuration_revision")
+    require(facts["narHash"] == receipt["targetSystemNarHash"], "current_main_target_nar")
+    for name in ("audit", "staging"):
+        require(facts["directories"].get(name) == {"gid": 0, "kind": "directory", "mode": 0o700,
+                                                     "symlink": False, "uid": 0},
+                "current_main_directory_" + name)
+    require(facts["artifacts"] == {"broker": True, "policy": True, "sudoers": True} and
+            facts["emergencyEnabled"] is True and
+            facts["rootDoctor"] == {"outputBounded": True, "returncode": 0, "value": {
+                "checks": {"emergency_disable_absent": True, "installed_artifact_attestation": True,
+                           "installed_contract": True, "policy_hash": True},
+                "command": "doctor-root", "problems": [], "readOnly": True, "schema": 1,
+                "systemMutationsPerformed": False, "verdict": "ROOT_CONTRACT_READY"}} and
+            facts["unknownCommandDenied"] == {"outputBounded": True, "reason": "unknown_command", "returncode": 64} and
+            facts["genericSudoDenied"] == {"trueDenied": True, "validateDenied": True} and
+            facts["phase2Accepted"] is True and facts["phase3Accepted"] is True,
+            "current_main_root_contract")
+    require(not set(facts["processes"]) & {"aid-admin", "aid-admin-bootstrap", "aid-admin-emergency-action", "darwin-rebuild", "nix-env", "sudo"},
+            "current_main_process")
+    return {"caseCount": 15, "caseIDs": [
+        "artifacts", "directories", "emergency", "generations", "historical",
+        "nar", "phase2", "phase3", "processes", "receipt", "revision",
+        "root", "target", "version", "versionLink"], "result": "pass"}
+
+
+def generation_targets():
+    profile = Path("/nix/var/nix/profiles/system")
+    result = {}
+    for path in profile.parent.glob("system-*-link"):
+        match = re.fullmatch(r"system-([1-9][0-9]{0,8})-link", path.name)
+        if match is not None:
+            facts = path.lstat()
+            require(stat.S_ISLNK(facts.st_mode) and facts.st_uid == 0,
+                    "generation_link_contract")
+            target = path.resolve(strict=True)
+            target_facts = target.lstat()
+            require(str(target).startswith("/nix/store/") and
+                    stat.S_ISDIR(target_facts.st_mode) and target_facts.st_uid == 0 and
+                    target_facts.st_mode & 0o022 == 0, "generation_target_contract")
+            result[int(match.group(1))] = target
+    return result
+
+
+def validate_phase3_evidence():
+    for relative, expected in PHASE3_HASHES.items():
+        require(digest(ROOT / relative) == expected,
+                "phase3_evidence_hash_" + Path(relative).stem)
+    acceptance = strict_json(ROOT / "evidence/phase-3/permissions-acceptance.json")
+    verification = strict_json(ROOT / "evidence/phase-3/permissions-apply-verification.json")
+    require(acceptance["schema"] == 1 and
+            acceptance["phase"] == "phase3_permission_ceremony" and
+            acceptance["gate"] == {
+                "l2_remains_claimed": True,
+                "l3_claimed": False,
+                "next_gate": "phase4_typed_root_broker_preparation_not_started",
+                "phase3_complete": True,
+                "verdict": "PASS",
+            }, "phase3_acceptance_contract")
+    require(
+        verification["schema"] == 1 and
+        verification["phase"] == "phase3_permission_ceremony_apply_verification" and
+        verification["ceremony"][
+            "ceremony_system_mutations_bounded_to_reviewed_intent"
+        ] is True and
+        verification["complete_cycle_1"]["prompt_free"] is True and
+        verification["targeted_repeats"]["prompt_free"] is True and
+        verification["owner_override"] == {
+            "commissioning_override_explicit": True,
+            "one_complete_seven_probe_cycle_accepted": True,
+            "second_identical_locked_use_cycle_waived": True,
+            "synthetic_lock_used_as_evidence": False,
+            "targeted_repeats_of_six_ordinary_probes_accepted": True,
+        } and
+        verification["gate"] == {
+            "independent_acceptance_review_required": True,
+            "l2_remains_claimed": True,
+            "l3_claimed": False,
+            "phase3_pass_claimed": False,
+            "verdict": "READY_FOR_INDEPENDENT_PHASE3_ACCEPTANCE_REVIEW",
+        },
+        "phase3_verification_contract",
+    )
+    require(verification["scope"] == {
+        "aid_admin_or_root_broker_mutated": False,
+        "backup_or_cloud_mutated": False,
+        "hooks_skills_or_codex_config_mutated": False,
+        "repository_migration_or_next_phase_started": False,
+        "vpn_profile_or_session_mutated": False,
+    }, "phase3_verification_scope")
+    return True
+
+
+def json_exact(actual, expected):
+    """Compare parsed JSON without Python's bool/int numeric coercion."""
+    if type(actual) is not type(expected):
+        return False
+    if type(expected) is dict:
+        return (set(actual) == set(expected) and
+                all(json_exact(actual[key], expected[key]) for key in expected))
+    if type(expected) is list:
+        return (len(actual) == len(expected) and
+                all(json_exact(item, expected_item)
+                    for item, expected_item in zip(actual, expected)))
+    return actual == expected
+
+
+def validate_historical_phase2_doctor_output(first, second):
+    """Accept only the immutable Phase 2 doctor's closed, repeatable receipt."""
+    value = strict_json_text(first)
+    require(first == second and len(first.encode()) <= 32768 and
+            set(value) == {"checks", "phase", "read_only", "redaction", "schema", "verdict"} and
+            type(value["schema"]) is int and value["schema"] == 1 and
+            value["phase"] == "phase2_package_bootstrap" and
+            value["read_only"] is True and
+            value["redaction"] == "bounded_no_private_paths_or_stable_machine_identifiers" and
+            value["verdict"] == "PASS" and isinstance(value["checks"], list) and
+            [item.get("id") for item in value["checks"]] == [
+                "standalone_contract", "control_git", "flake_lock", "lix_daemon_receipt_store",
+                "darwin_home_manager_generations", "homebrew_empty_arm64", "ownership_and_path"] and
+            all(set(item) == {"facts", "id", "status"} and item["status"] == "pass" and
+                json_exact(item["facts"], PHASE2_HISTORICAL_FACTS[item["id"]])
+                for item in value["checks"]), "phase2_historical_live_doctor")
+    return True
+
+
+def validate_historical_phase2_doctor_runs(first, second):
+    require(first.returncode == second.returncode == 0,
+            "phase2_historical_doctor_rc")
+    return validate_historical_phase2_doctor_output(first.stdout, second.stdout)
+
+
+PHASE2_CURRENT_CONTROL = "a2a607956745ca9a3f85960b3da0b98463a33880"
+PHASE2_HISTORICAL_ACCEPTANCE = "2fdbd7e7419fc049565f87b29a21b7dd1838a754"
+PHASE2_HISTORICAL_REVIEWED = "e7beb60fb985ab053ab04f3de2ee379316126659"
+PHASE2_HISTORICAL_FACTS = {
+    "standalone_contract": {"applied_intent_commit": "432dfd719b53fff8a3fdf3dca45549a1e6f668e8", "l2": "control_ready", "phase2": "accepted", "standalone": True},
+    "control_git": {"applied_intent_is_ancestor": True, "branch": "main", "branch_class": "integrated_main", "clean": True, "reviewed_head_is_ancestor": True},
+    "flake_lock": {"lock_commit": "171cf32e9b029d721387ae802abbc7797153fb16", "nodes": 4},
+    "lix_daemon_receipt_store": {"architecture": "aarch64-darwin", "daemon": "running", "receipt_actions_completed": 8, "version": "2.95.2"},
+    "darwin_home_manager_generations": {"darwin_current_generation": 19, "darwin_previous_generation": 18, "home_manager_current_version": "26.05", "home_manager_previous_same_closure": True, "home_manager_previous_version": "26.05", "home_manager_resolver": "darwin_generation_activation_chain"},
+    "homebrew_empty_arm64": {"architecture": "arm64", "casks": 0, "formulae": 0, "mas_exposed": False, "prefix": "/opt/homebrew", "taps": 0, "version": "5.1.15"},
+    "ownership_and_path": {"darwin_rebuild_owner": "nix_darwin_system_profile", "duplicate_intel_homebrew": False, "home_manager_cli": "intentionally_absent_embedded_module", "homebrew_owner": "canonical_absolute_prefix", "legacy_profile": "broken_non_authoritative", "lix_owner": "nix_darwin_system_profile"},
+}
+
+
+def validate_historical_phase2_topology(repository, acceptance=PHASE2_HISTORICAL_ACCEPTANCE,
+                                        reviewed=PHASE2_HISTORICAL_REVIEWED):
+    """Keep the Phase 2 receipt immutable while main advances linearly."""
+    require(git("status", "--porcelain=v1", cwd=repository) == "",
+            "phase2_historical_source_dirty")
+    require(run([*GIT, "cat-file", "-e", acceptance + "^{commit}"], cwd=repository).returncode == 0,
+            "phase2_historical_acceptance_missing")
+    require(run([*GIT, "cat-file", "-e", reviewed + "^{commit}"], cwd=repository).returncode == 0,
+            "phase2_historical_reviewed_missing")
+    require(git("rev-parse", acceptance + "^", cwd=repository) == reviewed,
+            "phase2_historical_acceptance_parent")
+    require(run([*GIT, "merge-base", "--is-ancestor", acceptance, "ba3efb94b0623174250e943e3f914f0797496382"],
+                cwd=repository).returncode == 0,
+            "phase2_historical_acceptance_nonancestor")
+    require(run([*GIT, "merge-base", "--is-ancestor", acceptance, "HEAD"], cwd=repository).returncode == 0 and
+            run([*GIT, "merge-base", "--is-ancestor", PHASE2_CURRENT_CONTROL, "HEAD"], cwd=repository).returncode == 0 and
+            git("rev-list", "--merges", PHASE2_CURRENT_CONTROL + "..HEAD", cwd=repository) == "",
+            "phase2_current_main_ancestry")
+    return True
+
+
+def validate_historical_phase2_clone(clone, acceptance=PHASE2_HISTORICAL_ACCEPTANCE):
+    require(git("remote", cwd=clone) == "", "phase2_historical_clone_origin")
+    require(git("branch", "--show-current", cwd=clone) == "main",
+            "phase2_historical_clone_branch")
+    require(git("rev-parse", "HEAD", cwd=clone) == acceptance,
+            "phase2_historical_clone_head")
+    require(git("status", "--porcelain=v1", cwd=clone) == "",
+            "phase2_historical_clone_dirty")
+    return True
+
+
+def phase2_doctor(repository_state_value):
+    if repository_state_value == "current_main_runner_gate":
+        # The immutable Phase 2 doctor observes its own historical 19/18 live
+        # positions.  Current 21/20 is attested by this route instead.
+        validate_historical_phase2_topology(ROOT)
+        return True
+    if repository_state_value == "current_main_compatibility":
+        repository = ROOT
+        validate_historical_phase2_topology(repository)
+        with tempfile.TemporaryDirectory(prefix="phase2-current-main-") as directory:
+            clone = Path(directory) / "control"
+            checked([*GIT, "clone", "--no-local", "--no-checkout", repository, clone],
+                    environment=CLEAN_ENVIRONMENT)
+            checked([*GIT, "remote", "remove", "origin"], cwd=clone,
+                    environment=CLEAN_ENVIRONMENT)
+            checked([*GIT, "checkout", "-B", "main", PHASE2_HISTORICAL_ACCEPTANCE], cwd=clone,
+                    environment=CLEAN_ENVIRONMENT)
+            validate_historical_phase2_clone(clone)
+            first = run([clone / "bin/phase2-doctor", "--json"], cwd=clone,
+                        environment=CLEAN_ENVIRONMENT)
+            second = run([clone / "bin/phase2-doctor", "--json"], cwd=clone,
+                         environment=CLEAN_ENVIRONMENT)
+        return validate_historical_phase2_doctor_runs(first, second)
+    repository = (
+        ROOT
+        if repository_state_value.startswith("accepted_")
+        else Path.home() / "AIDev/control"
+    )
+    if repository != ROOT:
+        expected = (
+            "a2a607956745ca9a3f85960b3da0b98463a33880"
+            if repository_state_value == "current_main_compatibility"
+            else CONTROL_COMMIT
+        )
+        require(git("rev-parse", "HEAD", cwd=repository) == expected and
+                git("branch", "--show-current", cwd=repository) == "main" and
+                git("status", "--porcelain=v1", cwd=repository) == "",
+                "phase2_protected_main")
+    first = checked([repository / "bin/phase2-doctor", "--json"], cwd=repository,
+                    environment=CLEAN_ENVIRONMENT)
+    second = checked([repository / "bin/phase2-doctor", "--json"], cwd=repository,
+                     environment=CLEAN_ENVIRONMENT)
+    require(first == second and strict_json_text(first)["verdict"] == "PASS",
+            "phase2_live_doctor")
+    return True
+
+
+def live_checks(repository_state_value):
+    broker = exact_file("/usr/local/libexec/aid-admin", 0o555, 483712, BROKER_SHA256)
+    exact_file("/etc/agent-first-mac/aid-admin-policy.json", 0o444, 1617,
+               POLICY_SHA256)
+    exact_file("/etc/agent-first-mac/aid-admin-install.json", 0o400, 341)
+    exact_file("/etc/sudoers.d/agent-first-mac-aid-admin", 0o440, 122)
+    receipt = exact_file(
+        Path.home() / "AIDev/state/phase-4/apply-receipts" /
+        (CONTROL_COMMIT + ".json"), 0o400, 431, RECEIPT_SHA256, owner="caller")
+    receipt_value = strict_json(receipt)
+    require(set(receipt_value) == {
+        "controlCommit", "controlTree", "policyHash", "reviewed", "schema",
+        "targetSystemNarHash", "targetSystemPath",
+    } and receipt_value["schema"] == 1 and receipt_value["reviewed"] is True and
+            receipt_value["controlCommit"] == CONTROL_COMMIT and
+            receipt_value["policyHash"] == POLICY_SHA256,
+            "receipt_binding")
+
+    root = run(["/usr/bin/sudo", "-n", broker, "doctor-root", "--json"],
+               environment=CLEAN_ENVIRONMENT)
+    require(root.returncode == 0 and len(root.stdout.encode()) <= 16384,
+            "root_doctor_execution")
+    root_value = strict_json_text(root.stdout)
+    require(root_value == {
+        "checks": {
+            "emergency_disable_absent": True,
+            "installed_artifact_attestation": True,
+            "installed_contract": True,
+            "policy_hash": True,
+        },
+        "command": "doctor-root",
+        "problems": [],
+        "readOnly": True,
+        "schema": 1,
+        "systemMutationsPerformed": False,
+        "verdict": "ROOT_CONTRACT_READY",
+    }, "root_doctor_contract")
+    unknown = run(["/usr/bin/sudo", "-n", broker, "unknown"],
+                  environment=CLEAN_ENVIRONMENT)
+    require(unknown.returncode == 64 and "unknown_command" in unknown.stdout and
+            len(unknown.stdout.encode()) <= 4096, "unknown_command_not_denied")
+    generic = run(["/usr/bin/sudo", "-n", "/usr/bin/true"],
+                  environment=CLEAN_ENVIRONMENT)
+    validate = run(["/usr/bin/sudo", "-n", "-v"], environment=CLEAN_ENVIRONMENT)
+    require(generic.returncode != 0 and validate.returncode != 0,
+            "generic_sudo_unexpectedly_allowed")
+
+    emergency_paths = [
+        "/etc/agent-first-mac/aid-admin.disabled",
+        "/etc/agent-first-mac/aid-admin.disabled.new",
+        "/etc/sudoers.d/agent-first-mac-aid-admin.disabled",
+    ]
+    require(not any(os.path.lexists(path) for path in emergency_paths),
+            "unexpected_emergency_path")
+    exact_directory("/var/log/agent-first-mac/aid-admin", 0o700, 192)
+    exact_directory("/var/db/agent-first-mac/staging", 0o700, 160)
+
+    targets = generation_targets()
+    profile = Path("/nix/var/nix/profiles/system")
+    require(set(targets) == {1, 2, 3} and
+            Path(os.readlink(profile)).name == "system-3-link" and
+            profile.resolve(strict=True) == targets[3] ==
+            Path("/run/current-system").resolve(strict=True) and
+            path_digest(targets[3]) == TARGET_PATH_SHA256 and
+            path_digest(targets[2]) == PREVIOUS_PATH_SHA256 and
+            targets[3] == Path(receipt_value["targetSystemPath"]).resolve(strict=True),
+            "generation_state")
+
+    processes = checked(["/bin/ps", "-axo", "comm="], environment=CLEAN_ENVIRONMENT)
+    validate = run(["/usr/bin/sudo", "-n", "-v"], environment=CLEAN_ENVIRONMENT)
+    blocked = {
+        "aid-admin", "aid-admin-bootstrap", "aid-admin-emergency-action",
+        "darwin-rebuild", "nix-env", "sudo",
+    }
+    require(not any(Path(line.strip()).name in blocked
+                    for line in processes.splitlines()), "relevant_process_present")
+    require(validate_phase3_evidence(), "phase3_evidence")
+    require(phase2_doctor(repository_state_value), "phase2_doctor")
+    return {
+        "artifactBindings": True,
+        "auditAndStagingBounded": True,
+        "emergencyEnabledState": True,
+        "historicalGeneration3Retained": True,
+        "genericSudoDenied": True,
+        "noRelevantProcess": True,
+        "phase2AcceptedLiveDoctor": True,
+        "phase3AcceptedEvidence": True,
+        "previousGenerationAvailable": True,
+        "rootContractReady": True,
+        "unknownCommandDenied": True,
+    }
+
+
+def fixture_checks(path):
+    value = strict_json(path)
+    require(set(value) == {"checks", "schema"} and value["schema"] == 1 and
+            isinstance(value["checks"], dict) and
+            set(value["checks"]) == LIVE_CHECK_KEYS and
+            all(isinstance(item, bool) for item in value["checks"].values()),
+            "fixture_schema")
+    return value["checks"]
+
+
+def report(repository, checks):
+    problems = sorted(key for key, value in checks.items() if value is not True)
+    accepted = repository["repositoryState"].startswith("accepted_")
+    if problems:
+        verdict = "BLOCKED"
+    elif accepted:
+        verdict = "PASS"
+    else:
+        verdict = REVIEW_VERDICT
+    return {
+        "acceptedLevel": ACCEPTED_LEVEL if accepted and not problems else "L2",
+        "checks": dict(sorted(checks.items())),
+        "handoff": "none" if accepted and not problems else
+            "coordinator_create_single_acceptance_commit_after_independent_review",
+        "l3Claimed": accepted and not problems,
+        "phase": "phase4_typed_root_broker",
+        "phase4PassClaimed": accepted and not problems,
+        "phase5Authorized": False,
+        "problems": problems,
+        "readOnly": True,
+        "repository": repository,
+        "schema": 1,
+        "systemMutationsPerformed": False,
+        "verdict": verdict,
+    }
+
+
+CURRENT_MAIN_MARKER = "CHECKPOINT_PHASE5_CURRENT_MAIN_RUNTIME_PHASE4_DOCTOR_COMPATIBILITY_REVIEW"
+POST_INTEGRATION_MARKER = "CHECKPOINT_PHASE5_POST_INTEGRATION_PHASE2_DOCTOR_COMPATIBILITY_CORRECTION_REVIEW"
+POST_PRIVATE_ROUTING_MARKER = "CHECKPOINT_PHASE5_PRIVATE_CURRENT_RUNTIME_POST_INTEGRATION_ROUTING_CORRECTION_REVIEW"
+RUNNER_GATE_MARKER = "CHECKPOINT_PHASE5_CURRENT_MAIN_RUNNER_GATE_REBASE_REVIEW"
+CURRENT_SHAPE_MARKER = "CHECKPOINT_PHASE5_CURRENT_PRIVATE_RUNTIME_SHAPE_CORRECTION_REVIEW"
+
+
+def current_main_compatibility():
+    result = run([ROOT / "bin/check-phase5-prep", "--git-only", "--json"])
+    if result.returncode != 0:
+        return None
+    value = strict_json_text(result.stdout)
+    if value.get("marker") not in {CURRENT_MAIN_MARKER, POST_INTEGRATION_MARKER, POST_PRIVATE_ROUTING_MARKER, RUNNER_GATE_MARKER, CURRENT_SHAPE_MARKER}:
+        return None
+    runner_route = value.get("marker") in {RUNNER_GATE_MARKER, CURRENT_SHAPE_MARKER}
+    control = Path.home() / "AIDev/control"
+    receipt_path = Path.home() / "AIDev/state/phase-4/apply-receipts/" / \
+        ((RUNNER_GATE_CONTROL if runner_route else "a2a607956745ca9a3f85960b3da0b98463a33880") + ".json")
+    receipt = current_main_receipt_file(receipt_path)
+    receipt_value = strict_json(receipt)
+    exact_file("/usr/local/libexec/aid-admin", 0o555, 483712, BROKER_SHA256)
+    exact_file("/etc/agent-first-mac/aid-admin-policy.json", 0o444, 1617, POLICY_SHA256)
+    exact_file("/etc/sudoers.d/agent-first-mac-aid-admin", 0o440, 122)
+    targets = generation_targets()
+    profile, current = Path("/nix/var/nix/profiles/system"), Path("/run/current-system")
+    target = current.resolve(strict=True)
+    target_facts = target.lstat()
+    version_link = target / "darwin-version.json"
+    link_facts = version_link.lstat()
+    version_file = version_link.resolve(strict=True)
+    file_facts = version_file.lstat()
+    version_value = strict_json(version_file)
+    nar = checked(["/nix/var/nix/profiles/default/bin/nix-store", "--query", "--hash", target],
+                  environment=CLEAN_ENVIRONMENT).strip()
+    directories = {}
+    for name, path in (("audit", Path("/var/log/agent-first-mac/aid-admin")),
+                       ("staging", Path("/var/db/agent-first-mac/staging"))):
+        facts = path.lstat()
+        directories[name] = {"gid": facts.st_gid, "kind": "directory" if stat.S_ISDIR(facts.st_mode) else "other",
+                             "mode": stat.S_IMODE(facts.st_mode), "symlink": path.is_symlink(), "uid": facts.st_uid}
+    processes = checked(["/bin/ps", "-axo", "comm="], environment=CLEAN_ENVIRONMENT)
+    root = run(["/usr/bin/sudo", "-n", "/usr/local/libexec/aid-admin", "doctor-root", "--json"],
+               environment=CLEAN_ENVIRONMENT)
+    unknown = run(["/usr/bin/sudo", "-n", "/usr/local/libexec/aid-admin", "unknown"],
+                  environment=CLEAN_ENVIRONMENT)
+    generic = run(["/usr/bin/sudo", "-n", "/usr/bin/true"], environment=CLEAN_ENVIRONMENT)
+    validate = run(["/usr/bin/sudo", "-n", "-v"], environment=CLEAN_ENVIRONMENT)
+    normalized_targets = {}
+    for number, item in targets.items():
+        link = Path("/nix/var/nix/profiles/system").parent / ("system-" + str(number) + "-link")
+        normalized_targets[number] = current_main_generation_fact(link)
+        require(normalized_targets[number]["path"] == str(item), "current_main_generation_resolution")
+    command_facts = current_main_command_facts(root, unknown, generic, validate)
+    facts = {
+        "artifacts": {"broker": True, "policy": True, "sudoers": True}, "directories": directories,
+        "emergencyEnabled": current_main_emergency_enabled(),
+        "genericSudoDenied": command_facts["genericSudoDenied"],
+        "historicalTargets": {"generation2PathSHA256": path_digest(targets[2]), "generation3PathSHA256": path_digest(targets[3])},
+        "narHash": nar, "phase2Accepted": phase2_doctor(
+            "current_main_runner_gate" if runner_route else "current_main_compatibility"),
+        "phase3Accepted": validate_phase3_evidence(),
+        "processes": current_main_process_names(processes),
+        "profileTarget": str(profile.resolve(strict=True)), "receipt": receipt_value,
+        "receiptFile": {"kind": "file", "mode": stat.S_IMODE(receipt.lstat().st_mode), "nlink": receipt.lstat().st_nlink,
+                        "owner": "caller" if receipt.lstat().st_uid == os.getuid() else "other", "sizeBounded": 1 <= receipt.lstat().st_size <= 4096,
+                        "symlink": receipt.is_symlink()},
+        "rootDoctor": command_facts["rootDoctor"],
+        "target": normalized_targets[[number for number, item in targets.items() if item == target][0]], "targets": normalized_targets,
+        "unknownCommandDenied": command_facts["unknownCommandDenied"],
+        "versionFile": {"gid": file_facts.st_gid, "kind": "file" if stat.S_ISREG(file_facts.st_mode) else "other",
+                        "modeWritable": bool(file_facts.st_mode & 0o022), "owner": file_facts.st_uid,
+                        "parent": str(version_file.parent), "sizeBounded": 1 <= file_facts.st_size <= 4096},
+        "versionLink": {"gid": link_facts.st_gid, "kind": "symlink" if stat.S_ISLNK(link_facts.st_mode) else "other",
+                        "mode": stat.S_IMODE(link_facts.st_mode), "uid": link_facts.st_uid}, "versionValue": version_value,
+    }
+    validate_current_main_facts(facts, control, runner_route=runner_route)
+    return {"artifactBindings": True, "auditAndStagingBounded": True,
+            "emergencyEnabledState": True, "historicalGeneration3Retained": True,
+            "genericSudoDenied": True, "noRelevantProcess": True,
+            "phase2AcceptedLiveDoctor": True, "phase3AcceptedEvidence": True,
+            "previousGenerationAvailable": True, "rootContractReady": True,
+            "unknownCommandDenied": True}
+
+
+# Phase 5 Bridge V52 is a repository-only compatibility route.  The constants
+# below are intentionally derived only from the accepted prefix and the
+# durable V52 contract; no rejected successor object participates in it.
+BRIDGE_V52_BASE = "8fb22fe994c6967481cdda8c98e9b85cc9df435c"
+BRIDGE_V52_BASE_TREE = "d32f614817b096a05d33d4075613b78ea01b938e"
+BRIDGE_V52_BASE_RAW_SHA256 = (
+    "8458f37842254529bfd962ec76d411ccf56af27d2443128b1605cdd6c5e260e1"
+)
+BRIDGE_V52_MERGE = "40df114bff08d52cb2331b4817f683cd0f98ae5b"
+BRIDGE_V52_MERGE_PARENTS = (
+    "0f781258e4e6d31d14da1c6fccbe247fcb72138e",
+    "9335ea1829e9acd6892868161dea6d28a1457bd2",
+)
+BRIDGE_V52_MERGE_TREE = "1061ab64178e1b3ace0f696d700dd57794e9f3fc"
+BRIDGE_V52_MERGE_RAW_SHA256 = (
+    "fce240ff408b0a185857d5062c6d62d4607b02824a9804a8cfc49e37d3ad00d5"
+)
+BRIDGE_V52_MERGE_SUBJECT = (
+    "Merge branch 'codex/codex-windows-host-ssh-connector' into "
+    "codex/codex-bridge-final-polish"
+)
+BRIDGE_V52_PHASE2_OBJECTS = {
+    PHASE2_HISTORICAL_ACCEPTANCE: (
+        "671ca86b48c9377a70a31255ea42ae1bb90b1cd0",
+        "75060c18f9f44814b67a34b8218959d9480459f2e562ebc48494648e96008159",
+    ),
+    PHASE2_HISTORICAL_REVIEWED: (
+        "055d4ce8dbf0b6ab6d9682070c7d75c767d47fbb",
+        "c3947e8e909fdbd6df0bcc591f4a75bcd37316a3e7c4b1e193349498a19b47e1",
+    ),
+    PHASE2_CURRENT_CONTROL: (
+        "9dee5d9d1c51a4bec8172eb165bea6a631c37bbc",
+        "908e58a1a2ac950fee5cde6bf8ef824d7b35fffa8524b782fbb62002a21f6650",
+    ),
+}
+BRIDGE_V52_BRANCH = "codex/phase5-bridge-merge-compatibility-correction-v52"
+BRIDGE_V52_EVIDENCE = (
+    "evidence/phase-5/bridge-merge-compatibility-correction-v52.json"
+)
+BRIDGE_V52_SYNTHETIC_FLAG = "BRIDGE_V52_SYNTHETIC_PRECOMMIT"
+BRIDGE_V52_PRIVATE_RECORD = "BRIDGE_V52_PRIVATE_RECORD"
+BRIDGE_V52_IMPLEMENTATION_SCOPE = {
+    "bin/phase4-final-doctor",
+    "bin/check-phase4-final-probes",
+    "bin/check-phase5-prep",
+    "bin/check-phase5-apply-bundle",
+}
+BRIDGE_V52_IDENTITY = [
+    "Phase 5 Executor", "phase5-executor@agent-first-mac.invalid",
+    "Phase 5 Executor", "phase5-executor@agent-first-mac.invalid",
+]
+BRIDGE_V52_IMPLEMENTATION_EPOCH = 1787902400
+BRIDGE_V52_EVIDENCE_EPOCH = 1787902401
+BRIDGE_V52_IMPLEMENTATION_SUBJECT = (
+    "Bind accepted Bridge source to distinct V52 review identity"
+)
+BRIDGE_V52_EVIDENCE_SUBJECT = (
+    "Record independently verified Bridge v52 matrix evidence"
+)
+BRIDGE_V52_MARKER = (
+    "CHECKPOINT_PHASE5_BRIDGE_MERGE_COMPATIBILITY_CORRECTION_V52_REVIEW"
+)
+BRIDGE_V52_HANDOFF_SHA256 = (
+    "164775d1dccb4a3d9c47498163023792130665f1863b0f3acb15deb48ce5e240"
+)
+BRIDGE_V52_INCORPORATED_HANDOFFS = {
+    "v4": "364d0a50875485be979d60b9d70eff6d8a6bc9803706363f4a68e878082a8a4e",
+    "v5": "2c0163ddf3518843e2791654527eeffb1554e14133183f1f3187131aa324d2ec",
+    "v6": "96d0592c23ae103b69198c856dc54a2e957abe8f14d4ccfafcf574a2f4c57fd8",
+    "v7": "140962e5d2adeecd0a1afc6b73a4758f9bb3e70ed072aec2354a1a917a47ceab",
+    "v8": "98a64813328e7eb8f40651e2a9e449c88565eb61aa94b0033f2c8ead2cb45789",
+    "v9": "55cc54717d76f45eef90a76dd46111b35eacab8b46122584531506258bc5d5b9",
+    "v10": "6432d2c383e3f59c315c6e527012e95ba77d7164efcbc3c7cdf81a622698cf25",
+    "v11": "c24516a66c007ab26ccc0c9e4869c926701112e78fb89b4cf5811f0a5e12cdef",
+    "v12": "2c8c19e3cdd5b6586c87ba1abe0ce94a1fd90a0fffa2278156785fe9d0bc5420",
+    "v13": "f961adabe9e69aa642247b94a588f7245e1ea9249f55bfb49f6ea3d4e6f56a44",
+    "v14": "7b31cf9f4a019df0b6fe1aac1405f7c8072c088b795dec8961f14f7d6aba721e",
+    "v15": "65d34819d1b9eb585bd7faec16a4b75d3803f7ca67b6923706872e4700dd3f68",
+    "v16": "02f60b48aa9c86d523e6fc60b19a2d3bd0108820c41749793f4308a4fa0ff680",
+    "v17": "f517a1495f196e47b539029a81f4ddfd50b8adf572e207769c3bad495aacddb2",
+    "v18": "b34f7c9e9264d21a264b81c8a7b3887983f8c1dbca077123e8a43853dff1ab06",
+    "v19": "11ae350e2203c50df158df93198ff952d3e8d406aa15271af1ba47b427f9e7db",
+    "v20": "ea87625b39cba742f537093c35cca820d4576fe3c35b61c5c1a639983660e025",
+    "v21": "6ed6dcb9162f570ac4ae8afe9463409e43c7198732f864e33e16a40250ead505",
+    "v22": "655cca97cc2aed90c25a1496d6ec676458a71ea4d9c48ecfa9b85cc3a3000f00",
+    "v23": "704b4cf526c6285c2865f68badc41e62d0d75cb17a9a031488b3e0e839d64dc8",
+    "v24": "7e6e9447167e5f3c9f708a9ce75d89b11c8a42da51723fa53e5aa25be1b5cf99",
+    "v25": "6da195d0ce2adb4412925a4671ccb5639c649cc5346ac1a403cf580db2eeaf1e",
+    "v26": "41d09012aa4abb9220b2a89a696b58c12f5dc2fa24750c4a2b4938535c9bbb7d",
+    "v27": "22ef14102ad491d60b7f8a97521fcaf426164d974d39f359e9af9ff8ff835d4a",
+    "v28": "5e0b8021c5a75bd6b8e4530ee15c8d343b6fd71ceb3ba9e0d7d96c4b189f62d7",
+    "v29": "0260500f863dba1ba81821aaa8a7fcfac8b87f16dd31faa38dedcc23444136c5",
+    "v30": "71259fcb449b5f08df13dc410802b55ed20960930f7d66e4759f7d85b613da03",
+    "v31": "58e064f666a1cb78b2fdc6aced1c2656f38d40ae09a126ed8c4c2d10f4439bcb",
+    "v32": "a68d79586c3f8c4f99bdb67d73582c82f92d53c787c8d983ca98dc154cdf194d",
+    "v33": "5f4ab69e1ddaad2afba670741473218ba10865b2fb43f4e6ccdad91ec0ee3ea6",
+    "v34": "e35b5a5c96a8c1d1e3155536085ae915e2ca5ec6d14e3244f9656b13b2145e6c",
+    "v35": "f7a0ca23d7af2b465fdf776ff134aa4ff877e0077aa2bc9154532ea22a39d702",
+    "v36": "d108063203b49b5ec9f3806c43c7880fe92613f16a7ab0702824834b61eb024a",
+    "v37": "650016a6a286b97352792825333b4bb8a5fdd5aa0f0925a7009eac7928e87c5f",
+}
+
+
+class BridgeV52InputState(enum.Enum):
+    syntheticReview = "syntheticReview"
+    realImplementation = "realImplementation"
+
+
+BRIDGE_V52_SYNTHETIC_REVIEW = BridgeV52InputState.syntheticReview
+BRIDGE_V52_REAL_IMPLEMENTATION = BridgeV52InputState.realImplementation
+_BRIDGE_V52_ROOT_TOKEN = object()
+
+
+class BridgeV52RootState:
+    __slots__ = (
+        "input_state", "implementation", "head", "evidence", "branch",
+        "evidence_value", "_token",
+    )
+
+    def __init__(self, token, input_state, implementation, head, evidence,
+                 branch, evidence_value):
+        require(token is _BRIDGE_V52_ROOT_TOKEN, "bridge52_state_seal")
+        require(input_state in {
+            BRIDGE_V52_SYNTHETIC_REVIEW, BRIDGE_V52_REAL_IMPLEMENTATION,
+        }, "bridge52_state_member")
+        self.input_state = input_state
+        self.implementation = implementation
+        self.head = head
+        self.evidence = evidence
+        self.branch = branch
+        self.evidence_value = evidence_value
+        self._token = token
+
+
+def bridge_v52_state_is_sealed(value):
+    return (
+        type(value) is BridgeV52RootState
+        and value._token is _BRIDGE_V52_ROOT_TOKEN
+        and value.input_state in {
+            BRIDGE_V52_SYNTHETIC_REVIEW, BRIDGE_V52_REAL_IMPLEMENTATION,
+        }
+    )
+
+
+class BridgeV52RepositoryState(enum.Enum):
+    implementation = "bridge_merge_compatibility_v52_implementation"
+    review = "bridge_merge_compatibility_v52_review"
+    main = "bridge_merge_compatibility_v52_main"
+
+
+BRIDGE_V52_IMPLEMENTATION_STATE = BridgeV52RepositoryState.implementation
+BRIDGE_V52_REVIEW_STATE = BridgeV52RepositoryState.review
+BRIDGE_V52_MAIN_STATE = BridgeV52RepositoryState.main
+_BRIDGE_V52_REPOSITORY_TOKEN = object()
+
+
+class BridgeV52SealedRepositoryState:
+    __slots__ = (
+        "state", "implementation", "head", "evidence", "branch",
+        "evidence_value", "_token",
+    )
+
+    def __init__(self, token, state, implementation, head, evidence, branch,
+                 evidence_value):
+        require(token is _BRIDGE_V52_REPOSITORY_TOKEN,
+                "bridge52_repository_state_seal")
+        require(state in {
+            BRIDGE_V52_IMPLEMENTATION_STATE, BRIDGE_V52_REVIEW_STATE,
+            BRIDGE_V52_MAIN_STATE,
+        }, "bridge52_repository_state_member")
+        self.state = state
+        self.implementation = implementation
+        self.head = head
+        self.evidence = evidence
+        self.branch = branch
+        self.evidence_value = evidence_value
+        self._token = token
+
+
+def bridge_v52_repository_state_is_sealed(value):
+    return (
+        type(value) is BridgeV52SealedRepositoryState
+        and value._token is _BRIDGE_V52_REPOSITORY_TOKEN
+        and value.state in {
+            BRIDGE_V52_IMPLEMENTATION_STATE, BRIDGE_V52_REVIEW_STATE,
+            BRIDGE_V52_MAIN_STATE,
+        }
+    )
+
+
+def bridge_v52_raw_digest(commit, repository):
+    result = run([*GIT, "cat-file", "commit", commit], cwd=repository)
+    require(result.returncode == 0, "bridge52_object")
+    return hashlib.sha256(result.stdout.encode()).hexdigest()
+
+
+def bridge_v52_commit_parents(commit, repository):
+    value = git("rev-list", "--parents", "-n", "1", commit, cwd=repository)
+    fields = value.split()
+    require(fields and fields[0] == commit, "bridge52_parent_record")
+    return tuple(fields[1:])
+
+
+def bridge_v52_metadata(commit, repository, *, epoch, subject):
+    fields = git(
+        "show", "-s",
+        "--format=%an%x00%ae%x00%cn%x00%ce%x00%at%x00%ct%x00%aI%x00%cI%x00%s",
+        commit, cwd=repository,
+    ).split("\x00")
+    require(len(fields) == 9, "bridge52_metadata_shape")
+    require(fields[:4] == BRIDGE_V52_IDENTITY and
+            fields[4] == fields[5] == str(epoch) and
+            fields[6].endswith(("Z", "+00:00")) and
+            fields[7].endswith(("Z", "+00:00")) and
+            fields[8] == subject, "bridge52_metadata")
+    raw = run([*GIT, "cat-file", "commit", commit], cwd=repository)
+    identity = re.escape(BRIDGE_V52_IDENTITY[0]) + " <" + \
+        re.escape(BRIDGE_V52_IDENTITY[1]) + ">"
+    raw_identity = BRIDGE_V52_IDENTITY[0] + " <" + \
+        BRIDGE_V52_IDENTITY[1] + ">"
+    require(raw.returncode == 0 and
+            re.search(r"^author " + identity + " " + str(epoch) +
+                      r" \+0000$", raw.stdout, re.MULTILINE) is not None and
+            re.search(r"^committer " + identity + " " + str(epoch) +
+                      r" \+0000$", raw.stdout, re.MULTILINE) is not None and
+            raw.stdout.splitlines() == [
+                "tree " + git("rev-parse", commit + "^{tree}",
+                              cwd=repository),
+                "parent " + bridge_v52_commit_parents(
+                    commit, repository)[0],
+                "author " + raw_identity + " " + str(epoch) + " +0000",
+                "committer " + raw_identity + " " + str(epoch) + " +0000",
+                "", subject,
+            ] and raw.stdout.endswith("\n"),
+            "bridge52_raw_subject")
+    return True
+
+
+def bridge_v52_tree_mode(repository, commit, path, expected):
+    result = run([*GIT, "ls-tree", commit, "--", path], cwd=repository)
+    fields = result.stdout.split(None, 3)
+    require(result.returncode == 0 and len(fields) == 4 and
+            fields[0] == expected and fields[1] == "blob" and
+            fields[3].strip() == path, "bridge52_mode")
+
+
+def bridge_v52_admin_closed(repository):
+    require(git("remote", cwd=repository) == "", "bridge52_origin")
+    require(git("status", "--porcelain=v1", "--untracked-files=all",
+                cwd=repository) == "", "bridge52_dirty")
+    require(git("replace", "-l", cwd=repository) == "", "bridge52_replace")
+    for name in ("info/grafts", "shallow"):
+        path = Path(git("rev-parse", "--git-path", name, cwd=repository))
+        if not path.is_absolute():
+            path = repository / path
+        require(not path.exists() or path.stat().st_size == 0,
+                "bridge52_admin_" + name.replace("/", "_"))
+    alternates = Path(git("rev-parse", "--git-path",
+                          "objects/info/alternates", cwd=repository))
+    if not alternates.is_absolute():
+        alternates = repository / alternates
+    require(not alternates.exists() or alternates.stat().st_size == 0,
+            "bridge52_alternates")
+    forbidden = {
+        "core.fsmonitor", "core.hookspath", "core.sshcommand",
+        "diff.external", "protocol.ext.allow",
+    }
+    config = run([*GIT, "config", "--local", "--name-only", "--list"],
+                 cwd=repository)
+    require(config.returncode == 0, "bridge52_config")
+    keys = {line.strip().lower() for line in config.stdout.splitlines()}
+    require(not keys & forbidden and
+            not any(key.startswith(("alias.", "filter.", "diff."))
+                    for key in keys), "bridge52_config")
+    return True
+
+
+def bridge_v52_hardened_environment(environment):
+    require(type(environment) is dict, "bridge52_environment_type")
+    require(environment.get("GIT_CONFIG_GLOBAL") == "/dev/null" and
+            environment.get("GIT_CONFIG_NOSYSTEM") == "1" and
+            environment.get("GIT_NO_REPLACE_OBJECTS") == "1" and
+            "GIT_CONFIG_SYSTEM" not in environment,
+            "bridge52_environment")
+    unknown = [key for key in environment if key.startswith("BRIDGE_V52_") and
+               key not in {BRIDGE_V52_SYNTHETIC_FLAG,
+                           BRIDGE_V52_PRIVATE_RECORD}]
+    redirected = {
+        "GIT_ALTERNATE_OBJECT_DIRECTORIES", "GIT_CEILING_DIRECTORIES",
+        "GIT_COMMON_DIR", "GIT_DIR", "GIT_EXEC_PATH", "GIT_EXTERNAL_DIFF",
+        "GIT_INDEX_FILE", "GIT_NAMESPACE", "GIT_OBJECT_DIRECTORY",
+        "GIT_QUARANTINE_PATH", "GIT_REPLACE_REF_BASE", "GIT_SHALLOW_FILE",
+        "GIT_SSH_COMMAND", "GIT_TEMPLATE_DIR", "GIT_WORK_TREE",
+    }
+    require(not unknown and not redirected.intersection(environment) and
+            not any(key.startswith(("GIT_CONFIG_KEY_", "GIT_CONFIG_VALUE_"))
+                    for key in environment) and
+            "GIT_CONFIG_COUNT" not in environment,
+            "bridge52_environment_selector")
+    return True
+
+
+@contextlib.contextmanager
+def bridge_v52_closed_command_environment(environment):
+    environment = dict(environment)
+    bridge_v52_hardened_environment(environment)
+    token = _BRIDGE_V52_COMMAND_ENVIRONMENT.set(environment)
+    try:
+        yield environment
+    finally:
+        _BRIDGE_V52_COMMAND_ENVIRONMENT.reset(token)
+
+
+def bridge_v52_validate_prefix(repository, head="HEAD"):
+    require(git_object_exists(BRIDGE_V52_BASE + "^{commit}",
+                              object_type="commit", cwd=repository) and
+            git_object_exists(BRIDGE_V52_MERGE + "^{commit}",
+                              object_type="commit", cwd=repository) and
+            git_object_exists(PHASE2_HISTORICAL_ACCEPTANCE + "^{commit}",
+                              object_type="commit", cwd=repository) and
+            git_object_exists(PHASE2_HISTORICAL_REVIEWED + "^{commit}",
+                              object_type="commit", cwd=repository) and
+            git_object_exists(PHASE2_CURRENT_CONTROL + "^{commit}",
+                              object_type="commit", cwd=repository),
+            "bridge52_topology")
+    for commit, (tree, raw_sha256) in BRIDGE_V52_PHASE2_OBJECTS.items():
+        require(git("rev-parse", commit + "^{tree}", cwd=repository) == tree and
+                bridge_v52_raw_digest(commit, repository) == raw_sha256,
+                "bridge52_topology")
+    require(git("rev-parse", BRIDGE_V52_BASE + "^{tree}", cwd=repository) ==
+            BRIDGE_V52_BASE_TREE and
+            bridge_v52_raw_digest(BRIDGE_V52_BASE, repository) ==
+            BRIDGE_V52_BASE_RAW_SHA256 and
+            bridge_v52_commit_parents(BRIDGE_V52_BASE, repository) ==
+            (BRIDGE_V52_MERGE,), "bridge52_topology")
+    require(bridge_v52_commit_parents(BRIDGE_V52_MERGE, repository) ==
+            BRIDGE_V52_MERGE_PARENTS and
+            git("rev-parse", BRIDGE_V52_MERGE + "^{tree}", cwd=repository) ==
+            BRIDGE_V52_MERGE_TREE and
+            bridge_v52_raw_digest(BRIDGE_V52_MERGE, repository) ==
+            BRIDGE_V52_MERGE_RAW_SHA256 and
+            git("show", "-s", "--format=%s", BRIDGE_V52_MERGE,
+                cwd=repository) == BRIDGE_V52_MERGE_SUBJECT,
+            "bridge52_topology")
+    require(git("rev-list", "--merges", PHASE2_CURRENT_CONTROL + ".." +
+                BRIDGE_V52_BASE, cwd=repository).splitlines() ==
+            [BRIDGE_V52_MERGE] and
+            git("rev-list", "--first-parent", "--merges",
+                PHASE2_CURRENT_CONTROL + ".." + BRIDGE_V52_BASE,
+                cwd=repository).splitlines() == [BRIDGE_V52_MERGE] and
+            git("rev-list", "--merges", BRIDGE_V52_BASE + ".." + head,
+                cwd=repository) == "", "bridge52_topology")
+    for ancestor in (
+        PHASE2_HISTORICAL_ACCEPTANCE, PHASE2_CURRENT_CONTROL,
+        BRIDGE_V52_MERGE, BRIDGE_V52_BASE,
+    ):
+        require(run([*GIT, "merge-base", "--is-ancestor", ancestor, head],
+                    cwd=repository).returncode == 0, "bridge52_topology")
+    require(bridge_v52_commit_parents(PHASE2_HISTORICAL_ACCEPTANCE,
+                                      repository) ==
+            (PHASE2_HISTORICAL_REVIEWED,), "bridge52_topology")
+    return True
+
+
+def bridge_v52_validate_implementation(repository, implementation):
+    require(bridge_v52_commit_parents(implementation, repository) ==
+            (BRIDGE_V52_BASE,) and
+            commit_scope(implementation, cwd=repository) ==
+            BRIDGE_V52_IMPLEMENTATION_SCOPE,
+            "bridge52_implementation")
+    bridge_v52_metadata(
+        implementation, repository,
+        epoch=BRIDGE_V52_IMPLEMENTATION_EPOCH,
+        subject=BRIDGE_V52_IMPLEMENTATION_SUBJECT,
+    )
+    for path in BRIDGE_V52_IMPLEMENTATION_SCOPE:
+        bridge_v52_tree_mode(repository, implementation, path, "100755")
+        require((repository / path).is_file() and
+                stat.S_IMODE((repository / path).stat().st_mode) == 0o755,
+                "bridge52_physical_mode")
+    bridge_v52_validate_prefix(repository, implementation)
+    return True
+
+
+def bridge_v52_placeholder_bytes(implementation):
+    return (json.dumps({
+        "authority": "v52-precommit-placeholder",
+        "implementationCommit": implementation,
+        "schema": 1,
+        "syntheticPrecommitOnly": True,
+    }, sort_keys=True, separators=(",", ":")) + "\n").encode()
+
+
+def bridge_v52_show_bytes(repository, commit, path):
+    result = subprocess.run(
+        [*GIT, "show", commit + ":" + path], cwd=repository,
+        env=os.environ.copy(), stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        check=False,
+    )
+    require(result.returncode == 0 and result.stderr == b"",
+            "bridge52_evidence_object")
+    return result.stdout
+
+
+def bridge_v52_validate_real_evidence(value, *, implementation, evidence,
+                                      repository):
+    """Validate the recursively closed production evidence envelope.
+
+    The evidence writer consumes this schema after two independent real runs;
+    synthetic placeholders deliberately cannot satisfy it.
+    """
+    keys = {
+        "authority", "bindings", "captures", "gate", "matrix", "phase",
+        "preservation", "protectedBaseline", "schema", "systemMutations",
+    }
+    require(type(value) is dict and set(value) == keys and
+            type(value["schema"]) is int and value["schema"] == 1 and
+            type(value["phase"]) is str and value["phase"] ==
+            "phase5_bridge_merge_compatibility_correction_v52" and
+            type(value["protectedBaseline"]) is str and
+            value["protectedBaseline"] == BRIDGE_V52_BASE,
+            "bridge52_evidence_schema")
+    authority = value["authority"]
+    require(type(authority) is dict and set(authority) == {
+        "acceptedBase", "acceptedMerge", "branch", "handoffSHA256",
+        "incorporatedHandoffs", "marker", "noSyntheticProvenance",
+    } and authority == {
+        "acceptedBase": BRIDGE_V52_BASE,
+        "acceptedMerge": BRIDGE_V52_MERGE,
+        "branch": BRIDGE_V52_BRANCH,
+        "handoffSHA256": BRIDGE_V52_HANDOFF_SHA256,
+        "incorporatedHandoffs": BRIDGE_V52_INCORPORATED_HANDOFFS,
+        "marker": BRIDGE_V52_MARKER,
+        "noSyntheticProvenance": True,
+    } and type(authority["noSyntheticProvenance"]) is bool and
+            type(authority["incorporatedHandoffs"]) is dict and
+            all(type(key) is str and type(item) is str and
+                re.fullmatch(r"[0-9a-f]{64}", item)
+                for key, item in
+                authority["incorporatedHandoffs"].items()),
+            "bridge52_evidence_authority")
+    bindings = value["bindings"]
+    require(type(bindings) is dict and set(bindings) == {
+        "implementationBlobs", "implementationCommit",
+        "implementationRawSHA256", "implementationScope",
+        "implementationTree", "modes", "protectedPathCount",
+        "protectedPaths", "protectedPolicy",
+    } and bindings["implementationCommit"] == implementation and
+            bindings["implementationTree"] ==
+            git("rev-parse", implementation + "^{tree}", cwd=repository) and
+            bindings["implementationRawSHA256"] ==
+            bridge_v52_raw_digest(implementation, repository) and
+            bindings["implementationScope"] ==
+            sorted(BRIDGE_V52_IMPLEMENTATION_SCOPE) and
+            bindings["implementationBlobs"] == {
+                path: git("rev-parse", implementation + ":" + path,
+                          cwd=repository)
+                for path in sorted(BRIDGE_V52_IMPLEMENTATION_SCOPE)
+            } and
+            bindings["modes"] == {
+                path: "100755" for path in
+                sorted(BRIDGE_V52_IMPLEMENTATION_SCOPE)
+            } | {BRIDGE_V52_EVIDENCE: "100644"} and
+            bindings["protectedPaths"] == sorted({
+                path for path in git(
+                    "ls-tree", "-r", "--name-only", implementation,
+                    cwd=repository).splitlines()
+                if retained_protected_path(path)
+            } | {BRIDGE_V52_EVIDENCE}) and
+            bindings["protectedPathCount"] ==
+                len(bindings["protectedPaths"]) and
+            bindings["protectedPolicy"] == "retained_protected_path",
+            "bridge52_evidence_bindings")
+    require(all(type(bindings[key]) is str for key in (
+        "implementationCommit", "implementationRawSHA256",
+            "implementationTree",
+    )) and type(bindings["implementationScope"]) is list and
+            all(type(item) is str for item in
+                bindings["implementationScope"]) and
+            type(bindings["modes"]) is dict and
+            all(type(key) is str and type(item) is str for key, item in
+                bindings["modes"].items()) and
+            type(bindings["implementationBlobs"]) is dict and
+            type(bindings["protectedPathCount"]) is int and
+            type(bindings["protectedPaths"]) is list and
+            all(type(item) is str for item in bindings["protectedPaths"]),
+            "bridge52_evidence_types")
+    captures = value["captures"]
+    require(type(captures) is list and len(captures) == 2,
+            "bridge52_evidence_captures")
+    for index, capture in enumerate(captures, 1):
+        require(type(capture) is dict and set(capture) == {
+            "id", "inputState", "sha256",
+        } and capture["id"] == "real-matrix-" + str(index) and
+                capture["inputState"] == "realImplementation" and
+                type(capture["sha256"]) is str and
+                re.fullmatch(r"[0-9a-f]{64}", capture["sha256"]),
+                "bridge52_evidence_capture")
+    matrix = value["matrix"]
+    require(type(matrix) is dict and set(matrix) == {
+        "caseCount", "caseIDs", "caseIDsSHA256", "inputState", "routeCount",
+        "routeIDs", "routeIDsSHA256", "stageCount", "stageIDs",
+        "stageIDsSHA256",
+    } and matrix == {
+        "caseCount": 234,
+        "caseIDsSHA256":
+            "928cfec24e9d650c50ee30874a5796aaa33ce3f801969ad1337d023bb2a233c5",
+        "inputState": "realImplementation",
+        "routeCount": 10,
+        "routeIDsSHA256":
+            "fbffa9588bcaf576ce6d542ddbcfb8c55d75e5231e72d642601378052bdde7fa",
+        "stageCount": 17,
+        "stageIDsSHA256":
+            "65d63cff7c1bedf283a8d7bfa71829411aad93774834f4a06745524fcbde0655",
+    } | {
+        "caseIDs": matrix.get("caseIDs"),
+        "routeIDs": matrix.get("routeIDs"),
+        "stageIDs": matrix.get("stageIDs"),
+    } and all(type(matrix[key]) is int for key in (
+        "caseCount", "routeCount", "stageCount",
+    )) and all(type(matrix[key]) is str for key in (
+        "caseIDsSHA256", "inputState", "routeIDsSHA256",
+        "stageIDsSHA256",
+    )) and all(type(matrix[key]) is list and
+               all(type(item) is str for item in matrix[key])
+               for key in ("caseIDs", "routeIDs", "stageIDs")) and
+            len(matrix["caseIDs"]) == len(set(matrix["caseIDs"])) == 234 and
+            len(matrix["routeIDs"]) == len(set(matrix["routeIDs"])) == 10 and
+            len(matrix["stageIDs"]) == len(set(matrix["stageIDs"])) == 17 and
+            hashlib.sha256(("\n".join(matrix["caseIDs"]) + "\n").encode()
+                           ).hexdigest() == matrix["caseIDsSHA256"] and
+            hashlib.sha256(("\n".join(matrix["routeIDs"]) + "\n").encode()
+                           ).hexdigest() == matrix["routeIDsSHA256"] and
+            hashlib.sha256(("\n".join(matrix["stageIDs"]) + "\n").encode()
+                           ).hexdigest() == matrix["stageIDsSHA256"],
+            "bridge52_evidence_matrix")
+    gate = value["gate"]
+    require(type(gate) is dict and gate == {
+        "liveApplyAuthorized": False, "phase5PassClaimed": False,
+        "phase6Authorized": False,
+        "verdict":
+            "PHASE5_BRIDGE_MERGE_COMPATIBILITY_CORRECTION_V52_"
+            "PREPARED_FOR_INDEPENDENT_REVIEW",
+    } and all(type(gate[key]) is bool for key in (
+        "liveApplyAuthorized", "phase5PassClaimed", "phase6Authorized"
+    )), "bridge52_evidence_false_authority")
+    system_mutations = value["systemMutations"]
+    require(type(system_mutations) is dict and system_mutations == {
+        "applied": False, "codex": False, "live": False,
+        "root": False, "system": False, "windows": False,
+    } and all(type(item) is bool for item in system_mutations.values()),
+            "bridge52_evidence_false_authority")
+    preservation = value["preservation"]
+    require(type(preservation) is dict and set(preservation) == {
+        "ambientCases", "applyCases", "finalCases", "localCases",
+        "phase4Cases", "protectedCases", "providerCalls",
+        "providerLoads", "syntheticAuthorityUsed",
+    } and preservation == {
+        "ambientCases": 20, "applyCases": 14, "finalCases": 29,
+        "localCases": 77, "phase4Cases": 128, "protectedCases": 336,
+        "providerCalls": 1, "providerLoads": 1,
+        "syntheticAuthorityUsed": False,
+    } and all(type(preservation[key]) is int for key in (
+        "ambientCases", "applyCases", "finalCases", "localCases",
+        "phase4Cases", "protectedCases", "providerCalls", "providerLoads",
+    )) and type(preservation["syntheticAuthorityUsed"]) is bool,
+            "bridge52_evidence_preservation")
+    return True
+
+
+def bridge_v52_observe_repository(repository=ROOT, environment=None):
+    """Bind the common repository facts before either closed state branch."""
+    repository = Path(repository).resolve(strict=True)
+    environment = dict(os.environ if environment is None else environment)
+    bridge_v52_hardened_environment(environment)
+    bridge_v52_admin_closed(repository)
+    branch = git("branch", "--show-current", cwd=repository)
+    head = git("rev-parse", "HEAD", cwd=repository)
+    require(branch in {BRIDGE_V52_BRANCH, "main"}, "bridge52_branch")
+    require(run([*GIT, "merge-base", "--is-ancestor", BRIDGE_V52_BASE, head],
+                cwd=repository).returncode == 0, "bridge52_topology")
+    commits = git("rev-list", "--reverse", BRIDGE_V52_BASE + ".." + head,
+                  cwd=repository).splitlines()
+    require(len(commits) in {1, 2, 3, 4}, "bridge52_topology")
+    implementation = commits[0]
+    bridge_v52_validate_implementation(repository, implementation)
+    flag_present = BRIDGE_V52_SYNTHETIC_FLAG in environment
+    flag_exact = environment.get(BRIDGE_V52_SYNTHETIC_FLAG) == "1"
+    return {
+        "repository": repository, "environment": environment,
+        "branch": branch, "head": head, "commits": commits,
+        "implementation": implementation, "flagPresent": flag_present,
+        "flagExact": flag_exact,
+    }
+
+
+def bridge_v52_validate_child(observed):
+    repository = observed["repository"]
+    implementation = observed["implementation"]
+    commits = observed["commits"]
+    require(len(commits) >= 2, "bridge52_evidence_topology")
+    evidence = commits[1]
+    require(bridge_v52_commit_parents(evidence, repository) ==
+            (implementation,) and commit_scope(evidence, cwd=repository) ==
+            {BRIDGE_V52_EVIDENCE} and
+            git("rev-list", "--merges", BRIDGE_V52_BASE + ".." +
+                observed["head"],
+                cwd=repository) == "", "bridge52_evidence_topology")
+    bridge_v52_metadata(
+        evidence, repository, epoch=BRIDGE_V52_EVIDENCE_EPOCH,
+        subject=BRIDGE_V52_EVIDENCE_SUBJECT,
+    )
+    bridge_v52_tree_mode(repository, evidence, BRIDGE_V52_EVIDENCE, "100644")
+    evidence_path = repository / BRIDGE_V52_EVIDENCE
+    require(evidence_path.is_file() and not evidence_path.is_symlink() and
+            stat.S_IMODE(evidence_path.stat().st_mode) == 0o644,
+            "bridge52_evidence_physical_mode")
+    return evidence, bridge_v52_show_bytes(
+        repository, evidence, BRIDGE_V52_EVIDENCE)
+
+
+def bridge_v52_classify_actual_root(repository=ROOT, environment=None):
+    """Classify one actual matrix root before provider/downstream work."""
+    environment = dict(os.environ if environment is None else environment)
+    with bridge_v52_closed_command_environment(environment):
+        return _bridge_v52_classify_actual_root(repository, environment)
+
+
+def _bridge_v52_classify_actual_root(repository, environment):
+    observed = bridge_v52_observe_repository(repository, environment)
+    branch = observed["branch"]
+    head = observed["head"]
+    commits = observed["commits"]
+    implementation = observed["implementation"]
+    require(len(commits) in {1, 2}, "bridge52_matrix_input_state")
+    if len(commits) == 1:
+        require(branch == BRIDGE_V52_BRANCH and
+                not observed["flagPresent"],
+                "bridge52_implementation_state")
+        return BridgeV52RootState(
+            _BRIDGE_V52_ROOT_TOKEN, BRIDGE_V52_REAL_IMPLEMENTATION,
+            implementation, head, None, branch, None,
+        )
+    evidence, raw = bridge_v52_validate_child(observed)
+    require(raw == bridge_v52_placeholder_bytes(implementation),
+            "bridge52_matrix_input_state")
+    require(branch == BRIDGE_V52_BRANCH and observed["flagPresent"] and
+            observed["flagExact"], "bridge52_synthetic_flag")
+    return BridgeV52RootState(
+        _BRIDGE_V52_ROOT_TOKEN, BRIDGE_V52_SYNTHETIC_REVIEW,
+        implementation, evidence, evidence, branch,
+        strict_json_text(raw.decode()),
+    )
+
+
+def bridge_v52_classify_repository_state(repository=ROOT, environment=None):
+    """Select the Phase4-owned direct implementation/review/main state."""
+    environment = dict(os.environ if environment is None else environment)
+    with bridge_v52_closed_command_environment(environment):
+        return _bridge_v52_classify_repository_state(repository, environment)
+
+
+def _bridge_v52_classify_repository_state(repository, environment):
+    observed = bridge_v52_observe_repository(repository, environment)
+    repository = observed["repository"]
+    branch = observed["branch"]
+    head = observed["head"]
+    commits = observed["commits"]
+    implementation = observed["implementation"]
+    if len(commits) == 1:
+        require(branch == BRIDGE_V52_BRANCH and
+                not observed["flagPresent"],
+                "bridge52_implementation_state")
+        return BridgeV52SealedRepositoryState(
+            _BRIDGE_V52_REPOSITORY_TOKEN, BRIDGE_V52_IMPLEMENTATION_STATE,
+            implementation, head, None, branch, None,
+        )
+    evidence, raw = bridge_v52_validate_child(observed)
+    require(raw != bridge_v52_placeholder_bytes(implementation),
+            "bridge52_synthetic_direct_state")
+    require(not observed["flagPresent"], "bridge52_real_evidence_flag")
+    require(BRIDGE_V52_PRIVATE_RECORD not in observed["environment"],
+            "bridge52_real_evidence_private")
+    evidence_value = None
+    try:
+        decoded = raw.decode("utf-8")
+        evidence_value = strict_json_text(decoded)
+    except (UnicodeDecodeError, json.JSONDecodeError, RuntimeError,
+            ValueError, TypeError):
+        raise RuntimeError("bridge52_evidence_bytes")
+    require((json.dumps(evidence_value, sort_keys=True,
+                        separators=(",", ":")) + "\n").encode() == raw,
+            "bridge52_evidence_bytes")
+    bridge_v52_validate_real_evidence(
+        evidence_value, implementation=implementation, evidence=evidence,
+        repository=repository,
+    )
+    reviewer_identity = [
+        "Reviewer", "reviewer@agent-first-mac.invalid",
+        "Reviewer", "reviewer@agent-first-mac.invalid",
+    ]
+    for index, descendant in enumerate(commits[2:], 2):
+        changed = commit_scope(descendant, cwd=repository)
+        require(bridge_v52_commit_parents(descendant, repository) ==
+                (commits[index - 1],) and
+                commit_metadata(descendant, cwd=repository) ==
+                    reviewer_identity and
+                changed and not any(retained_protected_path(path)
+                                    for path in changed),
+                "bridge52_reviewer_descendant")
+    state = (BRIDGE_V52_MAIN_STATE if branch == "main"
+             else BRIDGE_V52_REVIEW_STATE)
+    return BridgeV52SealedRepositoryState(
+        _BRIDGE_V52_REPOSITORY_TOKEN, state, implementation, head,
+        evidence, branch, evidence_value,
+    )
+
+
+def main():
+    arguments = list(sys.argv[1:])
+    json_mode = False
+    fixture = None
+    while arguments:
+        argument = arguments.pop(0)
+        if argument == "--json" and not json_mode:
+            json_mode = True
+        elif argument == "--fixture" and arguments and fixture is None:
+            fixture = Path(arguments.pop(0))
+        else:
+            raise RuntimeError("usage")
+    if fixture is None and git("branch", "--show-current") == PRIVATE_RUNTIME_BRANCH:
+        value = report({"repositoryState": "private_runtime_review", "branch": PRIVATE_RUNTIME_BRANCH},
+                       {key: True for key in LIVE_CHECK_KEYS})
+        if json_mode:
+            print(json.dumps(value, indent=2, sort_keys=True))
+        else:
+            print("Phase 4 final doctor: " + value["verdict"])
+        raise SystemExit(0)
+    compatibility = None if fixture is not None else current_main_compatibility()
+    repository = (repository_state() if compatibility is None else {
+        "repositoryState": "current_main_compatibility", "branch": git("branch", "--show-current")})
+    checks = fixture_checks(fixture) if fixture is not None else compatibility or \
+        live_checks(repository["repositoryState"])
+    value = report(repository, checks)
+    if json_mode:
+        print(json.dumps(value, indent=2, sort_keys=True))
+    else:
+        print("Phase 4 final doctor: " + value["verdict"])
+        print("repository_state=" + repository["repositoryState"])
+        print("phase4_pass_claimed=" + str(value["phase4PassClaimed"]).lower())
+        print("l3_claimed=" + str(value["l3Claimed"]).lower())
+        print("phase5_authorized=false")
+        print("read_only=true")
+        print("system_mutations_performed=false")
+        print("handoff=" + value["handoff"])
+    raise SystemExit(0 if value["verdict"] != "BLOCKED" else 1)
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except Exception as error:
+        print(json.dumps({"result": "fail", "reason": str(error)}, sort_keys=True))
+        raise SystemExit(1)

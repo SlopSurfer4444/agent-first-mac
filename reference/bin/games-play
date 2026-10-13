@@ -1,0 +1,181 @@
+#!/usr/bin/python3
+"""Stable independent game entry points; no automatic Ubisoft Steam login."""
+import sys
+sys.dont_write_bytecode = True
+import contextlib, fcntl, hashlib, json, os, pwd, re, socket, stat, subprocess
+from pathlib import Path
+HOME = Path(pwd.getpwuid(os.getuid()).pw_dir)
+ROOT = HOME/'Library/Application Support/Adapted Games'
+OWNER = 'control-games-hub'
+MIN_CRITICAL = {'engine/bin/wine', 'engine/bin/wineserver',
+                'engine/lib/wine/x86_64-unix/winebus.so',
+                'engine/lib/wine/x86_64-unix/libgtm-controller-SDL2.dylib'}
+
+def admission(home,route,goal=None):
+    # Execute exactly the reviewed helper bytes from the stable installed route.
+    path=home/'AIDev/bin/game-launch-admission'
+    for parent in [*reversed(path.parents),path.parent]:
+        facts=parent.lstat()
+        if not stat.S_ISDIR(facts.st_mode) or facts.st_uid not in (0,os.getuid()) or facts.st_mode&0o022:
+            raise RuntimeError('unsafe_admission_directory')
+    fd=os.open(str(path),os.O_RDONLY|os.O_NOFOLLOW|os.O_NONBLOCK)
+    try:
+        facts=os.fstat(fd)
+        if not stat.S_ISREG(facts.st_mode) or facts.st_uid!=os.getuid() or facts.st_nlink!=1 or facts.st_mode&0o022 or facts.st_size>65536:
+            raise RuntimeError('unsafe_admission_helper')
+        with os.fdopen(os.dup(fd),'rb') as stream:raw=stream.read()
+        after=os.fstat(fd)
+        keys=('st_dev','st_ino','st_mode','st_uid','st_nlink','st_size','st_mtime_ns','st_ctime_ns')
+        if any(getattr(facts,k)!=getattr(after,k) for k in keys) or hashlib.sha256(raw).hexdigest()!='f0227b4f9e38671a58d6bbbb8ad86a58354c706d55a99521ee9ce973d4ed5750':
+            raise RuntimeError('admission_helper_changed')
+    finally:os.close(fd)
+    namespace={'__name__':'game_launch_admission','__admission_source':raw}
+    exec(compile(raw,str(path),'exec'),namespace)
+    return namespace['Admission'](home,route,goal)
+
+def need(ok, reason):
+    if not ok: raise RuntimeError(reason)
+
+def safe_directory(path, data=False):
+    # Client data may be group writable below the owner's private prefix.
+    for current in [*reversed(path.parents),path]:
+        st=current.lstat()
+        need(stat.S_ISDIR(st.st_mode) and st.st_uid in (0,os.getuid())
+             and not st.st_mode & (0o002 if data else 0o022), 'unsafe_directory')
+    need(path.lstat().st_uid == os.getuid(), 'directory_owner')
+
+def read_regular(path, limit=None, data=False):
+    safe_directory(path.parent, data=data)
+    fd=os.open(str(path),os.O_RDONLY|os.O_NOFOLLOW|os.O_NONBLOCK)
+    try:
+        before=os.fstat(fd)
+        need(stat.S_ISREG(before.st_mode) and before.st_uid==os.getuid()
+             and before.st_nlink==1 and not before.st_mode & 0o022, 'unsafe_file')
+        need(limit is None or before.st_size<=limit, 'file_too_large')
+        with os.fdopen(os.dup(fd),'rb') as stream: raw=stream.read()
+        after=os.fstat(fd)
+        fields=('st_dev','st_ino','st_mode','st_uid','st_gid','st_nlink','st_size','st_mtime_ns','st_ctime_ns')
+        need(tuple(getattr(before,k) for k in fields)==tuple(getattr(after,k) for k in fields), 'file_changed')
+        return raw
+    finally: os.close(fd)
+
+def decode(raw):
+    def unique(rows):
+        result={}
+        for k,v in rows:
+            need(k not in result,'duplicate_json_key');result[k]=v
+        return result
+    try:
+        value=json.loads(raw.decode('utf-8'),object_pairs_hook=unique)
+    except (UnicodeError,json.JSONDecodeError,RecursionError):
+        raise RuntimeError('invalid_metadata') from None
+    need(type(value) is dict,'invalid_metadata')
+    return value
+
+def digest(raw): return hashlib.sha256(raw).hexdigest()
+
+@contextlib.contextmanager
+def locked():
+    directory=HOME/'AIDev/state';safe_directory(directory)
+    fd=os.open(str(directory/'games-hub.lock'),os.O_CREAT|os.O_RDWR|os.O_NOFOLLOW|os.O_NONBLOCK,0o600)
+    try:
+        st=os.fstat(fd)
+        need(stat.S_ISREG(st.st_mode) and st.st_uid==os.getuid()
+             and st.st_nlink==1 and not st.st_mode&0o077,'unsafe_lock')
+        try: fcntl.flock(fd,fcntl.LOCK_EX|fcntl.LOCK_NB)
+        except BlockingIOError: raise RuntimeError('launcher_busy') from None
+        yield
+    finally: os.close(fd)
+
+def validate():
+    safe_directory(ROOT)
+    raw=read_regular(ROOT/'manifest.json',1024*1024)
+    m=decode(raw);r=decode(read_regular(ROOT/'receipt.json',65536))
+    need(type(m.get('schema')) is int and m['schema']==1
+         and m.get('id')=='games-hub' and m.get('owner')==OWNER,'manifest_identity')
+    need(type(r.get('schema')) is int and r['schema']==1 and r.get('owner')==OWNER,'hub_owner_mismatch')
+    need(digest(raw)==r.get('manifestSha256'),'manifest_changed')
+    need(digest(read_regular(ROOT/'games-play',1024*1024))==r.get('launcherSha256'),'launcher_changed')
+    runtime=ROOT/'runtime';prefix=ROOT/'profiles/prince';safe_directory(runtime);safe_directory(prefix)
+    need(not prefix.lstat().st_mode&0o077,'prefix_not_private')
+    hashes=m.get('criticalHashes')
+    need(type(hashes) is dict and MIN_CRITICAL<=set(hashes),'invalid_runtime_hashes')
+    for rel,expected in hashes.items():
+        need(type(rel) is str and rel.startswith('engine/') and '..' not in Path(rel).parts
+             and str(Path(rel))==rel and type(expected) is str
+             and re.fullmatch('[0-9a-f]{64}',expected),'invalid_runtime_hashes')
+        need(digest(read_regular(runtime/rel))==expected,'runtime_changed')
+    engine=runtime/'engine'
+    need(os.access(engine/'bin/wine',os.X_OK) and os.access(engine/'bin/wineserver',os.X_OK),'runtime_not_executable')
+    safe_directory(runtime/'Frameworks');safe_directory(engine/'lib/wine')
+    return runtime,prefix,engine
+
+def environment(runtime,prefix,engine):
+    user=pwd.getpwuid(os.getuid()).pw_name
+    return {'HOME':str(HOME),'USER':user,'LOGNAME':user,
+         'PATH':'/usr/bin:/bin:/usr/sbin:/sbin','LANG':'en_US.UTF-8','WINEPREFIX':str(prefix),
+         'WINESERVER':str(engine/'bin/wineserver'),'WINELOADER':str(engine/'bin/wine'),
+         'WINEDLLPATH':str(engine/'lib/wine'),'DYLD_FALLBACK_LIBRARY_PATH':str(runtime/'Frameworks')+':/usr/lib',
+         'WINEDLLOVERRIDES':'winemenubuilder.exe=;mscoree,mshtml=;dxgi,d3d11,d3d10core,winemetal=b;nvapi64,nvngx=',
+         'WINEDEBUG':'-all','WINEMSYNC':'1','WINEESYNC':'0','ROSETTA_ADVERTISE_AVX':'1','AOELAB_STEAM_SINGLEPROCESS':'1','MTL_HUD_ENABLED':'0'}
+
+def inactive(engine,env):
+    try:
+        p=subprocess.run([str(engine/'bin/wineserver'),'-w'],env=env,stdin=subprocess.DEVNULL,
+                         stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,timeout=0.5)
+    except subprocess.TimeoutExpired: raise RuntimeError('profile_active') from None
+    need(p.returncode==0,'session_probe_failed')
+
+def no_foreign_steam():
+    need(not admission(HOME,'steam').summary()['foreignSteam'],'foreign_steam_active')
+
+def launch(mode,request):
+    runtime,prefix,engine=validate();env=environment(runtime,prefix,engine);request.reconcile()
+    session=request.allow_client()
+    if mode=='prince':
+        try:
+            with socket.create_connection(('127.0.0.1',10809),timeout=2): pass
+        except OSError: raise RuntimeError('vpn_proxy_unavailable') from None
+        exe=prefix/'drive_c/Program Files (x86)/Ubisoft/Ubisoft Game Launcher/upc.exe'
+        args=[str(exe),'--in-process-gpu','--proxy-server=http://127.0.0.1:10809']
+    else:
+        exe=prefix/'drive_c/Program Files (x86)/Steam/steam.exe';args=[str(exe),'-cef-disable-gpu']
+    read_regular(exe,64*1024*1024,data=True)
+    logs=ROOT/'logs';safe_directory(logs)
+    fd=os.open(str(logs/('launch-'+mode+'.log')),os.O_WRONLY|os.O_APPEND|os.O_CREAT|os.O_NOFOLLOW|os.O_NONBLOCK,0o600)
+    try:
+        st=os.fstat(fd)
+        need(stat.S_ISREG(st.st_mode) and st.st_uid==os.getuid() and st.st_nlink==1
+             and not st.st_mode&0o077,'unsafe_launch_log')
+        request.begin()
+        with os.fdopen(os.dup(fd),'ab') as log:
+            child=subprocess.Popen([str(engine/'bin/wine')]+args,env=env,cwd=exe.parent,
+                             stdin=subprocess.DEVNULL,stdout=log,stderr=log,start_new_session=True)
+        request.dispatched([child])
+    finally: os.close(fd)
+    return {'state':'LAUNCH_REQUESTED','route':mode,'gameplayVerified':False}
+
+def main():
+    os.umask(0o077)
+    need(len(sys.argv)==2 and sys.argv[1] in ('cs2','prince','steam','recover-launch'),'usage')
+    mode=sys.argv[1]
+    if mode=='cs2':
+        resolver=HOME/'AIDev/bin/cs2-play';target=HOME/'Library/Application Support/CS2 Standalone/cs2-play'
+        safe_directory(resolver.parent)
+        facts=resolver.lstat()
+        need(stat.S_ISLNK(facts.st_mode) and facts.st_uid==os.getuid()
+             and os.readlink(resolver)==str(target),'cs2_resolver_drift')
+        raw=read_regular(target,1024*1024)
+        receipt=decode(read_regular(target.parent/'runtime/.owner.json',65536))
+        need(type(receipt.get('schemaVersion')) is int and receipt['schemaVersion']==1
+             and receipt.get('owner')=='control-cs2-standalone'
+             and receipt.get('launcherSha256')==digest(raw),'cs2_launcher_drift')
+        need(os.access(target,os.X_OK),'cs2_launcher_missing')
+        os.execve(str(target),[str(target),'play'],{'HOME':str(HOME),'PATH':'/usr/bin:/bin:/usr/sbin:/sbin','LANG':'en_US.UTF-8'})
+    request=admission(HOME,'prince' if mode=='recover-launch' else mode)
+    with request.locked(): result=request.recover() if mode=='recover-launch' else launch(mode,request)
+    print(json.dumps(result,sort_keys=True))
+if __name__=='__main__':
+    try: main()
+    except Exception as e:
+        print(json.dumps({'state':'BLOCKED','reason':str(e) if isinstance(e,RuntimeError) else type(e).__name__},sort_keys=True));sys.exit(1)

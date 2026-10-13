@@ -1,0 +1,134 @@
+#!/usr/bin/python3
+"""Read-only successor grammar observation, never a live-operation gate.
+
+No plugin/MCP projection is admitted here. This command intentionally reports
+needs-review even for a syntactically valid configuration. Signed application,
+integration provenance, other managed targets and transaction recovery require
+their own evidence before any subsequent operation can be admitted.
+"""
+
+import hashlib
+import importlib.machinery
+import json
+import os
+from pathlib import Path
+import sys
+
+
+# Direct invocation must not create local import caches either.
+sys.dont_write_bytecode = True
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT))
+from lib.phase5_current_runtime import MAX_CONFIG_BYTES, classify  # noqa: E402
+
+
+class ObservationError(ValueError):
+    pass
+
+
+def identity(snapshot):
+    """Freeze only the required already descriptor-checked snapshot fields."""
+    if type(snapshot) is not dict:
+        raise ObservationError("config_observation_invalid")
+    value = snapshot.get("bytes")
+    metadata = snapshot.get("metadata")
+    file_id = snapshot.get("identity")
+    if (type(value) is not bytes or not 0 < len(value) <= MAX_CONFIG_BYTES
+            or type(metadata) is not dict
+            or type(file_id) is not tuple or len(file_id) != 2
+            or any(type(item) is not int or item < 0 for item in file_id)
+            or metadata.get("exists") is not True
+            or type(metadata.get("linkCount")) is not int
+            or metadata.get("linkCount") != 1
+            or metadata.get("mode") != "0600"
+            or metadata.get("ownerClass") != "current-user"
+            or type(metadata.get("size")) is not int
+            or metadata.get("size") != len(value)
+            or metadata.get("sha256") != hashlib.sha256(value).hexdigest()):
+        raise ObservationError("config_observation_invalid")
+    return value, file_id, metadata["mode"], metadata["linkCount"], metadata["ownerClass"]
+
+
+def report(classification, stable, error=None):
+    return {
+        "schema": 1,
+        "probe": "phase5-successor-current-runtime-grammar",
+        "classification": classification,
+        "configObservationStable": stable,
+        "error": error,
+        "integrationAdmission": False,
+        "signedRuntimeAttested": False,
+        "executionAdmission": False,
+        "configMutationAuthorized": False,
+        "trustMutationAuthorized": False,
+        "phase5PassClaimed": False,
+        "phase6Authorized": False,
+    }
+
+
+def observe(snapshot, *, control_root, hook_source, hook_records):
+    """Observe two descriptor reads without storing any private state.
+
+Publication refers only to the two observation boundaries, not a claim that
+all possible intervening or future writes were continuously excluded.
+The second read also occurs if classification throws or rejects the input.
+"""
+    try:
+        before = identity(snapshot())
+    except Exception:
+        return report(None, False, "config_observation_failed")
+    classification = None
+    error = None
+    try:
+        classification = classify(
+            before[0], control_root=control_root, hook_source=hook_source,
+            hook_records=hook_records, admitted_plugins=None, admitted_mcp=None,
+        )
+    except Exception:
+        error = "classification_failed"
+    try:
+        after = identity(snapshot())
+        stable = before == after
+    except Exception:
+        stable = False
+    if not stable:
+        # A result from a changed/unknown prestate is not usable evidence.
+        return report(None, False, "config_observation_drift")
+    return report(classification, True, error)
+
+
+def main():
+    if sys.argv[1:]:
+        print(json.dumps(report(None, False, "unsupported_arguments"), sort_keys=True))
+        return 2
+    try:
+        transaction = importlib.machinery.SourceFileLoader(
+            "phase5_successor_read_only_transaction",
+            str(ROOT / "bin/phase5-apply-transaction"),
+        ).load_module()
+        # Reuse only the accepted descriptor reader, not the historical
+        # transaction/main gate or its unrelated private state inventory.
+        home = transaction.canonical_account_home()
+        codex_home = home / ".codex"
+        target = codex_home / "config.toml"
+
+        def snapshot():
+            return transaction.snapshot_path(
+                target, os.getuid(), MAX_CONFIG_BYTES, allow_absent=False,
+                user_root=home,
+            )
+
+        result = observe(
+            snapshot, control_root=str(home / "AIDev/control"),
+            hook_source=str(codex_home / "hooks.json"),
+            hook_records={slot: digest for _, slot, digest in transaction.HOOK_TRUST_RECORDS},
+        )
+    except Exception:
+        result = report(None, False, "observation_setup_failed")
+    print(json.dumps(result, sort_keys=True, separators=(",", ":")))
+    # Syntactic success is not exit-zero execution or phase admission.
+    return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

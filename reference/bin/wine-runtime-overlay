@@ -1,0 +1,594 @@
+#!/usr/bin/env python3
+"""Offline, fixture-only Wine overlay transaction candidate. No live route."""
+import sys
+sys.dont_write_bytecode = True
+import argparse
+import contextlib
+import copy
+import fcntl
+import hashlib
+import json
+import os
+from pathlib import Path, PurePosixPath
+import re
+import stat
+import tempfile
+
+UNIX = 'engine/lib/wine/x86_64-unix/winemac.so'
+PE32 = 'engine/lib/wine/i386-windows/winemac.drv'
+PE = 'engine/lib/wine/x86_64-windows/winemac.drv'
+METAL = 'engine/lib/wine/x86_64-unix/winemetal.so'
+DONOR = 'engine/lib/wine/x86_64-unix/winemetal-airconv-original.so'
+NATIVE_LOADER = 'engine/lib/wine/x86_64-unix/wine'
+TARGETS = {
+    'hub.pe32': 'hub/runtime/'+PE32, 'hub.pe64': 'hub/runtime/'+PE,
+    'ds3.pe32': 'ds3/runtime/'+PE32, 'ds3.pe64': 'ds3/runtime/'+PE,
+    'hub.manifest': 'hub/manifest.json', 'ds3.manifest': 'ds3/manifest.json',
+    'ds3.lifecycle': 'ds3/ds3-runtime',
+    'hub.receipt': 'hub/receipt.json', 'ds3.receipt': 'ds3/receipt.json',
+    'ds3.borderless-receipt': 'ds3/borderless/receipt.json',
+}
+ORDER = tuple(TARGETS)
+GUARDS = ('hub/games-play', 'ds3/ds3-play', 'ds3/borderless/manifest.json',
+          'ds3/borderless/helper.exe','ds3/borderless/helper.c','ds3/borderless/build-provenance.json',
+          'ds3/borderless/final-fixture-results.json','payload/policy.json','payload/source-hub-v1.json')
+POLICY_FIELDS = {'schema','id','owner','previousHubManifestSha256','previousDS3ManifestSha256',
+                 'previousHubCriticalHashes','sourceHubManifestSha256','sourceCriticalHashes','desiredPEHashes','lifecycleSha256'}
+MAX_FILE = 128*1024*1024
+MAX_TREE = 8*1024*1024*1024
+MAX_ENTRIES = 100000
+MAX_METADATA_BYTES = 1024*1024
+MAX_PLAN_BYTES = 8*1024*1024
+MARKER = b'Wine overlay offline fixture v1\n'
+
+
+class Blocked(RuntimeError):
+    pass
+
+
+def need(ok, reason):
+    if not ok:
+        raise Blocked(reason)
+
+
+def digest(data):
+    return hashlib.sha256(data).hexdigest()
+
+
+def encode(value):
+    return (json.dumps(value, sort_keys=True, indent=2)+'\n').encode()
+
+
+def decode(data, limit=MAX_METADATA_BYTES):
+    need(len(data) <= limit, 'metadata_limit')
+    def unique(items):
+        out = {}
+        for key, value in items:
+            need(key not in out, 'duplicate_json_key')
+            out[key] = value
+        return out
+    try:
+        return json.loads(data, object_pairs_hook=unique)
+    except (ValueError, UnicodeError):
+        raise Blocked('invalid_json')
+
+
+def pin(value, length=64):
+    return type(value) is str and re.fullmatch('[0-9a-f]{'+str(length)+'}', value) is not None
+
+
+def regular(info, limit=MAX_FILE, loader=False):
+    need(stat.S_ISREG(info.st_mode) and info.st_uid == os.getuid()
+         and not info.st_mode & 0o022 and (info.st_nlink == 1 or loader)
+         and info.st_size <= limit, 'unsafe_file')
+
+
+def identity(info):
+    return info.st_dev, info.st_ino, info.st_uid, stat.S_IMODE(info.st_mode)
+
+
+class Root:
+    """Hold no-follow ancestor descriptors; mutation never follows a path link."""
+    def __init__(self, path):
+        path = Path(path)
+        temp = Path(tempfile.gettempdir()).resolve()
+        need(path.is_absolute() and path.parent == temp
+             and re.fullmatch('wine-overlay-fixture-[a-zA-Z0-9_-]+', path.name), 'fixture_root_required')
+        self.path = path
+        self.chain = []
+        fd = os.open('/', os.O_RDONLY | os.O_DIRECTORY)
+        self.chain.append((None, None, fd, identity(os.fstat(fd))))
+        try:
+            for component in path.parts[1:]:
+                parent = fd
+                fd = os.open(component, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=parent)
+                info = os.fstat(fd)
+                need(info.st_uid in (0, os.getuid()) and (not info.st_mode & 0o002 or info.st_mode & stat.S_ISVTX), 'unsafe_directory')
+                self.chain.append((parent, component, fd, identity(info)))
+            self.fd = fd
+            need(not os.fstat(fd).st_mode & 0o077, 'fixture_root_private_required')
+            need(self.read('.fixture-only')[0] == MARKER, 'fixture_marker_required')
+        except BaseException:
+            self.close()
+            raise
+
+    def close(self):
+        for _, _, fd, _ in reversed(self.chain):
+            os.close(fd)
+        self.chain = []
+
+    def bound(self):
+        for parent, name, fd, expected in self.chain:
+            need(identity(os.fstat(fd)) == expected, 'directory_identity_drift')
+            if parent is not None:
+                need(identity(os.stat(name, dir_fd=parent, follow_symlinks=False)) == expected, 'directory_binding_drift')
+
+    @contextlib.contextmanager
+    def parent(self, rel):
+        parts = PurePosixPath(rel).parts
+        need(type(rel) is str and rel == '/'.join(parts) and not rel.startswith('/')
+             and all(x not in ('.', '..') for x in parts), 'unsafe_relative_path')
+        self.bound()
+        chain = []
+        fd = self.fd
+        try:
+            for name in parts[:-1]:
+                parent = fd
+                fd = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=parent)
+                info = os.fstat(fd)
+                need(info.st_uid == os.getuid() and not info.st_mode & 0o022, 'unsafe_directory')
+                chain.append((parent, name, fd, identity(info)))
+            def check():
+                self.bound()
+                for parent, name, child, expected in chain:
+                    need(identity(os.fstat(child)) == expected and identity(os.stat(name, dir_fd=parent, follow_symlinks=False)) == expected, 'directory_binding_drift')
+            yield fd, parts[-1], check
+        finally:
+            for _, _, child, _ in reversed(chain):
+                os.close(child)
+
+    def read(self, rel, loader=False):
+        with self.parent(rel) as (parent, name, check):
+            fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=parent)
+            try:
+                before = os.fstat(fd)
+                regular(before, loader=loader)
+                data = b''
+                while True:
+                    block = os.read(fd, 1024*1024)
+                    if not block:
+                        break
+                    data += block
+                    need(len(data) <= MAX_FILE, 'file_limit')
+                after = os.fstat(fd)
+                check()
+                need((identity(before), before.st_size, before.st_mtime_ns, before.st_ctime_ns)
+                     == (identity(after), after.st_size, after.st_mtime_ns, after.st_ctime_ns), 'file_changed_during_read')
+                need(identity(os.stat(name, dir_fd=parent, follow_symlinks=False)) == identity(after), 'file_binding_drift')
+                return data, stat.S_IMODE(after.st_mode)
+            finally:
+                os.close(fd)
+
+    def exists(self, rel):
+        with self.parent(rel) as (parent, name, check):
+            try:
+                os.stat(name, dir_fd=parent, follow_symlinks=False)
+                check()
+                return True
+            except FileNotFoundError:
+                return False
+
+    def mkdir(self, rel):
+        with self.parent(rel) as (parent, name, check):
+            check()
+            os.mkdir(name, 0o700, dir_fd=parent)
+            os.fsync(parent)
+
+    def write_new(self, rel, data, mode=0o600):
+        with self.parent(rel) as (parent, name, check):
+            check()
+            fd = os.open(name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, mode, dir_fd=parent)
+            try:
+                os.fchmod(fd, mode)
+                view = memoryview(data)
+                while view:
+                    count = os.write(fd, view)
+                    need(count > 0, 'short_write')
+                    view = view[count:]
+                os.fsync(fd)
+            finally:
+                os.close(fd)
+            check()
+            os.fsync(parent)
+
+    def replace(self, rel, data, mode, expected, event=lambda _: None):
+        # Staging stays outside both runtime trees, private and fixed-name. Unknown temporary state is
+        # retained and blocks; recovery never deletes an unbound temporary file.
+        stage = self.stage_name(rel)
+        if self.exists(stage):
+            need(self.read(stage) == (data, mode), 'replacement_stage_drift')
+        else:
+            self.write_new(stage, data, mode)
+        event('staged:'+rel)
+        with self.parent(rel) as (parent, name, check), self.parent(stage) as (stage_parent, stage_name, stage_check):
+            need(self.read(rel) == expected, 'target_changed_before_replace')
+            check()
+            event('before-replace:'+rel)
+            check()
+            stage_check()
+            need(self.read(rel) == expected, 'target_changed_before_replace')
+            need(self.read(stage) == (data,mode), 'replacement_stage_drift')
+            need(os.fstat(parent).st_dev == os.fstat(stage_parent).st_dev, 'cross_device_stage')
+            os.replace(stage_name, name, src_dir_fd=stage_parent, dst_dir_fd=parent)
+            os.fsync(parent)
+            os.fsync(stage_parent)
+            event('replaced:'+rel)
+
+    @staticmethod
+    def stage_name(rel):
+        return 'state/transaction/stage.'+digest(rel.encode())[:16]
+
+    @contextlib.contextmanager
+    def lock(self):
+        with self.parent('state/games-hub.lock') as (parent, name, check):
+            fd = os.open(name, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600, dir_fd=parent)
+            try:
+                regular(os.fstat(fd), 0)
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                check()
+                need(identity(os.stat(name,dir_fd=parent,follow_symlinks=False)) == identity(os.fstat(fd)), 'lock_binding_drift')
+                yield
+            finally:
+                os.close(fd)
+
+
+def tree_rows(root, runtime):
+    """Hash only code runtime, with the same rows as the canonical lifecycle."""
+    rows = []
+    total = 0
+    entries = 0
+    with root.parent(runtime+'/.unused') as (base, _, check):
+        def visit(fd, prefix=''):
+            nonlocal total, entries
+            for name in sorted(os.listdir(fd)):
+                rel = prefix+name
+                info = os.stat(name, dir_fd=fd, follow_symlinks=False)
+                entries += 1
+                need(entries <= MAX_ENTRIES and len(PurePosixPath(rel).parts) <= 32, 'runtime_entry_limit')
+                if stat.S_ISDIR(info.st_mode):
+                    child = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
+                    try:
+                        need(info.st_uid == os.getuid() and not info.st_mode & 0o022, 'unsafe_directory')
+                        visit(child, rel+'/')
+                        need(identity(os.stat(name, dir_fd=fd, follow_symlinks=False)) == identity(info), 'directory_binding_drift')
+                    finally:
+                        os.close(child)
+                elif stat.S_ISLNK(info.st_mode):
+                    link = os.readlink(name, dir_fd=fd)
+                    # Resolve link components strictly through no-follow descriptors.
+                    need(not link.startswith('/'), 'absolute_runtime_link')
+                    normalized = []
+                    for part in (PurePosixPath(rel).parent/PurePosixPath(link)).parts:
+                        if part == '..':
+                            need(bool(normalized), 'external_runtime_link')
+                            normalized.pop()
+                        elif part != '.':
+                            normalized.append(part)
+                    if rel == 'deps/Frameworks' and link == '../Frameworks':
+                        # Observed runtime directory alias. Bind its actual internal
+                        # directory through no-follow descriptors, keep the literal
+                        # link row and visit the canonical Frameworks tree only once.
+                        # No other directory alias or multi-hop link is admitted.
+                        with root.parent(runtime+'/Frameworks/.unused') as (directory,_,bound):
+                            info=os.fstat(directory)
+                            need(stat.S_ISDIR(info.st_mode) and info.st_uid == os.getuid()
+                                 and not info.st_mode & 0o022,'unsafe_framework_directory')
+                            bound()
+                    else:
+                        # Other admitted links remain direct relative regular-file
+                        # links; directory and multi-hop resolution fails closed.
+                        root.read(runtime+'/'+('/'.join(normalized)), loader=('/'.join(normalized) == NATIVE_LOADER))
+                    rows.append([rel, 'link', link])
+                else:
+                    data, mode = root.read(runtime+'/'+rel, loader=(rel == NATIVE_LOADER))
+                    total += len(data)
+                    need(total <= MAX_TREE, 'runtime_size_limit')
+                    rows.append([rel, mode, digest(data)])
+        visit(base)
+        check()
+    return sorted(rows, key=lambda row: row[0])
+
+
+def tree_hash(rows):
+    return digest(json.dumps(rows, separators=(',', ':')).encode())
+
+
+def image(data, mode):
+    return {'sha256': digest(data), 'mode': mode}
+
+
+def verify_images(root, images):
+    for rel, expected in images.items():
+        need(image(*root.read(rel)) == expected, 'guard_drift')
+
+
+def build(root, commit, pe32_sha256, pe64_sha256, policy_sha256, publish=True, source_only=True):
+    """Build one exact paired Winemac transaction; expected payload pins mandatory."""
+    need(pin(commit, 40) and pin(pe32_sha256) and pin(pe64_sha256) and pin(policy_sha256), 'invalid_pins')
+    need(type(source_only) is bool,'invalid_route_metadata')
+    if publish: need(not root.exists('state/transaction'), 'transaction_exists')
+    payload = {PE32: root.read('payload/winemac-i386.drv')[0], PE: root.read('payload/winemac-x86_64.drv')[0]}
+    need(digest(payload[PE32]) == pe32_sha256 and digest(payload[PE]) == pe64_sha256, 'payload_pin_mismatch')
+    old = {key: root.read(rel) for key, rel in TARGETS.items()}
+    hm, hr, dm, dr, br = [decode(old[key][0]) for key in ('hub.manifest','hub.receipt','ds3.manifest','ds3.receipt','ds3.borderless-receipt')]
+    need(all(type(value) is dict and type(value.get('schema')) is int and value.get('schema') == 1 for value in (hm,hr,dr,br))
+         and type(dm) is dict and type(dm.get('schema')) is int and dm.get('schema') in (1,2), 'installed_metadata_schema')
+    need(type(hm.get('criticalHashes')) is dict and type(dm.get('sourceCriticalHashes')) is dict
+         and all(type(k) is str and pin(v) for pins in (hm['criticalHashes'],dm['sourceCriticalHashes']) for k,v in pins.items())
+         and pin(dm.get('candidateSha256')) and pin(dm.get('donorSha256')) and pin(dm.get('sourceHubManifestSha256')), 'installed_pin_schema')
+    need(hm.get('id') == 'games-hub' and hm.get('owner') == hr.get('owner') == 'control-games-hub', 'hub_identity')
+    need(dm.get('id') == 'ds3-marshal-fix' and dm.get('owner') == dr.get('owner') == br.get('owner') == 'control-ds3-marshal-fix', 'ds3_identity')
+    rows = {name: tree_rows(root, name+'/runtime') for name in ('hub','ds3')}
+    for name, manifest, receipt, key in (('hub',hm,hr,'hub.manifest'),('ds3',dm,dr,'ds3.manifest')):
+        need(receipt.get('manifestSha256') == digest(old[key][0]) and receipt.get('runtimeTreeSha256') == tree_hash(rows[name]), 'installed_closure_drift')
+    policy_raw = root.read('payload/policy.json')[0]
+    need(digest(policy_raw) == policy_sha256, 'overlay_policy_pin_mismatch')
+    policy = decode(policy_raw)
+    need(type(policy) is dict and set(policy) == POLICY_FIELDS and type(policy['schema']) is int and policy['schema'] == 1
+         and policy['id'] == 'wine-runtime-overlay' and policy['owner'] == 'control-games-hub', 'overlay_policy_schema')
+    lifecycle = root.read('payload/ds3-runtime')[0]
+    need(pin(policy['lifecycleSha256']) and digest(lifecycle) == policy['lifecycleSha256'], 'lifecycle_pin_mismatch')
+    need(policy['previousHubManifestSha256'] == digest(old['hub.manifest'][0]) and policy['previousDS3ManifestSha256'] == digest(old['ds3.manifest'][0])
+         and policy['previousHubCriticalHashes'] == hm['criticalHashes'] and policy['sourceHubManifestSha256'] == dm['sourceHubManifestSha256']
+         and policy['sourceCriticalHashes'] == dm['sourceCriticalHashes'] and policy['desiredPEHashes'] == {PE32:pe32_sha256,PE:pe64_sha256}, 'overlay_policy_binding')
+    original_raw = root.read('payload/source-hub-v1.json')[0]
+    original_hub = decode(original_raw)
+    need(type(original_hub) is dict and digest(original_raw) == dm['sourceHubManifestSha256']
+         and original_hub.get('criticalHashes') == dm['sourceCriticalHashes'], 'ds3_source_ancestry_drift')
+    overrides = dm.get('runtimeOverrides',{})
+    need(type(overrides) is dict and (dm['schema'] == 1 and not overrides or dm['schema'] == 2 and set(overrides) == {PE32,PE} and all(pin(v) for v in overrides.values())), 'ds3_override_schema')
+    need(br.get('baseRuntimeTreeSha256') == dr['runtimeTreeSha256'] and br.get('baseManifestSha256') == dr['manifestSha256'], 'borderless_base_drift')
+    borderless = decode(root.read('ds3/borderless/manifest.json')[0])
+    need(type(borderless) is dict, 'borderless_schema')
+    need(br.get('manifestSha256') == digest(root.read('ds3/borderless/manifest.json')[0]), 'borderless_manifest_drift')
+    need(borderless.get('nativeBinding') == {'winemetalSha256':dm.get('candidateSha256'),'donorSha256':dm.get('donorSha256'),'d3d11Sha256':dm['sourceCriticalHashes'].get('engine/lib/wine/x86_64-windows/d3d11.dll')}, 'borderless_native_binding_drift')
+    guards = {rel: image(*root.read(rel)) for rel in GUARDS}
+    for name,key in (('helper.exe','helperSha256'),('helper.c','sourceSha256'),('build-provenance.json','provenanceSha256'),('final-fixture-results.json','fixtureReportSha256')):
+        need(guards['ds3/borderless/'+name]['sha256'] == borderless.get(key), 'borderless_helper_drift')
+    need(digest(old['ds3.lifecycle'][0]) == dr.get('lifecycleSha256'), 'installed_helper_drift')
+    for rel, receipt, key in (('hub/games-play',hr,'launcherSha256'),('ds3/ds3-play',dr,'launcherSha256')):
+        need(guards[rel]['sha256'] == receipt.get(key), 'installed_helper_drift')
+    ds3_pins = dict(dm['sourceCriticalHashes'], **{METAL:dm['candidateSha256'],DONOR:dm['donorSha256']})
+    ds3_pins.update(overrides)
+    for name, pins in (('hub',hm['criticalHashes']),('ds3',ds3_pins)):
+        actual = {row[0]: row[2] for row in rows[name] if row[1] != 'link'}
+        need(all(actual.get(rel) == expected for rel, expected in pins.items()), 'critical_hash_drift')
+    # Every before/after row outside the explicitly declared Winemac pair stays exact.
+    after_rows = copy.deepcopy(rows)
+    after = dict(old)
+    after['ds3.lifecycle'] = lifecycle, old['ds3.lifecycle'][1]
+    for name in ('hub','ds3'):
+        for suffix, rel in (('pe32',PE32),('pe64',PE)):
+            key = name+'.'+suffix
+            after[key] = (payload[rel], old[key][1])
+            matches = [row for row in after_rows[name] if row[0] == rel]
+            need(len(matches) == 1 and matches[0][1] != 'link', 'overlay_target_missing')
+            matches[0][2] = digest(payload[rel])
+    new_hm, new_dm = copy.deepcopy(hm), copy.deepcopy(dm)
+    new_hm['criticalHashes'].update({PE32:pe32_sha256, PE:pe64_sha256})
+    new_hm['runtimeOverlayPolicySha256'] = policy_sha256
+    after['hub.manifest'] = encode(new_hm), old['hub.manifest'][1]
+    # source* remains immutable adoption ancestry; runtimeOverrides names only
+    # the exact PE pair. Existing verification needs the
+    # separately delivered source selector patch before this schema is usable.
+    new_dm.update(schema=2, runtimeOverrides={PE32:pe32_sha256,PE:pe64_sha256}, runtimeOverlayPolicySha256=policy_sha256)
+    after['ds3.manifest'] = encode(new_dm), old['ds3.manifest'][1]
+    for name, receipt in (('hub',hr),('ds3',dr)):
+        new_receipt = dict(receipt, commit=commit, manifestSha256=digest(after[name+'.manifest'][0]), runtimeTreeSha256=tree_hash(after_rows[name]))
+        if name == 'ds3': new_receipt['lifecycleSha256'] = policy['lifecycleSha256']
+        after[name+'.receipt'] = encode(new_receipt), old[name+'.receipt'][1]
+    after['ds3.borderless-receipt'] = encode(dict(br, commit=commit, baseManifestSha256=digest(after['ds3.manifest'][0]), baseRuntimeTreeSha256=tree_hash(after_rows['ds3']))), old['ds3.borderless-receipt'][1]
+    plan = {'schema':1,'kind':'wine-winemac-pe-pair-overlay','sourceOnly':source_only,'acceptedCommit':commit,
+            'targets':{key:{'before':image(*old[key]),'after':image(*after[key])} for key in ORDER},
+            'runtimeRows':{name:{'before':rows[name],'after':after_rows[name]} for name in rows},'guards':guards}
+    raw = encode(plan)
+    # The real plan includes complete before/after runtime row inventories.
+    # Admit its separate bounded size before publishing any transaction state.
+    need(len(raw) <= MAX_PLAN_BYTES,'plan_metadata_limit')
+    if not publish:
+        return {'state':'PLANNED_READ_ONLY','planSha256':digest(raw),'changed':False,'liveStateChanged':False}
+    # Publish journal/closure before any installed target mutation. Staging failures
+    # retain this directory, require explicit inspection, and alter no target bytes.
+    root.mkdir('state/transaction')
+    for key in ORDER:
+        for side, images in (('before',old),('after',after)):
+            root.write_new('state/transaction/'+key+'.'+side, *images[key])
+    root.write_new('state/transaction/plan.json', raw)
+    root.write_new('state/transaction/journal.json', encode({'schema':1,'planSha256':digest(raw),'phase':'prepared','intent':None}))
+    return {'state':'PREPARED_SOURCE_ONLY' if source_only else 'PREPARED_INSTALLED_TRANSACTION','planSha256':digest(raw),'changed':False,'liveStateChanged':False}
+
+
+class Transaction:
+    def __init__(self, root, expected_plan_sha256, event=lambda _: None, gate=None, source_only=True):
+        need(pin(expected_plan_sha256), 'plan_pin_required')
+        self.root, self.event, self.gate = root, event, gate
+        raw, _ = root.read('state/transaction/plan.json')
+        need(digest(raw) == expected_plan_sha256, 'plan_binding_drift')
+        self.plan_sha = expected_plan_sha256
+        self.plan = decode(raw,limit=MAX_PLAN_BYTES)
+        p = self.plan
+        need(type(source_only) is bool and type(p) is dict and set(p) == {'schema','kind','sourceOnly','acceptedCommit','targets','runtimeRows','guards'} and type(p['schema']) is int and p['schema'] == 1 and p['kind'] == 'wine-winemac-pe-pair-overlay' and type(p['sourceOnly']) is bool and p['sourceOnly'] is source_only and pin(p['acceptedCommit'],40), 'plan_schema')
+        need(type(p['targets']) is dict and set(p['targets']) == set(TARGETS) and type(p['runtimeRows']) is dict and set(p['runtimeRows']) == {'hub','ds3'} and type(p['guards']) is dict and set(p['guards']) == set(GUARDS), 'plan_scope')
+        for value in p['guards'].values():
+            need(type(value) is dict and set(value) == {'sha256','mode'} and pin(value['sha256']) and type(value['mode']) is int and 0 <= value['mode'] <= 0o777 and not value['mode'] & 0o022, 'guard_schema')
+        for value in p['runtimeRows'].values():
+            need(type(value) is dict and set(value) == {'before','after'}, 'runtime_rows_schema')
+            for rows in value.values():
+                need(type(rows) is list and 0 < len(rows) <= MAX_ENTRIES, 'runtime_rows_schema')
+                paths = []
+                for row in rows:
+                    need(type(row) is list and len(row) == 3 and type(row[0]) is str and (row[1] == 'link' and type(row[2]) is str or type(row[1]) is int and 0 <= row[1] <= 0o777 and pin(row[2])), 'runtime_row_schema')
+                    paths.append(row[0])
+                need(paths == sorted(set(paths)), 'runtime_rows_order')
+        self.images = {}
+        for key in ORDER:
+            entry = p['targets'][key]
+            need(type(entry) is dict and set(entry) == {'before','after'}, 'target_schema')
+            self.images[key] = {}
+            for side in ('before','after'):
+                row = entry[side]
+                need(type(row) is dict and set(row) == {'sha256','mode'} and pin(row['sha256']) and type(row['mode']) is int and 0 <= row['mode'] <= 0o777 and not row['mode'] & 0o022, 'image_schema')
+                data = root.read('state/transaction/'+key+'.'+side)
+                need(image(*data) == row, 'backup_drift')
+                self.images[key][side] = data
+        j = self.journal()
+        need(j['phase'] in ('prepared','applying','applied','rolling-back','rolled-back'), 'journal_phase')
+
+    def journal(self):
+        raw, _ = self.root.read('state/transaction/journal.json')
+        j = decode(raw)
+        need(type(j) is dict and set(j) == {'schema','planSha256','phase','intent'} and type(j['schema']) is int and j['schema'] == 1 and j['planSha256'] == self.plan_sha and j['intent'] in (None,*ORDER) and type(j['phase']) is str and j['phase'] in ('prepared','applying','applied','rolling-back','rolled-back'), 'journal_binding_drift')
+        return j
+
+    def checkpoint(self, phase, intent=None):
+        rel = 'state/transaction/journal.json'
+        raw, mode = self.root.read(rel)
+        next_j = {'schema':1,'planSha256':self.plan_sha,'phase':phase,'intent':intent}
+        self.root.replace(rel, encode(next_j), mode, (raw,mode))
+        self.event('journal:'+phase+(':'+intent if intent else ''))
+
+    def reconcile_journal_stage(self):
+        rel = 'state/transaction/journal.json'
+        stage = self.root.stage_name(rel)
+        if not self.root.exists(stage):
+            return
+        current = self.journal()
+        data, mode = self.root.read(stage)
+        pending = decode(data)
+        need(type(pending) is dict and set(pending) == set(current) and type(pending['schema']) is int and pending['schema'] == 1
+             and pending['planSha256'] == self.plan_sha and pending['intent'] in (None,*ORDER), 'journal_stage_drift')
+        transitions = {'prepared':{'applying','applied','rolled-back'},'applying':{'applying','applied'},'applied':{'rolling-back'},
+                       'rolling-back':{'rolling-back','rolled-back'},'rolled-back':{'applying'}}
+        need(type(pending['phase']) is str and pending['phase'] in transitions[current['phase']], 'journal_stage_transition')
+        need(mode == 0o600 and (pending['phase'] not in ('applied','rolled-back') or pending['intent'] is None), 'journal_stage_drift')
+        if pending['phase'] in ('applied','rolled-back'):
+            need(self.side('after' if pending['phase'] == 'applied' else 'before'), 'journal_terminal_state_drift')
+        self.root.replace(rel, data, mode, self.root.read(rel))
+
+    def preflight(self, mixed=False, allow_journal_stage=False):
+        # A stage can durably request the opposite direction even while every
+        # target still equals an apparently complete side. Ordinary readiness,
+        # plan and no-op must not report success until recovery reconciles it.
+        need(allow_journal_stage or not self.root.exists(self.root.stage_name('state/transaction/journal.json')),
+             'outstanding_journal_stage_requires_recovery')
+        # Gates are operation-local callbacks, exercised while the shared lock is
+        # held. They are assertions from a future trusted adapter, never persisted
+        # authority booleans and never inferred from the staged plan.
+        need(callable(self.gate), 'fresh_gate_required')
+        result = self.gate(self.plan['acceptedCommit'])
+        need(type(result) is dict and set(result) == {'sourceAccepted','doctorReady','prefixesInactive'}
+             and all(type(v) is bool and v for v in result.values()), 'fresh_gate_rejected')
+        verify_images(self.root, self.plan['guards'])
+        expected_names = {'plan.json','journal.json'} | {key+'.'+side for key in ORDER for side in ('before','after')}
+        allowed_stages = {PurePosixPath(self.root.stage_name(rel)).name for rel in (*TARGETS.values(),'state/transaction/journal.json')}
+        with self.root.parent('state/transaction/.unused') as (fd,_,check):
+            observed = set(os.listdir(fd))
+            need(expected_names <= observed and observed <= expected_names | allowed_stages, 'transaction_inventory_drift')
+            check()
+        for key in ORDER:
+            current = self.root.read(TARGETS[key])
+            choices = tuple(self.images[key].values()) if mixed else (self.images[key]['before'], self.images[key]['after'])
+            need(current in choices, 'target_unknown_drift')
+            stage = self.root.stage_name(TARGETS[key])
+            if self.root.exists(stage):
+                need(self.root.read(stage) in tuple(self.images[key].values()), 'replacement_stage_drift')
+        for name in ('hub','ds3'):
+            actual = tree_rows(self.root, name+'/runtime')
+            before, after = [self.plan['runtimeRows'][name][side] for side in ('before','after')]
+            need(len(actual) == len(before) == len(after), 'runtime_inventory_drift')
+            for observed, old, new in zip(actual, before, after):
+                need(observed == old or observed == new, 'runtime_unknown_drift')
+                if old != new:
+                    need(old[0] in (PE32,PE) and new[:2] == old[:2], 'plan_runtime_scope')
+        # Revalidate immutable staged bytes on every operation, including recovery.
+        for key in ORDER:
+            for side in ('before','after'):
+                need(self.root.read('state/transaction/'+key+'.'+side) == self.images[key][side], 'backup_drift')
+        need(allow_journal_stage or not self.root.exists(self.root.stage_name('state/transaction/journal.json')),
+             'outstanding_journal_stage_requires_recovery')
+
+    def side(self, side):
+        return all(self.root.read(TARGETS[key]) == self.images[key][side] for key in ORDER)
+
+    def run(self, side, recover=False):
+        need(side in ('before','after'), 'invalid_operation')
+        with self.root.lock():
+            self.preflight(mixed=recover,allow_journal_stage=recover)
+            if recover:
+                self.reconcile_journal_stage()
+            j = self.journal()
+            if not recover:
+                need(j['phase'] not in ('applying','rolling-back'), 'explicit_recovery_required')
+            else:
+                need(j['phase'] in ('applying','rolling-back','applied','rolled-back'), 'no_interrupted_transaction')
+                # Complete ONLY the durable direction already recorded before
+                # interruption; do not choose direction from whichever files exist.
+                side = 'after' if j['phase'] in ('applying','applied') else 'before'
+            start, end = ('applying','applied') if side == 'after' else ('rolling-back','rolled-back')
+            if self.side(side):
+                if j['phase'] != end:
+                    self.checkpoint(end)
+                return {'state':end.upper(),'changed':False,'liveStateChanged':False}
+            # Normal apply/rollback requires a complete exact opposing state;
+            # mixed targets are accepted only by explicit interruption recovery.
+            if not recover:
+                need(self.side('before' if side == 'after' else 'after'), 'mixed_state_requires_recovery')
+            self.checkpoint(start)
+            for key in (ORDER if side == 'after' else tuple(reversed(ORDER))):
+                current = self.root.read(TARGETS[key])
+                wanted = self.images[key][side]
+                if current == wanted:
+                    continue
+                self.preflight(mixed=True)
+                self.checkpoint(start, key)
+                self.root.replace(TARGETS[key], *wanted, current, event=self.event)
+            self.preflight(mixed=True)
+            need(self.side(side), 'postimage_mismatch')
+            self.checkpoint(end)
+            return {'state':end.upper(),'changed':True,'liveStateChanged':False}
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('operation', choices=('plan','apply','rollback','return','recover'))
+    parser.add_argument('fixture_root')
+    parser.add_argument('--commit')
+    parser.add_argument('--pe32-sha256')
+    parser.add_argument('--pe64-sha256')
+    parser.add_argument('--plan-sha256')
+    parser.add_argument('--policy-sha256')
+    parser.add_argument('--offline-fixture-gates', action='store_true')
+    args = parser.parse_args()
+    os.umask(0o077)
+    root = Root(Path(args.fixture_root))
+    try:
+        need(args.offline_fixture_gates, 'offline_fixture_ack_required')
+        if args.operation == 'plan':
+            with root.lock():
+                result = build(root, args.commit, args.pe32_sha256, args.pe64_sha256, args.policy_sha256)
+        else:
+            # Explicitly fixture-only. A production route must supply real source,
+            # doctor and both inactive-prefix checks; this flag cannot grant it.
+            tx = Transaction(root, args.plan_sha256, gate=lambda _: {'sourceAccepted':True,'doctorReady':True,'prefixesInactive':True})
+            result = tx.run('before' if args.operation == 'rollback' else 'after', recover=args.operation == 'recover')
+        print(json.dumps(result))
+    finally:
+        root.close()
+
+
+if __name__ == '__main__':
+    try:
+        main()
+    except (Blocked, OSError) as error:
+        print(json.dumps({'state':'BLOCKED','reason':str(error) if isinstance(error,Blocked) else type(error).__name__,'liveStateChanged':False}))
+        sys.exit(1)

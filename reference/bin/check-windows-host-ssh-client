@@ -1,0 +1,42 @@
+#!/usr/bin/python3
+from __future__ import annotations
+
+import json
+from pathlib import Path
+import re
+import sys
+
+
+ROOT = Path(__file__).resolve().parents[1]
+manifest = json.loads((ROOT / "manifests/windows-host-ssh-client.json").read_text())
+script = (ROOT / "bin/windows-host-ssh-client").read_text()
+docs = (ROOT / "docs/windows-host-ssh-client.md").read_text()
+architecture = (ROOT / "ARCHITECTURE.md").read_text()
+
+assert manifest["profile"] == "windows-host-ssh-client"
+assert manifest["sshPolicy"]["strictHostKeyChecking"] is True
+assert manifest["sshPolicy"]["passwordAuthentication"] is False
+assert manifest["dataBoundary"]["privateKeyReadOrCopied"] is False
+assert manifest["dataBoundary"]["hostFingerprintInGitOrEvidence"] is False
+for needle in (
+    "StrictHostKeyChecking yes",
+    "PasswordAuthentication no",
+    "KbdInteractiveAuthentication no",
+    "ForwardAgent no",
+    "independent_host_fingerprint_mismatch",
+    "rollback_refuses_managed_drift",
+):
+    assert needle in script
+for needle in ("host key", "runtime", "rollback", "Codex Remote"):
+    assert needle.lower() in docs.lower()
+assert "Codex Bridge strict SSH client and host-key pinning" in architecture
+
+# No real overlay IP, Windows account, tailnet DNS suffix, or pinned fingerprint
+# may enter the repository intent.
+combined = "\n".join((json.dumps(manifest), script, docs, architecture[-8000:]))
+assert not re.search(r"\b100\.(?:\d{1,3}\.){2}\d{1,3}\b", combined)
+assert not re.search(r"SHA256:[A-Za-z0-9+/]{30,}", combined)
+assert ".ts.net" not in combined
+
+print("validator_pass=true")
+sys.exit(0)

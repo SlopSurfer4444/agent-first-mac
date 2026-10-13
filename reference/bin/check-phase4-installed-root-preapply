@@ -1,0 +1,271 @@
+#!/usr/bin/python3
+"""Fail-closed validator for the installed-root pre-apply rollback handoff."""
+
+import hashlib
+import json
+import os
+from pathlib import Path
+import pwd
+import re
+import stat
+import subprocess
+import sys
+import tempfile
+
+
+ROOT = Path(__file__).resolve().parents[1]
+BASE = "217602def502f515f5c0c554f1d4c1d0aaabcb26"
+ACCEPTED_HEAD = "8b82037a0b7ec2e45e546641fc8128eb58d9b2a1"
+BRANCH = "codex/phase-4-root-broker-install-apply"
+COMMIT = BASE
+EVIDENCE = "evidence/phase-4/installed-root-preapply.json"
+MARKER = "CHECKPOINT_PHASE4_INSTALLED_ROOT_PREAPPLY_REVIEW"
+IMPLEMENTATION_SCOPE = {
+    "bin/check-phase4-installed-root-preapply",
+    "bin/phase4-owner-rollback-return",
+    "docs/phase-4-installed-root-phase-b.md",
+}
+GIT = ["/usr/bin/git", "-c", "core.fsmonitor=false", "-c",
+       "core.hooksPath=/dev/null"]
+
+
+def require(condition, reason):
+    if not condition:
+        raise RuntimeError(reason)
+
+
+def run(argv, *, cwd=ROOT, env=None):
+    return subprocess.run([str(value) for value in argv], cwd=cwd, env=env, text=True,
+                          stdout=subprocess.PIPE, stderr=subprocess.STDOUT, check=False)
+
+
+def checked(argv, *, cwd=ROOT, env=None):
+    result = run(argv, cwd=cwd, env=env)
+    require(result.returncode == 0,
+            f"command_failed_{Path(str(argv[0])).name}: {result.stdout[-1200:]}")
+    return result.stdout.strip()
+
+
+def git(*arguments, cwd=ROOT):
+    return checked([*GIT, *arguments], cwd=cwd)
+
+
+def digest(path):
+    value = hashlib.sha256()
+    with path.open("rb") as stream:
+        while chunk := stream.read(65536):
+            value.update(chunk)
+    return value.hexdigest()
+
+
+def scope(commit):
+    return set(git("diff-tree", "--no-commit-id", "--name-only", "-r", commit).splitlines())
+
+
+def worktree_scope():
+    lines = git("status", "--porcelain=v1", "--untracked-files=all").splitlines()
+    return {line[3:] for line in lines if len(line) > 3}
+
+
+def validate_git(mode):
+    require(git("branch", "--show-current") == BRANCH, "wrong_branch")
+    require(git("merge-base", "--is-ancestor", ACCEPTED_HEAD, "HEAD") == "", "accepted_head")
+    if mode == "contract":
+        require(git("rev-parse", "HEAD") == ACCEPTED_HEAD, "contract_head")
+        require(worktree_scope() == IMPLEMENTATION_SCOPE, "contract_scope")
+        return None, None
+    require(git("status", "--porcelain=v1", "--untracked-files=all") == "", "dirty_worktree")
+    if mode == "implementation":
+        implementation = git("rev-parse", "HEAD")
+        require(git("rev-parse", "HEAD^") == ACCEPTED_HEAD, "implementation_parent")
+        require(scope(implementation) == IMPLEMENTATION_SCOPE, "implementation_scope")
+        return implementation, None
+    require(git("rev-list", "--count", f"{BASE}..HEAD") == "6", "final_history_count")
+    evidence_commit = git("rev-parse", "HEAD")
+    implementation = git("rev-parse", "HEAD^")
+    require(git("rev-parse", "HEAD^^") == ACCEPTED_HEAD, "final_parent_chain")
+    require(scope(implementation) == IMPLEMENTATION_SCOPE, "final_implementation_scope")
+    require(scope(evidence_commit) == {EVIDENCE}, "final_evidence_scope")
+    evidence = json.loads((ROOT / EVIDENCE).read_text())
+    require(evidence["implementationCommit"] == implementation and
+            evidence["acceptedHead"] == ACCEPTED_HEAD and
+            evidence["gate"]["marker"] == MARKER and
+            evidence["gate"]["phase4PassClaimed"] is False and
+            evidence["gate"]["l3Claimed"] is False,
+            "evidence_contract")
+    if mode == "clone":
+        require(git("remote") == "", "clone_has_remote")
+    return implementation, evidence
+
+
+def exact_stat(path, mode, kind):
+    facts = path.lstat()
+    require(facts.st_uid == 0 and stat.S_IMODE(facts.st_mode) == mode, f"{kind}_owner_mode")
+    require((path.is_file() if kind == "file" else path.is_dir()) and not path.is_symlink(),
+            f"{kind}_type")
+    return facts.st_size
+
+
+def validate_installed():
+    binary = Path("/usr/local/libexec/aid-admin")
+    policy = Path("/etc/agent-first-mac/aid-admin-policy.json")
+    attestation = Path("/etc/agent-first-mac/aid-admin-install.json")
+    sudoers = Path("/etc/sudoers.d/agent-first-mac-aid-admin")
+    require(exact_stat(binary, 0o555, "file") == 466544, "binary_size")
+    require(exact_stat(policy, 0o444, "file") == 1617, "policy_size")
+    require(exact_stat(attestation, 0o400, "file") == 341, "attestation_size")
+    require(exact_stat(sudoers, 0o440, "file") == 122, "sudoers_size")
+    require(exact_stat(Path("/var/log/agent-first-mac/aid-admin"), 0o700, "directory") >= 0,
+            "audit_directory")
+    require(exact_stat(Path("/var/db/agent-first-mac/staging"), 0o700, "directory") >= 0,
+            "staging_directory")
+    require(digest(binary) == "adc6c151e89420159a6c807b267694030663572c9638a4c8763c1828d6b6a4a8",
+            "binary_hash")
+    require(digest(policy) == "2555b3f0ed1f75cd26bc41af6512ecc30d444ba1b0113458f72efcfccc304225",
+            "policy_hash")
+    require(not Path("/etc/agent-first-mac/aid-admin.disabled").exists() and
+            not Path("/etc/sudoers.d/agent-first-mac-aid-admin.disabled").exists(),
+            "emergency_disable_present")
+
+    owner = pwd.getpwuid(os.getuid()).pw_name
+    template = ROOT / "install-bundles/phase-4/aid-admin/agent-first-mac-aid-admin.sudoers-template"
+    rendered = template.read_text().replace("@@AGENT_OWNER@@", owner).encode()
+    require(hashlib.sha256(rendered).hexdigest() ==
+            "b51a2c60bae3652decef1df7ffe2fd66931ee317305fbf1bc5c50e491f5c3ee6" and
+            len(rendered) == 122, "rendered_sudoers")
+    with tempfile.NamedTemporaryFile(prefix="phase4-sudoers.", delete=False) as temporary:
+        temporary.write(rendered)
+        rendered_path = Path(temporary.name)
+    try:
+        rendered_path.chmod(0o440)
+        require(run(["/usr/sbin/visudo", "-cf", rendered_path]).returncode == 0,
+                "rendered_visudo")
+    finally:
+        rendered_path.unlink(missing_ok=True)
+
+    human = checked(["/usr/bin/sudo", "-n", binary, "doctor-root"])
+    machine = json.loads(checked(["/usr/bin/sudo", "-n", binary, "doctor-root", "--json"]))
+    require("ROOT_CONTRACT_READY" in human and machine["verdict"] == "ROOT_CONTRACT_READY" and
+            machine["systemMutationsPerformed"] is False and
+            all(machine["checks"].values()), "root_doctor")
+    return machine
+
+
+def validate_denies():
+    binary = "/usr/local/libexec/aid-admin"
+    cases = [
+        ["unknown"], ["apply-system", "bad"],
+        ["apply-system", COMMIT.upper()], ["apply-system", COMMIT[:-1]],
+        ["apply-system", COMMIT, "extra"], ["apply-system", "../../" + COMMIT],
+    ]
+    for arguments in cases:
+        require(run(["/usr/bin/sudo", "-n", binary, *arguments]).returncode != 0,
+                f"broker_negative_{arguments[0]}")
+    direct = [
+        ["/run/current-system/sw/bin/darwin-rebuild", "--help"],
+        ["/bin/sh", "-c", "exit 0"], ["/bin/zsh", "-c", "exit 0"],
+        ["/nix/var/nix/profiles/default/bin/nix-env", "--version"],
+        ["/usr/bin/git", "--version"], ["/usr/sbin/visudo", "-c"], ["/usr/bin/true"],
+    ]
+    for arguments in direct:
+        result = run(["/usr/bin/sudo", "-n", *arguments])
+        require(result.returncode != 0 and "password is required" in result.stdout,
+                f"direct_backend_not_denied_{Path(arguments[0]).name}")
+    return len(cases), len(direct)
+
+
+def validate_receipt_and_blocker():
+    output = checked([ROOT / "bin/phase4-owner-rollback-return", "--preflight"])
+    require("OWNER_ROLLBACK_RETURN_ACTION_PREPARED" in output and
+            "system_mutations_performed=false" in output, "owner_action_preflight")
+    consumed = Path.home() / "AIDev/state/phase-4/apply-receipts" / f"{COMMIT}.json"
+    require(not consumed.exists() and not consumed.is_symlink(), "consumed_receipt_present")
+    source = (ROOT / "Sources/AidAdminApply/main.swift").read_text()
+    policy = json.loads((ROOT / "policy/aid-admin-apply-policy.json").read_text())
+    require(policy["allowedCommands"] == ["apply-system", "doctor-root"] and
+            'case "rollback-system"' not in source and 'case "return-system"' not in source,
+            "closed_surface_drift")
+    return True
+
+
+def validate_compatibility():
+    main = Path.home() / "AIDev/control"
+    require(git("rev-parse", "HEAD", cwd=main) == BASE and
+            git("status", "--porcelain=v1", "--untracked-files=all", cwd=main) == "",
+            "protected_main")
+    checked([main / "bin/check-phase4-root-broker-prep", "--git-only"], cwd=main)
+    checked([main / "bin/check-phase2a"], cwd=main)
+    first = checked([main / "bin/phase2-doctor", "--json"], cwd=main)
+    second = checked([main / "bin/phase2-doctor", "--json"], cwd=main)
+    require(first == second and json.loads(first)["verdict"] == "PASS", "phase2_doctor")
+    require(run([*GIT, "diff", "--quiet", BASE, "--", "evidence/phase-2", "evidence/phase-3",
+                 "evidence/phase-4/preparation-acceptance.json"]).returncode == 0,
+            "accepted_evidence_changed")
+    for worktree_line in git("worktree", "list", "--porcelain").splitlines():
+        if worktree_line.startswith("worktree "):
+            worktree = Path(worktree_line.removeprefix("worktree "))
+            if worktree.resolve() != ROOT.resolve():
+                require(git("status", "--porcelain=v1", "--untracked-files=all",
+                            cwd=worktree) == "", f"dirty_worktree_{worktree.name}")
+
+
+def validate_static():
+    for path in (ROOT / "bin").iterdir():
+        if path.is_file() and path.read_bytes().startswith(b"#!/usr/bin/python3"):
+            compile(path.read_text(), str(path), "exec")
+    action = (ROOT / "bin/phase4-owner-rollback-return").read_text()
+    for forbidden in ("shell=True", "os.system", "popen(", "/bin/sh", "/bin/zsh"):
+        require(forbidden not in action, f"owner_action_forbidden_{forbidden}")
+    require(action.count('SUDO = "/usr/bin/sudo"') == 1 and
+            action.count('"--switch-generation"') == 2 and
+            "getpass" not in action and "input(" not in action and
+            "standardInput" not in action, "owner_action_surface")
+    documentation = (ROOT / "docs/phase-4-installed-root-phase-b.md").read_text()
+    require(MARKER in documentation and
+            "INSTALLED_ROOT_PREAPPLY_ROLLBACK_HANDOFF_REQUIRED" in documentation,
+            "documentation_marker")
+    tracked = set(git("ls-files").splitlines()) | IMPLEMENTATION_SCOPE
+    content = "\n".join((ROOT / path).read_text(errors="ignore") for path in sorted(tracked)
+                        if (ROOT / path).is_file() and
+                        not path.startswith("install-bundles/phase-4/aid-admin/aid-admin"))
+    require(re.search(r"/Users/[A-Za-z0-9._-]+", content) is None, "private_path_retained")
+    require(re.search(r"\b(?:hostname|serial|hardware_uuid|machine_uuid)\s*[:=]",
+                      content, re.IGNORECASE) is None, "stable_identifier_retained")
+    require("BEGIN " + "PRIVATE KEY" not in content, "secret_retained")
+    require(run([*GIT, "diff", "--check", ACCEPTED_HEAD]).returncode == 0, "diff_check")
+    require(run([*GIT, "fsck", "--full"]).returncode == 0, "git_fsck")
+
+
+def main():
+    args = sys.argv[1:]
+    require(args in ([], ["--contract"], ["--implementation"], ["--clone"]), "usage")
+    mode = "final" if not args else args[0].removeprefix("--")
+    implementation, evidence = validate_git(mode)
+    validate_static()
+    doctor = validate_installed()
+    broker_denies, direct_denies = validate_denies()
+    validate_receipt_and_blocker()
+    validate_compatibility()
+    if evidence is not None:
+        require(evidence["ownerAction"]["sha256"] ==
+                digest(ROOT / "bin/phase4-owner-rollback-return"), "owner_action_evidence_hash")
+    print(json.dumps({
+        "schema": 1, "result": "pass", "mode": mode,
+        "implementationCommit": implementation,
+        "installedRootDoctor": doctor["verdict"],
+        "brokerDenyCases": broker_denies, "directBackendDenyCases": direct_denies,
+        "consumedReceiptAbsent": True, "liveApplyStarted": False,
+        "rollbackReturnPromptFreeAvailable": False,
+        "ownerActionSHA256": digest(ROOT / "bin/phase4-owner-rollback-return"),
+        "phase4PassClaimed": False, "l3Claimed": False,
+        "verdict": "INSTALLED_ROOT_PREAPPLY_ROLLBACK_HANDOFF_REQUIRED",
+        "marker": MARKER,
+    }, indent=2, sort_keys=True))
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except Exception as error:
+        print(json.dumps({"result": "fail", "reason": str(error)}, sort_keys=True))
+        raise SystemExit(1)

@@ -1,0 +1,286 @@
+#!/usr/bin/python3
+"""Fail-closed static validator for the Mac Bridge M1 lifecycle."""
+
+import json
+from pathlib import Path
+import re
+import sys
+
+
+ROOT = Path(__file__).resolve().parent.parent
+MANIFEST = ROOT / "manifests/tailscale-windows-host-m1.json"
+
+
+def require(condition, reason):
+    if not condition:
+        raise RuntimeError(reason)
+
+
+def main():
+    require(sys.argv[1:] == [], "usage")
+    manifest_text = MANIFEST.read_text()
+    manifest = json.loads(manifest_text)
+    module = (ROOT / "darwin/tailscale.nix").read_text()
+    doctor = (ROOT / "bin/tailscale-windows-host-doctor").read_text()
+    doctor_tests = (ROOT / "tests/test_tailscale_windows-host_doctor.py").read_text()
+    key_script = (ROOT / "bin/create-windows-host-ssh-key").read_text()
+    docs = (ROOT / "docs/tailscale-windows-host-m1.md").read_text()
+    evidence = json.loads((ROOT /
+                           "evidence/tailscale-windows-host-m1/preparation.json").read_text())
+    correction_evidence = json.loads((
+        ROOT / "evidence/tailscale-windows-host-m1/partial-state-correction.json"
+    ).read_text())
+    architecture = (ROOT / "ARCHITECTURE.md").read_text()
+    agents = (ROOT / "AGENTS.md").read_text()
+    flake = (ROOT / "flake.nix").read_text()
+
+    require(manifest["schema"] == 1, "manifest_schema")
+    require(manifest["profile"] == "tailscale-windows-host-m1", "profile")
+    require(manifest["profileActive"] is True, "profile_active")
+    require(manifest["owner"] == {
+        "primary": "AIDev/control reviewed official standalone vendor-pkg lifecycle",
+        "lifecycleManifest": "manifests/tailscale-windows-host-m1.json",
+    }, "owner")
+    authorization = manifest["ownerAuthorization"]
+    require(authorization["phrase"] ==
+            "CONTROL QUIESCENT — M1 APPLY AUTHORIZED", "owner_phrase")
+    require(authorization["liveApplyAuthorized"] is True and
+            authorization["windowsMutationAuthorized"] is False and
+            authorization["phase5MutationAuthorized"] is False,
+            "authorization_boundary")
+
+    source = manifest["source"]
+    require(source["version"] == "1.98.10", "source_version")
+    require(source["url"] ==
+            "https://pkgs.tailscale.com/stable/Tailscale-1.98.10-macos.pkg",
+            "source_url")
+    require(source["sha256"] ==
+            "c2eaf5f660ad45a64d1ba43ee72401029a5cb06e6d148c5e90a987a6f546bc58",
+            "source_sha256")
+    require(source["nixHash"] ==
+            "sha256-wur19mCtRaZNG6Q+5yQBAppcsG5tFIxekKmHpvVGvFg=", "nix_hash")
+    require(source["packageIdentifier"] == "com.tailscale.ipn.macsys",
+            "package_identifier")
+    require(source["installerTeamIdentifier"] == "W5364U7YZB",
+            "installer_team")
+    require(source["preinstallSha256"] ==
+            "bd97a1bf3d6053f67d8f06772b9b142dc52fe9d659bcf0ce89d79bd484a8233d",
+            "preinstall_hash")
+    require(source["postinstallSha256"] ==
+            "41b7b0d699807d421bd29bb7e47f9df51bd38c597f8df3d695acd0dd886184fc",
+            "postinstall_hash")
+    require("signed-vendor-floor" in source["runtimeUpdatePolicy"],
+            "runtime_update_policy")
+
+    application = manifest["application"]
+    require(application == {
+        "path": "/Applications/Tailscale.app",
+        "bundleIdentifier": "io.tailscale.ipn.macsys",
+        "minimumVersion": "1.98.10",
+        "initialBundleVersion": "101.98.10",
+        "teamIdentifier": "W5364U7YZB",
+        "executable": "Contents/MacOS/Tailscale",
+        "canonicalCli": "Contents/MacOS/tailscale",
+        "systemExtension":
+            "Contents/Library/SystemExtensions/io.tailscale.ipn.macsys.network-extension.systemextension",
+        "systemExtensionBundleIdentifier":
+            "io.tailscale.ipn.macsys.network-extension",
+        "versionRelationship":
+            "application, embedded CLI, and System Extension must be one signed vendor release",
+    }, "application_identity")
+
+    companions = manifest["vendorCompanions"]
+    require(companions["receipt"] == "com.tailscale.ipn.macsys",
+            "receipt_identity")
+    require(companions["cliWrapper"] == "/usr/local/bin/tailscale" and
+            companions["cliWrapperSha256"] ==
+            "26b0e5a65e1b723e38f187619964b443e44118c2e02217e9b11165ce17afa65e",
+            "wrapper_identity")
+    require(companions["manPage"] ==
+            "/usr/local/share/man/man8/tssentineld.8" and
+            companions["manPageSha256"] ==
+            "723e0bf99d9b96f7eed77428bbfc518060515aaf047a880e662004081c483ca0",
+            "manpage_identity")
+
+    require(all(value is False for value in manifest["prestate"].values()),
+            "prestate_not_absent")
+    network = manifest["networkBoundary"]
+    for key in ["macRemoteLoginEnabled", "macInboundSshEnabled",
+                "tailscaleSshServerEnabled", "advertiseExitNode",
+                "advertiseSubnetRoutes", "remoteControlAssumed",
+                "handoffAssumed", "processMigrationPossible"]:
+        require(network[key] is False, "network_boundary_" + key)
+    require(network["macRole"] == "control surface and outbound SSH client" and
+            network["windowsRole"] == "remote execution host",
+            "bridge_roles")
+    require(all(value is False for value in manifest["dataBoundary"].values()),
+            "data_boundary")
+    lifecycle = manifest["lifecycle"]
+    require("immutable Nix store" in lifecycle["install"] and
+            "exact signed 1.98.10 application" in
+            lifecycle["partialStateRecovery"] and
+            "without reinstalling" in lifecycle["partialStateRecovery"],
+            "partial_state_lifecycle")
+    key = manifest["sshClientKey"]
+    require(key["algorithm"] == "Ed25519" and
+            key["privatePath"] == "$HOME/.ssh/windows-host_ed25519" and
+            key["publicPath"] == "$HOME/.ssh/windows-host_ed25519.pub" and
+            key["privateKeyMayLeaveMac"] is False and
+            key["publicBodyMayEnterGitOrEvidence"] is False and
+            key["allowedHandoffValue"] == "SHA256 public fingerprint only",
+            "ssh_key_boundary")
+
+    flag = re.search(r"tailscaleStandaloneEnabled = (true|false);", module)
+    require(flag is not None and
+            ((flag.group(1) == "true") == manifest["profileActive"]),
+            "module_profile_flag")
+    required_module_fragments = [
+        "pkgs.fetchurl", source["url"], source["nixHash"],
+        "/usr/sbin/pkgutil --check-signature",
+        "Developer ID Installer: Tailscale Inc. (W5364U7YZB)",
+        "/usr/sbin/spctl --assess --type install",
+        "/usr/sbin/installer -pkg \"$pkg\" -target /",
+        "verify_managed_target", "unexpected_or_competing_prestate",
+        "system_extension_registered", "mac_inbound_ssh_off",
+        "consent_bearing_system_extension_requires_owner_uninstall",
+        "remove_exact_unconsented_payload", "rollback_failed_install",
+        "marker_dir=/var/db/agent-first-mac/tailscale",
+        "marker=$marker_dir/managed-source", companions["cliWrapperSha256"],
+        companions["manPageSha256"], application["systemExtensionBundleIdentifier"],
+        "tailscaleCliWrapper = pkgs.writeTextFile",
+        "tailscaleManagedMarker = pkgs.writeText",
+        "system_extension_exact_enabled", "verify_exact_consent_partial",
+        "install_exact_wrapper", "install_managed_marker",
+        "Tailscale Standalone exact consent-bearing partial state adopted",
+    ]
+    for fragment in required_module_fragments:
+        require(fragment in module, "module_contract_missing")
+    require(module.index("if verify_managed_target") <
+            module.index("unexpected_or_competing_prestate"),
+            "exact_noop_order")
+    require(module.index("if verify_exact_consent_partial") <
+            module.index("unexpected_or_competing_prestate"),
+            "partial_adoption_order")
+    require('cli_version=$("$cli" version' not in module,
+            "stateful_cli_in_activation")
+    require("'%d:%i' \"$app_binary\"" in module and
+            "'%d:%i' \"$cli\"" in module,
+            "nonstateful_cli_identity")
+    require("./darwin/tailscale.nix" in flake, "flake_module_import")
+
+    for fragment in ["status", "--json", "debug", "prefs",
+                     "rawStatusStored", "identifiersEmitted",
+                     "system_extension_enabled", "backend_running",
+                     "no_advertised_routes", "not_using_exit_node",
+                     "tailscale_ssh_server_off", "mac_tcp22_not_listening"]:
+        require(fragment in doctor, "doctor_contract_missing")
+    require("print(status" not in doctor and "print(prefs" not in doctor,
+            "raw_status_output")
+    require("def no_advertised_routes(prefs):" in doctor and
+            '"AdvertiseRoutes" not in prefs' in doctor and
+            "routes is None or (isinstance(routes, list) and len(routes) == 0)"
+            in doctor, "advertised_routes_schema")
+    for fragment in ["test_null_and_empty_list_pass", "test_nonempty_list_fails",
+                     "test_missing_or_other_type_fails"]:
+        require(fragment in doctor_tests, "advertised_routes_fixture")
+
+    for fragment in ["/usr/bin/ssh-keygen -q -t ed25519 -N '' -C ''",
+                     "/bin/ln \"$staging/key\" \"$private_key\"",
+                     "dedicated Bridge key path collision",
+                     "stat -f '%u:%Lp' \"$private_key\"",
+                     "ssh-keygen -l -E sha256 -f \"$public_key\"",
+                     "printf 'fingerprint=%s\\n' \"$fingerprint\""]:
+        require(fragment in key_script, "key_contract_missing")
+    for forbidden in ["ssh-keygen -y", "cat \"$private_key\"",
+                      "cp \"$private_key\"", "printf '%s' \"$public_key\""]:
+        require(forbidden not in key_script, "private_or_public_material_output")
+
+    require("## 32. Codex Bridge Mac M1 outbound control lifecycle" in architecture,
+            "architecture_contract")
+    require("## 33. Codex Bridge M1 consent-bearing partial-state correction"
+            in architecture, "correction_architecture_contract")
+    require(authorization["phrase"] in agents, "agents_authorization")
+    require("System Settings" in docs and "Network Extensions" in docs and
+            "Windows W1" in docs, "operator_handoff")
+    require("partial state with the matching enabled extension" in docs and
+            "never invokes the embedded CLI" in docs,
+            "correction_operator_contract")
+    require(".#darwinConfigurations.bootstrap-with-homebrew.system" in docs and
+            "./bin/prepare-productivity-apply <exact-commit>" in docs,
+            "current_system_receipt_gate")
+    require(".#darwinConfigurations.bootstrap.system" not in docs,
+            "wrong_system_target")
+    require(evidence == {
+        "schema": 1,
+        "profile": "tailscale-windows-host-m1",
+        "result": "prepared",
+        "officialStableVersion": "1.98.10",
+        "packageChecksumVerified": True,
+        "installerSignatureVerified": True,
+        "installerNotarizationVerified": True,
+        "applicationIdentityVerifiedInQuarantine": True,
+        "systemExtensionIdentityVerifiedInQuarantine": True,
+        "collisionFreePrestate": True,
+        "macInboundSshOff": True,
+        "dedicatedKeyPrestateAbsent": True,
+        "secretsOrIdentifiersStored": False,
+        "systemMutationsPerformed": False,
+    }, "preparation_evidence")
+
+    require(correction_evidence == {
+        "schema": 1,
+        "profile": "tailscale-windows-host-m1",
+        "result": "correction-prepared",
+        "officialPackagePostinstallReviewedAsData": True,
+        "signedApplicationIdentityVerified": True,
+        "packageReceiptVerified": True,
+        "vendorManPageVerified": True,
+        "cliWrapperAbsent": True,
+        "managedMarkerAbsent": True,
+        "matchingSystemExtensionEnabled": True,
+        "competingVariantPresent": False,
+        "macInboundSshOff": True,
+        "vpnOrAuthenticationStateRead": False,
+        "rawStatusStored": False,
+        "identifiersStored": False,
+        "windowsMutationPerformed": False,
+    }, "partial_state_correction_evidence")
+
+    combined = "\n".join([manifest_text, module, doctor, key_script, docs,
+                            doctor_tests,
+                            json.dumps(evidence, sort_keys=True),
+                            json.dumps(correction_evidence, sort_keys=True)])
+    require(re.search(r"/Users/[A-Za-z0-9._-]+/", combined) is None,
+            "stable_user_path_in_repository")
+    require(re.search(
+        r"\b100\.(?:6[4-9]|[7-9][0-9]|1[01][0-9]|12[0-7])(?:\.[0-9]{1,3}){2}\b",
+        combined) is None, "overlay_address_in_repository")
+    for forbidden in ["BEGIN OPENSSH PRIVATE KEY", "BEGIN PRIVATE KEY",
+                      "ssh-ed25519 AAAA", "authkey=", "oauth_token",
+                      "access_token"]:
+        require(forbidden not in combined, "forbidden_repository_material")
+    for forbidden in ["systemsetup -setremotelogin on",
+                      "launchctl enable system/com.openssh.sshd",
+                      "tailscale up", "--advertise-exit-node",
+                      "--advertise-routes"]:
+        require(forbidden not in module and forbidden not in key_script,
+                "forbidden_mutation_surface")
+
+    print(json.dumps({
+        "schema": 1,
+        "result": "pass",
+        "profileActive": manifest["profileActive"],
+        "officialStandalone": True,
+        "fixedOutputSource": True,
+        "macInboundSshEnabled": False,
+        "windowsMutationAuthorized": False,
+        "secretsOrIdentifiersStored": False,
+    }, indent=2, sort_keys=True))
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except Exception as error:
+        print(json.dumps({"result": "fail", "reason": str(error)}, sort_keys=True))
+        raise SystemExit(1)

@@ -1,0 +1,93 @@
+#!/usr/bin/python3
+"""Read-only repository doctor for the Phase 3 apply review packet."""
+
+import json
+from pathlib import Path
+import runpy
+import subprocess
+import sys
+
+ROOT = Path(__file__).resolve().parents[1]
+BASE = "46597a386212e8007e1fa4ef2decddbcbc5c99a2"
+PREP = "9602193d730d73517cf2a8442d2b109b6fab317b"
+OVERRIDE = "579bfefd76e7331c7333f66947639daadfc46506"
+BRANCH = "codex/phase-3-permissions-apply"
+MARKER = "READY_FOR_INDEPENDENT_PHASE3_ACCEPTANCE_REVIEW"
+
+
+def git(*args):
+    result = subprocess.run(
+        ["/usr/bin/git", *args], cwd=ROOT, text=True,
+        stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, check=False,
+    )
+    return result.returncode, result.stdout.strip()
+
+
+def main():
+    if sys.argv[1:] not in ([], ["--json"]):
+        raise SystemExit("usage: phase3-permissions-doctor [--json]")
+    branch_status, branch = git("branch", "--show-current")
+    clean_status, dirty = git("status", "--porcelain")
+    parent_status, parent = git("rev-parse", f"{PREP}^")
+    head_parent_status, head_parent = git("rev-parse", "HEAD^")
+    ancestor_status, _ = git("merge-base", "--is-ancestor", BASE, "HEAD")
+    git_exact = (
+        branch_status == clean_status == parent_status == head_parent_status == 0
+        and branch == BRANCH and dirty == "" and parent == BASE
+        and head_parent == PREP and ancestor_status == 0
+    )
+    problems = []
+    try:
+        validator = runpy.run_path(
+            str(ROOT / "bin/check-phase3-permissions-apply"),
+            run_name="phase3_review_validator",
+        )
+        plan = json.loads((ROOT / "manifests/phase3-permissions-apply.json").read_text())
+        evidence = json.loads(
+            (ROOT / "evidence/phase-3/permissions-apply-verification.json").read_text()
+        )
+        intent = validator["validate_files"]()
+        validator["validate_plan"](plan, intent)
+        validator["validate_evidence"](evidence)
+        validator["validate_git"](False)
+    except Exception:
+        problems.append("review_packet_validation_failed")
+    if not git_exact:
+        problems.append("control_git_not_exact_and_clean")
+    report = {
+        "schema": 1,
+        "phase": "phase3_permission_ceremony_apply_review_packet",
+        "read_only": True,
+        "control_git": {
+            "accepted_control_main": BASE,
+            "reviewed_apply_intent_commit": PREP,
+            "branch_expected": branch_status == 0 and branch == BRANCH,
+            "clean": clean_status == 0 and dirty == "",
+            "history_exact": git_exact,
+        },
+        "review_packet": {
+            "owner_override_provenance_commit": OVERRIDE,
+            "standalone": True,
+            "boolean_evidence_verified": not problems,
+            "independent_acceptance_required": True,
+            "phase3_pass_claimed": False,
+            "l2_remains_claimed": True,
+            "l3_claimed": False,
+        },
+        "live_capability_probe_performed": False,
+        "system_mutations_performed": False,
+        "problems": sorted(set(problems)),
+        "verdict": MARKER if not problems else "BLOCKED",
+    }
+    if sys.argv[1:] == ["--json"]:
+        print(json.dumps(report, indent=2, sort_keys=True))
+    else:
+        print(f"Phase 3 permissions doctor: {report['verdict']}")
+        print(f"control_git_exact={str(git_exact).lower()}")
+        print("live_capability_probe_performed=false")
+        print("system_mutations_performed=false")
+    raise SystemExit(0 if not problems else 1)
+
+
+if __name__ == "__main__":
+    main()

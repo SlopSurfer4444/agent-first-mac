@@ -1,0 +1,77 @@
+#!/bin/zsh
+set -eu
+export LC_ALL=C
+
+readonly CODEX_BINARY='/Applications/ChatGPT.app/Contents/Resources/codex'
+readonly SAFE_PATH='/usr/bin:/bin:/usr/sbin:/sbin'
+readonly OWNER_HOME=$(/usr/bin/python3 -c 'import os, pwd; print(pwd.getpwuid(os.getuid()).pw_dir)')
+
+if [[ $# -ne 4 || "$1" != "--root" || "$3" != "--" ]]; then
+  print -u2 'usage: codex-quarantine --root /absolute/quarantine/repo -- "single task"'
+  exit 2
+fi
+
+requested_root=$2
+prompt=$4
+
+if [[ "$OWNER_HOME" != /* || "$OWNER_HOME" == *[[:cntrl:]]* || "$OWNER_HOME" == *\\* || "$OWNER_HOME" == *\"* ]]; then
+  print -u2 'canonical owner home is unsafe'
+  exit 2
+fi
+if [[ "$requested_root" != /* || "$requested_root" == *[[:cntrl:]]* || "$requested_root" == *\\* || "$requested_root" == *\"* ]]; then
+  print -u2 'quarantine root must be one safe absolute path'
+  exit 2
+fi
+if [[ ! -d "$requested_root" || -L "$requested_root" ]]; then
+  print -u2 'quarantine root does not exist'
+  exit 2
+fi
+
+root=$(builtin cd "$requested_root" && /bin/pwd -P)
+if [[ "$root" != "$requested_root" ]]; then
+  print -u2 'quarantine root must already be canonical'
+  exit 2
+fi
+if [[ ! -d "$OWNER_HOME/.codex" || -L "$OWNER_HOME/.codex" ]]; then
+  print -u2 'canonical Codex home is unavailable'
+  exit 2
+fi
+if [[ ! -d "$OWNER_HOME/AIDev/quarantine" || -L "$OWNER_HOME/AIDev/quarantine" ]]; then
+  print -u2 'canonical quarantine directory is unavailable'
+  exit 2
+fi
+quarantine_root=$(builtin cd "$OWNER_HOME/AIDev/quarantine" && /bin/pwd -P)
+if [[ "$root" != "$quarantine_root"/* ]]; then
+  print -u2 'root must be a child of $HOME/AIDev/quarantine'
+  exit 2
+fi
+
+if [[ ! -f "$CODEX_BINARY" || ! -x "$CODEX_BINARY" || -L "$CODEX_BINARY" ]]; then
+  print -u2 'canonical Codex CLI is unavailable'
+  exit 2
+fi
+
+project_override="projects.\"$root\".trust_level=\"untrusted\""
+exec /usr/bin/env -i \
+  HOME="$OWNER_HOME" \
+  CODEX_HOME="$OWNER_HOME/.codex" \
+  PATH="$SAFE_PATH" \
+  LANG=C \
+  LC_ALL=C \
+  SHELL=/bin/zsh \
+  "$CODEX_BINARY" exec \
+  --ignore-user-config \
+  --ignore-rules \
+  --ephemeral \
+  --profile quarantine \
+  --cd "$root" \
+  --config 'approval_policy="never"' \
+  --config 'web_search="disabled"' \
+  --config 'allow_login_shell=false' \
+  --config 'mcp_servers={}' \
+  --config 'features.apps=false' \
+  --config 'features.plugins=false' \
+  --config 'features.remote_plugin=false' \
+  --config "$project_override" \
+  -- \
+  "$prompt"

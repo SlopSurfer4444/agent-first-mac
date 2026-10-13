@@ -1,0 +1,4679 @@
+#!/usr/bin/python3
+"""Exact user-level Phase 5 Codex apply, rollback, return, and verification."""
+
+import argparse
+import ctypes
+import errno
+import hashlib
+import importlib.machinery
+import importlib.util
+import json
+import os
+from pathlib import Path
+import pwd
+import re
+import select
+import stat
+import subprocess
+import time
+
+
+ROOT = Path(__file__).resolve().parents[1]
+MANIFEST_PATH = ROOT / "manifests/phase5-apply-bundle.json"
+MERGE_TOOL = ROOT / "bin/phase5-config-transaction"
+VALIDATOR = ROOT / "bin/check-phase5-apply-bundle"
+CODEX = Path("/Applications/ChatGPT.app/Contents/Resources/codex")
+GIT = Path("/usr/bin/git")
+RUN_ID = re.compile(r"^p5-[0-9a-f]{32}$")
+HEX40 = re.compile(r"^[0-9a-f]{40}$")
+HEX64 = re.compile(r"^[0-9a-f]{64}$")
+MAX_CONFIG = 1024 * 1024
+MAX_GENERATED = 256 * 1024
+MAX_RPC_LINE = 4 * 1024 * 1024
+RENAME_SWAP = 0x00000002
+RENAME_EXCL = 0x00000004
+SAFE_ENVIRONMENT = {
+    "LANG": "C",
+    "LC_ALL": "C",
+    "PATH": "/usr/bin:/bin:/usr/sbin:/sbin",
+    "SHELL": "/bin/zsh",
+}
+TARGET_IDS = (
+    "config",
+    "global-agents",
+    "quarantine-profile",
+    "hooks-definition",
+    "hook-router",
+    "skill-definition",
+    "skill-metadata",
+    "quarantine-launcher",
+)
+LEGACY_RUN_ID = "p5-fa188ec22716bd13c56ae3c11a53e653"
+LEGACY_ACCEPTED_COMMIT = "9521f21711b5d6124e295dd02305d3ac966bd6ed"
+LEGACY_MANIFEST_SHA256 = (
+    "b1b096fe1b9b12b94b753972ffabc64a2dd5628f3fea1ac7cccea5c4052e9896"
+)
+LEGACY_RECEIPT_SHA256 = (
+    "814275f2ce3e81fb3617f08ee02c4d6a6992670b8b4a175966f4ca2a7b323bf9"
+)
+LEGACY_RECEIPT_CORE_SHA256 = (
+    "6bb8e7a71b5fcdb83773387f739c5df6101a171253beeab0247715606e32162c"
+)
+LEGACY_CONFIG_BASE_SHA256 = (
+    "58b2800ab9444592b705a88131a2edca2a1e94b9d4dc8f2da457ee9543788896"
+)
+LEGACY_CONFIG_BASE_LENGTH = 5761
+LEGACY_CONFIG_DRIFT_SHA256 = (
+    "99ab76e732e8ae705578228a1b2ef90b78e28b2c45523ef01cb1a96e568d4964"
+)
+LEGACY_CONFIG_DRIFT_LENGTH = 6300
+LEGACY_PROJECT_INSERT_OFFSET = 5455
+LEGACY_HOOK_OVERLAY_SHA256 = (
+    "81ad5392fe6d55b8cb4e8fdf5dbbc945e5a6c79b39ed065b40d9667c516feccb"
+)
+LEGACY_HOOK_OVERLAY_LENGTH = 472
+REJECTED_CONFIG_COMPOSER_SHA256 = (
+    "31a65746b8b0437f6af4dac97ab9d885939e008201f50f5c31be071c08ddab7b"
+)
+REJECTED_CONFIG_COMPOSER_LENGTH = 6285
+OVERLAY_RECEIPT = "external-config-overlay.json"
+OVERLAY_PREIMAGE = "config-before-overlay-reconciliation"
+RUNTIME_LAYER_DIRECTORY = "private-current-runtime"
+RUNTIME_CURRENT_OBJECT = "current-config"
+RUNTIME_ROLLBACK_OBJECT = "rollback-composition"
+RUNTIME_RETURN_OBJECT = "return-composition"
+RUNTIME_COMPANION = "runtime-layer-receipt.json"
+RUNTIME_LAYER_OBJECTS = (
+    RUNTIME_CURRENT_OBJECT,
+    RUNTIME_ROLLBACK_OBJECT,
+    RUNTIME_RETURN_OBJECT,
+    RUNTIME_COMPANION,
+)
+HOOK_TRUST_RECORDS = (
+    (
+        "preToolUse",
+        "pre_tool_use:0:0",
+        "sha256:1e8fd91f2e5e662f57c1200ca05c4a0b274c034603b5008e793f061c8cc2f1bd",
+    ),
+    (
+        "sessionStart",
+        "session_start:0:0",
+        "sha256:d9671fa6e250a531fbc07ef2d75d19adfa5f88541f05e2b5f23168ff53e34f6b",
+    ),
+    (
+        "stop",
+        "stop:0:0",
+        "sha256:75a28e1a7c3a64cdaad8d46ef0c7b44e0c77e6bd6a0659892a3457ef3eedbcf4",
+    ),
+)
+EMPTY_HOOKS = {
+    event: []
+    for event in (
+        "PermissionRequest",
+        "PostCompact",
+        "PostToolUse",
+        "PreCompact",
+        "PreToolUse",
+        "SessionStart",
+        "SessionEnd",
+        "Stop",
+        "SubagentStart",
+        "SubagentStop",
+        "UserPromptSubmit",
+    )
+}
+TARGET_SPECS = {
+    "config": (
+        "codex/trusted-intent.toml",
+        "$HOME/.codex/config.toml",
+        "merge-top-level",
+        None,
+    ),
+    "global-agents": (
+        "codex/global-AGENTS.md",
+        "$HOME/.codex/AGENTS.md",
+        "replace",
+        0o600,
+    ),
+    "quarantine-profile": (
+        "codex/quarantine.config.toml",
+        "$HOME/.codex/quarantine.config.toml",
+        "replace",
+        0o600,
+    ),
+    "hooks-definition": (
+        "codex/hooks.json",
+        "$HOME/.codex/hooks.json",
+        "replace",
+        0o600,
+    ),
+    "hook-router": (
+        "codex/hooks/phase5-contract.py",
+        "$HOME/.codex/hooks/phase5-contract.py",
+        "replace",
+        0o600,
+    ),
+    "skill-definition": (
+        "skills/manage-workstation/SKILL.md",
+        "$HOME/.codex/skills/manage-workstation/SKILL.md",
+        "replace",
+        0o600,
+    ),
+    "skill-metadata": (
+        "skills/manage-workstation/agents/openai.yaml",
+        "$HOME/.codex/skills/manage-workstation/agents/openai.yaml",
+        "replace",
+        0o600,
+    ),
+    "quarantine-launcher": (
+        "bin/codex-quarantine",
+        "$HOME/AIDev/bin/codex-quarantine",
+        "replace",
+        0o700,
+    ),
+}
+
+
+class TransactionError(RuntimeError):
+    pass
+
+
+class Layout:
+    def __init__(self, home, control, state_root, codex_home, aid_bin, uid=None):
+        self.home = Path(home)
+        self.control = Path(control)
+        self.state_root = Path(state_root)
+        self.codex_home = Path(codex_home)
+        self.aid_bin = Path(aid_bin)
+        self.uid = os.getuid() if uid is None else uid
+
+    def targets(self):
+        return {
+            "config": self.codex_home / "config.toml",
+            "global-agents": self.codex_home / "AGENTS.md",
+            "quarantine-profile": self.codex_home / "quarantine.config.toml",
+            "hooks-definition": self.codex_home / "hooks.json",
+            "hook-router": self.codex_home / "hooks/phase5-contract.py",
+            "skill-definition":
+                self.codex_home / "skills/manage-workstation/SKILL.md",
+            "skill-metadata":
+                self.codex_home / "skills/manage-workstation/agents/openai.yaml",
+            "quarantine-launcher": self.aid_bin / "codex-quarantine",
+        }
+
+    def managed_directories(self):
+        return (
+            self.codex_home / "hooks",
+            self.codex_home / "skills/manage-workstation",
+            self.codex_home / "skills/manage-workstation/agents",
+        )
+
+
+def fail(reason):
+    raise TransactionError(reason)
+
+
+def digest_bytes(value):
+    return hashlib.sha256(value).hexdigest()
+
+
+def digest_file(path):
+    value = hashlib.sha256()
+    with Path(path).open("rb") as stream:
+        while True:
+            chunk = stream.read(65536)
+            if not chunk:
+                return value.hexdigest()
+            value.update(chunk)
+
+
+def strict_json_bytes(value, reason):
+    def unique(pairs):
+        result = {}
+        for key, item in pairs:
+            if key in result:
+                fail(reason)
+            result[key] = item
+        return result
+
+    try:
+        return json.loads(value, object_pairs_hook=unique)
+    except TransactionError:
+        raise
+    except Exception:
+        fail(reason)
+
+
+def canonical_account_home():
+    path = Path(pwd.getpwuid(os.getuid()).pw_dir)
+    if not path.is_absolute():
+        fail("canonical_home")
+    return path
+
+
+def clean_environment(home=None, codex_home=None):
+    value = dict(SAFE_ENVIRONMENT)
+    if home is not None:
+        value["HOME"] = str(home)
+    if codex_home is not None:
+        value["CODEX_HOME"] = str(codex_home)
+    return value
+
+
+def toml_basic_string(value):
+    if not isinstance(value, str) or "\x00" in value:
+        fail("config_overlay_path")
+    return json.dumps(value, ensure_ascii=False)
+
+
+def normalized_rpc_value(value, layout, parser_home):
+    substitutions = (
+        (str(parser_home), "$PARSER_HOME"),
+        (str(layout.home), "$HOME"),
+    )
+    if isinstance(value, dict):
+        return {
+            key: normalized_rpc_value(item, layout, parser_home)
+            for key, item in value.items()
+        }
+    if isinstance(value, list):
+        return [
+            normalized_rpc_value(item, layout, parser_home)
+            for item in value
+        ]
+    if isinstance(value, str):
+        result = value
+        for source, replacement in substitutions:
+            result = result.replace(source, replacement)
+        return result
+    return value
+
+
+def rpc_response(process, request, identifier):
+    encoded = (
+        json.dumps(request, sort_keys=True, separators=(",", ":")) + "\n"
+    )
+    try:
+        process.stdin.write(encoded)
+        process.stdin.flush()
+    except Exception:
+        fail("config_overlay_parser")
+    deadline = time.monotonic() + 10
+    while time.monotonic() < deadline:
+        try:
+            ready, _, _ = select.select([process.stdout], [], [], 0.25)
+        except Exception:
+            fail("config_overlay_parser")
+        if not ready:
+            if process.poll() is not None:
+                fail("config_overlay_parser")
+            continue
+        line = process.stdout.readline(MAX_RPC_LINE + 1)
+        if not line or len(line.encode()) > MAX_RPC_LINE:
+            fail("config_overlay_parser")
+        try:
+            value = strict_json_bytes(
+                line.encode(),
+                "config_overlay_parser",
+            )
+        except Exception:
+            fail("config_overlay_parser")
+        if value.get("id") == identifier:
+            if "error" in value or set(value) - {"id", "result"}:
+                fail("config_overlay_parser")
+            return value.get("result")
+    fail("config_overlay_parser")
+
+
+def config_snapshot_in_run(layout, run_root, value):
+    """Parse one config with the installed app-server without a model call."""
+    run_handle = open_directory(
+        run_root,
+        layout.uid,
+        {0o700},
+        layout.home,
+    )
+    workspace = None
+    config_identity = None
+    retained_config = None
+    process = None
+    name = ".overlay-check-" + os.urandom(8).hex()
+    try:
+        workspace = make_child_directory(
+            run_handle,
+            name,
+            0o700,
+            exclusive=True,
+        )
+        config_identity = write_new_at(
+            workspace,
+            "config.toml",
+            value,
+            layout.uid,
+            0o600,
+        )
+        process = subprocess.Popen(
+            [
+                str(CODEX),
+                "app-server",
+                "--listen",
+                "stdio://",
+                "-c",
+                "analytics.enabled=false",
+            ],
+            env=clean_environment(".", "."),
+            text=True,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            pass_fds=(workspace.descriptor,),
+            preexec_fn=lambda: os.fchdir(workspace.descriptor),
+            bufsize=1,
+        )
+        initialized = rpc_response(
+            process,
+            {
+                "id": 1,
+                "method": "initialize",
+                "params": {
+                    "capabilities": {"experimentalApi": True},
+                    "clientInfo": {
+                        "name": "phase5-config-overlay-validator",
+                        "version": "1",
+                    },
+                },
+            },
+            1,
+        )
+        if not isinstance(initialized, dict):
+            fail("config_overlay_parser")
+        response = rpc_response(
+            process,
+            {
+                "id": 2,
+                "method": "config/read",
+                "params": {"includeLayers": False},
+            },
+            2,
+        )
+        if (
+            not isinstance(response, dict)
+            or set(response) != {"config", "origins"}
+            or not isinstance(response["config"], dict)
+            or not isinstance(response["origins"], dict)
+        ):
+            fail("config_overlay_parser")
+        return normalized_rpc_value(
+            response["config"],
+            layout,
+            workspace.path,
+        )
+    finally:
+        parser_failed = False
+        if process is not None:
+            try:
+                if process.stdin is not None:
+                    process.stdin.close()
+            except Exception:
+                pass
+            try:
+                process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                process.terminate()
+                try:
+                    process.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    process.wait(timeout=5)
+            if process.returncode != 0:
+                parser_failed = True
+            if process.stderr is not None:
+                error = process.stderr.read()
+                if error:
+                    parser_failed = True
+        if workspace is not None:
+            clear_private_parser_state(
+                workspace,
+                {"config.toml"} if config_identity is not None else set(),
+            )
+            if config_identity is not None:
+                # Retain the exact inode across unlink.  The nlink=0 check is
+                # a production-path proof that parser failure cannot retain
+                # the private overlay by another directory entry.
+                retained_config = os.open(
+                    "config.toml",
+                    os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW,
+                    dir_fd=workspace.descriptor,
+                )
+                unlink_exact_at(
+                    workspace,
+                    "config.toml",
+                    config_identity,
+                )
+                try:
+                    retained_facts = os.fstat(retained_config)
+                    if ((retained_facts.st_dev, retained_facts.st_ino) != config_identity or
+                            retained_facts.st_nlink != 0):
+                        fail("config_overlay_cleanup")
+                finally:
+                    os.close(retained_config)
+                    retained_config = None
+            try:
+                remove_child_directory(run_handle, workspace)
+                try:
+                    os.stat(name, dir_fd=run_handle.descriptor,
+                            follow_symlinks=False)
+                except FileNotFoundError:
+                    pass
+                else:
+                    fail("config_overlay_cleanup")
+            finally:
+                workspace.close()
+        run_handle.close()
+        # Parser errors are emitted only after descriptor-rooted cleanup has
+        # removed every disposable object and closed every retained fd.
+        if parser_failed:
+            fail("config_overlay_parser")
+
+
+DIRECTORY_FLAGS = (
+    os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+)
+SAFE_DIRECTORY_MODES = {0o700, 0o750, 0o755}
+
+
+def directory_identity(facts):
+    return (
+        facts.st_dev,
+        facts.st_ino,
+        facts.st_uid,
+        stat.S_IFMT(facts.st_mode),
+        stat.S_IMODE(facts.st_mode),
+    )
+
+
+class DirectoryHandle:
+    """One directory reached through an exact no-follow descriptor chain."""
+
+    def __init__(self, path, user_root, uid, descriptor, chain):
+        self.path = Path(path)
+        self.user_root = Path(user_root)
+        self.uid = uid
+        self.descriptor = descriptor
+        self.chain = tuple(chain)
+        self.closed = False
+
+    @staticmethod
+    def validate_path(path, user_root):
+        path = Path(path)
+        user_root = Path(user_root)
+        if (
+            not path.is_absolute()
+            or not user_root.is_absolute()
+            or ".." in path.parts
+            or ".." in user_root.parts
+            or not (path == user_root or user_root in path.parents)
+        ):
+            fail("directory_path")
+        return path, user_root
+
+    @classmethod
+    def open(
+        cls,
+        path,
+        user_root,
+        uid,
+        modes=SAFE_DIRECTORY_MODES,
+        *,
+        allow_missing=False,
+    ):
+        path, user_root = cls.validate_path(path, user_root)
+        descriptor = -1
+        current = Path(path.anchor)
+        chain = []
+        try:
+            descriptor = os.open(path.anchor, DIRECTORY_FLAGS)
+            root_facts = os.fstat(descriptor)
+            if not stat.S_ISDIR(root_facts.st_mode):
+                fail("directory_metadata")
+            chain.append((None, directory_identity(root_facts)))
+            for name in path.parts[1:]:
+                try:
+                    child = os.open(
+                        name,
+                        DIRECTORY_FLAGS,
+                        dir_fd=descriptor,
+                    )
+                except FileNotFoundError:
+                    if allow_missing:
+                        os.close(descriptor)
+                        return None
+                    fail("directory_missing")
+                except OSError as error:
+                    if error.errno in {errno.ELOOP, errno.ENOTDIR}:
+                        fail("directory_symlink")
+                    fail("directory_open")
+                os.close(descriptor)
+                descriptor = child
+                current = current / name
+                facts = os.fstat(descriptor)
+                if not stat.S_ISDIR(facts.st_mode):
+                    fail("directory_metadata")
+                if current == user_root or user_root in current.parents:
+                    if (
+                        facts.st_uid != uid
+                        or stat.S_IMODE(facts.st_mode)
+                        not in SAFE_DIRECTORY_MODES
+                        or facts.st_mode & 0o022
+                    ):
+                        fail("directory_metadata")
+                chain.append((name, directory_identity(facts)))
+            final = os.fstat(descriptor)
+            if (
+                final.st_uid != uid
+                or stat.S_IMODE(final.st_mode) not in modes
+                or final.st_mode & 0o022
+            ):
+                fail("directory_metadata")
+            return cls(path, user_root, uid, descriptor, chain)
+        except Exception:
+            if descriptor >= 0:
+                os.close(descriptor)
+            raise
+
+    @classmethod
+    def child(cls, parent, name, modes=SAFE_DIRECTORY_MODES):
+        if (
+            not isinstance(name, str)
+            or not name
+            or name in {".", ".."}
+            or "/" in name
+        ):
+            fail("directory_path")
+        parent.verify()
+        try:
+            descriptor = os.open(
+                name,
+                DIRECTORY_FLAGS,
+                dir_fd=parent.descriptor,
+            )
+        except FileNotFoundError:
+            return None
+        except OSError as error:
+            if error.errno in {errno.ELOOP, errno.ENOTDIR}:
+                fail("directory_symlink")
+            fail("directory_open")
+        facts = os.fstat(descriptor)
+        if (
+            not stat.S_ISDIR(facts.st_mode)
+            or facts.st_uid != parent.uid
+            or stat.S_IMODE(facts.st_mode) not in modes
+            or facts.st_mode & 0o022
+        ):
+            os.close(descriptor)
+            fail("directory_metadata")
+        value = cls(
+            parent.path / name,
+            parent.user_root,
+            parent.uid,
+            descriptor,
+            parent.chain + ((name, directory_identity(facts)),),
+        )
+        try:
+            value.verify()
+            return value
+        except Exception:
+            value.close()
+            raise
+
+    def verify(self):
+        if self.closed:
+            fail("directory_descriptor_closed")
+        try:
+            if directory_identity(os.fstat(self.descriptor)) != self.chain[-1][1]:
+                fail("directory_chain_changed")
+            descriptor = os.open(self.path.anchor, DIRECTORY_FLAGS)
+            try:
+                facts = os.fstat(descriptor)
+                if directory_identity(facts) != self.chain[0][1]:
+                    fail("directory_chain_changed")
+                for index, (name, expected) in enumerate(self.chain[1:], 1):
+                    child = os.open(
+                        name,
+                        DIRECTORY_FLAGS,
+                        dir_fd=descriptor,
+                    )
+                    os.close(descriptor)
+                    descriptor = child
+                    if directory_identity(os.fstat(descriptor)) != expected:
+                        fail("directory_chain_changed")
+            finally:
+                os.close(descriptor)
+        except TransactionError:
+            raise
+        except OSError:
+            fail("directory_chain_changed")
+
+    def names(self):
+        self.verify()
+        try:
+            result = os.listdir(self.descriptor)
+        except OSError:
+            fail("directory_list")
+        self.verify()
+        return result
+
+    def close(self):
+        if not self.closed:
+            os.close(self.descriptor)
+            self.closed = True
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, _type, _value, _traceback):
+        self.close()
+
+
+def open_directory(path, uid, modes, user_root, *, allow_missing=False):
+    return DirectoryHandle.open(
+        path,
+        user_root,
+        uid,
+        modes,
+        allow_missing=allow_missing,
+    )
+
+
+def checked_directory(
+    path,
+    uid,
+    modes,
+    *,
+    user_root=None,
+    allow_missing=False,
+):
+    root = Path(path) if user_root is None else Path(user_root)
+    handle = open_directory(
+        path,
+        uid,
+        modes,
+        root,
+        allow_missing=allow_missing,
+    )
+    if handle is None:
+        return False
+    handle.close()
+    return True
+
+
+def directory_names(path, uid, modes, user_root):
+    handle = open_directory(path, uid, modes, user_root)
+    try:
+        return set(handle.names())
+    finally:
+        handle.close()
+
+
+def make_child_directory(parent, name, mode, *, exclusive):
+    parent.verify()
+    existing = DirectoryHandle.child(parent, name, {mode})
+    if existing is not None:
+        existing.close()
+        if exclusive:
+            fail("run_id_reused")
+        fail("directory_substitution")
+    created_identity = None
+    child = None
+    try:
+        os.mkdir(name, mode, dir_fd=parent.descriptor)
+        created = os.stat(
+            name,
+            dir_fd=parent.descriptor,
+            follow_symlinks=False,
+        )
+        created_identity = directory_identity(created)
+        child = DirectoryHandle.child(parent, name, {mode})
+        if child is None:
+            fail("directory_creation")
+        if child.chain[-1][1] != created_identity:
+            fail("directory_chain_changed")
+        parent.verify()
+        child.verify()
+        os.fsync(parent.descriptor)
+        return child
+    except Exception:
+        if child is not None:
+            child.close()
+        cleanup_failed = False
+        try:
+            if created_identity is not None:
+                named = os.stat(
+                    name,
+                    dir_fd=parent.descriptor,
+                    follow_symlinks=False,
+                )
+                if directory_identity(named) == created_identity:
+                    os.rmdir(name, dir_fd=parent.descriptor)
+                    os.fsync(parent.descriptor)
+        except OSError:
+            cleanup_failed = True
+        if cleanup_failed:
+            fail("directory_cleanup_failed")
+        fail("directory_chain_changed")
+
+
+def remove_child_directory(parent, child):
+    if child.path.parent != parent.path:
+        fail("directory_path")
+    child.verify()
+    if child.names():
+        fail("rollback_directory_not_empty")
+    parent.verify()
+    named = os.stat(
+        child.path.name,
+        dir_fd=parent.descriptor,
+        follow_symlinks=False,
+    )
+    if directory_identity(named) != child.chain[-1][1]:
+        fail("directory_chain_changed")
+    os.rmdir(child.path.name, dir_fd=parent.descriptor)
+    os.fsync(parent.descriptor)
+    parent.verify()
+
+
+def unlink_exact_at(parent, name, identity):
+    parent.verify()
+    named = os.stat(
+        name,
+        dir_fd=parent.descriptor,
+        follow_symlinks=False,
+    )
+    if (named.st_dev, named.st_ino) != identity:
+        fail("private_file_substitution")
+    os.unlink(name, dir_fd=parent.descriptor)
+    os.fsync(parent.descriptor)
+    parent.verify()
+
+
+def clear_private_parser_state(parent, preserved):
+    budget = {"entries": 0, "bytes": 0}
+
+    def clear(descriptor, depth):
+        if depth > 4:
+            fail("config_parser_state")
+        for name in os.listdir(descriptor):
+            if name in preserved and depth == 0:
+                continue
+            if (
+                not isinstance(name, str)
+                or not name
+                or name in {".", ".."}
+                or "/" in name
+            ):
+                fail("config_parser_state")
+            budget["entries"] += 1
+            if budget["entries"] > 128:
+                fail("config_parser_state")
+            facts = os.stat(
+                name,
+                dir_fd=descriptor,
+                follow_symlinks=False,
+            )
+            if facts.st_uid != parent.uid or facts.st_mode & 0o022:
+                fail("config_parser_state")
+            if stat.S_ISREG(facts.st_mode):
+                if facts.st_nlink != 1:
+                    fail("config_parser_state")
+                budget["bytes"] += facts.st_size
+                if budget["bytes"] > 32 * 1024 * 1024:
+                    fail("config_parser_state")
+                os.unlink(name, dir_fd=descriptor)
+            elif stat.S_ISLNK(facts.st_mode):
+                if (
+                    facts.st_nlink != 1
+                    or os.readlink(name, dir_fd=descriptor) != str(CODEX)
+                ):
+                    fail("config_parser_state")
+                os.unlink(name, dir_fd=descriptor)
+            elif stat.S_ISDIR(facts.st_mode):
+                child = os.open(
+                    name,
+                    DIRECTORY_FLAGS,
+                    dir_fd=descriptor,
+                )
+                try:
+                    opened = os.fstat(child)
+                    if directory_identity(opened) != directory_identity(facts):
+                        fail("config_parser_state")
+                    clear(child, depth + 1)
+                    if os.listdir(child):
+                        fail("config_parser_state")
+                finally:
+                    os.close(child)
+                named = os.stat(
+                    name,
+                    dir_fd=descriptor,
+                    follow_symlinks=False,
+                )
+                if directory_identity(named) != directory_identity(facts):
+                    fail("config_parser_state")
+                os.rmdir(name, dir_fd=descriptor)
+            else:
+                fail("config_parser_state")
+        os.fsync(descriptor)
+
+    parent.verify()
+    clear(parent.descriptor, 0)
+    parent.verify()
+
+
+def absent_snapshot():
+    return {
+        "bytes": None,
+        "identity": None,
+        "metadata": {
+            "exists": False,
+            "linkCount": 0,
+            "mode": None,
+            "ownerClass": "absent",
+            "sha256": None,
+            "size": 0,
+        },
+    }
+
+
+def snapshot_at(
+    parent,
+    name,
+    uid,
+    maximum,
+    *,
+    allow_absent,
+    bind_chain=True,
+):
+    if bind_chain:
+        parent.verify()
+    try:
+        descriptor = os.open(
+            name,
+            os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK,
+            dir_fd=parent.descriptor,
+        )
+    except FileNotFoundError:
+        if allow_absent:
+            if bind_chain:
+                parent.verify()
+            return absent_snapshot()
+        fail("required_file_absent")
+    except OSError:
+        fail("target_open")
+    try:
+        facts = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(facts.st_mode)
+            or facts.st_uid != uid
+            or facts.st_nlink != 1
+            or facts.st_mode & 0o022
+            or facts.st_size > maximum
+        ):
+            fail("target_metadata")
+        first = (
+            facts.st_dev,
+            facts.st_ino,
+            facts.st_size,
+            facts.st_mtime_ns,
+            facts.st_ctime_ns,
+        )
+        chunks = []
+        remaining = maximum + 1
+        while remaining:
+            chunk = os.read(descriptor, min(65536, remaining))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        value = b"".join(chunks)
+        final_facts = os.fstat(descriptor)
+        final = (
+            final_facts.st_dev,
+            final_facts.st_ino,
+            final_facts.st_size,
+            final_facts.st_mtime_ns,
+            final_facts.st_ctime_ns,
+        )
+        named = os.stat(
+            name,
+            dir_fd=parent.descriptor,
+            follow_symlinks=False,
+        )
+        if bind_chain:
+            parent.verify()
+        if (
+            first != final
+            or len(value) != facts.st_size
+            or (named.st_dev, named.st_ino)
+            != (facts.st_dev, facts.st_ino)
+        ):
+            fail("target_changed_during_read")
+        return {
+            "bytes": value,
+            "identity": (facts.st_dev, facts.st_ino),
+            "metadata": {
+                "exists": True,
+                "linkCount": 1,
+                "mode": f"{stat.S_IMODE(facts.st_mode):04o}",
+                "ownerClass": "current-user",
+                "sha256": digest_bytes(value),
+                "size": len(value),
+            },
+        }
+    finally:
+        os.close(descriptor)
+
+
+def snapshot_path(
+    path,
+    uid,
+    maximum,
+    *,
+    allow_absent,
+    user_root=None,
+):
+    path = Path(path)
+    root = path.parent if user_root is None else Path(user_root)
+    parent = open_directory(
+        path.parent,
+        uid,
+        SAFE_DIRECTORY_MODES,
+        root,
+        allow_missing=allow_absent,
+    )
+    if parent is None:
+        return absent_snapshot()
+    try:
+        return snapshot_at(
+            parent,
+            path.name,
+            uid,
+            maximum,
+            allow_absent=allow_absent,
+        )
+    finally:
+        parent.close()
+
+
+def write_new_at(parent, name, value, uid, mode=0o600):
+    parent.verify()
+    descriptor = os.open(
+        name,
+        os.O_WRONLY
+        | os.O_CREAT
+        | os.O_EXCL
+        | os.O_CLOEXEC
+        | os.O_NOFOLLOW,
+        mode,
+        dir_fd=parent.descriptor,
+    )
+    identity = None
+    try:
+        os.fchmod(descriptor, mode)
+        offset = 0
+        while offset < len(value):
+            offset += os.write(descriptor, value[offset:])
+        os.fsync(descriptor)
+        facts = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(facts.st_mode)
+            or facts.st_uid != uid
+            or facts.st_nlink != 1
+            or stat.S_IMODE(facts.st_mode) != mode
+        ):
+            fail("private_file_metadata")
+        identity = (facts.st_dev, facts.st_ino)
+    finally:
+        os.close(descriptor)
+    try:
+        named = os.stat(
+            name,
+            dir_fd=parent.descriptor,
+            follow_symlinks=False,
+        )
+        if (named.st_dev, named.st_ino) != identity:
+            fail("private_file_substitution")
+        parent.verify()
+        os.fsync(parent.descriptor)
+        return identity
+    except Exception:
+        try:
+            named = os.stat(
+                name,
+                dir_fd=parent.descriptor,
+                follow_symlinks=False,
+            )
+            if (named.st_dev, named.st_ino) == identity:
+                os.unlink(name, dir_fd=parent.descriptor)
+                os.fsync(parent.descriptor)
+        except OSError:
+            pass
+        raise
+
+
+def write_new(path, value, mode=0o600, *, uid=None, user_root=None):
+    path = Path(path)
+    owner = os.getuid() if uid is None else uid
+    root = path.parent if user_root is None else Path(user_root)
+    parent = open_directory(
+        path.parent,
+        owner,
+        SAFE_DIRECTORY_MODES,
+        root,
+    )
+    try:
+        return write_new_at(parent, path.name, value, owner, mode)
+    finally:
+        parent.close()
+
+
+def atomic_json(path, value, *, uid=None, user_root=None):
+    path = Path(path)
+    owner = os.getuid() if uid is None else uid
+    root = path.parent if user_root is None else Path(user_root)
+    parent = open_directory(
+        path.parent,
+        owner,
+        {0o700},
+        root,
+    )
+    encoded = (
+        json.dumps(value, sort_keys=True, separators=(",", ":")) + "\n"
+    ).encode()
+    temporary = ".receipt-" + os.urandom(8).hex()
+    installed = False
+    renamed = False
+    try:
+        temporary_identity = write_new_at(
+            parent,
+            temporary,
+            encoded,
+            owner,
+            0o600,
+        )
+        before = snapshot_at(
+            parent,
+            path.name,
+            owner,
+            256 * 1024,
+            allow_absent=True,
+        )
+        parent.verify()
+        if before["metadata"]["exists"]:
+            if before["metadata"]["mode"] != "0600":
+                fail("receipt_file_metadata")
+            libc_rename(parent.descriptor, temporary, path.name, RENAME_SWAP)
+            renamed = True
+            try:
+                swapped = snapshot_at(
+                    parent,
+                    temporary,
+                    owner,
+                    256 * 1024,
+                    allow_absent=False,
+                    bind_chain=False,
+                )
+                if swapped["identity"] != before["identity"]:
+                    fail("receipt_toctou_substitution")
+                parent.verify()
+            except Exception as error:
+                try:
+                    libc_rename(
+                        parent.descriptor,
+                        temporary,
+                        path.name,
+                        RENAME_SWAP,
+                    )
+                    renamed = False
+                    os.fsync(parent.descriptor)
+                except OSError:
+                    fail("receipt_atomic_rollback_failed")
+                raise error
+            os.unlink(temporary, dir_fd=parent.descriptor)
+            renamed = False
+        else:
+            libc_rename(parent.descriptor, temporary, path.name, RENAME_EXCL)
+            renamed = True
+            try:
+                parent.verify()
+            except Exception as error:
+                try:
+                    named = os.stat(
+                        path.name,
+                        dir_fd=parent.descriptor,
+                        follow_symlinks=False,
+                    )
+                    if (
+                        named.st_dev,
+                        named.st_ino,
+                    ) != temporary_identity:
+                        fail("receipt_atomic_rollback_failed")
+                    os.unlink(path.name, dir_fd=parent.descriptor)
+                    renamed = False
+                    os.fsync(parent.descriptor)
+                except OSError:
+                    fail("receipt_atomic_rollback_failed")
+                raise error
+            renamed = False
+        installed = True
+        os.fsync(parent.descriptor)
+        final = snapshot_at(
+            parent,
+            path.name,
+            owner,
+            256 * 1024,
+            allow_absent=False,
+        )
+        if final["bytes"] != encoded or final["metadata"]["mode"] != "0600":
+            fail("receipt_write")
+    finally:
+        cleanup_failed = False
+        if not installed:
+            if renamed:
+                cleanup_failed = True
+            else:
+                try:
+                    os.unlink(temporary, dir_fd=parent.descriptor)
+                except FileNotFoundError:
+                    pass
+        parent.close()
+        if cleanup_failed:
+            fail("receipt_atomic_rollback_failed")
+
+
+def load_manifest(path=MANIFEST_PATH):
+    value = strict_json_bytes(Path(path).read_bytes(), "manifest_json")
+    required = {
+        "authority",
+        "cli",
+        "externalConfigOverlay",
+        "gate",
+        "phase",
+        "privateCurrentRuntimeReconciliation",
+        "receipt",
+        "schema",
+        "stageB",
+        "transaction",
+    }
+    if set(value) != required or value.get("schema") != 1:
+        fail("manifest_shape")
+    if value.get("phase") != "phase5_codex_contract_apply_bundle":
+        fail("manifest_phase")
+    authority = value["authority"]
+    if authority != {
+        "acceptedControlBase": "1d7f5cd214e6572307f24728828ec24d9dde1740",
+        "migrationAuthorizationCommit":
+            "7f3dd6d7f33adcd37a450f749e418550bc9f6230",
+        "operationalMigrationDependency": False,
+        "ownerAuthorizationPhrase": "Разрешаю Phase 5 apply gate",
+        "protectedBaselineEvidence":
+            "89225697ac53652ad84772b4adbc482210682a28",
+        "protectedBaselineImplementation":
+            "b61c34ab7b1196ea02d6563a26a65849da4f1191",
+    }:
+        fail("manifest_authority")
+    if value["cli"] != {
+        "canonicalPath": str(CODEX),
+        "fileContract": "regular-executable-non-symlink",
+        "observedVersion": "codex-cli 0.145.0-alpha.18",
+        "versionPolicy": "exact-stage-b-re-attestation",
+    }:
+        fail("manifest_cli")
+    if value["externalConfigOverlay"] != manifest_overlay_contract():
+        fail("manifest_external_config_overlay")
+    private_runtime = value["privateCurrentRuntimeReconciliation"]
+    expected_private_runtime = {
+        "adoptionOnly": {
+            "configByteDelta": 0,
+            "configRewrite": False,
+            "legacyReconcileTrustAliased": False,
+            "tomlReserialization": False,
+        },
+        "expectedCurrent": {
+            "externalProjectAdditions": 6,
+            "hookLeafRecords": 3,
+            "hookParentTables": 1,
+            "projectRows": 25,
+            "vendorClasses": [
+                "last_updated",
+                "browser_client_hash",
+                "browser_client_hash",
+                "app_version",
+            ],
+        },
+        "layer": {
+            "companion": "hash-only-layered-companion",
+            "directoryMode": "0700",
+            "exclusive": True,
+            "objects": [
+                "captured-current-config",
+                "rollback-composition-over-immutable-before",
+                "return-composition-over-immutable-after",
+                "hash-only-layered-companion",
+            ],
+            "objectLinkCount": 1,
+            "objectMode": "0600",
+            "separateFromHistoricalObjects": True,
+        },
+        "ownerAuthorization": "согласовано",
+        "states": ["prepared", "reconciled", "recovery-required"],
+        "transaction": {
+            "configObservationCount": 2,
+            "descriptorRooted": True,
+            "liveConfigWrite": False,
+            "stageBContinuationRequired": True,
+        },
+    }
+    private_runtime_without_grammar = dict(private_runtime)
+    grammar = private_runtime_without_grammar.pop("publicGrammar", None)
+    valid_grammar = (
+            type(grammar) is dict and set(grammar) == {"topLevelKeys", "pluginTableOrder", "tables", "vendorDifferenceRows"}
+            and grammar["topLevelKeys"] == ["model", "model_reasoning_effort", "sandbox_mode", "approval_policy", "service_tier", "notify"]
+            and len(grammar["pluginTableOrder"]) == 13 and len(set(grammar["pluginTableOrder"])) == 13
+            and type(grammar["tables"]) is list and len(grammar["tables"]) == 29
+            and all(type(item) is dict and set(item) == {"header", "keys"} and type(item["header"]) is str and type(item["keys"]) is list for item in grammar["tables"])
+            and type(grammar["vendorDifferenceRows"]) is list and len(grammar["vendorDifferenceRows"]) == 4
+            and all(type(item) is dict and set(item) == {"table", "key", "class"} for item in grammar["vendorDifferenceRows"])
+        )
+    grammar_digest = hashlib.sha256(json.dumps(grammar, sort_keys=True,
+                                                separators=(",", ":")).encode()).hexdigest() if valid_grammar else ""
+    codex_contract = strict_json_bytes((ROOT / "manifests/codex-contract.json").read_bytes(),
+                                       "manifest_codex_contract")
+    try:
+        plugin_rows = codex_contract["extensions"]["plugins"]
+        plugin_by_id = {item["id"]: item for item in plugin_rows}
+        runtime_app_version = codex_contract["runtime"]["observedAppVersion"]
+        plugin_ids = {item["id"] for item in plugin_rows
+                      if item["enabledObserved"] is True}
+        plugin_bound = (
+            type(plugin_rows) is list and len(plugin_rows) == 13 and
+            plugin_ids == set(grammar["pluginTableOrder"]) and
+            all(type(item) is dict and item["id"] in plugin_ids and
+                item["source"]["marketplace"] == item["id"].rsplit("@", 1)[1]
+                for item in plugin_rows) and
+            plugin_by_id["browser@openai-bundled"]["observedVersion"] == runtime_app_version and
+            plugin_by_id["chrome@openai-bundled"]["observedVersion"] == runtime_app_version
+        )
+        mcp = {item["id"]: item for item in codex_contract["extensions"]["mcp"]}
+        node = mcp["node_repl"]
+        node_transport = node["transport"]
+        computer_transport = mcp["computer-use"]["transport"]
+        docs_transport = mcp["openaiDeveloperDocs"]["transport"]
+        env_keys = next(item["keys"] for item in grammar["tables"]
+                        if item["header"] == "mcp_servers.node_repl.env")
+        mcp_bound = (
+            set(mcp) == {"computer-use", "node_repl", "openaiDeveloperDocs"} and
+            node["enabledObserved"] is True and
+            node["startupTimeoutSecObserved"] == 120.0 and
+            node_transport["type"] == "stdio" and node_transport["args"] == [] and
+            node_transport["commandRelative"] == "cua_node/bin/node_repl" and
+            node_transport["commandResolver"] == "chatgpt-app-resources" and
+            node_transport["cwdPolicy"] == "none" and
+            node_transport["envMode"] == "explicit-map" and
+            node_transport["forwardedEnvKeys"] == [] and
+            set(node_transport["envKeys"]) == set(env_keys) and
+            node_transport["envValueClasses"] == {
+                "BROWSER_USE_AVAILABLE_BACKENDS": "comma-separated-safe-identifiers",
+                "BROWSER_USE_CODEX_APP_BUILD_FLAVOR": "bounded-safe-token",
+                "BROWSER_USE_CODEX_APP_VERSION": "dotted-version",
+                "CODEX_CLI_PATH": "canonical-chatgpt-cli",
+                "CODEX_HOME": "canonical-codex-home",
+                "NODE_REPL_INSTRUCTIONS_USE_CASE_BROWSER": "bounded-single-line-instruction",
+                "NODE_REPL_INSTRUCTIONS_USE_CASE_CHROME": "bounded-single-line-instruction",
+                "NODE_REPL_INSTRUCTIONS_USE_CASE_COMPUTER_USE": "bounded-single-line-instruction",
+                "NODE_REPL_NATIVE_PIPE_CONNECT_TIMEOUT_MS": "positive-decimal-milliseconds",
+                "NODE_REPL_NODE_MODULE_DIRS": "chatgpt-resource-directory",
+                "NODE_REPL_NODE_PATH": "chatgpt-resource-file",
+                "NODE_REPL_TRUSTED_BROWSER_CLIENT_SHA256S": "comma-separated-sha256",
+                "NODE_REPL_TRUSTED_CODE_PATHS": "canonical-codex-home",
+                "SKY_CUA_SERVICE_PATH": "owner-home-codex-computer-use-app",
+            } and
+            mcp["computer-use"]["enabledObserved"] is False and
+            computer_transport == {
+                "args": ["mcp"],
+                "commandRelative": "Codex Computer Use.app/Contents/SharedSupport/SkyComputerUseClient.app/Contents/MacOS/SkyComputerUseClient",
+                "commandResolver": "disabled-cwd-relative-observed",
+                "cwdPolicy": "relative-dot-observed-disabled",
+                "envKeys": [], "envMode": "none", "envValueClasses": {},
+                "forwardedEnvKeys": [], "type": "stdio",
+            } and
+            mcp["openaiDeveloperDocs"]["enabledObserved"] is True and
+            docs_transport == {
+                "bearerTokenEnvVar": None, "envHttpHeaders": "none",
+                "httpHeaders": "none", "type": "streamable_http",
+                "url": "https://developers.openai.com/mcp",
+            })
+    except (KeyError, TypeError):
+        mcp_bound = False
+        plugin_ids = set()
+        plugin_bound = False
+    if (private_runtime_without_grammar != expected_private_runtime or not valid_grammar or
+            grammar_digest != "0d1647c0c8dbd6f342d7e51f9dcac693ab0a63878effd5a4e9adb626449e76b8" or
+            not plugin_bound or not mcp_bound or
+            codex_contract.get("runtime", {}).get("observedAppVersion") != "26.721.41059"):
+        fail("manifest_private_current_runtime")
+    # This is an in-memory projection of the accepted, already cross-bound
+    # manifest.  Runtime comparison must consume this projection rather than
+    # introducing another unbound copy of plugin/MCP authority.
+    value["_acceptedRuntimeContract"] = {
+        "appVersion": codex_contract["runtime"]["observedAppVersion"],
+        "mcp": {
+            identifier: {
+                "enabled": item["enabledObserved"],
+                "startupTimeout": item["startupTimeoutSecObserved"],
+                "transport": item["transport"],
+            }
+            for identifier, item in mcp.items()
+        },
+        "plugins": {item["id"]: item["enabledObserved"] for item in plugin_rows},
+    }
+    transaction = value["transaction"]
+    if (
+        set(transaction)
+        != {
+            "destinations",
+            "directoryAuthority",
+            "managedConfigKeys",
+            "mergeTool",
+            "runIdPattern",
+            "stateRoot",
+        }
+        or transaction["directoryAuthority"]
+        != {
+            "anchor": "canonical-account-home",
+            "componentFlags": [
+                "O_CLOEXEC",
+                "O_DIRECTORY",
+                "O_NOFOLLOW",
+            ],
+            "mutationStyle": "descriptor-relative-only",
+        }
+        or transaction["managedConfigKeys"]
+        != {
+            "approval_policy": "never",
+            "sandbox_mode": "danger-full-access",
+        }
+        or transaction["mergeTool"] != "bin/phase5-config-transaction"
+        or transaction["runIdPattern"] != RUN_ID.pattern
+        or transaction["stateRoot"]
+        != "$HOME/AIDev/state/codex-transactions"
+    ):
+        fail("manifest_transaction")
+    rows = transaction["destinations"]
+    if not isinstance(rows, list) or len(rows) != len(TARGET_IDS):
+        fail("manifest_destinations")
+    expected_rows = []
+    accepted = load_accepted_generated_hashes()
+    for identifier in TARGET_IDS:
+        source, target, strategy, mode = TARGET_SPECS[identifier]
+        expected_rows.append(
+            {
+                "id": identifier,
+                "installMode":
+                    "preserve-safe-preimage" if mode is None else f"{mode:04o}",
+                "sha256": accepted[source],
+                "source": source,
+                "strategy": strategy,
+                "target": target,
+            }
+        )
+    if rows != expected_rows:
+        fail("manifest_destination_contract")
+    return value
+
+
+def load_accepted_generated_hashes():
+    value = strict_json_bytes(
+        (ROOT / "manifests/codex-contract.json").read_bytes(),
+        "accepted_manifest_json",
+    )
+    try:
+        rows = value["generatedFiles"]
+    except Exception:
+        fail("accepted_manifest_shape")
+    result = {}
+    for row in rows:
+        if (
+            not isinstance(row, dict)
+            or set(row) != {"mode", "sha256", "source", "target"}
+            or not HEX64.fullmatch(row["sha256"])
+            or row["source"] in result
+        ):
+            fail("accepted_generated_shape")
+        result[row["source"]] = row["sha256"]
+    if set(result) != {item[0] for item in TARGET_SPECS.values()}:
+        fail("accepted_generated_scope")
+    return result
+
+
+def canonical_cli_version(layout):
+    try:
+        facts = CODEX.lstat()
+    except OSError:
+        fail("canonical_cli")
+    if (
+        CODEX.is_symlink()
+        or not stat.S_ISREG(facts.st_mode)
+        or not os.access(CODEX, os.X_OK)
+        or CODEX.resolve(strict=True) != CODEX
+    ):
+        fail("canonical_cli")
+    result = subprocess.run(
+        [str(CODEX), "--version"],
+        cwd=layout.control,
+        env=clean_environment(layout.home, layout.codex_home),
+        text=True,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        check=False,
+    )
+    observed = result.stdout.strip()
+    match = re.fullmatch(r"codex-cli (\d+)\.(\d+)\.(\d+)(?:-alpha\.(\d+)(?:\.(\d+))?)?", observed)
+    if (
+        result.returncode != 0
+        or match is None
+        or (int(match.group(1)), int(match.group(2)), int(match.group(3))) < (0, 145, 0)
+    ):
+        fail("canonical_cli_version")
+    return observed
+
+
+def cli_version_at_floor(value):
+    match = re.fullmatch(r"codex-cli (\d+)\.(\d+)\.(\d+)(?:-alpha\.(\d+)(?:\.(\d+))?)?", value)
+    minimum = (0, 145, 0, 0, 18)
+    if match is None:
+        return False
+    stable = tuple(int(match.group(index)) for index in (1, 2, 3))
+    prerelease = (0, int(match.group(4)), int(match.group(5) or 0)) if match.group(4) else (1, 0, 0)
+    return stable + prerelease >= minimum
+
+
+def production_layout():
+    home = canonical_account_home()
+    return Layout(
+        home,
+        home / "AIDev/control",
+        home / "AIDev/state/codex-transactions",
+        home / ".codex",
+        home / "AIDev/bin",
+    )
+
+
+def production_gate(layout):
+    git_env = clean_environment(layout.home, layout.codex_home)
+    before = subprocess.run(["/usr/bin/git", "rev-parse", "HEAD"], cwd=layout.control,
+                            text=True, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                            stderr=subprocess.PIPE, env=git_env, check=False)
+    if before.returncode != 0 or not HEX40.fullmatch(before.stdout.strip()):
+        fail("apply_bundle_gate")
+    before_head = before.stdout.strip()
+    result = subprocess.run(
+        [str(VALIDATOR), "--git-only", "--json"],
+        cwd=layout.control,
+        env=git_env,
+        text=True,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        check=False,
+    )
+    if result.returncode != 0:
+        fail("apply_bundle_not_accepted")
+    value = strict_json_bytes(result.stdout.encode(), "apply_gate_output")
+    runner_keys = {"acceptedControlCommit", "liveApplyAuthorized", "marker", "mode", "phase5ApplyAuthorized", "phase5PassClaimed", "phase6Authorized", "protectedBaselineCommit", "repositoryState", "schema", "sourceCommit", "stageBContinuationRequired", "verdict"}
+    runner = (type(value) is dict and set(value) == runner_keys and
+              value.get("acceptedControlCommit") == "9521f21711b5d6124e295dd02305d3ac966bd6ed" and
+              value.get("marker") == "CHECKPOINT_PHASE5_CURRENT_MAIN_RUNNER_GATE_REBASE_REVIEW" and
+              value.get("repositoryState") == "private_runtime_runner_gate_main" and
+              value.get("verdict") == "PHASE5_CURRENT_MAIN_RUNNER_GATE_REBASE_PREPARED_FOR_INDEPENDENT_REVIEW" and
+              value.get("mode") == "git-only" and type(value.get("schema")) is int and value.get("schema") == 1 and
+              value.get("sourceCommit") == before_head and
+              all(type(value.get(key)) is bool and value.get(key) is expected for key, expected in
+                  (("liveApplyAuthorized", False), ("phase5ApplyAuthorized", False), ("phase5PassClaimed", False),
+                   ("phase6Authorized", False), ("stageBContinuationRequired", True))) and
+              type(value.get("protectedBaselineCommit")) is str and HEX40.fullmatch(value.get("protectedBaselineCommit")) is not None)
+    if runner:
+        baseline = subprocess.run(["/usr/bin/git", "log", "-1", "--format=%H", before_head, "--",
+                                   "evidence/phase-5/current-main-runner-gate-rebase.json"], cwd=layout.control,
+                                  text=True, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                                  stderr=subprocess.PIPE, env=git_env, check=False)
+        runner = baseline.returncode == 0 and baseline.stdout.strip() == value["protectedBaselineCommit"]
+    after = subprocess.run(["/usr/bin/git", "rev-parse", "HEAD"], cwd=layout.control,
+                           text=True, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                           stderr=subprocess.PIPE, env=git_env, check=False)
+    if after.returncode != 0 or after.stdout.strip() != before_head:
+        fail("apply_bundle_gate")
+    if (
+        not (runner or (value.get("repositoryState") == "integrated_main" and value.get("verdict") == "ACCEPTED_APPLY_BUNDLE"))
+        or value.get("liveApplyAuthorized") is not False
+        or value.get("stageBContinuationRequired") is not True
+        or not HEX40.fullmatch(value.get("acceptedControlCommit", ""))
+        or not HEX40.fullmatch(value.get("protectedBaselineCommit", ""))
+        or not HEX40.fullmatch(value.get("sourceCommit", ""))
+    ):
+        fail("apply_bundle_gate")
+    return {
+        "acceptedControlCommit": value["acceptedControlCommit"],
+        "protectedBaselineCommit": value["protectedBaselineCommit"],
+        "sourceCommit": value["sourceCommit"],
+    }
+
+
+def validate_layout(layout, *, create_state_root):
+    if (
+        layout.control.resolve(strict=True) != ROOT.resolve(strict=True)
+        or
+        layout.codex_home != layout.home / ".codex"
+        or layout.aid_bin != layout.home / "AIDev/bin"
+        or layout.state_root
+        != layout.home / "AIDev/state/codex-transactions"
+    ):
+        fail("layout_root_contract")
+    checked_directory(
+        layout.home,
+        layout.uid,
+        SAFE_DIRECTORY_MODES,
+        user_root=layout.home,
+    )
+    checked_directory(
+        layout.control,
+        layout.uid,
+        SAFE_DIRECTORY_MODES,
+        user_root=layout.control,
+    )
+    checked_directory(
+        layout.codex_home,
+        layout.uid,
+        SAFE_DIRECTORY_MODES,
+        user_root=layout.home,
+    )
+    checked_directory(
+        layout.aid_bin,
+        layout.uid,
+        SAFE_DIRECTORY_MODES,
+        user_root=layout.home,
+    )
+    parent = layout.state_root.parent
+    parent_handle = open_directory(
+        parent,
+        layout.uid,
+        SAFE_DIRECTORY_MODES,
+        layout.home,
+    )
+    state_handle = None
+    try:
+        state_handle = DirectoryHandle.child(
+            parent_handle,
+            layout.state_root.name,
+            {0o700},
+        )
+        if state_handle is None:
+            if not create_state_root:
+                fail("state_root_missing")
+            state_handle = make_child_directory(
+                parent_handle,
+                layout.state_root.name,
+                0o700,
+                exclusive=False,
+            )
+        for name in state_handle.names():
+            if RUN_ID.fullmatch(name) is None:
+                fail("unexpected_state_root_child")
+            child = DirectoryHandle.child(state_handle, name, {0o700})
+            if child is None:
+                fail("directory_missing")
+            child.close()
+    finally:
+        if state_handle is not None:
+            state_handle.close()
+        parent_handle.close()
+    expected_targets = layout.targets()
+    if set(expected_targets) != set(TARGET_IDS):
+        fail("layout_targets")
+    for identifier, path in expected_targets.items():
+        if not path.is_absolute() or not (
+            path == layout.codex_home / "config.toml"
+            or layout.codex_home in path.parents
+            or layout.aid_bin in path.parents
+        ):
+            fail("target_escape")
+        if identifier == "config" and path.parent != layout.codex_home:
+            fail("config_target")
+    skill_root = layout.codex_home / "skills/manage-workstation"
+    skill_handle = open_directory(
+        skill_root,
+        layout.uid,
+        SAFE_DIRECTORY_MODES,
+        layout.home,
+        allow_missing=True,
+    )
+    if skill_handle is not None:
+        try:
+            names = set(skill_handle.names())
+            if names - {"SKILL.md", "agents"}:
+                fail("unexpected_managed_skill_child")
+            if "agents" in names:
+                agents = DirectoryHandle.child(
+                    skill_handle,
+                    "agents",
+                    SAFE_DIRECTORY_MODES,
+                )
+                if agents is None:
+                    fail("unexpected_managed_skill_child")
+                try:
+                    if set(agents.names()) - {"openai.yaml"}:
+                        fail("unexpected_managed_skill_child")
+                finally:
+                    agents.close()
+        finally:
+            skill_handle.close()
+
+
+def directory_receipt(layout):
+    value = []
+    for path in layout.managed_directories():
+        handle = open_directory(
+            path,
+            layout.uid,
+            SAFE_DIRECTORY_MODES,
+            layout.home,
+            allow_missing=True,
+        )
+        exists = handle is not None
+        if handle is not None:
+            handle.close()
+        value.append(
+            {
+                "createdByApply": False,
+                "existsBefore": exists,
+                "id": {
+                    layout.codex_home / "hooks": "hooks-directory",
+                    layout.codex_home / "skills/manage-workstation":
+                        "skill-directory",
+                    layout.codex_home / "skills/manage-workstation/agents":
+                        "skill-agents-directory",
+                }[path],
+                "modeAfter": "0700",
+            }
+        )
+    return value
+
+
+def run_directory(layout, run_id):
+    if not RUN_ID.fullmatch(run_id):
+        fail("run_id")
+    return layout.state_root / run_id
+
+
+def create_run_directory(layout, run_id):
+    root = run_directory(layout, run_id)
+    state = open_directory(
+        layout.state_root,
+        layout.uid,
+        {0o700},
+        layout.home,
+    )
+    run_handle = None
+    children = []
+    try:
+        run_handle = make_child_directory(
+            state,
+            run_id,
+            0o700,
+            exclusive=True,
+        )
+        for name in ("preimages", "staged"):
+            child = make_child_directory(
+                run_handle,
+                name,
+                0o700,
+                exclusive=True,
+            )
+            children.append(child)
+        for child in children:
+            child.close()
+        children = []
+        run_handle.close()
+        run_handle = None
+    except Exception:
+        for child in reversed(children):
+            try:
+                remove_child_directory(run_handle, child)
+            finally:
+                child.close()
+        if run_handle is not None:
+            try:
+                remove_child_directory(state, run_handle)
+            finally:
+                run_handle.close()
+        raise
+    finally:
+        state.close()
+    return root
+
+
+def load_merge_tool():
+    loader = importlib.machinery.SourceFileLoader(
+        "phase5_config_transaction",
+        str(MERGE_TOOL),
+    )
+    specification = importlib.util.spec_from_loader(loader.name, loader)
+    if specification is None:
+        fail("config_merge")
+    module = importlib.util.module_from_spec(specification)
+    loader.exec_module(module)
+    return module
+
+
+def strict_config_in_run(layout, run_root, value):
+    run_handle = open_directory(
+        run_root,
+        layout.uid,
+        {0o700},
+        layout.home,
+    )
+    workspace = None
+    config_identity = None
+    name = ".config-check-" + os.urandom(8).hex()
+    try:
+        workspace = make_child_directory(
+            run_handle,
+            name,
+            0o700,
+            exclusive=True,
+        )
+        config_identity = write_new_at(
+            workspace,
+            "config.toml",
+            value,
+            layout.uid,
+            0o600,
+        )
+        missing_schema = "must-not-exist.json"
+        result = subprocess.run(
+            [
+                str(CODEX),
+                "--strict-config",
+                "exec",
+                "--ephemeral",
+                "--output-schema",
+                missing_schema,
+                "--",
+                "phase5-static-config-parse",
+            ],
+            env=clean_environment(".", "."),
+            text=True,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            check=False,
+            pass_fds=(workspace.descriptor,),
+            preexec_fn=lambda: os.fchdir(workspace.descriptor),
+        )
+        if not (
+            result.returncode != 0
+            and "Failed to read output schema file " in result.stdout
+            and missing_schema in result.stdout
+            and "Error loading config.toml:" not in result.stdout
+        ):
+            fail("config_merge")
+    finally:
+        if workspace is not None:
+            clear_private_parser_state(
+                workspace,
+                {"config.toml"} if config_identity is not None else set(),
+            )
+            if config_identity is not None:
+                unlink_exact_at(
+                    workspace,
+                    "config.toml",
+                    config_identity,
+                )
+            try:
+                remove_child_directory(run_handle, workspace)
+            finally:
+                workspace.close()
+        run_handle.close()
+
+
+def merge_config(layout, current, root, reviewed_commit):
+    if not HEX40.fullmatch(reviewed_commit):
+        fail("config_merge")
+    strict_config_in_run(layout, root, current)
+    try:
+        staged = load_merge_tool().merge(current)
+    except SystemExit:
+        fail("config_merge")
+    if len(staged) > MAX_CONFIG:
+        fail("config_merge_binding")
+    strict_config_in_run(layout, root, staged)
+    return staged
+
+
+def manifest_overlay_contract():
+    return {
+        "byteExactness": {
+            "composition":
+                "immutable-base-with-project-region-insertion-plus-"
+                "exact-canonical-hook-overlay",
+            "hookOverlay":
+                "parent-table-plus-three-ordered-leaf-records-at-eof",
+            "projectTrustRemoval":
+                "exact-middle-two-line-table-plus-one-separator",
+            "semanticEquivalenceAccepted": False,
+            "transactionBases": ["before", "after"],
+        },
+        "companionReceipt": OVERLAY_RECEIPT,
+        "hookSource": "$HOME/.codex/hooks.json",
+        "hookTrustRecords": [
+            {
+                "event": event,
+                "eventSlot": slot,
+                "trustedHash": trusted_hash,
+            }
+            for event, slot, trusted_hash in HOOK_TRUST_RECORDS
+        ],
+        "legacyAppliedRun": {
+            "acceptedControlCommit": LEGACY_ACCEPTED_COMMIT,
+            "baseConfigLength": LEGACY_CONFIG_BASE_LENGTH,
+            "baseConfigSHA256": LEGACY_CONFIG_BASE_SHA256,
+            "driftConfigLength": LEGACY_CONFIG_DRIFT_LENGTH,
+            "driftConfigSHA256": LEGACY_CONFIG_DRIFT_SHA256,
+            "hookOverlayLength": LEGACY_HOOK_OVERLAY_LENGTH,
+            "hookOverlaySHA256": LEGACY_HOOK_OVERLAY_SHA256,
+            "manifestSHA256": LEGACY_MANIFEST_SHA256,
+            "projectInsertOffset": LEGACY_PROJECT_INSERT_OFFSET,
+            "rejectedComposerLength": REJECTED_CONFIG_COMPOSER_LENGTH,
+            "rejectedComposerSHA256": REJECTED_CONFIG_COMPOSER_SHA256,
+            "receiptCoreSHA256": LEGACY_RECEIPT_CORE_SHA256,
+            "receiptSHA256": LEGACY_RECEIPT_SHA256,
+            "runId": LEGACY_RUN_ID,
+        },
+        "ownerAuthorization": "exact-reviewed-user-hook-hashes",
+        "projectTrustReconciliation": {
+            "entry": "$HOME/AIDev/control",
+            "expectedAddedTrustLevel": "trusted",
+            "preexistingProjectEntries": 19,
+            "result": "absent",
+        },
+        "survives": ["verify", "noop", "rollback", "return"],
+    }
+
+
+def expected_hook_state(layout):
+    source = str(layout.codex_home / "hooks.json")
+    return {
+        source + ":" + slot: {"trusted_hash": trusted_hash}
+        for _event, slot, trusted_hash in HOOK_TRUST_RECORDS
+    }
+
+
+def exact_hook_overlay(layout):
+    source = str(layout.codex_home / "hooks.json")
+    blocks = []
+    for _event, slot, trusted_hash in HOOK_TRUST_RECORDS:
+        blocks.append(
+            (
+                "[hooks.state."
+                + toml_basic_string(source + ":" + slot)
+                + "]\ntrusted_hash = "
+                + toml_basic_string(trusted_hash)
+                + "\n"
+            ).encode()
+        )
+    return b"[hooks.state]\n\n" + b"\n".join(blocks)
+
+
+def config_overlay_separator(base):
+    return b"" if base.endswith(b"\n\n") else b"\n"
+
+
+def compose_exact_config(base, overlay):
+    return base + config_overlay_separator(base) + overlay
+
+
+def exact_project_trust_block(layout):
+    control = str(layout.control.resolve(strict=True))
+    return (
+        "[projects."
+        + toml_basic_string(control)
+        + "]\ntrust_level = \"trusted\"\n"
+    ).encode()
+
+
+def project_region_boundary(base):
+    lines = base.splitlines(keepends=True)
+    offsets = []
+    position = 0
+    for line in lines:
+        offsets.append(position)
+        position += len(line)
+    project_rows = [
+        index
+        for index, line in enumerate(lines)
+        if line.startswith(b"[projects.") and line.rstrip(b"\r\n").endswith(b"]")
+    ]
+    if len(project_rows) != 19:
+        fail("project_region_shape")
+    last_project = project_rows[-1]
+    following = [
+        index
+        for index in range(last_project + 1, len(lines))
+        if lines[index].startswith(b"[")
+    ]
+    if not following:
+        fail("project_region_retained_table")
+    boundary = offsets[following[0]]
+    if (
+        boundary <= 0
+        or not base[:boundary].endswith(b"\n\n")
+        or base[boundary:boundary + 1] != b"["
+    ):
+        fail("project_region_boundary")
+    return boundary
+
+
+def insert_project_trust(layout, base):
+    boundary = project_region_boundary(base)
+    return (
+        base[:boundary]
+        + exact_project_trust_block(layout)
+        + b"\n"
+        + base[boundary:]
+    )
+
+
+def compose_project_trust_config(layout, base, overlay):
+    return compose_exact_config(
+        insert_project_trust(layout, base),
+        overlay,
+    )
+
+
+def config_overlay_contract(
+    layout,
+    run_root,
+    live,
+    base,
+    *,
+    project_trust_present,
+):
+    """Return the exact hook suffix after proving only the allowed overlay."""
+    if (
+        not isinstance(live, bytes)
+        or not isinstance(base, bytes)
+        or len(live) > MAX_CONFIG
+        or len(base) > MAX_CONFIG
+    ):
+        fail("config_overlay_shape")
+    live_config = config_snapshot_in_run(layout, run_root, live)
+    base_config = config_snapshot_in_run(layout, run_root, base)
+    expected_state = expected_hook_state(layout)
+    hooks = live_config.get("hooks")
+    if (
+        not isinstance(hooks, dict)
+        or hooks.get("state") != expected_state
+    ):
+        fail("hook_trust_overlay")
+    hooks = dict(hooks)
+    del hooks["state"]
+    if hooks and hooks != EMPTY_HOOKS:
+        live_config["hooks"] = hooks
+    else:
+        live_config.pop("hooks", None)
+    base_hooks = base_config.get("hooks")
+    if base_hooks in (None, {}, EMPTY_HOOKS):
+        base_config.pop("hooks", None)
+
+    control = str(layout.control.resolve(strict=True))
+    projects = live_config.get("projects")
+    base_projects = base_config.get("projects")
+    if not isinstance(projects, dict) or not isinstance(base_projects, dict):
+        fail("project_trust_overlay")
+    projects = dict(projects)
+    if project_trust_present:
+        if (
+            projects.get(control) != {"trust_level": "trusted"}
+            or control in base_projects
+            or len(base_projects) != 19
+            or len(projects) != 20
+        ):
+            fail("project_trust_overlay")
+        del projects[control]
+    elif control in projects or control in base_projects:
+        fail("unexpected_project_trust")
+    live_config["projects"] = projects
+    if live_config != base_config:
+        fail("config_overlay_drift")
+
+    suffix = exact_hook_overlay(layout)
+    reconciled = compose_exact_config(base, suffix)
+    if project_trust_present:
+        expected = compose_project_trust_config(
+            layout,
+            base,
+            suffix,
+        )
+        if live != expected:
+            fail("config_overlay_before_byte_drift")
+    elif live != reconciled:
+        fail("config_overlay_after_byte_drift")
+    return {
+        "hookOverlay": suffix,
+        "hookOverlaySHA256": digest_bytes(suffix),
+        "reconciled": reconciled,
+    }
+
+
+def compose_config_overlay(layout, run_root, base, overlay, expected_hash):
+    if (
+        overlay != exact_hook_overlay(layout)
+        or digest_bytes(overlay) != expected_hash
+    ):
+        fail("hook_trust_overlay_hash")
+    value = compose_exact_config(base, overlay)
+    config_overlay_contract(
+        layout,
+        run_root,
+        value,
+        base,
+        project_trust_present=False,
+    )
+    return value
+
+
+def source_bytes(layout, source, expected):
+    path = layout.control / source
+    if path.is_symlink() or not path.is_file():
+        fail("source_file")
+    try:
+        relative = path.resolve(strict=True).relative_to(layout.control.resolve(strict=True))
+    except ValueError:
+        fail("source_escape")
+    if relative != Path(source):
+        fail("source_noncanonical")
+    snapshot = snapshot_path(
+        path,
+        layout.uid,
+        MAX_GENERATED,
+        allow_absent=False,
+        user_root=layout.control,
+    )
+    value = snapshot["bytes"]
+    if snapshot["metadata"]["sha256"] != expected:
+        fail("source_hash")
+    return value
+
+
+def stage(layout, run_id, gate):
+    manifest = load_manifest()
+    validate_layout(layout, create_state_root=True)
+    if (
+        not isinstance(gate, dict)
+        or set(gate)
+        != {
+            "acceptedControlCommit",
+            "protectedBaselineCommit",
+            "sourceCommit",
+        }
+        or not HEX40.fullmatch(gate.get("acceptedControlCommit", ""))
+        or not HEX40.fullmatch(gate.get("protectedBaselineCommit", ""))
+        or not HEX40.fullmatch(gate.get("sourceCommit", ""))
+    ):
+        fail("gate_binding")
+    version = canonical_cli_version(layout)
+    root = create_run_directory(layout, run_id)
+    try:
+        targets = layout.targets()
+        target_rows = []
+        accepted_hashes = load_accepted_generated_hashes()
+        staged_values = {}
+        before_values = {}
+        for identifier in TARGET_IDS:
+            path = targets[identifier]
+            allow_absent = identifier != "config"
+            before = snapshot_path(
+                path,
+                layout.uid,
+                MAX_CONFIG,
+                allow_absent=allow_absent,
+                user_root=layout.home,
+            )
+            source, _, strategy, mode = TARGET_SPECS[identifier]
+            source_value = source_bytes(
+                layout, source, accepted_hashes[source]
+            )
+            staged_value = (
+                merge_config(
+                    layout,
+                    before["bytes"],
+                    root,
+                    gate["acceptedControlCommit"],
+                )
+                if strategy == "merge-top-level"
+                else source_value
+            )
+            install_mode = (
+                int(before["metadata"]["mode"], 8)
+                if mode is None
+                else mode
+            )
+            if install_mode & 0o077 and identifier != "quarantine-launcher":
+                fail("install_mode")
+            write_new(
+                root / "staged" / identifier,
+                staged_value,
+                uid=layout.uid,
+                user_root=layout.home,
+            )
+            if before["bytes"] is None:
+                write_new(
+                    root / "preimages" / (identifier + ".absent"),
+                    b"absent\n",
+                    uid=layout.uid,
+                    user_root=layout.home,
+                )
+            else:
+                write_new(
+                    root / "preimages" / identifier,
+                    before["bytes"],
+                    uid=layout.uid,
+                    user_root=layout.home,
+                )
+            staged_values[identifier] = staged_value
+            before_values[identifier] = before
+            target_rows.append(
+                {
+                    "after": {
+                        "exists": True,
+                        "linkCount": 1,
+                        "mode": f"{install_mode:04o}",
+                        "ownerClass": "current-user",
+                        "sha256": digest_bytes(staged_value),
+                        "size": len(staged_value),
+                    },
+                    "applied": False,
+                    "before": before["metadata"],
+                    "id": identifier,
+                    "sourceSHA256": accepted_hashes[source],
+                }
+            )
+        manifest_hash = digest_file(MANIFEST_PATH)
+        receipt = {
+            "acceptedControlCommit": gate["acceptedControlCommit"],
+            "appliedOrder": [],
+            "applyResult": "not-run",
+            "cli": {
+                "source": "chatgpt-app-bundle",
+                "version": version,
+                "versionPolicy": "exact-stage-b-re-attestation",
+            },
+            "directories": directory_receipt(layout),
+            "generatedSourceHashes": {
+                source: accepted_hashes[source]
+                for source in sorted(accepted_hashes)
+            },
+            "manifestSHA256": manifest_hash,
+            "phase": "phase5_codex_contract_apply",
+            "rollbackState": "not-run",
+            "runId": run_id,
+            "schema": 1,
+            "sourceCommit": gate["sourceCommit"],
+            "state": "staged",
+            "targets": target_rows,
+        }
+        atomic_json(
+            root / "receipt.json",
+            receipt,
+            uid=layout.uid,
+            user_root=layout.home,
+        )
+        validate_run_state(layout, root, receipt)
+        return public_report(receipt)
+    except Exception:
+        marker = root / "stage-failed"
+        try:
+            write_new(
+                marker,
+                b"stage-failed\n",
+                uid=layout.uid,
+                user_root=layout.home,
+            )
+        except Exception:
+            pass
+        raise
+
+
+def receipt_core_digest(receipt):
+    value = strict_json_bytes(
+        (
+            json.dumps(receipt, sort_keys=True, separators=(",", ":"))
+        ).encode(),
+        "receipt_core",
+    )
+    for key in ("appliedOrder", "applyResult", "rollbackState", "state"):
+        value.pop(key, None)
+    for row in value.get("targets", []):
+        row.pop("applied", None)
+    for row in value.get("directories", []):
+        row.pop("createdByApply", None)
+    return digest_bytes(
+        json.dumps(
+            value,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode()
+    )
+
+
+def overlay_record_value(
+    receipt,
+    receipt_sha256,
+    before_sha256,
+    reconciled_sha256,
+    overlay_sha256,
+    state,
+    rollback_state,
+):
+    return {
+        "configBeforeReconciliationSHA256": before_sha256,
+        "hookOverlaySHA256": overlay_sha256,
+        "hookSource": "$HOME/.codex/hooks.json",
+        "hookTrustRecords":
+            manifest_overlay_contract()["hookTrustRecords"],
+        "phase": "phase5_external_config_overlay",
+        "projectTrustEntryRemoved": "$HOME/AIDev/control",
+        "projectTrustRowsAfter": 19,
+        "projectTrustRowsBefore": 20,
+        "receiptCoreSHA256": receipt_core_digest(receipt),
+        "receiptSHA256AtReconciliation": receipt_sha256,
+        "reconciledConfigSHA256": reconciled_sha256,
+        "rollbackState": rollback_state,
+        "runId": receipt["runId"],
+        "schema": 1,
+        "state": state,
+    }
+
+
+def overlay_record_keys():
+    return {
+        "configBeforeReconciliationSHA256",
+        "hookOverlaySHA256",
+        "hookSource",
+        "hookTrustRecords",
+        "phase",
+        "projectTrustEntryRemoved",
+        "projectTrustRowsAfter",
+        "projectTrustRowsBefore",
+        "receiptCoreSHA256",
+        "receiptSHA256AtReconciliation",
+        "reconciledConfigSHA256",
+        "rollbackState",
+        "runId",
+        "schema",
+        "state",
+    }
+
+
+def load_overlay_record(layout, root, receipt, *, allow_missing):
+    path = root / OVERLAY_RECEIPT
+    snapshot = snapshot_path(
+        path,
+        layout.uid,
+        256 * 1024,
+        allow_absent=True,
+        user_root=layout.home,
+    )
+    if not snapshot["metadata"]["exists"]:
+        if allow_missing:
+            return None
+        fail("external_overlay_receipt_missing")
+    if snapshot["metadata"]["mode"] != "0600":
+        fail("external_overlay_receipt_metadata")
+    record = strict_json_bytes(
+        snapshot["bytes"],
+        "external_overlay_receipt_json",
+    )
+    if (
+        set(record) != overlay_record_keys()
+        or record.get("schema") != 1
+        or record.get("phase") != "phase5_external_config_overlay"
+        or record.get("runId") != receipt["runId"]
+        or record.get("hookSource") != "$HOME/.codex/hooks.json"
+        or record.get("hookTrustRecords")
+        != manifest_overlay_contract()["hookTrustRecords"]
+        or record.get("hookOverlaySHA256")
+        != digest_bytes(exact_hook_overlay(layout))
+        or record.get("projectTrustEntryRemoved")
+        != "$HOME/AIDev/control"
+        or record.get("projectTrustRowsBefore") != 20
+        or record.get("projectTrustRowsAfter") != 19
+        or record.get("receiptCoreSHA256")
+        != receipt_core_digest(receipt)
+        or record.get("state")
+        not in {
+            "prepared",
+            "reconciled",
+            "rolled-back-after-failure",
+            "reconciliation-rollback-failed",
+        }
+        or (
+            record.get("state"),
+            record.get("rollbackState"),
+        )
+        not in {
+            ("prepared", "not-run"),
+            ("reconciled", "not-required"),
+            ("rolled-back-after-failure", "complete"),
+            ("reconciliation-rollback-failed", "failed"),
+        }
+        or any(
+            HEX64.fullmatch(record.get(key, "")) is None
+            for key in (
+                "configBeforeReconciliationSHA256",
+                "hookOverlaySHA256",
+                "receiptCoreSHA256",
+                "receiptSHA256AtReconciliation",
+                "reconciledConfigSHA256",
+            )
+        )
+        or (
+            receipt["runId"] == LEGACY_RUN_ID
+            and record.get("receiptSHA256AtReconciliation")
+            != LEGACY_RECEIPT_SHA256
+        )
+        or (
+            receipt["runId"] == LEGACY_RUN_ID
+            and record.get("receiptCoreSHA256")
+            != LEGACY_RECEIPT_CORE_SHA256
+        )
+    ):
+        fail("external_overlay_receipt")
+    preimage = snapshot_path(
+        root / "preimages" / OVERLAY_PREIMAGE,
+        layout.uid,
+        MAX_CONFIG,
+        allow_absent=False,
+        user_root=layout.home,
+    )
+    if (
+        preimage["metadata"]["mode"] != "0600"
+        or preimage["metadata"]["sha256"]
+        != record["configBeforeReconciliationSHA256"]
+    ):
+        fail("external_overlay_preimage")
+    return record
+
+
+def receipt_keys():
+    return {
+        "acceptedControlCommit",
+        "appliedOrder",
+        "applyResult",
+        "cli",
+        "directories",
+        "generatedSourceHashes",
+        "manifestSHA256",
+        "phase",
+        "rollbackState",
+        "runId",
+        "schema",
+        "sourceCommit",
+        "state",
+        "targets",
+    }
+
+
+def load_receipt(layout, run_id, gate=None):
+    root = run_directory(layout, run_id)
+    checked_directory(
+        root,
+        layout.uid,
+        {0o700},
+        user_root=layout.home,
+    )
+    path = root / "receipt.json"
+    snapshot = snapshot_path(
+        path,
+        layout.uid,
+        256 * 1024,
+        allow_absent=False,
+        user_root=layout.home,
+    )
+    value = strict_json_bytes(snapshot["bytes"], "receipt_json")
+    legacy = (
+        run_id == LEGACY_RUN_ID
+        and value.get("acceptedControlCommit") == LEGACY_ACCEPTED_COMMIT
+        and value.get("sourceCommit") == LEGACY_ACCEPTED_COMMIT
+        and value.get("manifestSHA256") == LEGACY_MANIFEST_SHA256
+    )
+    if (
+        set(value) != receipt_keys()
+        or value.get("schema") != 1
+        or value.get("phase") != "phase5_codex_contract_apply"
+        or value.get("runId") != run_id
+        or not HEX40.fullmatch(value.get("acceptedControlCommit", ""))
+        or not HEX40.fullmatch(value.get("sourceCommit", ""))
+        or (
+            value.get("manifestSHA256") != digest_file(MANIFEST_PATH)
+            and not legacy
+        )
+        or not isinstance(value.get("cli"), dict)
+        or value["cli"].get("source") != "chatgpt-app-bundle"
+        or value["cli"].get("versionPolicy") != "exact-stage-b-re-attestation"
+        or not cli_version_at_floor(value["cli"].get("version", ""))
+    ):
+        fail("stale_receipt")
+    overlay_present = (
+        snapshot_path(
+            root / OVERLAY_RECEIPT,
+            layout.uid,
+            256 * 1024,
+            allow_absent=True,
+            user_root=layout.home,
+        )["metadata"]["exists"]
+    )
+    if (
+        legacy
+        and receipt_core_digest(value)
+        != LEGACY_RECEIPT_CORE_SHA256
+    ):
+        fail("stale_legacy_receipt")
+    if (
+        legacy
+        and not overlay_present
+        and digest_bytes(snapshot["bytes"]) != LEGACY_RECEIPT_SHA256
+    ):
+        fail("stale_legacy_receipt")
+    if gate is not None:
+        if (
+            not isinstance(gate, dict)
+            or set(gate)
+            != {
+                "acceptedControlCommit",
+                "protectedBaselineCommit",
+                "sourceCommit",
+            }
+            or value["acceptedControlCommit"]
+            != gate["acceptedControlCommit"]
+            or (
+                value["sourceCommit"] != gate["sourceCommit"]
+                and not legacy
+            )
+            or not HEX40.fullmatch(gate["protectedBaselineCommit"])
+        ):
+            fail("stale_receipt_gate")
+    validate_run_state(layout, root, value)
+    if overlay_present:
+        load_overlay_record(
+            layout,
+            root,
+            value,
+            allow_missing=False,
+        )
+    return root, value
+
+
+def validate_metadata_shape(value, *, exists):
+    if not isinstance(value, dict) or set(value) != {
+        "exists",
+        "linkCount",
+        "mode",
+        "ownerClass",
+        "sha256",
+        "size",
+    }:
+        fail("receipt_metadata_shape")
+    if value["exists"] is not exists:
+        fail("receipt_metadata_exists")
+    if not exists:
+        if value != {
+            "exists": False,
+            "linkCount": 0,
+            "mode": None,
+            "ownerClass": "absent",
+            "sha256": None,
+            "size": 0,
+        }:
+            fail("receipt_absent_metadata")
+        return
+    if (
+        value["linkCount"] != 1
+        or not isinstance(value["mode"], str)
+        or re.fullmatch(r"[0-7]{4}", value["mode"]) is None
+        or value["ownerClass"] != "current-user"
+        or not isinstance(value["sha256"], str)
+        or HEX64.fullmatch(value["sha256"]) is None
+        or isinstance(value["size"], bool)
+        or not isinstance(value["size"], int)
+        or value["size"] < 0
+        or value["size"] > MAX_CONFIG
+    ):
+        fail("receipt_present_metadata")
+
+
+def validate_run_state(layout, root, receipt):
+    expected_children = {"preimages", "receipt.json", "staged"}
+    actual_children = directory_names(
+        root,
+        layout.uid,
+        {0o700},
+        layout.home,
+    )
+    overlay_present = OVERLAY_RECEIPT in actual_children
+    if overlay_present:
+        expected_children.add(OVERLAY_RECEIPT)
+    if actual_children != expected_children:
+        fail("partial_transaction_state")
+    checked_directory(
+        root / "preimages",
+        layout.uid,
+        {0o700},
+        user_root=layout.home,
+    )
+    checked_directory(
+        root / "staged",
+        layout.uid,
+        {0o700},
+        user_root=layout.home,
+    )
+    rows = receipt.get("targets")
+    if (
+        not isinstance(rows, list)
+        or any(not isinstance(item, dict) for item in rows)
+        or [item.get("id") for item in rows] != list(TARGET_IDS)
+        or not isinstance(receipt.get("appliedOrder"), list)
+        or any(item not in TARGET_IDS for item in receipt["appliedOrder"])
+        or len(set(receipt["appliedOrder"])) != len(receipt["appliedOrder"])
+    ):
+        fail("receipt_targets")
+    allowed_states = {
+        ("applied", "applied", "available"),
+        ("applying", "in-progress", "not-run"),
+        ("noop", "noop", "not-required"),
+        ("rolled-back", "noop", "noop-complete"),
+        ("rolled-back", "rolled-back", "complete"),
+        ("rolled-back-after-failure", "failed", "complete"),
+        ("rollback-failed", "failed", "failed"),
+        ("staged", "not-run", "not-run"),
+        ("returned", "returned", "returned-to-reviewed-state"),
+        ("returning", "in-progress", "not-run"),
+    }
+    if (
+        (
+            receipt.get("state"),
+            receipt.get("applyResult"),
+            receipt.get("rollbackState"),
+        )
+        not in allowed_states
+    ):
+        fail("receipt_state_contract")
+    directories = receipt.get("directories")
+    expected_directory_ids = [
+        "hooks-directory",
+        "skill-directory",
+        "skill-agents-directory",
+    ]
+    if (
+        not isinstance(directories, list)
+        or any(not isinstance(item, dict) for item in directories)
+        or [item.get("id") for item in directories]
+        != expected_directory_ids
+    ):
+        fail("receipt_directories")
+    for row in directories:
+        if (
+            set(row)
+            != {"createdByApply", "existsBefore", "id", "modeAfter"}
+            or not isinstance(row["createdByApply"], bool)
+            or not isinstance(row["existsBefore"], bool)
+            or row["modeAfter"] != "0700"
+            or row["existsBefore"]
+            and row["createdByApply"]
+            or receipt["state"]
+            in {"noop", "rolled-back", "rolled-back-after-failure", "staged"}
+            and row["createdByApply"]
+        ):
+            fail("receipt_directory_shape")
+    expected_staged = set(TARGET_IDS)
+    if directory_names(
+        root / "staged",
+        layout.uid,
+        {0o700},
+        layout.home,
+    ) != expected_staged:
+        fail("partial_staged_state")
+    expected_preimages = {
+        row["id"]
+        if row["before"]["exists"]
+        else row["id"] + ".absent"
+        for row in rows
+    }
+    if overlay_present:
+        expected_preimages.add(OVERLAY_PREIMAGE)
+    if directory_names(
+        root / "preimages",
+        layout.uid,
+        {0o700},
+        layout.home,
+    ) != expected_preimages:
+        fail("partial_preimage_state")
+    accepted_hashes = load_accepted_generated_hashes()
+    for row in rows:
+        if (
+            set(row)
+            != {"after", "applied", "before", "id", "sourceSHA256"}
+            or not isinstance(row["applied"], bool)
+            or not isinstance(row["before"], dict)
+            or not isinstance(row["after"], dict)
+            or not isinstance(row["sourceSHA256"], str)
+            or not HEX64.fullmatch(row["sourceSHA256"])
+        ):
+            fail("receipt_target_shape")
+        validate_metadata_shape(
+            row["before"], exists=row["before"].get("exists") is True
+        )
+        validate_metadata_shape(row["after"], exists=True)
+        source, _, _, mode = TARGET_SPECS[row["id"]]
+        if (
+            row["sourceSHA256"]
+            != accepted_hashes[source]
+            or mode is not None
+            and row["after"]["mode"] != f"{mode:04o}"
+            or mode is None
+            and row["after"]["mode"] != row["before"]["mode"]
+        ):
+            fail("receipt_target_binding")
+        staged = snapshot_path(
+            root / "staged" / row["id"],
+            layout.uid,
+            MAX_CONFIG,
+            allow_absent=False,
+            user_root=layout.home,
+        )
+        if (
+            staged["metadata"]["mode"] != "0600"
+            or staged["metadata"]["sha256"] != row["after"]["sha256"]
+            or staged["metadata"]["size"] != row["after"]["size"]
+        ):
+            fail("staged_hash_drift")
+        if row["before"]["exists"]:
+            preimage = snapshot_path(
+                root / "preimages" / row["id"],
+                layout.uid,
+                MAX_CONFIG,
+                allow_absent=False,
+                user_root=layout.home,
+            )
+            if (
+                preimage["metadata"]["mode"] != "0600"
+                or preimage["metadata"]["sha256"]
+                != row["before"]["sha256"]
+                or preimage["metadata"]["size"] != row["before"]["size"]
+            ):
+                fail("preimage_hash_drift")
+        else:
+            marker = snapshot_path(
+                root / "preimages" / (row["id"] + ".absent"),
+                layout.uid,
+                64,
+                allow_absent=False,
+                user_root=layout.home,
+            )
+            if marker["bytes"] != b"absent\n":
+                fail("absence_marker_drift")
+    if receipt.get("generatedSourceHashes") != {
+        source: accepted_hashes[source]
+        for source in sorted(accepted_hashes)
+    }:
+        fail("receipt_generated_hashes")
+    if receipt["state"] != "rollback-failed":
+        applied = [row["id"] for row in rows if row["applied"]]
+        if receipt["appliedOrder"] != applied:
+            fail("receipt_applied_order")
+
+
+def target_row(receipt, identifier):
+    for row in receipt["targets"]:
+        if row["id"] == identifier:
+            return row
+    fail("receipt_target_missing")
+
+
+def metadata_matches(snapshot, metadata, *, after=False):
+    keys = {
+        "exists",
+        "linkCount",
+        "mode",
+        "ownerClass",
+        "sha256",
+        "size",
+    }
+    actual = {
+        key: snapshot["metadata"].get(key)
+        for key in keys
+    }
+    expected = {key: metadata.get(key) for key in keys}
+    return actual == expected
+
+
+def private_transaction_bytes(layout, path, expected, reason):
+    snapshot = snapshot_path(
+        path,
+        layout.uid,
+        MAX_CONFIG,
+        allow_absent=False,
+        user_root=layout.home,
+    )
+    if (
+        snapshot["metadata"]["mode"] != "0600"
+        or snapshot["metadata"]["sha256"] != expected["sha256"]
+        or snapshot["metadata"]["size"] != expected["size"]
+    ):
+        fail(reason)
+    return snapshot["bytes"]
+
+
+def metadata_shell_matches(snapshot, metadata):
+    return all(
+        snapshot["metadata"].get(key) == metadata.get(key)
+        for key in ("exists", "linkCount", "mode", "ownerClass")
+    )
+
+
+def overlay_record_for_operation(layout, root, receipt):
+    record = load_overlay_record(
+        layout,
+        root,
+        receipt,
+        allow_missing=True,
+    )
+    if record is not None and record["state"] != "reconciled":
+        fail("external_overlay_recovery_required")
+    if record is not None:
+        canonical_cli_version(layout)
+    return record
+
+
+def config_base_bytes(layout, root, receipt, kind):
+    row = target_row(receipt, "config")
+    metadata = row[kind]
+    path = (
+        root / "staged/config"
+        if kind == "after"
+        else root / "preimages/config"
+    )
+    return private_transaction_bytes(
+        layout,
+        path,
+        metadata,
+        "staged_hash_drift" if kind == "after" else "preimage_hash_drift",
+    )
+
+
+def overlay_config_matches(
+    layout,
+    root,
+    receipt,
+    current,
+    kind,
+    record,
+):
+    metadata = target_row(receipt, "config")[kind]
+    if (
+        not current["metadata"]["exists"]
+        or not metadata_shell_matches(current, metadata)
+    ):
+        return False
+    base = config_base_bytes(layout, root, receipt, kind)
+    try:
+        expected = compose_config_overlay(
+            layout,
+            root,
+            base,
+            exact_hook_overlay(layout),
+            record["hookOverlaySHA256"],
+        )
+    except TransactionError:
+        return False
+    return (
+        current["bytes"] == expected
+        and current["metadata"]["sha256"] == digest_bytes(expected)
+        and current["metadata"]["size"] == len(expected)
+    )
+
+
+def target_matches(
+    layout,
+    root,
+    receipt,
+    identifier,
+    current,
+    kind,
+    record,
+):
+    if identifier == "config" and record is not None:
+        return overlay_config_matches(
+            layout,
+            root,
+            receipt,
+            current,
+            kind,
+            record,
+        )
+    return metadata_matches(
+        current,
+        target_row(receipt, identifier)[kind],
+    )
+
+
+def install_config_base(
+    layout,
+    root,
+    receipt,
+    from_kind,
+    to_kind,
+    record,
+):
+    target = layout.targets()["config"]
+    current = snapshot_path(
+        target,
+        layout.uid,
+        MAX_CONFIG,
+        allow_absent=False,
+        user_root=layout.home,
+    )
+    if not overlay_config_matches(
+        layout,
+        root,
+        receipt,
+        current,
+        from_kind,
+        record,
+    ):
+        fail("config_overlay_destination_drift")
+    from_base = config_base_bytes(
+        layout,
+        root,
+        receipt,
+        from_kind,
+    )
+    contract = config_overlay_contract(
+        layout,
+        root,
+        current["bytes"],
+        from_base,
+        project_trust_present=False,
+    )
+    to_base = config_base_bytes(layout, root, receipt, to_kind)
+    desired = compose_config_overlay(
+        layout,
+        root,
+        to_base,
+        contract["hookOverlay"],
+        record["hookOverlaySHA256"],
+    )
+    after = {
+        "exists": True,
+        "linkCount": 1,
+        "mode": target_row(receipt, "config")[to_kind]["mode"],
+        "ownerClass": "current-user",
+        "sha256": digest_bytes(desired),
+        "size": len(desired),
+    }
+    atomic_install(
+        layout,
+        "config-overlay-" + from_kind + "-to-" + to_kind,
+        target,
+        current["metadata"],
+        after,
+        desired,
+    )
+    final = snapshot_path(
+        target,
+        layout.uid,
+        MAX_CONFIG,
+        allow_absent=False,
+        user_root=layout.home,
+    )
+    if not overlay_config_matches(
+        layout,
+        root,
+        receipt,
+        final,
+        to_kind,
+        record,
+    ):
+        fail("config_overlay_post_install")
+
+
+def ensure_managed_directories(layout, receipt):
+    mapping = {
+        "hooks-directory": layout.codex_home / "hooks",
+        "skill-directory": layout.codex_home / "skills/manage-workstation",
+        "skill-agents-directory":
+            layout.codex_home / "skills/manage-workstation/agents",
+    }
+    created = []
+    for row in receipt["directories"]:
+        path = mapping[row["id"]]
+        if row["existsBefore"]:
+            checked_directory(
+                path,
+                layout.uid,
+                SAFE_DIRECTORY_MODES,
+                user_root=layout.home,
+            )
+            continue
+        parent = path.parent
+        parent_handle = open_directory(
+            parent,
+            layout.uid,
+            SAFE_DIRECTORY_MODES,
+            layout.home,
+        )
+        child = None
+        try:
+            existing = DirectoryHandle.child(
+                parent_handle,
+                path.name,
+                SAFE_DIRECTORY_MODES,
+            )
+            if existing is not None:
+                existing.close()
+                fail("directory_substitution")
+            child = make_child_directory(
+                parent_handle,
+                path.name,
+                0o700,
+                exclusive=False,
+            )
+            row["createdByApply"] = True
+            created.append(row["id"])
+        finally:
+            if child is not None:
+                child.close()
+            parent_handle.close()
+    return created
+
+
+def libc_rename(parent_fd, source, destination, flag):
+    library = ctypes.CDLL("/usr/lib/libSystem.B.dylib", use_errno=True)
+    function = library.renameatx_np
+    function.argtypes = [
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_uint,
+    ]
+    function.restype = ctypes.c_int
+    result = function(
+        parent_fd,
+        os.fsencode(source),
+        parent_fd,
+        os.fsencode(destination),
+        flag,
+    )
+    if result != 0:
+        code = ctypes.get_errno()
+        raise OSError(code, os.strerror(code))
+
+
+def atomic_install(
+    layout,
+    identifier,
+    path,
+    before,
+    after,
+    value,
+    *,
+    before_atomic=None,
+    after_atomic=None,
+):
+    parent = open_directory(
+        path.parent,
+        layout.uid,
+        SAFE_DIRECTORY_MODES,
+        layout.home,
+    )
+    temporary = ".phase5-" + identifier + "-" + os.urandom(8).hex()
+    installed = False
+    renamed = False
+    try:
+        temporary_identity = write_new_at(
+            parent,
+            temporary,
+            value,
+            layout.uid,
+            int(after["mode"], 8),
+        )
+        current = snapshot_at(
+            parent,
+            path.name,
+            layout.uid,
+            MAX_CONFIG,
+            allow_absent=True,
+        )
+        if not metadata_matches(current, before):
+            fail("destination_drift")
+        if before_atomic is not None:
+            before_atomic(identifier, path)
+        parent.verify()
+        current = snapshot_at(
+            parent,
+            path.name,
+            layout.uid,
+            MAX_CONFIG,
+            allow_absent=True,
+        )
+        if not metadata_matches(current, before):
+            fail("destination_toctou_substitution")
+        if before["exists"]:
+            libc_rename(
+                parent.descriptor,
+                temporary,
+                path.name,
+                RENAME_SWAP,
+            )
+        else:
+            libc_rename(
+                parent.descriptor,
+                temporary,
+                path.name,
+                RENAME_EXCL,
+            )
+        renamed = True
+        try:
+            if before["exists"]:
+                swapped = snapshot_at(
+                    parent,
+                    temporary,
+                    layout.uid,
+                    MAX_CONFIG,
+                    allow_absent=False,
+                    bind_chain=False,
+                )
+                if (
+                    not metadata_matches(swapped, before)
+                    or swapped["identity"] != current["identity"]
+                ):
+                    fail("destination_toctou_substitution")
+            else:
+                named = os.stat(
+                    path.name,
+                    dir_fd=parent.descriptor,
+                    follow_symlinks=False,
+                )
+                if (named.st_dev, named.st_ino) != temporary_identity:
+                    fail("destination_toctou_substitution")
+            parent.verify()
+            os.fsync(parent.descriptor)
+            if after_atomic is not None:
+                after_atomic(identifier, path)
+            parent.verify()
+            final = snapshot_at(
+                parent,
+                path.name,
+                layout.uid,
+                MAX_CONFIG,
+                allow_absent=False,
+            )
+            if not metadata_matches(final, after, after=True):
+                fail("post_install_hash")
+        except Exception as error:
+            try:
+                if before["exists"]:
+                    libc_rename(
+                        parent.descriptor,
+                        temporary,
+                        path.name,
+                        RENAME_SWAP,
+                    )
+                    restored = snapshot_at(
+                        parent,
+                        path.name,
+                        layout.uid,
+                        MAX_CONFIG,
+                        allow_absent=False,
+                        bind_chain=False,
+                    )
+                    if not metadata_matches(restored, before):
+                        fail("atomic_local_rollback_failed")
+                    os.unlink(temporary, dir_fd=parent.descriptor)
+                else:
+                    named = os.stat(
+                        path.name,
+                        dir_fd=parent.descriptor,
+                        follow_symlinks=False,
+                    )
+                    if (named.st_dev, named.st_ino) != temporary_identity:
+                        fail("atomic_local_rollback_failed")
+                    os.unlink(path.name, dir_fd=parent.descriptor)
+                renamed = False
+                os.fsync(parent.descriptor)
+            except Exception:
+                fail("atomic_local_rollback_failed")
+            raise error
+        if before["exists"]:
+            os.unlink(temporary, dir_fd=parent.descriptor)
+        renamed = False
+        installed = True
+        os.fsync(parent.descriptor)
+    finally:
+        cleanup_failed = False
+        if not installed:
+            if renamed:
+                cleanup_failed = True
+            else:
+                try:
+                    os.unlink(temporary, dir_fd=parent.descriptor)
+                except FileNotFoundError:
+                    pass
+        parent.close()
+        if cleanup_failed:
+            fail("atomic_local_rollback_failed")
+
+
+def remove_exact(layout, path, expected):
+    parent = open_directory(
+        path.parent,
+        layout.uid,
+        SAFE_DIRECTORY_MODES,
+        layout.home,
+    )
+    temporary = ".phase5-remove-" + os.urandom(8).hex()
+    moved = False
+    try:
+        current = snapshot_at(
+            parent,
+            path.name,
+            layout.uid,
+            MAX_CONFIG,
+            allow_absent=False,
+        )
+        if not metadata_matches(current, expected):
+            fail("rollback_destination_drift")
+        named = os.stat(
+            path.name,
+            dir_fd=parent.descriptor,
+            follow_symlinks=False,
+        )
+        if (named.st_dev, named.st_ino) != current["identity"]:
+            fail("rollback_toctou_substitution")
+        libc_rename(
+            parent.descriptor,
+            path.name,
+            temporary,
+            RENAME_EXCL,
+        )
+        moved = True
+        try:
+            moved_facts = os.stat(
+                temporary,
+                dir_fd=parent.descriptor,
+                follow_symlinks=False,
+            )
+            if (
+                moved_facts.st_dev,
+                moved_facts.st_ino,
+            ) != current["identity"]:
+                fail("rollback_toctou_substitution")
+            parent.verify()
+        except Exception as error:
+            libc_rename(
+                parent.descriptor,
+                temporary,
+                path.name,
+                RENAME_EXCL,
+            )
+            moved = False
+            os.fsync(parent.descriptor)
+            raise error
+        os.unlink(temporary, dir_fd=parent.descriptor)
+        moved = False
+        os.fsync(parent.descriptor)
+    finally:
+        if moved:
+            try:
+                libc_rename(
+                    parent.descriptor,
+                    temporary,
+                    path.name,
+                    RENAME_EXCL,
+                )
+            except OSError:
+                pass
+        parent.close()
+
+
+def restore_existing(layout, identifier, path, after, before, value):
+    atomic_install(
+        layout,
+        "rollback-" + identifier,
+        path,
+        after,
+        before,
+        value,
+    )
+
+
+def rollback_applied(
+    layout,
+    root,
+    receipt,
+    identifiers,
+    overlay_record=None,
+):
+    targets = layout.targets()
+    for identifier in reversed(identifiers):
+        row = target_row(receipt, identifier)
+        if identifier == "config" and overlay_record is not None:
+            install_config_base(
+                layout,
+                root,
+                receipt,
+                "after",
+                "before",
+                overlay_record,
+            )
+        elif row["before"]["exists"]:
+            value = private_transaction_bytes(
+                layout,
+                root / "preimages" / identifier,
+                row["before"],
+                "preimage_hash_drift",
+            )
+            restore_existing(
+                layout,
+                identifier,
+                targets[identifier],
+                row["after"],
+                row["before"],
+                value,
+            )
+        else:
+            remove_exact(layout, targets[identifier], row["after"])
+        row["applied"] = False
+    mapping = {
+        "hooks-directory": layout.codex_home / "hooks",
+        "skill-directory": layout.codex_home / "skills/manage-workstation",
+        "skill-agents-directory":
+            layout.codex_home / "skills/manage-workstation/agents",
+    }
+    for row in reversed(receipt["directories"]):
+        if row["createdByApply"]:
+            path = mapping[row["id"]]
+            parent = open_directory(
+                path.parent,
+                layout.uid,
+                SAFE_DIRECTORY_MODES,
+                layout.home,
+            )
+            child = None
+            try:
+                child = DirectoryHandle.child(parent, path.name, {0o700})
+                if child is None:
+                    fail("rollback_directory_missing")
+                remove_child_directory(parent, child)
+                row["createdByApply"] = False
+            finally:
+                if child is not None:
+                    child.close()
+                parent.close()
+
+
+def verify_preimage_state(layout, root, receipt, overlay_record=None):
+    for identifier, path in layout.targets().items():
+        row = target_row(receipt, identifier)
+        current = snapshot_path(
+            path,
+            layout.uid,
+            MAX_CONFIG,
+            allow_absent=True,
+            user_root=layout.home,
+        )
+        if not target_matches(
+            layout,
+            root,
+            receipt,
+            identifier,
+            current,
+            "before",
+            overlay_record,
+        ):
+            fail("rollback_verify_target")
+    mapping = {
+        "hooks-directory": layout.codex_home / "hooks",
+        "skill-directory": layout.codex_home / "skills/manage-workstation",
+        "skill-agents-directory":
+            layout.codex_home / "skills/manage-workstation/agents",
+    }
+    for row in receipt["directories"]:
+        handle = open_directory(
+            mapping[row["id"]],
+            layout.uid,
+            SAFE_DIRECTORY_MODES,
+            layout.home,
+            allow_missing=not row["existsBefore"],
+        )
+        if row["existsBefore"]:
+            if handle is None:
+                fail("rollback_directory_missing")
+            handle.close()
+        elif handle is not None:
+            handle.close()
+            fail("rollback_directory_remaining")
+
+
+def apply_receipt(
+    layout,
+    run_id,
+    *,
+    before_atomic=None,
+    after_atomic=None,
+    fail_after=None,
+    returning=False,
+    gate=None,
+):
+    root, receipt = load_receipt(layout, run_id, gate)
+    overlay_record = overlay_record_for_operation(
+        layout,
+        root,
+        receipt,
+    )
+    expected_state = "rolled-back" if returning else "staged"
+    if receipt["state"] != expected_state:
+        fail("receipt_state")
+    canonical_cli_version(layout)
+    targets = layout.targets()
+    all_noop = True
+    for identifier in TARGET_IDS:
+        row = target_row(receipt, identifier)
+        current = snapshot_path(
+            targets[identifier],
+            layout.uid,
+            MAX_CONFIG,
+            allow_absent=True,
+            user_root=layout.home,
+        )
+        expected = row["before"]
+        if not target_matches(
+            layout,
+            root,
+            receipt,
+            identifier,
+            current,
+            "before",
+            overlay_record,
+        ):
+            fail("destination_drift")
+        if not target_matches(
+            layout,
+            root,
+            receipt,
+            identifier,
+            current,
+            "after",
+            overlay_record,
+        ):
+            all_noop = False
+    if all_noop:
+        receipt["applyResult"] = "noop"
+        receipt["rollbackState"] = "not-required"
+        receipt["state"] = "noop"
+        atomic_json(
+            root / "receipt.json",
+            receipt,
+            uid=layout.uid,
+            user_root=layout.home,
+        )
+        return public_report(receipt)
+
+    receipt["state"] = "returning" if returning else "applying"
+    receipt["applyResult"] = "in-progress"
+    receipt["rollbackState"] = "not-run"
+    atomic_json(
+        root / "receipt.json",
+        receipt,
+        uid=layout.uid,
+        user_root=layout.home,
+    )
+    applied = []
+    try:
+        ensure_managed_directories(layout, receipt)
+        atomic_json(
+            root / "receipt.json",
+            receipt,
+            uid=layout.uid,
+            user_root=layout.home,
+        )
+        for identifier in TARGET_IDS:
+            row = target_row(receipt, identifier)
+            current = snapshot_path(
+                targets[identifier],
+                layout.uid,
+                MAX_CONFIG,
+                allow_absent=True,
+                user_root=layout.home,
+            )
+            if target_matches(
+                layout,
+                root,
+                receipt,
+                identifier,
+                current,
+                "after",
+                overlay_record,
+            ):
+                continue
+            if not target_matches(
+                layout,
+                root,
+                receipt,
+                identifier,
+                current,
+                "before",
+                overlay_record,
+            ):
+                fail("destination_drift")
+            if identifier == "config" and overlay_record is not None:
+                install_config_base(
+                    layout,
+                    root,
+                    receipt,
+                    "before",
+                    "after",
+                    overlay_record,
+                )
+                row["applied"] = True
+                applied.append(identifier)
+                receipt["appliedOrder"] = list(applied)
+                atomic_json(
+                    root / "receipt.json",
+                    receipt,
+                    uid=layout.uid,
+                    user_root=layout.home,
+                )
+                if fail_after is not None and len(applied) == fail_after:
+                    fail("injected_apply_failure")
+                continue
+            value = private_transaction_bytes(
+                layout,
+                root / "staged" / identifier,
+                row["after"],
+                "staged_hash_drift",
+            )
+            atomic_install(
+                layout,
+                identifier,
+                targets[identifier],
+                row["before"],
+                row["after"],
+                value,
+                before_atomic=before_atomic,
+                after_atomic=after_atomic,
+            )
+            row["applied"] = True
+            applied.append(identifier)
+            receipt["appliedOrder"] = list(applied)
+            atomic_json(
+                root / "receipt.json",
+                receipt,
+                uid=layout.uid,
+                user_root=layout.home,
+            )
+            if fail_after is not None and len(applied) == fail_after:
+                fail("injected_apply_failure")
+        receipt["applyResult"] = "returned" if returning else "applied"
+        receipt["rollbackState"] = (
+            "returned-to-reviewed-state" if returning else "available"
+        )
+        receipt["state"] = "returned" if returning else "applied"
+        atomic_json(
+            root / "receipt.json",
+            receipt,
+            uid=layout.uid,
+            user_root=layout.home,
+        )
+        verify_receipt(layout, run_id)
+        return public_report(receipt)
+    except Exception as error:
+        try:
+            rollback_applied(
+                layout,
+                root,
+                receipt,
+                applied,
+                overlay_record,
+            )
+            verify_preimage_state(
+                layout,
+                root,
+                receipt,
+                overlay_record,
+            )
+            receipt["appliedOrder"] = []
+            receipt["applyResult"] = "failed"
+            receipt["rollbackState"] = "complete"
+            receipt["state"] = "rolled-back-after-failure"
+            atomic_json(
+                root / "receipt.json",
+                receipt,
+                uid=layout.uid,
+                user_root=layout.home,
+            )
+        except Exception:
+            receipt["applyResult"] = "failed"
+            receipt["rollbackState"] = "failed"
+            receipt["state"] = "rollback-failed"
+            atomic_json(
+                root / "receipt.json",
+                receipt,
+                uid=layout.uid,
+                user_root=layout.home,
+            )
+            raise TransactionError("automatic_rollback_failed") from error
+        raise
+
+
+def recover_applied_ids(layout, root, receipt, overlay_record=None):
+    result = []
+    targets = layout.targets()
+    for identifier in TARGET_IDS:
+        row = target_row(receipt, identifier)
+        current = snapshot_path(
+            targets[identifier],
+            layout.uid,
+            MAX_CONFIG,
+            allow_absent=True,
+            user_root=layout.home,
+        )
+        before_match = target_matches(
+            layout,
+            root,
+            receipt,
+            identifier,
+            current,
+            "before",
+            overlay_record,
+        )
+        after_match = target_matches(
+            layout,
+            root,
+            receipt,
+            identifier,
+            current,
+            "after",
+            overlay_record,
+        )
+        if after_match and not before_match:
+            result.append(identifier)
+        elif not before_match and not after_match:
+            fail("partial_state_destination_unknown")
+    return result
+
+
+def rollback_receipt(layout, run_id, gate=None):
+    root, receipt = load_receipt(layout, run_id, gate)
+    overlay_record = overlay_record_for_operation(
+        layout,
+        root,
+        receipt,
+    )
+    if receipt["state"] == "noop":
+        receipt["state"] = "rolled-back"
+        receipt["rollbackState"] = "noop-complete"
+        atomic_json(
+            root / "receipt.json",
+            receipt,
+            uid=layout.uid,
+            user_root=layout.home,
+        )
+        return public_report(receipt)
+    if receipt["state"] not in {
+        "applied",
+        "returned",
+        "applying",
+        "returning",
+        "rollback-failed",
+    }:
+        fail("receipt_state")
+    identifiers = recover_applied_ids(
+        layout,
+        root,
+        receipt,
+        overlay_record,
+    )
+    try:
+        rollback_applied(
+            layout,
+            root,
+            receipt,
+            identifiers,
+            overlay_record,
+        )
+        verify_preimage_state(
+            layout,
+            root,
+            receipt,
+            overlay_record,
+        )
+        receipt["appliedOrder"] = []
+        receipt["applyResult"] = "rolled-back"
+        receipt["rollbackState"] = "complete"
+        receipt["state"] = "rolled-back"
+        atomic_json(
+            root / "receipt.json",
+            receipt,
+            uid=layout.uid,
+            user_root=layout.home,
+        )
+    except Exception:
+        receipt["applyResult"] = "failed"
+        receipt["rollbackState"] = "failed"
+        receipt["state"] = "rollback-failed"
+        atomic_json(
+            root / "receipt.json",
+            receipt,
+            uid=layout.uid,
+            user_root=layout.home,
+        )
+        raise
+    verify_rollback(layout, run_id)
+    return public_report(receipt)
+
+
+def verify_receipt(layout, run_id, gate=None):
+    root, receipt = load_receipt(layout, run_id, gate)
+    overlay_record = overlay_record_for_operation(
+        layout,
+        root,
+        receipt,
+    )
+    if receipt["state"] not in {"applied", "returned", "noop"}:
+        fail("verify_state")
+    for identifier, path in layout.targets().items():
+        current = snapshot_path(
+            path,
+            layout.uid,
+            MAX_CONFIG,
+            allow_absent=False,
+            user_root=layout.home,
+        )
+        if not target_matches(
+            layout,
+            root,
+            receipt,
+            identifier,
+            current,
+            "after",
+            overlay_record,
+        ):
+            fail("verify_target")
+    return public_report(receipt)
+
+
+def verify_rollback(layout, run_id, gate=None):
+    root, receipt = load_receipt(layout, run_id, gate)
+    overlay_record = overlay_record_for_operation(
+        layout,
+        root,
+        receipt,
+    )
+    if receipt["state"] not in {
+        "rolled-back",
+        "rolled-back-after-failure",
+    }:
+        fail("rollback_verify_state")
+    for identifier, path in layout.targets().items():
+        row = target_row(receipt, identifier)
+        current = snapshot_path(
+            path,
+            layout.uid,
+            MAX_CONFIG,
+            allow_absent=True,
+            user_root=layout.home,
+        )
+        if not target_matches(
+            layout,
+            root,
+            receipt,
+            identifier,
+            current,
+            "before",
+            overlay_record,
+        ):
+            fail("rollback_verify_target")
+    return public_report(receipt)
+
+
+def overlay_report(receipt, record):
+    return {
+        "hookTrustRecords": len(record["hookTrustRecords"]),
+        "liveApplyAuthorized": False,
+        "phase5PassClaimed": False,
+        "phase6Authorized": False,
+        "projectTrustEntryPresent": False,
+        "rollbackState": record["rollbackState"],
+        "runId": receipt["runId"],
+        "schema": 1,
+        "state": record["state"],
+    }
+
+
+def reconciled_metadata(receipt, value):
+    before = target_row(receipt, "config")["before"]
+    return {
+        "exists": True,
+        "linkCount": 1,
+        "mode": before["mode"],
+        "ownerClass": "current-user",
+        "sha256": digest_bytes(value),
+        "size": len(value),
+    }
+
+
+def reconciliation_preimage(layout, root, record):
+    metadata = {
+        "sha256": record["configBeforeReconciliationSHA256"],
+        "size": snapshot_path(
+            root / "preimages" / OVERLAY_PREIMAGE,
+            layout.uid,
+            MAX_CONFIG,
+            allow_absent=False,
+            user_root=layout.home,
+        )["metadata"]["size"],
+    }
+    return private_transaction_bytes(
+        layout,
+        root / "preimages" / OVERLAY_PREIMAGE,
+        metadata,
+        "external_overlay_preimage",
+    )
+
+
+def write_overlay_record(layout, root, record):
+    atomic_json(
+        root / OVERLAY_RECEIPT,
+        record,
+        uid=layout.uid,
+        user_root=layout.home,
+    )
+
+
+def reconcile_receipt(
+    layout,
+    run_id,
+    *,
+    before_atomic=None,
+    after_atomic=None,
+    fail_after=None,
+    gate=None,
+):
+    root, receipt = load_receipt(layout, run_id, gate)
+    canonical_cli_version(layout)
+    if (
+        receipt["state"] != "applied"
+        or receipt["applyResult"] != "applied"
+        or receipt["rollbackState"] != "available"
+    ):
+        fail("reconciliation_receipt_state")
+    prior_record = load_overlay_record(
+        layout,
+        root,
+        receipt,
+        allow_missing=True,
+    )
+    if prior_record is not None and prior_record["state"] not in {
+        "rolled-back-after-failure",
+    }:
+        fail("reconciliation_state")
+    config_path = layout.targets()["config"]
+    current = snapshot_path(
+        config_path,
+        layout.uid,
+        MAX_CONFIG,
+        allow_absent=False,
+        user_root=layout.home,
+    )
+    base = config_base_bytes(layout, root, receipt, "after")
+    contract = config_overlay_contract(
+        layout,
+        root,
+        current["bytes"],
+        base,
+        project_trust_present=True,
+    )
+    if (
+        run_id == LEGACY_RUN_ID
+        and (
+            len(base) != LEGACY_CONFIG_BASE_LENGTH
+            or digest_bytes(base) != LEGACY_CONFIG_BASE_SHA256
+            or project_region_boundary(base)
+            != LEGACY_PROJECT_INSERT_OFFSET
+            or len(current["bytes"]) != LEGACY_CONFIG_DRIFT_LENGTH
+            or current["metadata"]["sha256"]
+            != LEGACY_CONFIG_DRIFT_SHA256
+            or len(contract["hookOverlay"])
+            != LEGACY_HOOK_OVERLAY_LENGTH
+            or contract["hookOverlaySHA256"]
+            != LEGACY_HOOK_OVERLAY_SHA256
+        )
+    ):
+        fail("legacy_config_binding")
+    receipt_snapshot = snapshot_path(
+        root / "receipt.json",
+        layout.uid,
+        256 * 1024,
+        allow_absent=False,
+        user_root=layout.home,
+    )
+    if (
+        run_id == LEGACY_RUN_ID
+        and receipt_snapshot["metadata"]["sha256"]
+        != LEGACY_RECEIPT_SHA256
+    ):
+        fail("stale_legacy_receipt")
+    reconciled = contract["reconciled"]
+    after = reconciled_metadata(receipt, reconciled)
+    record = overlay_record_value(
+        receipt,
+        receipt_snapshot["metadata"]["sha256"],
+        current["metadata"]["sha256"],
+        after["sha256"],
+        contract["hookOverlaySHA256"],
+        "prepared",
+        "not-run",
+    )
+    preimage_path = root / "preimages" / OVERLAY_PREIMAGE
+    if prior_record is None:
+        write_new(
+            preimage_path,
+            current["bytes"],
+            uid=layout.uid,
+            user_root=layout.home,
+        )
+    else:
+        if (
+            prior_record["configBeforeReconciliationSHA256"]
+            != current["metadata"]["sha256"]
+            or reconciliation_preimage(layout, root, prior_record)
+            != current["bytes"]
+        ):
+            fail("reconciliation_retry_drift")
+    write_overlay_record(layout, root, record)
+    steps = {"count": 0}
+
+    def checkpoint():
+        steps["count"] += 1
+        if fail_after == steps["count"]:
+            fail("injected_reconciliation_failure")
+
+    def post_mutation(_identifier, _path):
+        if after_atomic is not None:
+            after_atomic(_identifier, _path)
+        checkpoint()
+        installed = snapshot_path(
+            config_path,
+            layout.uid,
+            MAX_CONFIG,
+            allow_absent=False,
+            user_root=layout.home,
+        )
+        if (
+            not metadata_matches(installed, after)
+            or config_overlay_contract(
+                layout,
+                root,
+                installed["bytes"],
+                base,
+                project_trust_present=False,
+            )["hookOverlaySHA256"]
+            != record["hookOverlaySHA256"]
+        ):
+            fail("reconciliation_post_verify")
+        checkpoint()
+        record["state"] = "reconciled"
+        record["rollbackState"] = "not-required"
+        write_overlay_record(layout, root, record)
+        checkpoint()
+        loaded = load_overlay_record(
+            layout,
+            root,
+            receipt,
+            allow_missing=False,
+        )
+        if loaded != record:
+            fail("reconciliation_receipt_post_verify")
+        checkpoint()
+
+    try:
+        atomic_install(
+            layout,
+            "config-project-trust-reconciliation",
+            config_path,
+            current["metadata"],
+            after,
+            reconciled,
+            before_atomic=before_atomic,
+            after_atomic=post_mutation,
+        )
+    except Exception as error:
+        restored = snapshot_path(
+            config_path,
+            layout.uid,
+            MAX_CONFIG,
+            allow_absent=False,
+            user_root=layout.home,
+        )
+        if (
+            not metadata_matches(restored, current["metadata"])
+            or restored["bytes"] != reconciliation_preimage(
+                layout,
+                root,
+                record,
+            )
+        ):
+            record["state"] = "reconciliation-rollback-failed"
+            record["rollbackState"] = "failed"
+            write_overlay_record(layout, root, record)
+            raise TransactionError(
+                "reconciliation_rollback_failed"
+            ) from error
+        record["state"] = "rolled-back-after-failure"
+        record["rollbackState"] = "complete"
+        write_overlay_record(layout, root, record)
+        raise
+    loaded = load_overlay_record(
+        layout,
+        root,
+        receipt,
+        allow_missing=False,
+    )
+    if loaded != record:
+        fail("reconciliation_receipt_post_verify")
+    return overlay_report(receipt, record)
+
+
+def recover_reconciliation(layout, run_id, gate=None):
+    root, receipt = load_receipt(layout, run_id, gate)
+    canonical_cli_version(layout)
+    record = load_overlay_record(
+        layout,
+        root,
+        receipt,
+        allow_missing=False,
+    )
+    if record["state"] not in {
+        "prepared",
+        "reconciled",
+        "reconciliation-rollback-failed",
+    }:
+        fail("reconciliation_recovery_state")
+    config_path = layout.targets()["config"]
+    current = snapshot_path(
+        config_path,
+        layout.uid,
+        MAX_CONFIG,
+        allow_absent=False,
+        user_root=layout.home,
+    )
+    original = reconciliation_preimage(
+        layout,
+        root,
+        record,
+    )
+    if (
+        record["state"] == "reconciled"
+        and current["metadata"]["sha256"]
+        == record["reconciledConfigSHA256"]
+    ):
+        fail("reconciliation_recovery_state")
+    if current["metadata"]["sha256"] == record[
+        "configBeforeReconciliationSHA256"
+    ]:
+        if current["bytes"] != original:
+            fail("reconciliation_recovery_drift")
+    elif current["metadata"]["sha256"] == record[
+        "reconciledConfigSHA256"
+    ]:
+        before = current["metadata"]
+        after = dict(before)
+        after["sha256"] = digest_bytes(original)
+        after["size"] = len(original)
+        atomic_install(
+            layout,
+            "config-reconciliation-recovery",
+            config_path,
+            before,
+            after,
+            original,
+        )
+    else:
+        fail("reconciliation_recovery_drift")
+    final = snapshot_path(
+        config_path,
+        layout.uid,
+        MAX_CONFIG,
+        allow_absent=False,
+        user_root=layout.home,
+    )
+    if (
+        final["bytes"] != original
+        or final["metadata"]["sha256"]
+        != record["configBeforeReconciliationSHA256"]
+    ):
+        fail("reconciliation_recovery_failed")
+    record["state"] = "rolled-back-after-failure"
+    record["rollbackState"] = "complete"
+    write_overlay_record(layout, root, record)
+    return overlay_report(receipt, record)
+
+
+def public_report(receipt):
+    return {
+        "acceptedControlCommit": receipt["acceptedControlCommit"],
+        "applyResult": receipt["applyResult"],
+        "liveTargets": len(receipt["targets"]),
+        "phase5PassClaimed": False,
+        "phase6Authorized": False,
+        "rollbackState": receipt["rollbackState"],
+        "runId": receipt["runId"],
+        "schema": 1,
+        "state": receipt["state"],
+    }
+
+
+def runtime_layer_directory(layout, root):
+    """Return the private, descriptor-rooted adoption-only runtime layer.
+
+    This deliberately has no relationship to ``reconcile-trust``.  The latter
+    is a retained historical repair that replaces config bytes; this layer
+    only captures and binds an already-valid current composition.
+    """
+    return Path(root) / RUNTIME_LAYER_DIRECTORY
+
+
+def runtime_private_object(layout, layer, name):
+    if name not in RUNTIME_LAYER_OBJECTS:
+        fail("runtime_layer_object")
+    snapshot = snapshot_path(
+        Path(layer) / name,
+        layout.uid,
+        MAX_CONFIG,
+        allow_absent=False,
+        user_root=layout.home,
+    )
+    if snapshot["metadata"]["mode"] != "0600":
+        fail("runtime_layer_object_metadata")
+    return snapshot
+
+
+def canonical_project_identity(identity, control_identity):
+    """Validate one project spelling without resolving or reading its path."""
+    if not isinstance(identity, str) or not isinstance(control_identity, str):
+        fail("current_private_runtime_project")
+    if (not identity.startswith("/") or identity in {"$HOME/AIDev/control", control_identity} or
+            identity.endswith("/") or "//" in identity):
+        fail("current_private_runtime_project")
+    components = identity.split("/")[1:]
+    if not components or any(not component or component in {".", ".."} for component in components):
+        fail("current_private_runtime_project")
+    return identity
+
+
+def runtime_project_rows(value, control_identity):
+    """Extract the sole closed project region from an integrity-bound base."""
+    if not isinstance(value, bytes) or not value or len(value) > MAX_CONFIG:
+        fail("current_private_runtime_shape")
+    if (b"\x00" in value or not value.endswith(b"\n") or b"\r" in value or
+            any(separator in value for separator in (b"\x0b", b"\x0c", b"\x1c", b"\x1d", b"\x1e", b"\x1f"))):
+        fail("current_private_runtime_shape")
+    try:
+        text = value.decode("utf-8", "strict")
+    except UnicodeDecodeError:
+        fail("current_private_runtime_shape")
+    if any(separator in text for separator in ("\u0085", "\u2028", "\u2029")):
+        fail("current_private_runtime_shape")
+    lines = text.splitlines()
+    if not lines:
+        fail("current_private_runtime_incomplete_project")
+    rows, seen = [], set()
+    region_started = False
+    region_closed = False
+    project_open = None
+    separator_seen = False
+    nonproject_header = re.compile(
+        r'\[(?:[A-Za-z_][A-Za-z0-9_.-]*)(?:\."[^"\\\n]+")?\]'
+    )
+    for line in lines:
+        project = re.fullmatch(r'\[projects\."([^"\\\n]+)"\]', line)
+        if project is not None:
+            if region_closed or project_open is not None or separator_seen:
+                fail("current_private_runtime_project")
+            region_started = True
+            identity = canonical_project_identity(project.group(1), control_identity)
+            if identity in seen:
+                fail("current_private_runtime_project")
+            seen.add(identity)
+            project_open = identity
+            continue
+        if line.startswith("[projects"):
+            fail("current_private_runtime_project")
+        if project_open is not None:
+            trust = re.fullmatch(r'trust_level = ("trusted"|"untrusted")', line)
+            if trust is None:
+                fail("current_private_runtime_incomplete_project")
+            rows.append((project_open, trust.group(1)))
+            project_open = None
+            continue
+        if re.match(r'trust_level\b', line):
+            fail("current_private_runtime_incomplete_project")
+        if region_started and not region_closed:
+            if line == "":
+                if separator_seen:
+                    fail("current_private_runtime_incomplete_project")
+                separator_seen = True
+                continue
+            if not separator_seen or nonproject_header.fullmatch(line) is None:
+                fail("current_private_runtime_incomplete_project")
+            region_closed = True
+    if (not region_started or project_open is not None or not separator_seen or
+            not region_closed):
+        fail("current_private_runtime_incomplete_project")
+    return rows
+
+
+def inline_toml_comment(raw):
+    """Recognize a comment delimiter without second-guessing TOML syntax."""
+    if not isinstance(raw, str) or len(raw) > MAX_CONFIG:
+        fail("current_private_runtime_shape")
+    quote = None
+    escaped = False
+    offset = 0
+    while offset < len(raw):
+        character = raw[offset]
+        if quote == '"':
+            if escaped:
+                escaped = False
+            elif character == "\\":
+                escaped = True
+            elif character == '"':
+                quote = None
+            offset += 1
+            continue
+        if quote == "'":
+            if character == "'":
+                quote = None
+            offset += 1
+            continue
+        if character == "#":
+            return True
+        if raw.startswith('\"\"\"', offset) or raw.startswith("'''", offset):
+            return True
+        if character in {'"', "'"}:
+            quote = character
+        offset += 1
+    return False
+
+
+def runtime_config_shape(value, *, base=None, layout=None, manifest=None):
+    """Parse only the reviewed public grammar; retain private rows in memory.
+
+    This is deliberately not a TOML normalizer.  The table and assignment
+    stream is consumed exactly once, and only bounded counts/classes escape.
+    ``base`` is the accepted immutable ``after`` object and is used solely for
+    the private 19-row prefix comparison.
+    """
+    if not isinstance(value, bytes) or not value or len(value) > MAX_CONFIG:
+        fail("current_private_runtime_shape")
+    if (b"\x00" in value or not value.endswith(b"\n") or b"\r" in value or
+            any(separator in value for separator in (b"\x0b", b"\x0c", b"\x1c", b"\x1d", b"\x1e", b"\x1f"))):
+        fail("current_private_runtime_shape")
+    try:
+        text = value.decode("utf-8", "strict")
+    except UnicodeDecodeError:
+        fail("current_private_runtime_shape")
+    if any(separator in text for separator in ("\u0085", "\u2028", "\u2029")):
+        fail("current_private_runtime_shape")
+    if manifest is None:
+        manifest = load_manifest()
+    if layout is None:
+        fail("current_private_runtime_shape")
+    control_identity = str(layout.control)
+    contract = manifest["privateCurrentRuntimeReconciliation"]
+    grammar = contract["publicGrammar"]
+    top = grammar["topLevelKeys"]
+    tables = grammar["tables"]
+    plugin_ids = grammar["pluginTableOrder"]
+    hook_names = []
+    if layout is not None:
+        source = str(layout.codex_home / "hooks.json")
+        hook_names = [source + ":" + slot for _event, slot, _hash in HOOK_TRUST_RECORDS]
+
+    project_rows, project_open, seen_projects = [], None, set()
+    table_index, key_index, active_keys, active_table = 0, 0, None, None
+    active_plugin = None
+    top_index, managed, vendor_values, values, plugin_values, hook_leaves = 0, {}, {}, {}, {}, []
+    table_headers = 0
+
+    def open_table(header):
+        nonlocal table_index, key_index, active_keys, active_table, active_plugin, project_open, table_headers
+        if project_open is not None:
+            fail("current_private_runtime_incomplete_project")
+        if active_table is None and top_index != len(top):
+            fail("current_private_runtime_structure")
+        if active_keys is not None:
+            fail("current_private_runtime_structure")
+        table_headers += 1
+        project = re.fullmatch(r'\[projects\."([^"\\\n]+)"\]', header)
+        if project:
+            project_region = next(index for index, item in enumerate(tables)
+                                  if item["header"] == "shell_environment_policy.set")
+            if table_index != project_region or len(project_rows) >= 25:
+                fail("current_private_runtime_project")
+            name = canonical_project_identity(project.group(1), control_identity)
+            if name in seen_projects:
+                fail("current_private_runtime_project")
+            seen_projects.add(name)
+            project_open = name
+            active_table, active_keys, key_index = "project", ["trust_level"], 0
+            return
+        if table_index >= len(tables):
+            fail("current_private_runtime_structure")
+        if tables[table_index]["header"] == "shell_environment_policy.set" and len(project_rows) != 25:
+            fail("current_private_runtime_project")
+        expected = tables[table_index]
+        expected_header = expected["header"]
+        if expected_header == "plugins":
+            if table_index >= len(tables) or len(plugin_ids) == 0:
+                fail("current_private_runtime_structure")
+            offset = sum(1 for item in tables[:table_index] if item["header"] == "plugins")
+            if offset >= len(plugin_ids) or header != '[plugins."' + plugin_ids[offset] + '"]':
+                fail("current_private_runtime_structure")
+            active_plugin = plugin_ids[offset]
+        elif expected_header == "hook-leaf":
+            offset = sum(1 for item in tables[:table_index] if item["header"] == "hook-leaf")
+            if not hook_names or offset >= len(hook_names) or header != '[hooks.state.' + json.dumps(hook_names[offset]) + ']':
+                fail("current_private_runtime_structure")
+        elif header != "[" + expected_header + "]":
+            fail("current_private_runtime_structure")
+        if expected_header != "plugins":
+            active_plugin = None
+        active_table, active_keys, key_index = expected_header, (expected["keys"] or None), 0
+        table_index += 1
+
+    for line in text.splitlines():
+        if not line or line.startswith("#"):
+            fail("current_private_runtime_shape")
+        if line.startswith("["):
+            open_table(line)
+            continue
+        match = re.fullmatch(r'([A-Za-z_][A-Za-z0-9_.-]*) = ([^\n]+)', line)
+        if match is None:
+            fail("current_private_runtime_shape")
+        key, raw = match.groups()
+        if raw != raw.strip(" \t") or inline_toml_comment(raw):
+            fail("current_private_runtime_shape")
+        if active_keys is None:
+            if top_index >= len(top) or key != top[top_index]:
+                fail("current_private_runtime_managed_scalar")
+            top_index += 1
+            if key in {"approval_policy", "sandbox_mode"}:
+                managed[key] = raw
+            continue
+        if key_index >= len(active_keys) or key != active_keys[key_index]:
+            fail("current_private_runtime_structure")
+        key_index += 1
+        values[(active_table, key)] = raw
+        if active_table == "plugins":
+            plugin_values[active_plugin] = raw
+        if active_table == "project":
+            if raw not in {'"trusted"', '"untrusted"'}:
+                fail("current_private_runtime_incomplete_project")
+            project_rows.append((project_open, raw))
+            project_open = None
+            active_keys = None
+        elif active_table == "hook-leaf":
+            if raw != json.dumps(HOOK_TRUST_RECORDS[len(hook_leaves)][2]):
+                fail("current_private_runtime_structure")
+            hook_leaves.append(raw)
+            if key_index == len(active_keys):
+                active_keys = None
+        else:
+            coordinate = (active_table, key)
+            classes = grammar["vendorDifferenceRows"]
+            for item in classes:
+                if coordinate == (item["table"], item["key"]):
+                    vendor_values[(item["table"], item["key"])] = (item["class"], raw)
+            if key_index == len(active_keys):
+                active_keys = None
+    if (top_index != len(top) or table_index != len(tables) or project_open is not None or
+            active_keys is not None or managed != {"approval_policy": '"never"', "sandbox_mode": '"danger-full-access"'}):
+        fail("current_private_runtime_structure")
+    if len(project_rows) != contract["expectedCurrent"]["projectRows"] or len(hook_leaves) != 3:
+        fail("current_private_runtime_structure")
+    vendor_rows = [vendor_values.get((item["table"], item["key"]))
+                   for item in grammar["vendorDifferenceRows"]]
+    if any(item is None for item in vendor_rows):
+        fail("current_private_runtime_vendor")
+    classes = [item[0] for item in vendor_rows]
+    if classes != contract["expectedCurrent"]["vendorClasses"]:
+        fail("current_private_runtime_vendor")
+    accepted = manifest["_acceptedRuntimeContract"]
+    node_contract = accepted["mcp"]["node_repl"]
+    computer_contract = accepted["mcp"]["computer-use"]
+    docs_contract = accepted["mcp"]["openaiDeveloperDocs"]
+    browser = [raw for kind, raw in vendor_rows if kind == "browser_client_hash"]
+    def toml_string(raw):
+        try:
+            value = json.loads(raw)
+            return value if type(value) is str else None
+        except Exception:
+            return None
+    def hash_class(raw):
+        value = toml_string(raw)
+        entries = [] if value is None else value.split(",")
+        return bool(entries) and all(re.fullmatch(r"[0-9a-fA-F]{64}", item) for item in entries)
+    def bounded_string(raw):
+        value = toml_string(raw)
+        return value is not None and 0 < len(value) <= 4096 and not any(
+            ord(character) < 32 for character in value)
+    def canonical_path_below(raw, anchor, *, allow_anchor=False):
+        value = toml_string(raw)
+        anchor = Path(anchor)
+        if not bounded_string(raw) or value != str(Path(value)):
+            return False
+        candidate = Path(value)
+        if not candidate.is_absolute() or ".." in candidate.parts or "." in candidate.parts:
+            return False
+        return (allow_anchor and candidate == anchor) or anchor in candidate.parents
+    def identifier_list(raw):
+        value = toml_string(raw)
+        return value is not None and bool(re.fullmatch(
+            r"[A-Za-z0-9_-]+(?:,[A-Za-z0-9_-]+)*", value))
+    def safe_token(raw):
+        value = toml_string(raw)
+        return value is not None and bool(re.fullmatch(r"[A-Za-z0-9_.-]{1,128}", value))
+    def positive_decimal_string(raw):
+        value = toml_string(raw)
+        return value is not None and bool(re.fullmatch(r"[1-9][0-9]{0,9}", value))
+    def rfc3339_timestamp(raw):
+        value = toml_string(raw)
+        if value is None or not re.fullmatch(
+            r"[0-9]{4}-(?:0[1-9]|1[0-2])-(?:0[1-9]|[12][0-9]|3[01])T"
+            r"(?:[01][0-9]|2[0-3]):[0-5][0-9]:[0-5][0-9]"
+            r"(?:\.[0-9]{1,9})?(?:Z|[+-](?:0[0-9]|1[0-4]):[0-5][0-9])", value):
+            return False
+        try:
+            time.strptime(value[:19], "%Y-%m-%dT%H:%M:%S")
+        except ValueError:
+            return False
+        return True
+    app_version = toml_string(values[("mcp_servers.node_repl.env", "BROWSER_USE_CODEX_APP_VERSION")])
+    node_args = values[("mcp_servers.node_repl", "args")]
+    node_command = toml_string(values[("mcp_servers.node_repl", "command")])
+    node_timeout = values[("mcp_servers.node_repl", "startup_timeout_sec")]
+    computer_args = values[("mcp_servers.computer-use", "args")]
+    computer_command = toml_string(values[("mcp_servers.computer-use", "command")])
+    computer_cwd = toml_string(values[("mcp_servers.computer-use", "cwd")])
+    docs_url = toml_string(values[("mcp_servers.openaiDeveloperDocs", "url")])
+    resource_anchor = CODEX.parent
+    def env_class_ok(key, raw):
+        kind = node_contract["transport"]["envValueClasses"][key]
+        if kind == "positive-decimal-milliseconds":
+            return positive_decimal_string(raw)
+        if kind == "comma-separated-sha256":
+            return hash_class(raw)
+        if kind == "comma-separated-safe-identifiers":
+            return identifier_list(raw)
+        if kind == "bounded-safe-token":
+            return safe_token(raw)
+        if kind == "dotted-version":
+            value = toml_string(raw)
+            return (value == accepted["appVersion"] and
+                    bool(re.fullmatch(r"[0-9]+(?:\.[0-9]+)+", value)))
+        if kind == "bounded-single-line-instruction":
+            return bounded_string(raw)
+        if kind == "canonical-codex-home":
+            return toml_string(raw) == str(layout.codex_home)
+        if kind == "canonical-chatgpt-cli":
+            return toml_string(raw) == str(CODEX)
+        if kind == "chatgpt-resource-directory":
+            return canonical_path_below(raw, resource_anchor)
+        if kind == "chatgpt-resource-file":
+            return canonical_path_below(raw, resource_anchor)
+        if kind == "owner-home-codex-computer-use-app":
+            return canonical_path_below(
+                raw,
+                layout.home / "Applications" / "Codex Computer Use.app",
+            )
+        return False
+    accepted_plugins = accepted["plugins"]
+    plugin_values_ok = (
+        set(plugin_values) == set(accepted_plugins) and
+        all(raw == json.dumps(accepted_plugins[identifier])
+            for identifier, raw in plugin_values.items()))
+    node_command_expected = str(resource_anchor / node_contract["transport"]["commandRelative"])
+    computer_transport = computer_contract["transport"]
+    if (len(browser) != 2 or browser[0] != browser[1] or not all(hash_class(item) for item in browser) or
+            not rfc3339_timestamp(values[("marketplaces.openai-bundled", "last_updated")]) or
+            not plugin_values_ok or
+            not all(env_class_ok(key, values[("mcp_servers.node_repl.env", key)])
+                    for key in node_contract["transport"]["envValueClasses"]) or
+            app_version != accepted["appVersion"] or not re.fullmatch(r"[0-9]+(?:\.[0-9]+)+", app_version) or
+            node_args != json.dumps(node_contract["transport"]["args"], separators=(",", ":")) or
+            node_command != node_command_expected or not re.fullmatch(r"[0-9]+(?:\.[0-9]+)?", node_timeout) or
+            float(node_timeout) != node_contract["startupTimeout"] or
+            toml_string(values[("mcp_servers.node_repl.env", "NODE_REPL_NODE_PATH")]) != node_command or
+            values[("shell_environment_policy.set", "BROWSER_USE_AVAILABLE_BACKENDS")] !=
+                values[("mcp_servers.node_repl.env", "BROWSER_USE_AVAILABLE_BACKENDS")] or
+            values[("shell_environment_policy.set", "NODE_REPL_TRUSTED_CODE_PATHS")] !=
+                values[("mcp_servers.node_repl.env", "NODE_REPL_TRUSTED_CODE_PATHS")] or
+            computer_args != json.dumps(computer_transport["args"], separators=(",", ":")) or
+            computer_command != computer_transport["commandRelative"] or computer_cwd != "." or
+            values[("mcp_servers.computer-use", "enabled")] != json.dumps(computer_contract["enabled"]) or
+            docs_url != docs_contract["transport"]["url"]):
+        fail("current_private_runtime_vendor")
+    if base is not None:
+        base_rows = runtime_project_rows(base, control_identity)
+        if len(base_rows) != 19 or project_rows[:19] != base_rows:
+            fail("current_private_runtime_project")
+        suffix = project_rows[19:]
+        if len(suffix) != 6 or any(row in base_rows for row in suffix) or len({row[0] for row in suffix}) != 6:
+            fail("current_private_runtime_project")
+    return {"projectRows": len(project_rows), "externalAdditions": len(project_rows) - 19,
+            "vendorClasses": classes, "hookLeaves": len(hook_leaves), "hookParents": 1,
+            "tableHeaders": table_headers, "sha256": digest_bytes(value)}
+
+
+def runtime_layer_record(receipt, current, rollback, returned, shape, state):
+    if state not in {"prepared", "reconciled", "recovery-required"}:
+        fail("runtime_layer_state")
+    return {
+        "acceptedControlCommit": receipt["acceptedControlCommit"],
+        "configSHA256": digest_bytes(current),
+        "externalAdditions": shape["externalAdditions"],
+        "hookLeaves": shape["hookLeaves"],
+        "hookParents": shape["hookParents"],
+        "legacyReceiptCoreSHA256": LEGACY_RECEIPT_CORE_SHA256,
+        "legacyReceiptSHA256": LEGACY_RECEIPT_SHA256,
+        "projectRows": shape["projectRows"],
+        "returnSHA256": digest_bytes(returned),
+        "rollbackSHA256": digest_bytes(rollback),
+        "schema": 1,
+        "state": state,
+        "vendorClasses": shape["vendorClasses"],
+    }
+
+
+def reconcile_current_runtime(layout, run_id, *, gate=None):
+    """Create an adoption-only private layer and prove a zero byte delta."""
+    root, receipt = load_receipt(layout, run_id, gate)
+    if receipt["state"] not in {"applied", "returned", "noop"}:
+        fail("runtime_layer_receipt_state")
+    manifest = load_manifest()
+    config_path = layout.targets()["config"]
+    first = snapshot_path(config_path, layout.uid, MAX_CONFIG, allow_absent=False,
+                          user_root=layout.home)
+    base = config_base_bytes(layout, root, receipt, "after")
+    # The app-server path parses a disposable descriptor-rooted copy without a
+    # model request.  Its cleanup is retained in config_snapshot_in_run.
+    config_snapshot_in_run(layout, root, first["bytes"])
+    shape = runtime_config_shape(first["bytes"], base=base, layout=layout, manifest=manifest)
+    if shape["externalAdditions"] != 6:
+        fail("current_private_runtime_stale")
+    # A second descriptor-safe observation rejects every TOCTOU or byte drift.
+    second = snapshot_path(config_path, layout.uid, MAX_CONFIG, allow_absent=False,
+                           user_root=layout.home)
+    if first["identity"] != second["identity"] or first["bytes"] != second["bytes"]:
+        fail("current_private_runtime_changed")
+    parent = open_directory(root, layout.uid, {0o700}, layout.home)
+    layer = None
+    try:
+        layer = make_child_directory(parent, RUNTIME_LAYER_DIRECTORY, 0o700,
+                                     exclusive=True)
+        for name in (RUNTIME_CURRENT_OBJECT, RUNTIME_ROLLBACK_OBJECT,
+                     RUNTIME_RETURN_OBJECT):
+            write_new_at(layer, name, first["bytes"], layout.uid, 0o600)
+        record = runtime_layer_record(receipt, first["bytes"], first["bytes"],
+                                      first["bytes"], shape, "prepared")
+        write_new_at(layer, RUNTIME_COMPANION,
+                     (json.dumps(record, sort_keys=True, separators=(",", ":")) + "\n").encode(),
+                     layout.uid, 0o600)
+        # No rename/write of config is permitted in this operation.
+        final = snapshot_path(config_path, layout.uid, MAX_CONFIG, allow_absent=False,
+                              user_root=layout.home)
+        if final["bytes"] != first["bytes"] or final["metadata"]["sha256"] != first["metadata"]["sha256"]:
+            fail("current_private_runtime_byte_delta")
+        record["state"] = "reconciled"
+        atomic_json(layer.path / RUNTIME_COMPANION, record, uid=layout.uid,
+                    user_root=layout.home)
+        for name in RUNTIME_LAYER_OBJECTS:
+            runtime_private_object(layout, layer.path, name)
+        return {
+            "configByteIdentical": True,
+            "externalAdditions": shape["externalAdditions"],
+            "hookLeaves": shape["hookLeaves"],
+            "hookParents": shape["hookParents"],
+            "liveApplyAuthorized": False,
+            "phase5PassClaimed": False,
+            "phase6Authorized": False,
+            "projectRows": shape["projectRows"],
+            "schema": 1,
+            "state": "reconciled",
+            "vendorRows": len(shape["vendorClasses"]),
+        }
+    except Exception:
+        # A partial layer is deliberately retained for explicit recovery only.
+        raise
+    finally:
+        if layer is not None:
+            layer.close()
+        parent.close()
+
+
+def recover_current_runtime(layout, run_id, *, gate=None):
+    """Validate only the known zero-delta compositions; never reserialize TOML."""
+    root, _receipt = load_receipt(layout, run_id, gate)
+    layer = runtime_layer_directory(layout, root)
+    current = runtime_private_object(layout, layer, RUNTIME_CURRENT_OBJECT)
+    rollback = runtime_private_object(layout, layer, RUNTIME_ROLLBACK_OBJECT)
+    returned = runtime_private_object(layout, layer, RUNTIME_RETURN_OBJECT)
+    if not (current["bytes"] == rollback["bytes"] == returned["bytes"]):
+        fail("runtime_layer_unknown_composition")
+    live = snapshot_path(layout.targets()["config"], layout.uid, MAX_CONFIG,
+                         allow_absent=False, user_root=layout.home)
+    if live["bytes"] != current["bytes"]:
+        fail("runtime_layer_unknown_composition")
+    return {"configByteIdentical": True, "liveApplyAuthorized": False,
+            "phase5PassClaimed": False, "phase6Authorized": False,
+            "schema": 1, "state": "prepared"}
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    commands = parser.add_subparsers(dest="command", required=True)
+    for name in (
+        "stage",
+        "apply",
+        "rollback",
+        "return",
+        "verify",
+        "reconcile-trust",
+        "recover-reconciliation",
+        "reconcile-current-runtime",
+        "recover-current-runtime",
+    ):
+        command = commands.add_parser(name)
+        command.add_argument("--run-id", required=True)
+        command.add_argument("--json", action="store_true")
+    arguments = parser.parse_args()
+    layout = production_layout()
+    gate = production_gate(layout)
+    if arguments.command != "stage":
+        validate_layout(layout, create_state_root=False)
+    if arguments.command == "stage":
+        value = stage(layout, arguments.run_id, gate)
+    elif arguments.command == "apply":
+        value = apply_receipt(layout, arguments.run_id, gate=gate)
+    elif arguments.command == "rollback":
+        value = rollback_receipt(layout, arguments.run_id, gate=gate)
+    elif arguments.command == "return":
+        value = apply_receipt(
+            layout,
+            arguments.run_id,
+            returning=True,
+            gate=gate,
+        )
+    elif arguments.command == "reconcile-trust":
+        value = reconcile_receipt(
+            layout,
+            arguments.run_id,
+            gate=gate,
+        )
+    elif arguments.command == "recover-reconciliation":
+        value = recover_reconciliation(
+            layout,
+            arguments.run_id,
+            gate=gate,
+        )
+    elif arguments.command == "reconcile-current-runtime":
+        value = reconcile_current_runtime(layout, arguments.run_id, gate=gate)
+    elif arguments.command == "recover-current-runtime":
+        value = recover_current_runtime(layout, arguments.run_id, gate=gate)
+    else:
+        value = verify_receipt(layout, arguments.run_id, gate=gate)
+    print(
+        json.dumps(value, sort_keys=True, separators=(",", ":"))
+        if arguments.json
+        else json.dumps(value, indent=2, sort_keys=True)
+    )
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except Exception as error:
+        print(
+            json.dumps(
+                {
+                    "error": str(error),
+                    "schema": 1,
+                    "verdict": "FAIL",
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+        )
+        raise SystemExit(1)

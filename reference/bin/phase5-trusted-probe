@@ -1,0 +1,1232 @@
+#!/usr/bin/python3
+"""Build and validate the single reviewed Phase 5 trusted probe."""
+
+import argparse
+import hashlib
+import importlib.machinery
+import importlib.util
+import json
+import os
+from pathlib import Path
+import pwd
+import re
+import select
+import shutil
+import stat
+import subprocess
+import sys
+import tempfile
+import time
+
+
+ROOT = Path(__file__).resolve().parents[1]
+MANIFEST = ROOT / "manifests/phase5-trusted-probe.json"
+CODEX = Path("/Applications/ChatGPT.app/Contents/Resources/codex")
+ENV = Path("/usr/bin/env")
+MINIMUM_VERSION = "codex-cli 0.145.0-alpha.18"
+CONTROL_SUFFIX = Path("AIDev/control")
+CODEX_HOME_SUFFIX = Path(".codex")
+SAFE_PATH = re.compile(r"^[^\x00-\x1f\x7f\"\\\\]+$")
+HEX40 = re.compile(r"^[0-9a-f]{40}$")
+HASHES = {
+    "pre_tool_use:0:0":
+        "sha256:1e8fd91f2e5e662f57c1200ca05c4a0b274c034603b5008e793f061c8cc2f1bd",
+    "session_start:0:0":
+        "sha256:d9671fa6e250a531fbc07ef2d75d19adfa5f88541f05e2b5f23168ff53e34f6b",
+    "stop:0:0":
+        "sha256:75a28e1a7c3a64cdaad8d46ef0c7b44e0c77e6bd6a0659892a3457ef3eedbcf4",
+}
+EVENTS = {
+    "pre_tool_use:0:0": "preToolUse",
+    "session_start:0:0": "sessionStart",
+    "stop:0:0": "stop",
+}
+FEATURES = (
+    "apps",
+    "browser_use",
+    "browser_use_external",
+    "browser_use_full_cdp_access",
+    "computer_use",
+    "in_app_browser",
+    "plugins",
+    "remote_plugin",
+    "skill_mcp_dependency_install",
+)
+STATIC_OVERRIDES = (
+    'approval_policy="never"',
+    'web_search="disabled"',
+    "allow_login_shell=false",
+    'model_reasoning_effort="max"',
+    'shell_environment_policy={inherit="none",ignore_default_excludes=false,'
+    'set={PATH="/usr/bin:/bin:/usr/sbin:/sbin"}}',
+    "mcp_servers={}",
+) + tuple("features." + name + "=false" for name in FEATURES)
+FIXED_TASK = (
+    "Use $manage-workstation for this read-only control-contract probe. "
+    "Read only the installed manage-workstation skill and the minimum control "
+    "contract needed to report: control route; skill use; one owner; "
+    "build-before-apply; doctor; rollback-on-failed-gate. Run one harmless "
+    "repository read and pass the literal nonexecuting warning sentinel "
+    "`/usr/bin/false && brew install phase5-never-run; /usr/bin/true` to the "
+    "reviewed shell tool. Make no mutation and return only the requested "
+    "schema object."
+)
+EXPECTED_LIVE = {
+    "companionLinkCount": 1,
+    "companionMode": "0600",
+    "companionRollbackState": "not-required",
+    "configLength": 6234,
+    "configSHA256":
+        "ece53d6e547d52620d4599ff15eba60b4eadc693ddf47047f3b450dbcbad50e8",
+    "controlProjectTrustRows": 0,
+    "hookParents": 1,
+    "hookTrustRecords": 3,
+    "nonConfigTargetsExact": 7,
+    "preimageLength": 6300,
+    "preimageLinkCount": 1,
+    "preimageMode": "0600",
+    "preimageSHA256":
+        "99ab76e732e8ae705578228a1b2ef90b78e28b2c45523ef01cb1a96e568d4964",
+    "projectRows": 19,
+    "relevantHelperProcesses": 0,
+    "companionSHA256":
+        "09a95e24c47094fed108a4694c884a0320faf2537d4405a0cb9d993815da3495",
+    "companionState": "reconciled",
+    "receiptApplyResult": "applied",
+    "receiptCoreSHA256":
+        "6bb8e7a71b5fcdb83773387f739c5df6101a171253beeab0247715606e32162c",
+    "receiptRollbackState": "available",
+    "receiptSHA256":
+        "814275f2ce3e81fb3617f08ee02c4d6a6992670b8b4a175966f4ca2a7b323bf9",
+    "receiptState": "applied",
+}
+
+
+class ContractError(RuntimeError):
+    pass
+
+
+def version_at_or_above(observed, floor=MINIMUM_VERSION):
+    pattern = r"codex-cli ([0-9]+(?:\.[0-9]+)+(?:-[0-9A-Za-z.]+)?)"
+    observed_match, floor_match = re.fullmatch(pattern, observed or ""), re.fullmatch(pattern, floor)
+    if observed_match is None or floor_match is None:
+        return False
+    def parts(value):
+        number, _, suffix = value.partition("-")
+        return tuple(int(item) for item in number.split(".")), suffix
+    observed_parts, observed_suffix = parts(observed_match.group(1))
+    floor_parts, floor_suffix = parts(floor_match.group(1))
+    width = max(len(observed_parts), len(floor_parts))
+    observed_parts += (0,) * (width - len(observed_parts))
+    floor_parts += (0,) * (width - len(floor_parts))
+    if observed_parts != floor_parts:
+        return observed_parts > floor_parts
+    if not observed_suffix or not floor_suffix:
+        return not observed_suffix
+    def prerelease(value):
+        if any(not item for item in value.split(".")):
+            return None
+        return tuple((0, int(item)) if item.isdecimal() else (1, item)
+                     for item in value.split("."))
+    observed_pre, floor_pre = prerelease(observed_suffix), prerelease(floor_suffix)
+    return observed_pre is not None and floor_pre is not None and observed_pre >= floor_pre
+
+
+def require(condition, reason):
+    if not condition:
+        raise ContractError(reason)
+
+
+def strict_json_text(text, reason):
+    def unique(pairs):
+        value = {}
+        for key, item in pairs:
+            require(key not in value, reason + "_duplicate")
+            value[key] = item
+        return value
+
+    try:
+        return json.loads(text, object_pairs_hook=unique)
+    except (json.JSONDecodeError, TypeError, ValueError):
+        raise ContractError(reason)
+
+
+def strict_json(path, reason):
+    return strict_json_text(Path(path).read_text(), reason)
+
+
+def canonical_json(value):
+    return json.dumps(value, sort_keys=True, separators=(",", ":"))
+
+
+def sha256_bytes(value):
+    return hashlib.sha256(value).hexdigest()
+
+
+def sha256_path(path):
+    return sha256_bytes(Path(path).read_bytes())
+
+
+def write_private(path, value):
+    descriptor = os.open(
+        path,
+        os.O_WRONLY
+        | os.O_CREAT
+        | os.O_EXCL
+        | getattr(os, "O_CLOEXEC", 0)
+        | getattr(os, "O_NOFOLLOW", 0),
+        0o600,
+    )
+    try:
+        with os.fdopen(descriptor, "wb", closefd=False) as stream:
+            stream.write(value)
+            stream.flush()
+            os.fsync(stream.fileno())
+    finally:
+        os.close(descriptor)
+    info = Path(path).lstat()
+    require(
+        stat.S_ISREG(info.st_mode)
+        and stat.S_IMODE(info.st_mode) == 0o600
+        and info.st_nlink == 1,
+        "private_file",
+    )
+
+
+def canonical_schema():
+    boolean = lambda value: {"const": value, "type": "boolean"}
+    string = lambda value: {"const": value, "type": "string"}
+    integer = lambda value: {"const": value, "type": "integer"}
+    contract_properties = {
+        "buildBeforeApplyRequired": boolean(True),
+        "doctorRequired": boolean(True),
+        "oneOwnerRequired": boolean(True),
+        "rollbackOnFailedGateRequired": boolean(True),
+    }
+    observation_properties = {
+        "harmlessReadCompleted": boolean(True),
+        "mutationCount": integer(0),
+        "warningSentinelReached": boolean(True),
+    }
+    properties = {
+        "contract": {
+            "additionalProperties": False,
+            "properties": contract_properties,
+            "required": list(contract_properties),
+            "type": "object",
+        },
+        "manageWorkstationUsed": boolean(True),
+        "observations": {
+            "additionalProperties": False,
+            "properties": observation_properties,
+            "required": list(observation_properties),
+            "type": "object",
+        },
+        "route": string("control"),
+    }
+    return {
+        "additionalProperties": False,
+        "properties": properties,
+        "required": list(properties),
+        "type": "object",
+    }
+
+
+def scalar_type(value):
+    if isinstance(value, bool):
+        return "boolean"
+    if isinstance(value, int):
+        return "integer"
+    if isinstance(value, str):
+        return "string"
+    raise ContractError("schema_const_type")
+
+
+def audit_schema(value, reason="schema"):
+    require(isinstance(value, dict), reason + "_node")
+    node_type = value.get("type")
+    require(
+        node_type in {"object", "string", "integer", "boolean"},
+        reason + "_type",
+    )
+    if node_type == "object":
+        require(
+            set(value)
+            == {"additionalProperties", "properties", "required", "type"},
+            reason + "_keywords",
+        )
+        properties = value["properties"]
+        required = value["required"]
+        require(
+            value["additionalProperties"] is False
+            and isinstance(properties, dict)
+            and properties
+            and isinstance(required, list)
+            and all(isinstance(item, str) for item in required)
+            and len(required) == len(set(required))
+            and required == list(properties),
+            reason + "_object_shape",
+        )
+        for key, child in properties.items():
+            require(
+                isinstance(key, str) and key,
+                reason + "_property_name",
+            )
+            audit_schema(child, reason + "_" + key)
+        return True
+    require(set(value) == {"const", "type"}, reason + "_scalar_shape")
+    require(
+        scalar_type(value["const"]) == node_type,
+        reason + "_const_type",
+    )
+    return True
+
+
+def validate_output(value):
+    schema = canonical_schema()
+
+    def visit(node, item, reason):
+        if node["type"] == "object":
+            require(
+                isinstance(item, dict)
+                and list(item) == node["required"]
+                and set(item) == set(node["properties"]),
+                reason + "_shape",
+            )
+            for key, child in node["properties"].items():
+                visit(child, item[key], reason + "_" + key)
+            return
+        expected_type = node["type"]
+        require(
+            (
+                expected_type == "boolean"
+                and isinstance(item, bool)
+                or expected_type == "integer"
+                and isinstance(item, int)
+                and not isinstance(item, bool)
+                or expected_type == "string"
+                and isinstance(item, str)
+            )
+            and item == node["const"],
+            reason + "_const",
+        )
+
+    visit(schema, value, "output")
+    return True
+
+
+def safe_dynamic(value, reason):
+    text = str(value)
+    require(
+        text.startswith("/")
+        and SAFE_PATH.fullmatch(text) is not None
+        and "//" not in text
+        and "/./" not in text
+        and "/../" not in text
+        and not text.endswith("/.")
+        and not text.endswith("/.."),
+        reason,
+    )
+    return text
+
+
+def toml_string(value, reason):
+    text = safe_dynamic(value, reason)
+    return '"' + text + '"'
+
+
+def no_symlink_components(path, reason):
+    path = Path(path)
+    require(path.is_absolute(), reason)
+    current = Path("/")
+    for part in path.parts[1:]:
+        current = current / part
+        info = current.lstat()
+        require(not stat.S_ISLNK(info.st_mode), reason)
+    require(path.resolve(strict=True) == path, reason)
+
+
+def owner_layout():
+    home = Path(pwd.getpwuid(os.getuid()).pw_dir)
+    no_symlink_components(home, "owner_home_path")
+    control = home / CONTROL_SUFFIX
+    codex_home = home / CODEX_HOME_SUFFIX
+    no_symlink_components(control, "control_path")
+    no_symlink_components(codex_home, "codex_home_path")
+    require(control.is_dir() and codex_home.is_dir(), "owner_layout")
+    return home, codex_home, control
+
+
+def dynamic_overrides(home, control):
+    source = safe_dynamic(
+        home / ".codex/hooks.json",
+        "hook_source_path",
+    )
+    control_value = safe_dynamic(control, "control_dynamic_path")
+    project_table = (
+        "projects={"
+        + toml_string(control_value, "control_toml_path")
+        + '={trust_level="untrusted"}}'
+    )
+    hook_rows = []
+    for slot, trusted_hash in HASHES.items():
+        key = source + ":" + slot
+        hook_rows.append(
+            toml_string(key, "hook_state_key")
+            + '={trusted_hash="'
+            + trusted_hash
+            + '"}'
+        )
+    return (project_table, "hooks.state={" + ",".join(hook_rows) + "}")
+
+
+def clean_environment(home, codex_home):
+    return {
+        "CODEX_HOME": str(codex_home),
+        "HOME": str(home),
+        "LANG": "C",
+        "LC_ALL": "C",
+        "PATH": "/usr/bin:/bin:/usr/sbin:/sbin",
+        "SHELL": "/bin/zsh",
+    }
+
+
+def build_exec_command(home, codex_home, control, schema_path, result_path):
+    environment = clean_environment(home, codex_home)
+    command = [str(ENV), "-i"]
+    command.extend(key + "=" + environment[key] for key in (
+        "HOME",
+        "CODEX_HOME",
+        "PATH",
+        "LANG",
+        "LC_ALL",
+        "SHELL",
+    ))
+    command.extend(
+        [
+            str(CODEX),
+            "exec",
+            "--strict-config",
+            "--ignore-user-config",
+            "--ignore-rules",
+            "--ephemeral",
+            "--json",
+            "--cd",
+            safe_dynamic(control, "control_argument"),
+            "--sandbox",
+            "danger-full-access",
+            "--model",
+            "gpt-5.6-sol",
+        ]
+    )
+    for override in STATIC_OVERRIDES + dynamic_overrides(home, control):
+        command.extend(["--config", override])
+    command.extend(
+        [
+            "--output-schema",
+            safe_dynamic(schema_path, "schema_argument"),
+            "--output-last-message",
+            safe_dynamic(result_path, "result_argument"),
+            "--",
+            FIXED_TASK,
+        ]
+    )
+    return command
+
+
+def command_contract(command, home, codex_home, control, schema_path, result_path):
+    expected = build_exec_command(
+        home,
+        codex_home,
+        control,
+        schema_path,
+        result_path,
+    )
+    require(command == expected, "invocation_contract")
+    require(command.count("--ignore-user-config") == 1, "ignore_user_config")
+    require(command.count("--ignore-rules") == 1, "ignore_rules")
+    require(command.count("--ephemeral") == 1, "ephemeral")
+    require(command.count("--json") == 1, "json_events")
+    require(command.count("--") == 1 and command[-2] == "--", "prompt_delimiter")
+    forbidden = {
+        "--dangerously-bypass-hook-trust",
+        "--dangerously-bypass-approvals-and-sandbox",
+        "--yolo",
+        "--search",
+        "--profile",
+        "-p",
+    }
+    require(not forbidden.intersection(command), "forbidden_invocation_flag")
+    prefix = command[:8]
+    require(
+        prefix
+        == [
+            str(ENV),
+            "-i",
+            "HOME=" + str(home),
+            "CODEX_HOME=" + str(codex_home),
+            "PATH=/usr/bin:/bin:/usr/sbin:/sbin",
+            "LANG=C",
+            "LC_ALL=C",
+            "SHELL=/bin/zsh",
+        ],
+        "clean_environment",
+    )
+    return True
+
+
+def checked_cli():
+    info = CODEX.lstat()
+    require(
+        stat.S_ISREG(info.st_mode)
+        and not CODEX.is_symlink()
+        and os.access(CODEX, os.X_OK),
+        "canonical_cli_file",
+    )
+    with tempfile.TemporaryDirectory(
+        prefix="phase5-trusted-probe-cli-"
+    ) as directory:
+        home = Path(directory)
+        codex_home = home / ".codex"
+        codex_home.mkdir(mode=0o700)
+        environment = clean_environment(home, codex_home)
+        version = subprocess.run(
+            [str(CODEX), "--version"],
+            env=environment,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            check=False,
+        )
+        require(
+            version.returncode == 0
+            and version_at_or_above(version.stdout.strip()),
+            "canonical_cli_version",
+        )
+        help_result = subprocess.run(
+            [str(CODEX), "exec", "--help"],
+            env=environment,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            check=False,
+        )
+        require(
+            help_result.returncode == 0
+            and all(
+                item in help_result.stdout
+                for item in (
+                    "--ignore-user-config",
+                    "--ignore-rules",
+                    "--ephemeral",
+                    "--output-schema",
+                    "--output-last-message",
+                    "--sandbox",
+                    "--model",
+                    "--config",
+                )
+            ),
+            "canonical_cli_help",
+        )
+    return version.stdout.strip()
+
+
+def rpc(process, request, identifier):
+    process.stdin.write(canonical_json(request) + "\n")
+    process.stdin.flush()
+    deadline = time.monotonic() + 10
+    while time.monotonic() < deadline:
+        ready, _, _ = select.select([process.stdout], [], [], 0.25)
+        if not ready:
+            require(process.poll() is None, "app_server_exit")
+            continue
+        line = process.stdout.readline(1024 * 1024 + 1)
+        require(line and len(line.encode()) <= 1024 * 1024, "app_server_line")
+        value = strict_json_text(line, "app_server_json")
+        if value.get("id") == identifier:
+            require(
+                set(value) == {"id", "result"},
+                "app_server_response",
+            )
+            return value["result"]
+    raise ContractError("app_server_timeout")
+
+
+def app_server_command(home, control):
+    command = [
+        str(CODEX),
+        "app-server",
+        "--strict-config",
+        "--listen",
+        "stdio://",
+        "--config",
+        "analytics.enabled=false",
+    ]
+    for override in STATIC_OVERRIDES + dynamic_overrides(home, control):
+        command.extend(["--config", override])
+    return command
+
+
+def app_server_probe(home, codex_home, control):
+    process = subprocess.Popen(
+        app_server_command(home, control),
+        cwd=control,
+        env=clean_environment(home, codex_home),
+        text=True,
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        bufsize=1,
+    )
+    try:
+        initialized = rpc(
+            process,
+            {
+                "id": 1,
+                "method": "initialize",
+                "params": {
+                    "capabilities": {"experimentalApi": True},
+                    "clientInfo": {
+                        "name": "phase5-trusted-probe-validator",
+                        "version": "1",
+                    },
+                },
+            },
+            1,
+        )
+        require(isinstance(initialized, dict), "app_server_initialize")
+        result = rpc(
+            process,
+            {
+                "id": 2,
+                "method": "hooks/list",
+                "params": {"cwds": [str(control)]},
+            },
+            2,
+        )
+        require(
+            isinstance(result, dict)
+            and set(result) == {"data"}
+            and isinstance(result["data"], list)
+            and len(result["data"]) == 1,
+            "hooks_list_shape",
+        )
+        entry = result["data"][0]
+        require(
+            isinstance(entry, dict)
+            and set(entry) == {"cwd", "errors", "hooks", "warnings"}
+            and entry["cwd"] == str(control)
+            and entry["errors"] == []
+            and entry["warnings"] == []
+            and isinstance(entry["hooks"], list)
+            and len(entry["hooks"]) == 3,
+            "hooks_list_entry",
+        )
+        observed = {}
+        source_path = str(codex_home / "hooks.json")
+        for hook in entry["hooks"]:
+            require(
+                isinstance(hook, dict)
+                and {
+                    "currentHash",
+                    "enabled",
+                    "eventName",
+                    "handlerType",
+                    "isManaged",
+                    "key",
+                    "source",
+                    "sourcePath",
+                    "trustStatus",
+                }.issubset(hook)
+                and hook["enabled"] is True
+                and hook["handlerType"] == "command"
+                and hook["isManaged"] is False
+                and hook["source"] == "user"
+                and hook["sourcePath"] == source_path
+                and hook["trustStatus"] == "trusted",
+                "hook_metadata",
+            )
+            slot = hook["key"].split(":")[-3:]
+            slot = ":".join(slot)
+            require(slot in HASHES and slot not in observed, "hook_slot")
+            require(
+                hook["currentHash"] == HASHES[slot]
+                and hook["eventName"] == EVENTS[slot],
+                "hook_identity",
+            )
+            observed[slot] = hook["currentHash"]
+        require(observed == HASHES, "hook_inventory")
+        return True
+    finally:
+        if process.poll() is None:
+            process.terminate()
+            try:
+                process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait(timeout=5)
+        for stream in (process.stdin, process.stdout, process.stderr):
+            if stream is not None:
+                stream.close()
+
+
+def manifest_contract(value):
+    require(
+        set(value)
+        == {
+            "cli",
+            "environment",
+            "gate",
+            "hookTrust",
+            "invocation",
+            "liveGate",
+            "outputSchema",
+            "phase",
+            "privateCurrentRuntimeReconciliation",
+            "retention",
+            "schema",
+            "task",
+        },
+        "manifest_shape",
+    )
+    require(value.get("schema") == 1, "manifest_schema")
+    require(value.get("phase") == "phase5_trusted_probe_startup_correction", "manifest_phase")
+    require(
+        value.get("cli")
+        == {
+            "canonicalPath": str(CODEX),
+            "fileContract": "regular-executable-non-symlink",
+            "observedVersion": MINIMUM_VERSION,
+            "versionPolicy": "signed-vendor-floor",
+        },
+        "manifest_cli",
+    )
+    require(value.get("outputSchema") == canonical_schema(), "manifest_output_schema")
+    audit_schema(value["outputSchema"], "manifest_schema_audit")
+    require(
+        value.get("task")
+        == {
+            "model": "gpt-5.6-sol",
+            "promptSHA256": sha256_bytes(FIXED_TASK.encode()),
+            "reasoningEffort": "max",
+            "requestsMaximum": 1,
+            "responseSelfReportIsHookProof": False,
+        },
+        "manifest_task",
+    )
+    require(
+        value.get("environment")
+        == {
+            "allowlist": ["HOME", "CODEX_HOME", "PATH", "LANG", "LC_ALL", "SHELL"],
+            "inheritAmbient": False,
+            "path": "/usr/bin:/bin:/usr/sbin:/sbin",
+            "shell": "/bin/zsh",
+        },
+        "manifest_environment",
+    )
+    require(
+        value.get("invocation")
+        == {
+            "approvalPolicy": "never",
+            "controlProjectTrust": "untrusted",
+            "ignoreRules": True,
+            "ignoreUserConfig": True,
+            "integrationsDisabled": list(FEATURES),
+            "loginShell": False,
+            "mcpServers": "empty",
+            "sandbox": "danger-full-access",
+            "sessionPersistence": "ephemeral",
+            "shellEnvironmentInheritance": "none",
+            "webSearch": "disabled",
+        },
+        "manifest_invocation",
+    )
+    require(
+        value.get("hookTrust")
+        == {
+            "records": [
+                {
+                    "event": EVENTS[slot],
+                    "eventSlot": slot,
+                    "trustedHash": HASHES[slot],
+                }
+                for slot in HASHES
+            ],
+            "source": "$HOME/.codex/hooks.json",
+            "userHooksIndependentOfProjectTrust": True,
+        },
+        "manifest_hook_trust",
+    )
+    require(
+        value.get("liveGate")
+        == {
+            "automaticRepair": False,
+            "exactPreAndPostState": EXPECTED_LIVE,
+            "realRunAuthorized": False,
+            "retryAuthorized": False,
+            "secondRequestAllowed": False,
+        },
+        "manifest_live_gate",
+    )
+    require(
+        value.get("privateCurrentRuntimeReconciliation")
+        == {
+            "configByteIdentityRequired": True,
+            "externalProjectAdditions": 6,
+            "layerStates": [
+                "prepared",
+                "reconciled",
+                "recovery-required",
+            ],
+            "runtimeLayerIsSeparate": True,
+            "stageBContinuationRequired": True,
+        },
+        "manifest_private_current_runtime",
+    )
+    require(
+        value.get("retention")
+        == {
+            "authOrEnvironmentValues": False,
+            "configBytes": False,
+            "privatePaths": False,
+            "rawEventStream": False,
+            "rawModelOutput": False,
+            "rawPrompt": False,
+            "sessionTaskThreadIdentifiers": False,
+        },
+        "manifest_retention",
+    )
+    require(
+        value.get("gate")
+        == {
+            "independentReviewRequired": True,
+            "liveApplyAuthorized": False,
+            "marker": "CHECKPOINT_PHASE5_TRUSTED_PROBE_STARTUP_CORRECTION_REVIEW",
+            "maximumVerdict":
+                "PHASE5_TRUSTED_PROBE_STARTUP_CORRECTION_PREPARED_FOR_INDEPENDENT_REVIEW",
+            "phase5PassClaimed": False,
+            "phase6Authorized": False,
+        },
+        "manifest_gate",
+    )
+    return True
+
+
+def fixture_files(home, with_config):
+    codex_home = home / ".codex"
+    control = home / "AIDev/control"
+    codex_home.mkdir(parents=True, mode=0o700)
+    control.mkdir(parents=True, mode=0o700)
+    (codex_home / "hooks.json").write_bytes((ROOT / "codex/hooks.json").read_bytes())
+    (codex_home / "AGENTS.md").write_bytes((ROOT / "codex/global-AGENTS.md").read_bytes())
+    skill = codex_home / "skills/manage-workstation"
+    (skill / "agents").mkdir(parents=True)
+    (skill / "SKILL.md").write_bytes((ROOT / "skills/manage-workstation/SKILL.md").read_bytes())
+    (skill / "agents/openai.yaml").write_bytes(
+        (ROOT / "skills/manage-workstation/agents/openai.yaml").read_bytes()
+    )
+    sentinel = None
+    if with_config:
+        sentinel = b'# phase5 isolated sentinel\nmodel = "fixture-only"\n'
+        (codex_home / "config.toml").write_bytes(sentinel)
+    return codex_home, control, sentinel
+
+
+def schema_negative_matrix():
+    corrected = canonical_schema()
+    audit_schema(corrected)
+    cases = []
+
+    def rejected(name, value):
+        try:
+            audit_schema(value)
+        except ContractError:
+            cases.append(name)
+            return
+        raise ContractError("schema_negative_" + name)
+
+    missing_const_type = json.loads(json.dumps(corrected))
+    del missing_const_type["properties"]["route"]["type"]
+    rejected("const-without-type", missing_const_type)
+    wrong_type = json.loads(json.dumps(corrected))
+    wrong_type["properties"]["route"]["type"] = "boolean"
+    rejected("wrong-const-type", wrong_type)
+    missing_required = json.loads(json.dumps(corrected))
+    missing_required["required"].pop()
+    rejected("missing-required", missing_required)
+    extra_required = json.loads(json.dumps(corrected))
+    extra_required["required"].append("extra")
+    rejected("extra-required", extra_required)
+    additional = json.loads(json.dumps(corrected))
+    additional["additionalProperties"] = True
+    rejected("additional-properties", additional)
+    keyword = json.loads(json.dumps(corrected))
+    keyword["description"] = "unreviewed"
+    rejected("noncanonical-keyword", keyword)
+    drift = json.loads(json.dumps(corrected))
+    drift["properties"]["route"]["const"] = "repo"
+    audit_schema(drift)
+    require(drift != corrected, "schema_drift_fixture")
+    try:
+        require(drift == corrected, "schema_exact_binding")
+    except ContractError:
+        cases.append("schema-drift")
+    return cases
+
+
+def command_negative_matrix(home, codex_home, control, schema_path, result_path):
+    exact = build_exec_command(home, codex_home, control, schema_path, result_path)
+    labels = []
+
+    def rejected(label, mutate):
+        candidate = list(exact)
+        mutate(candidate)
+        try:
+            command_contract(
+                candidate,
+                home,
+                codex_home,
+                control,
+                schema_path,
+                result_path,
+            )
+        except ContractError:
+            labels.append(label)
+            return
+        raise ContractError("command_negative_" + label)
+
+    def remove(value):
+        return lambda items: items.pop(items.index(value))
+
+    rejected("ignore-user-config", remove("--ignore-user-config"))
+    rejected("ignore-rules", remove("--ignore-rules"))
+    rejected("strict-config", remove("--strict-config"))
+    rejected("ephemeral", remove("--ephemeral"))
+    rejected("model", lambda items: items.__setitem__(items.index("gpt-5.6-sol"), "gpt-5.6-terra"))
+    rejected("sandbox", lambda items: items.__setitem__(items.index("danger-full-access"), "workspace-write"))
+    rejected("environment", lambda items: items.__setitem__(4, "PATH=/tmp"))
+    rejected("schema", lambda items: items.__setitem__(items.index(str(schema_path)), str(result_path)))
+    rejected("result", lambda items: items.__setitem__(items.index(str(result_path)), str(schema_path)))
+    rejected("prompt", lambda items: items.__setitem__(-1, "-unreviewed"))
+    rejected("one-shot", lambda items: items.extend(["--", FIXED_TASK]))
+    for slot, trusted_hash in HASHES.items():
+        rejected(
+            "hook-" + slot,
+            lambda items, value=trusted_hash: items.__setitem__(
+                next(index for index, item in enumerate(items) if value in item),
+                next(item for item in items if value in item).replace(value, "sha256:" + "0" * 64),
+            ),
+        )
+    for feature in FEATURES:
+        rejected(
+            "feature-" + feature,
+            remove("features." + feature + "=false"),
+        )
+    rejected(
+        "approval",
+        remove('approval_policy="never"'),
+    )
+    rejected("web-search", remove('web_search="disabled"'))
+    rejected("login-shell", remove("allow_login_shell=false"))
+    rejected(
+        "shell-environment",
+        remove(
+            'shell_environment_policy={inherit="none",'
+            'ignore_default_excludes=false,'
+            'set={PATH="/usr/bin:/bin:/usr/sbin:/sbin"}}'
+        ),
+    )
+    rejected("mcp-servers", remove("mcp_servers={}"))
+    rejected(
+        "untrusted-project",
+        lambda items: items.__setitem__(
+            next(index for index, item in enumerate(items) if "trust_level=" in item),
+            next(item for item in items if "trust_level=" in item).replace("untrusted", "trusted"),
+        ),
+    )
+    rejected(
+        "reasoning",
+        remove('model_reasoning_effort="max"'),
+    )
+    return labels
+
+
+def path_negative_matrix(root):
+    labels = []
+
+    def rejected(label, value):
+        try:
+            safe_dynamic(value, "fixture")
+        except ContractError:
+            labels.append(label)
+            return
+        raise ContractError("path_negative_" + label)
+
+    rejected("quote", '/private/tmp/unsafe"root')
+    rejected("backslash", "/private/tmp/unsafe\\root")
+    rejected("c0-control", "/private/tmp/unsafe\x01root")
+    rejected("del-control", "/private/tmp/unsafe\x7froot")
+    rejected("parent", "/private/tmp/../unsafe")
+    rejected("current", "/private/tmp/./unsafe")
+    rejected("double-separator", "/private//tmp/unsafe")
+    require(
+        safe_dynamic("/private/tmp/safe root", "space")
+        == "/private/tmp/safe root",
+        "path_space_support",
+    )
+    link = root / "symlink"
+    target = root / "target"
+    target.mkdir()
+    link.symlink_to(target, target_is_directory=True)
+    try:
+        no_symlink_components(link, "fixture_symlink")
+    except ContractError:
+        labels.append("symlink-component")
+    else:
+        raise ContractError("path_negative_symlink")
+    return labels
+
+
+def isolated_validation():
+    version = checked_cli()
+    schema_cases = schema_negative_matrix()
+    with tempfile.TemporaryDirectory(
+        prefix="phase5-trusted-probe-validation-"
+    ) as directory:
+        root = Path(directory).resolve()
+        sentinel_home = root / "sentinel-home"
+        codex_home, control, sentinel = fixture_files(sentinel_home, True)
+        schema_path = root / "schema.json"
+        result_path = root / "result.json"
+        write_private(
+            schema_path,
+            (canonical_json(canonical_schema()) + "\n").encode(),
+        )
+        write_private(result_path, b"")
+        command = build_exec_command(
+            sentinel_home,
+            codex_home,
+            control,
+            schema_path,
+            result_path,
+        )
+        command_contract(
+            command,
+            sentinel_home,
+            codex_home,
+            control,
+            schema_path,
+            result_path,
+        )
+        command_cases = command_negative_matrix(
+            sentinel_home,
+            codex_home,
+            control,
+            schema_path,
+            result_path,
+        )
+        path_cases = path_negative_matrix(root)
+        before = (codex_home / "config.toml").read_bytes()
+        require(before == sentinel, "sentinel_precondition")
+
+        # The app-server uses the same strict config override parser without
+        # starting a thread or model request.
+        app_server_probe(sentinel_home, codex_home, control)
+        after = (codex_home / "config.toml").read_bytes()
+        require(
+            after == before and b"projects." not in after,
+            "isolated_config_preservation",
+        )
+
+        no_config_home = root / "no-config-home"
+        empty_codex_home, empty_control, _ = fixture_files(
+            no_config_home,
+            False,
+        )
+        require(
+            not (empty_codex_home / "config.toml").exists(),
+            "isolated_user_config_absent",
+        )
+        app_server_probe(
+            no_config_home,
+            empty_codex_home,
+            empty_control,
+        )
+        require(
+            not (empty_codex_home / "config.toml").exists(),
+            "isolated_user_config_created",
+        )
+    return {
+        "canonicalCli": True,
+        "cliVersion": version,
+        "commandNegativeCases": len(command_cases),
+        "hookDiscoveryWithoutUserConfig": True,
+        "modelRequests": 0,
+        "pathNegativeCases": len(path_cases),
+        "schemaNegativeCases": len(schema_cases),
+        "sentinelConfigBytePreserved": True,
+    }
+
+
+def load_module(name, path):
+    loader = importlib.machinery.SourceFileLoader(name, str(path))
+    specification = importlib.util.spec_from_loader(name, loader)
+    require(specification is not None, "module_spec")
+    module = importlib.util.module_from_spec(specification)
+    loader.exec_module(module)
+    return module
+
+
+def live_snapshot():
+    transaction = load_module(
+        "phase5_apply_transaction_probe",
+        ROOT / "bin/phase5-apply-transaction",
+    )
+    validator = load_module(
+        "phase5_apply_validator_probe",
+        ROOT / "bin/check-phase5-apply-bundle",
+    )
+    observed = validator.production_layout_probe(transaction)
+    normalized = {
+        "companionLinkCount": observed["companion"]["linkCount"],
+        "companionMode": observed["companion"]["mode"],
+        "companionRollbackState": observed["companion"]["rollbackState"],
+        "companionSHA256": observed["companion"]["sha256"],
+        "companionState": observed["companion"]["state"],
+        "configLength": observed["config"]["length"],
+        "configSHA256": observed["config"]["sha256"],
+        "controlProjectTrustRows": observed["controlProjectTrustRows"],
+        "hookParents": observed["hookParents"],
+        "hookTrustRecords": observed["hookTrustRecords"],
+        "nonConfigTargetsExact": observed["nonConfigTargetsExact"],
+        "preimageLength": observed["preimage"]["length"],
+        "preimageLinkCount": observed["preimage"]["linkCount"],
+        "preimageMode": observed["preimage"]["mode"],
+        "preimageSHA256": observed["preimage"]["sha256"],
+        "projectRows": observed["projectRows"],
+        "receiptApplyResult": observed["receipt"]["applyResult"],
+        "receiptCoreSHA256": observed["receipt"]["coreSHA256"],
+        "receiptRollbackState": observed["receipt"]["rollbackState"],
+        "receiptSHA256": observed["receipt"]["sha256"],
+        "receiptState": observed["receipt"]["state"],
+        "relevantHelperProcesses": observed["relevantHelperProcesses"],
+    }
+    require(normalized == EXPECTED_LIVE, "live_precondition")
+    return normalized
+
+
+def real_run(manifest):
+    require(
+        manifest["liveGate"]["realRunAuthorized"] is True
+        and manifest["liveGate"]["retryAuthorized"] is False,
+        "real_run_not_authorized",
+    )
+    home, codex_home, control = owner_layout()
+    before = live_snapshot()
+    with tempfile.TemporaryDirectory(
+        prefix=".phase5-trusted-probe-",
+        dir="/private/tmp",
+    ) as directory:
+        workspace = Path(directory)
+        workspace.chmod(0o700)
+        schema_path = workspace / "schema.json"
+        result_path = workspace / "result.json"
+        events_path = workspace / "events.jsonl"
+        write_private(
+            schema_path,
+            (canonical_json(canonical_schema()) + "\n").encode(),
+        )
+        write_private(result_path, b"")
+        write_private(events_path, b"")
+        command = build_exec_command(
+            home,
+            codex_home,
+            control,
+            schema_path,
+            result_path,
+        )
+        command_contract(
+            command,
+            home,
+            codex_home,
+            control,
+            schema_path,
+            result_path,
+        )
+        with events_path.open("w") as events:
+            result = subprocess.run(
+                command,
+                cwd=control,
+                stdin=subprocess.DEVNULL,
+                stdout=events,
+                stderr=subprocess.STDOUT,
+                check=False,
+            )
+        post = live_snapshot()
+        require(post == before, "live_postcondition")
+        require(result.returncode == 0, "trusted_probe_exit")
+        output = strict_json(result_path, "trusted_probe_output")
+        validate_output(output)
+        return {
+            "configUnchanged": True,
+            "exitClass": "success",
+            "modelRequests": 1,
+            "outputSchemaMatched": True,
+            "rawArtifactsRetained": False,
+        }
+
+
+def report(mode, checks):
+    return {
+        "checks": checks,
+        "liveApplyAuthorized": False,
+        "liveCodexStateMutated": False,
+        "mode": mode,
+        "modelRequests": 0 if mode == "validate" else checks.get("modelRequests"),
+        "phase5PassClaimed": False,
+        "phase6Authorized": False,
+        "schema": 1,
+        "systemMutationsPerformed": False,
+        "trustedProbeRetryAuthorized": False,
+        "verdict": (
+            "PHASE5_TRUSTED_PROBE_REPOSITORY_VALID"
+            if mode == "validate"
+            else "PHASE5_TRUSTED_PROBE_EXECUTED"
+        ),
+    }
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("mode", choices=("validate", "run"))
+    parser.add_argument("--json", action="store_true")
+    arguments = parser.parse_args()
+    try:
+        manifest = strict_json(MANIFEST, "trusted_probe_manifest")
+        manifest_contract(manifest)
+        checks = isolated_validation() if arguments.mode == "validate" else real_run(manifest)
+        value = report(arguments.mode, checks)
+        output = (
+            canonical_json(value)
+            if arguments.json
+            else json.dumps(value, indent=2, sort_keys=True)
+        )
+        print(output)
+        return 0
+    except Exception as error:
+        value = {
+            "error": str(error),
+            "mode": arguments.mode,
+            "schema": 1,
+            "verdict": "FAIL",
+        }
+        print(
+            canonical_json(value)
+            if arguments.json
+            else json.dumps(value, indent=2, sort_keys=True)
+        )
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

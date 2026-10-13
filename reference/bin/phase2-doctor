@@ -1,0 +1,333 @@
+#!/usr/bin/python3
+"""Read-only, redacted Phase 2 package-control verification."""
+
+import json
+import os
+from pathlib import Path
+import re
+import subprocess
+import sys
+
+
+ROOT = Path(__file__).resolve().parents[1]
+HOME = Path.home()
+NIX = Path("/nix/var/nix/profiles/default/bin/nix")
+BREW = Path("/opt/homebrew/bin/brew")
+APPLIED_INTENT = "432dfd719b53fff8a3fdf3dca45549a1e6f668e8"
+REVIEWED_HEAD = "e7beb60fb985ab053ab04f3de2ee379316126659"
+LOCK_COMMIT = "171cf32e9b029d721387ae802abbc7797153fb16"
+DARWIN_REV = "c3e90c89649b07d1a96e4b9dd6cd0d6e44b91a74"
+BREW_HEAD = "863696a47f8d9292cb25084b6f8228e003084101"
+
+
+def run(argv, *, env=None):
+    completed = subprocess.run(
+        [str(item) for item in argv],
+        cwd=ROOT,
+        env=env,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        check=False,
+    )
+    if completed.returncode != 0:
+        raise RuntimeError(f"command failed ({completed.returncode}): {Path(argv[0]).name}")
+    return completed.stdout.strip()
+
+
+def require(condition, message):
+    if not condition:
+        raise RuntimeError(message)
+
+
+def safe_store_kind(path, suffix):
+    resolved = Path(path).resolve(strict=True)
+    require(resolved.parent == Path("/nix/store"), "resolver is outside the Nix store")
+    require(re.fullmatch(r"[a-z0-9]{32}-" + re.escape(suffix), resolved.name) is not None,
+            f"unexpected {suffix} store object")
+    return resolved
+
+
+def resolve_home_generation(system_path):
+    activate = Path(system_path) / "activate"
+    text = activate.read_text()
+    helpers = re.findall(r"(/nix/store/[a-z0-9]{32}-activation-[A-Za-z0-9._-]+)", text)
+    require(len(set(helpers)) == 1, "Darwin generation lacks one embedded Home Manager resolver")
+    helper = Path(helpers[0])
+    require(helper.is_file(), "Home Manager activation helper is unavailable")
+    generations = re.findall(
+        r"(/nix/store/[a-z0-9]{32}-home-manager-generation)/activate",
+        helper.read_text(),
+    )
+    require(len(set(generations)) == 1, "activation helper lacks one Home Manager generation")
+    generation = safe_store_kind(generations[0], "home-manager-generation")
+    require((generation / "activate").is_file(), "Home Manager generation is unusable")
+    require((generation / "hm-version").read_text().strip() == "26.05",
+            "unexpected Home Manager version")
+    return generation
+
+
+checks = []
+
+
+def record(check_id, function):
+    try:
+        facts = function() or {}
+        checks.append({"id": check_id, "status": "pass", "facts": facts})
+    except Exception as error:  # fail closed while keeping output bounded
+        checks.append({"id": check_id, "status": "fail", "reason": str(error)})
+
+
+def check_contract():
+    workstation = json.loads((ROOT / "manifests/workstation.json").read_text())
+    packages = json.loads((ROOT / "manifests/package-sources.json").read_text())
+    evidence = json.loads((ROOT / "evidence/phase-2/verification.json").read_text())
+    acceptance = json.loads((ROOT / "evidence/phase-2/acceptance.json").read_text())
+    require(workstation["architecture_authority"] == {
+        "kind": "repository_local", "path": "ARCHITECTURE.md", "standalone": True,
+    }, "local architecture authority drifted")
+    require(workstation["continuation"] == {
+        "received": True, "required_message": "CONTINUE_AFTER_LOCK_REVIEW",
+    }, "coordinator continuation is not recorded")
+    require(workstation["checkpoint"]["applied_intent_commit"] == APPLIED_INTENT,
+            "applied intent commit drifted")
+    require(workstation["acceptance"] == {
+        "evidence": "evidence/phase-2/acceptance.json",
+        "reviewed_head": REVIEWED_HEAD,
+        "verdict": "PASS",
+    }, "Phase 2 acceptance reference drifted")
+    require(workstation["l2_claimed"] is True and workstation["phase2_complete"] is True,
+            "accepted Phase 2/L2 state drifted")
+    require(workstation["phase_status"] == "phase2_accepted_l2_control_ready",
+            "Phase 2 accepted status drifted")
+    require(packages["policy"]["continuation_received"] is True,
+            "package policy continuation is not recorded")
+    require(packages["policy"]["current_checkpoint"] == "phase2_accepted_l2_control_ready",
+            "package policy accepted checkpoint drifted")
+    require(packages["policy"]["phase3_authorized"] is False,
+            "Phase 3 was authorized by the Phase 2 manifest")
+    require(packages["policy"]["flake_lock"]["commit"] == LOCK_COMMIT,
+            "lock checkpoint commit drifted")
+    require(packages["policy"]["package_payloads_declared"] is False,
+            "unexpected package payload is declared")
+    require(evidence["applied_authority"]["applied_intent_commit"] == APPLIED_INTENT,
+            "evidence applied intent drifted")
+    require(evidence["probes"]["first_noop_attempt"]["result"] == "failure" and
+            evidence["probes"]["first_noop_attempt"]["fail_closed"] is True,
+            "fail-closed first attempt is not preserved")
+    require(evidence["probes"]["restoration_after_first_attempt"]["result"] == "pass" and
+            evidence["probes"]["exact_intent_v2"]["result"] == "pass",
+            "exact-intent recovery evidence drifted")
+    require(evidence["gate"] == {
+        "control_main_merge_allowed": False,
+        "l2_claimed": False,
+        "phase2_complete": False,
+        "verdict": "READY_FOR_INDEPENDENT_PHASE2_REVIEW",
+    }, "pre-acceptance review packet drifted")
+    require(acceptance["gate"] == {
+        "l2_claimed": True,
+        "next_gate": "phase3_permissions_preparation_not_started",
+        "phase2_complete": True,
+        "phase3_authorized": False,
+        "verdict": "PASS",
+    }, "Phase 2 acceptance gate drifted")
+    require(acceptance["independent_review"]["reviewed_head"] == REVIEWED_HEAD,
+            "independent review head drifted")
+    require(acceptance["integration"] == {
+        "control_main_fast_forwarded": True,
+        "main_head_before_acceptance_record": REVIEWED_HEAD,
+        "method": "fast_forward_only",
+        "remote_added": False,
+    }, "control main integration record drifted")
+    require(acceptance["system_mutation_during_independent_review"] is False,
+            "independent review mutation record drifted")
+    return {"applied_intent_commit": APPLIED_INTENT, "l2": "control_ready",
+            "phase2": "accepted", "standalone": True}
+
+
+def check_git():
+    branch = run(["/usr/bin/git", "branch", "--show-current"])
+    require(branch == "main", "unexpected control branch")
+    require(run(["/usr/bin/git", "status", "--porcelain"]) == "", "control worktree is dirty")
+    run(["/usr/bin/git", "merge-base", "--is-ancestor", APPLIED_INTENT, "HEAD"])
+    run(["/usr/bin/git", "merge-base", "--is-ancestor", REVIEWED_HEAD, "HEAD"])
+    for tracked in ("flake.nix", "flake.lock", "darwin/bootstrap.nix",
+                    "darwin/home-manager.nix", "darwin/homebrew.nix"):
+        expected = run(["/usr/bin/git", "show", f"{APPLIED_INTENT}:{tracked}"])
+        require((ROOT / tracked).read_text().rstrip("\n") == expected,
+                f"applied intent file drifted: {tracked}")
+    return {"branch": branch, "branch_class": "integrated_main", "clean": True,
+            "applied_intent_is_ancestor": True, "reviewed_head_is_ancestor": True}
+
+
+def check_lock():
+    lock = json.loads((ROOT / "flake.lock").read_text())
+    sources = json.loads((ROOT / "manifests/package-sources.json").read_text())["sources"]
+    require(lock["version"] == 7 and lock["root"] == "root", "unexpected lock format")
+    require(set(lock["nodes"]) == {"root", "nixpkgs", "nix-darwin", "home-manager"},
+            "unexpected lock node set")
+    for node, source in (("nixpkgs", "nixpkgs"), ("nix-darwin", "nix_darwin"),
+                         ("home-manager", "home_manager")):
+        require(lock["nodes"][node]["locked"]["rev"] == sources[source]["revision"],
+                f"{node} revision drifted")
+        require(lock["nodes"][node]["locked"]["narHash"] == sources[source]["nar_hash"],
+                f"{node} NAR hash drifted")
+    require(lock["nodes"]["nix-darwin"]["inputs"] == {"nixpkgs": ["nixpkgs"]},
+            "nix-darwin follows edge drifted")
+    require(lock["nodes"]["home-manager"]["inputs"] == {"nixpkgs": ["nixpkgs"]},
+            "Home Manager follows edge drifted")
+    return {"lock_commit": LOCK_COMMIT, "nodes": 4}
+
+
+def check_lix():
+    version = run([NIX, "--version"])
+    require(version.splitlines()[0] == "nix (Lix, like Nix) 2.95.2" and
+            "System type: aarch64-darwin" in version, "unexpected Lix version")
+    run(["/bin/launchctl", "print", "system/org.nixos.nix-daemon"])
+    ping = run([NIX, "store", "ping", "--store", "daemon"])
+    require("Store URL: daemon" in ping and "Version: 2.95.2" in ping,
+            "daemon store identity drifted")
+    receipt = json.loads(Path("/nix/receipt.json").read_text())
+    require(len(receipt["actions"]) == 8, "unexpected Lix receipt action count")
+    require(all(action.get("state") == "Completed" for action in receipt["actions"]),
+            "Lix receipt is incomplete")
+    require(Path("/nix/nix-installer").is_file(), "retained Lix installer is absent")
+    return {"version": "2.95.2", "architecture": "aarch64-darwin",
+            "daemon": "running", "receipt_actions_completed": 8}
+
+
+generation_facts = {}
+
+
+def check_generations():
+    generation_links = {}
+    for path in Path("/nix/var/nix/profiles").glob("system-*-link"):
+        match = re.fullmatch(r"system-([0-9]+)-link", path.name)
+        if match and path.is_symlink():
+            generation_links[int(match.group(1))] = safe_store_kind(
+                path, f"darwin-system-26.05.{DARWIN_REV[:7]}")
+    require(len(generation_links) >= 2, "fewer than two Darwin generations exist")
+    profile_target = os.readlink("/nix/var/nix/profiles/system")
+    match = re.fullmatch(r"system-([0-9]+)-link", profile_target)
+    require(match is not None, "current Darwin profile is not a numbered generation")
+    current = int(match.group(1))
+    previous_candidates = sorted(number for number in generation_links if number < current)
+    require(current in generation_links and previous_candidates, "previous Darwin generation is absent")
+    previous = previous_candidates[-1]
+    require(Path("/run/current-system").resolve(strict=True) == generation_links[current],
+            "current system and Darwin profile disagree")
+    current_home = resolve_home_generation(generation_links[current])
+    previous_home = resolve_home_generation(generation_links[previous])
+    gcroot = HOME / ".local/state/home-manager/gcroots/current-home"
+    require(gcroot.is_symlink() and gcroot.resolve(strict=True) == current_home,
+            "stable current Home Manager GC root drifted")
+    generation_facts.update({
+        "darwin_current_generation": current,
+        "darwin_previous_generation": previous,
+        "home_manager_current_version": "26.05",
+        "home_manager_previous_version": "26.05",
+        "home_manager_previous_same_closure": current_home == previous_home,
+        "home_manager_resolver": "darwin_generation_activation_chain",
+    })
+    return dict(generation_facts)
+
+
+def check_homebrew():
+    require(BREW.is_file(), "canonical Homebrew command is absent")
+    env = dict(os.environ)
+    env.update({"HOMEBREW_NO_AUTO_UPDATE": "1", "HOMEBREW_NO_ANALYTICS": "1",
+                "HOMEBREW_NO_COLOR": "1"})
+    require(run([BREW, "--version"], env=env).splitlines()[0] == "Homebrew 5.1.15",
+            "unexpected Homebrew version")
+    require(run([BREW, "--prefix"], env=env) == "/opt/homebrew",
+            "unexpected Homebrew prefix")
+    require(run(["/usr/bin/git", "-C", "/opt/homebrew", "rev-parse", "HEAD"]) == BREW_HEAD,
+            "Homebrew source revision drifted")
+    config = run(["/usr/bin/arch", "-arm64", BREW, "config"], env=env)
+    require("macOS: 26.5-arm64" in config and "Rosetta 2: false" in config,
+            "Homebrew arm64 process probe failed")
+    counts = {}
+    for kind in ("formula", "cask"):
+        output = run([BREW, "list", f"--{kind}"], env=env)
+        counts[kind] = len(output.splitlines()) if output else 0
+    taps = run([BREW, "tap"], env=env)
+    counts["tap"] = len(taps.splitlines()) if taps else 0
+    require(counts == {"formula": 0, "cask": 0, "tap": 0},
+            "Homebrew contains undeclared payloads")
+    require(not Path("/usr/local/bin/brew").exists(), "Intel Homebrew resolver exists")
+    require(not (Path("/run/current-system/sw/bin/mas").exists() or
+                 Path("/opt/homebrew/bin/mas").exists()), "MAS is unexpectedly exposed")
+    return {"version": "5.1.15", "prefix": "/opt/homebrew", "architecture": "arm64",
+            "formulae": 0, "casks": 0, "taps": 0, "mas_exposed": False}
+
+
+def check_resolution():
+    user = run(["/usr/bin/id", "-un"])
+    managed = Path("/etc/profiles/per-user") / user
+    require(managed.is_symlink() and managed.resolve(strict=True).is_dir(),
+            "managed per-user profile is unavailable")
+    legacy = HOME / ".nix-profile"
+    expected_legacy = HOME / ".local/state/nix/profiles/profile"
+    require(legacy.is_symlink() and Path(os.readlink(legacy)) == expected_legacy,
+            "legacy profile link has an unexpected target")
+    require(not legacy.exists(), "legacy profile unexpectedly became authoritative")
+    zshenv = Path("/etc/zshenv").read_text()
+    environment_paths = re.findall(r"(/nix/store/[a-z0-9]{32}-set-environment)", zshenv)
+    require(len(set(environment_paths)) == 1, "generated shell environment resolver drifted")
+    environment = Path(environment_paths[0]).read_text()
+    require("$HOME/.nix-profile/bin:/etc/profiles/per-user/$USER/bin:/run/current-system/sw/bin" in environment,
+            "generated shell PATH order drifted")
+    clean_env = {"HOME": str(HOME), "USER": user, "SHELL": "/bin/zsh"}
+    resolutions = run([
+        "/usr/bin/env", "-i", *[f"{key}={value}" for key, value in clean_env.items()],
+        "/bin/zsh", "-l", "-c",
+        "for c in nix darwin-rebuild brew mas home-manager; do "
+        "if command -v $c >/dev/null 2>&1; then echo $c=present; else echo $c=absent; fi; done",
+    ])
+    require(resolutions.splitlines() == [
+        "nix=present", "darwin-rebuild=present", "brew=absent", "mas=absent",
+        "home-manager=absent",
+    ], "clean-shell command ownership drifted")
+    require(Path("/run/current-system/sw/bin/nix").is_file(), "system Lix resolver is absent")
+    require(Path("/run/current-system/sw/bin/darwin-rebuild").is_file(),
+            "nix-darwin resolver is absent")
+    require(BREW.is_file(), "canonical absolute Homebrew resolver is absent")
+    return {
+        "lix_owner": "nix_darwin_system_profile",
+        "darwin_rebuild_owner": "nix_darwin_system_profile",
+        "homebrew_owner": "canonical_absolute_prefix",
+        "legacy_profile": "broken_non_authoritative",
+        "home_manager_cli": "intentionally_absent_embedded_module",
+        "duplicate_intel_homebrew": False,
+    }
+
+
+record("standalone_contract", check_contract)
+record("control_git", check_git)
+record("flake_lock", check_lock)
+record("lix_daemon_receipt_store", check_lix)
+record("darwin_home_manager_generations", check_generations)
+record("homebrew_empty_arm64", check_homebrew)
+record("ownership_and_path", check_resolution)
+
+verdict = "PASS" if all(item["status"] == "pass" for item in checks) else "HANDOFF"
+report = {
+    "schema": 1,
+    "phase": "phase2_package_bootstrap",
+    "read_only": True,
+    "redaction": "bounded_no_private_paths_or_stable_machine_identifiers",
+    "verdict": verdict,
+    "checks": checks,
+}
+
+if "--json" in sys.argv[1:]:
+    require(sys.argv[1:] == ["--json"], "usage: phase2-doctor [--json]")
+    print(json.dumps(report, indent=2, sort_keys=True))
+else:
+    require(not sys.argv[1:], "usage: phase2-doctor [--json]")
+    print(f"Phase 2 doctor: {verdict}")
+    for item in checks:
+        detail = item.get("reason", "verified")
+        print(f"{item['status'].upper():7} {item['id']}: {detail}")
+
+sys.exit(0 if verdict == "PASS" else 1)

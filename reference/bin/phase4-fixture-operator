@@ -1,0 +1,301 @@
+#!/usr/bin/python3
+"""Exercise the bounded bootstrap/disable/uninstall contracts in a temp fixture root."""
+
+import hashlib
+import json
+import os
+from pathlib import Path
+import re
+import shutil
+import stat
+import subprocess
+import sys
+import tempfile
+import uuid
+
+
+MARKER = ".aid-admin-fixture-root"
+TOKEN = "@@AGENT_OWNER@@"
+TEMPLATE_RELATIVE = "policy/sudoers.d/agent-first-mac-aid-admin"
+
+
+def fail(message):
+    raise RuntimeError(message)
+
+
+def fixture_root(value, require_marker=True):
+    supplied = Path(value)
+    if not supplied.is_absolute() or not supplied.exists():
+        fail("fixture_root_must_be_existing_absolute_directory")
+    resolved = supplied.resolve(strict=True)
+    temporary = Path(tempfile.gettempdir()).resolve(strict=True)
+    if resolved == Path("/") or resolved == temporary or temporary not in resolved.parents:
+        fail("live_or_non_temporary_root_forbidden")
+    if not resolved.name.startswith("aid-admin-fixture."):
+        fail("fixture_root_name")
+    if require_marker and (resolved / MARKER).read_text() != "phase4-fixture-v2\n":
+        fail("fixture_marker")
+    return resolved
+
+
+def target(root, logical):
+    if not logical.startswith("/") or ".." in Path(logical).parts:
+        fail("target_path")
+    result = root / logical.removeprefix("/")
+    if root not in result.parents:
+        fail("target_escape")
+    ancestor = result
+    while ancestor != root and not (ancestor.exists() or ancestor.is_symlink()):
+        ancestor = ancestor.parent
+    resolved_ancestor = ancestor.resolve(strict=True)
+    if resolved_ancestor != root and root not in resolved_ancestor.parents:
+        fail("target_symlink_escape")
+    return result
+
+
+def digest(path):
+    value = hashlib.sha256()
+    with path.open("rb") as stream:
+        while chunk := stream.read(65536):
+            value.update(chunk)
+    return value.hexdigest()
+
+
+def strict_json(path, keys):
+    value = json.loads(path.read_text())
+    if not isinstance(value, dict) or set(value) != set(keys):
+        fail("unexpected_manifest_key")
+    return value
+
+
+def validate_owner(owner_name, owner_uid, sudoers_identity):
+    if re.fullmatch(r"[a-z_][a-z0-9_-]{0,31}", owner_name) is None:
+        fail("unsafe_owner_name")
+    if re.fullmatch(r"[1-9][0-9]{0,9}", owner_uid) is None or int(owner_uid) > 4294967295:
+        fail("unsafe_owner_uid")
+    allowed = {f"name:{owner_name}": owner_name, f"uid:{owner_uid}": f"#{owner_uid}"}
+    if sudoers_identity not in allowed:
+        fail("sudoers_identity_not_exact_owner")
+    return allowed[sudoers_identity]
+
+
+def render_sudoers(template, principal):
+    text = template.read_text()
+    if text.count(TOKEN) != 1 or "%" in text or "*" in text:
+        fail("sudoers_template_contract")
+    rendered = text.replace(TOKEN, principal)
+    lowered = rendered.lower()
+    forbidden = ("nopasswd: all", "/bin/sh", "/bin/zsh", "editor", "brew",
+                 "darwin-rebuild", " launchctl", " /usr/bin/git", " /bin/cp",
+                 " /usr/bin/install")
+    if any(value in lowered for value in forbidden):
+        fail("sudoers_direct_backend")
+    return rendered.encode()
+
+
+def copy_no_follow(source, destination, mode):
+    source = Path(source)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    source_fd = os.open(source, os.O_RDONLY | os.O_NOFOLLOW)
+    destination_fd = os.open(destination, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, mode)
+    try:
+        before = os.fstat(source_fd)
+        if not stat.S_ISREG(before.st_mode) or before.st_mode & 0o022 or before.st_size > 64 * 1024 * 1024:
+            fail("mutable_or_nonregular_bootstrap_source")
+        while chunk := os.read(source_fd, 65536):
+            offset = 0
+            while offset < len(chunk):
+                written = os.write(destination_fd, chunk[offset:])
+                if written <= 0:
+                    fail("bootstrap_copy_failed")
+                offset += written
+        os.fsync(destination_fd)
+        after = os.fstat(source_fd)
+        if (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns) != \
+                (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns):
+            fail("bootstrap_source_race")
+    finally:
+        os.close(source_fd)
+        os.close(destination_fd)
+    destination.chmod(mode)
+
+
+def atomic_copy(source, destination, mode):
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    temporary = destination.with_name(destination.name + ".new")
+    if temporary.exists() or temporary.is_symlink():
+        fail("bootstrap_temporary_exists")
+    with source.open("rb") as input_stream, temporary.open("xb") as output_stream:
+        shutil.copyfileobj(input_stream, output_stream, 65536)
+        output_stream.flush()
+        os.fsync(output_stream.fileno())
+    temporary.chmod(mode)
+    os.replace(temporary, destination)
+
+
+def prepare(value):
+    root = fixture_root(value, require_marker=False)
+    if any(root.iterdir()):
+        fail("fixture_root_not_empty")
+    marker = root / MARKER
+    marker.write_text("phase4-fixture-v2\n")
+    marker.chmod(0o400)
+
+
+def reviewed_source(value):
+    supplied = Path(value)
+    if not supplied.is_absolute() or supplied.is_symlink():
+        fail("reviewed_source_path")
+    return supplied.resolve(strict=True)
+
+
+def bootstrap(value, binary, policy, template, reviewed_manifest, owner_name,
+              owner_uid, sudoers_identity, after_copy=None):
+    root = fixture_root(value)
+    sources = {
+        "binarySHA256": reviewed_source(binary),
+        "policySHA256": reviewed_source(policy),
+        "sudoersTemplateSHA256": reviewed_source(template),
+    }
+    reviewed = strict_json(Path(reviewed_manifest).resolve(strict=True),
+                           {"schema", "renderedSudoersSHA256", *sources.keys()})
+    if reviewed["schema"] != 1 or any(
+            re.fullmatch(r"[0-9a-f]{64}", reviewed[key]) is None
+            for key in (*sources.keys(), "renderedSudoersSHA256")):
+        fail("reviewed_manifest_schema")
+    principal = validate_owner(owner_name, owner_uid, sudoers_identity)
+    staging_root = target(root, "/var/db/agent-first-mac/bootstrap")
+    staging_root.mkdir(parents=True, exist_ok=True)
+    staging_root.chmod(0o700)
+    staging = staging_root / ("transaction-" + uuid.uuid4().hex)
+    staging.mkdir(mode=0o700)
+    staging_facts = staging.lstat()
+    if staging_facts.st_uid != os.geteuid() or staging_facts.st_mode & 0o777 != 0o700:
+        fail("staging_owner_or_mode")
+    enabled = target(root, "/etc/sudoers.d/agent-first-mac-aid-admin")
+    destinations = {
+        "binary": target(root, "/usr/local/libexec/aid-admin"),
+        "policy": target(root, "/etc/agent-first-mac/aid-admin-policy.json"),
+        "attestation": target(root, "/etc/agent-first-mac/aid-admin-install.json"),
+        "sudoers": enabled,
+    }
+    if any(path.exists() or path.is_symlink() for path in destinations.values()):
+        fail("bootstrap_artifact_already_installed")
+    try:
+        staged = {}
+        for key, source in sources.items():
+            destination = staging / source.name
+            copy_no_follow(source, destination, 0o400)
+            staged[key] = destination
+        if after_copy is not None:
+            after_copy(staging, staged)
+        for key, path in staged.items():
+            if digest(path) != reviewed[key]:
+                fail("reviewed_hash_mismatch")
+            if path.lstat().st_uid != os.geteuid() or path.lstat().st_mode & 0o777 != 0o400:
+                fail("staged_mode_drift")
+        rendered = staging / "agent-first-mac-aid-admin.rendered"
+        rendered.write_bytes(render_sudoers(staged["sudoersTemplateSHA256"], principal))
+        rendered.chmod(0o440)
+        if digest(rendered) != reviewed["renderedSudoersSHA256"]:
+            fail("reviewed_rendered_sudoers_hash_mismatch")
+        visudo = subprocess.run(["/usr/sbin/visudo", "-cf", str(rendered)], text=True,
+                                stdout=subprocess.PIPE, stderr=subprocess.STDOUT, check=False)
+        if visudo.returncode != 0:
+            fail("rendered_sudoers_invalid")
+        attestation = {
+            "agentOwnerIdentity": owner_name,
+            "agentOwnerUID": int(owner_uid),
+            "binarySHA256": reviewed["binarySHA256"],
+            "policySHA256": reviewed["policySHA256"],
+            "schema": 1,
+            "sudoersSHA256": reviewed["renderedSudoersSHA256"],
+        }
+        attestation_path = staging / "aid-admin-install.json"
+        attestation_path.write_text(json.dumps(attestation, indent=2, sort_keys=True) + "\n")
+        attestation_path.chmod(0o400)
+
+        for logical in ("/var/log/agent-first-mac/aid-admin", "/var/db/agent-first-mac/staging"):
+            directory = target(root, logical)
+            directory.mkdir(parents=True, exist_ok=True)
+            directory.chmod(0o700)
+        atomic_copy(staged["binarySHA256"], destinations["binary"], 0o555)
+        atomic_copy(staged["policySHA256"], destinations["policy"], 0o444)
+        atomic_copy(attestation_path, destinations["attestation"], 0o400)
+        installed_contract = (
+            (destinations["binary"], 0o555, reviewed["binarySHA256"]),
+            (destinations["policy"], 0o444, reviewed["policySHA256"]),
+            (destinations["attestation"], 0o400, digest(attestation_path)),
+        )
+        for path, mode, expected_hash in installed_contract:
+            facts = path.lstat()
+            if (not stat.S_ISREG(facts.st_mode) or facts.st_uid != os.geteuid() or
+                    facts.st_mode & 0o777 != mode or digest(path) != expected_hash):
+                fail("installed_artifact_verification_failed")
+        atomic_copy(rendered, enabled, 0o440)
+    finally:
+        shutil.rmtree(staging, ignore_errors=True)
+
+
+def disable(value):
+    root = fixture_root(value)
+    sudoers = target(root, "/etc/sudoers.d/agent-first-mac-aid-admin")
+    disabled_sudoers = sudoers.with_name(sudoers.name + ".disabled")
+    if not sudoers.is_file() or disabled_sudoers.exists():
+        fail("sudoers_state")
+    sudoers.rename(disabled_sudoers)
+    disabled = target(root, "/etc/agent-first-mac/aid-admin.disabled")
+    disabled.parent.mkdir(parents=True, exist_ok=True)
+    disabled.write_text("disabled-by-owner\n")
+    disabled.chmod(0o400)
+
+
+def uninstall(value):
+    root = fixture_root(value)
+    for logical in (
+        "/etc/agent-first-mac/aid-admin.disabled",
+        "/etc/agent-first-mac/aid-admin-install.json",
+        "/etc/agent-first-mac/aid-admin-policy.json",
+        "/etc/sudoers.d/agent-first-mac-aid-admin",
+        "/etc/sudoers.d/agent-first-mac-aid-admin.disabled",
+        "/usr/local/libexec/aid-admin",
+    ):
+        path = target(root, logical)
+        if path.exists() or path.is_symlink():
+            path.unlink()
+
+
+def status(value):
+    root = fixture_root(value)
+    checks = {
+        "attestation": target(root, "/etc/agent-first-mac/aid-admin-install.json").is_file(),
+        "binary": target(root, "/usr/local/libexec/aid-admin").is_file(),
+        "disabled": target(root, "/etc/agent-first-mac/aid-admin.disabled").is_file(),
+        "policy": target(root, "/etc/agent-first-mac/aid-admin-policy.json").is_file(),
+        "sudoers": target(root, "/etc/sudoers.d/agent-first-mac-aid-admin").is_file(),
+        "sudoers_disabled": target(root, "/etc/sudoers.d/agent-first-mac-aid-admin.disabled").is_file(),
+    }
+    print(json.dumps({"schema": 2, "fixture_only": True, "checks": checks}, sort_keys=True))
+
+
+def main():
+    args = sys.argv[1:]
+    if len(args) == 2 and args[0] == "prepare":
+        prepare(args[1])
+    elif len(args) == 9 and args[0] == "bootstrap":
+        bootstrap(*args[1:])
+    elif len(args) == 2 and args[0] == "disable":
+        disable(args[1])
+    elif len(args) == 2 and args[0] == "uninstall":
+        uninstall(args[1])
+    elif len(args) == 2 and args[0] == "status":
+        status(args[1])
+    else:
+        fail("usage")
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except Exception as error:
+        raise SystemExit(f"phase4-fixture-operator: rejected: {error}")

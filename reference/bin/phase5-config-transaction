@@ -1,0 +1,280 @@
+#!/usr/bin/python3
+"""Allowlisted, byte-preserving Codex config merge with exact rollback."""
+
+import argparse
+import hashlib
+import json
+import os
+from pathlib import Path
+import re
+import stat
+import subprocess
+import tempfile
+
+
+CODEX = Path("/Applications/ChatGPT.app/Contents/Resources/codex")
+MANAGED = {
+    "approval_policy": '"never"',
+    "sandbox_mode": '"danger-full-access"',
+}
+COMMIT = re.compile(r"^[0-9a-f]{40}$")
+ASSIGNMENT = re.compile(
+    r"^(?P<prefix>\s*(?P<key>approval_policy|sandbox_mode)\s*=\s*)"
+    r'(?P<value>"(?:[^"\\]|\\.)*")(?P<suffix>\s*(?:#.*)?(?:\r?\n)?)$'
+)
+
+
+def fail(message):
+    raise SystemExit("phase5-config-transaction: " + message)
+
+
+def digest(value):
+    return hashlib.sha256(value).hexdigest()
+
+
+def strict_config(value):
+    try:
+        mode = CODEX.lstat().st_mode
+    except OSError:
+        fail("canonical Codex CLI unavailable")
+    if CODEX.is_symlink() or not stat.S_ISREG(mode) or not os.access(CODEX, os.X_OK):
+        fail("canonical Codex CLI unavailable")
+    with tempfile.TemporaryDirectory(prefix="phase5-config-parse-") as directory:
+        home = Path(directory)
+        (home / "config.toml").write_bytes(value)
+        missing_schema = home / "must-not-exist.json"
+        environment = {
+            "CODEX_HOME": str(home),
+            "HOME": str(home),
+            "LANG": "C",
+            "LC_ALL": "C",
+            "PATH": "/usr/bin:/bin:/usr/sbin:/sbin",
+            "SHELL": "/bin/zsh",
+        }
+        result = subprocess.run(
+            [
+                str(CODEX),
+                "--strict-config",
+                "exec",
+                "--ephemeral",
+                "--output-schema",
+                str(missing_schema),
+                "--",
+                "phase5-static-config-parse",
+            ],
+            cwd=home,
+            env=environment,
+            text=True,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            check=False,
+        )
+        if not (
+            result.returncode != 0
+            and "Failed to read output schema file " in result.stdout
+            and str(missing_schema) in result.stdout
+            and "Error loading config.toml:" not in result.stdout
+        ):
+            fail("config fails installed strict parser")
+
+
+def strict_json(path):
+    def unique(pairs):
+        value = {}
+        for key, item in pairs:
+            if key in value:
+                fail("duplicate receipt key")
+            value[key] = item
+        return value
+    try:
+        return json.loads(path.read_text(), object_pairs_hook=unique)
+    except Exception as error:
+        fail("invalid receipt: " + type(error).__name__)
+
+
+def checked_target(path, codex_home):
+    path = Path(path)
+    codex_home = Path(codex_home)
+    if codex_home.is_symlink() or not codex_home.is_dir():
+        fail("Codex home must be one existing non-symlink directory")
+    if path.parent.resolve() != codex_home.resolve():
+        fail("target must be the direct config.toml child of the declared Codex home")
+    if path.name != "config.toml":
+        fail("only config.toml is an allowed target")
+    if path.is_symlink() or not path.is_file():
+        fail("target must be one existing regular non-symlink file")
+    return path
+
+
+def checked_output(path, others, codex_home):
+    path = Path(path)
+    if path in others or path.is_symlink():
+        fail("transaction paths must be distinct non-symlinks")
+    resolved = path.resolve()
+    home = Path(codex_home).resolve()
+    if resolved == home or home in resolved.parents:
+        fail("staged state and backups must stay outside Codex home")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def merge(current):
+    try:
+        text = current.decode("utf-8")
+    except UnicodeDecodeError:
+        fail("config must be UTF-8")
+    lines = text.splitlines(keepends=True)
+    first_table = len(lines)
+    for index, line in enumerate(lines):
+        if line.lstrip().startswith("["):
+            first_table = index
+            break
+    seen = set()
+    for index in range(first_table):
+        match = ASSIGNMENT.match(lines[index])
+        if re.match(r"^\s*(approval_policy|sandbox_mode)\s*=", lines[index]) and not match:
+            fail("managed keys must be simple quoted top-level scalars")
+        if not match:
+            continue
+        key = match.group("key")
+        if key in seen:
+            fail("duplicate managed top-level key")
+        seen.add(key)
+        lines[index] = match.group("prefix") + MANAGED[key] + match.group("suffix")
+    missing = [key for key in MANAGED if key not in seen]
+    if missing:
+        if first_table and lines[first_table - 1] and not lines[first_table - 1].endswith(("\n", "\r")):
+            fail("cannot insert managed block after an unterminated line")
+        block = ["# BEGIN agent-first managed trusted intent\n"]
+        block += [f"{key} = {MANAGED[key]}\n" for key in missing]
+        block += ["# END agent-first managed trusted intent\n"]
+        lines[first_table:first_table] = block
+    result = "".join(lines).encode("utf-8")
+    return result
+
+
+def write_private(path, value):
+    descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    with os.fdopen(descriptor, "wb") as stream:
+        stream.write(value)
+        stream.flush()
+        os.fsync(stream.fileno())
+
+
+def atomic_replace(path, value, mode):
+    descriptor, temporary = tempfile.mkstemp(prefix=".phase5-", dir=path.parent)
+    try:
+        os.fchmod(descriptor, stat.S_IMODE(mode))
+        with os.fdopen(descriptor, "wb") as stream:
+            stream.write(value)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
+
+
+def stage(arguments):
+    current = checked_target(arguments.current, arguments.codex_home)
+    if not COMMIT.fullmatch(arguments.reviewed_commit):
+        fail("reviewed commit must be one lowercase 40-hex commit")
+    current_bytes = current.read_bytes()
+    strict_config(current_bytes)
+    staged_bytes = merge(current_bytes)
+    strict_config(staged_bytes)
+    staged = checked_output(arguments.staged, {current}, arguments.codex_home)
+    backup = checked_output(arguments.backup, {current, staged}, arguments.codex_home)
+    receipt = checked_output(arguments.receipt, {current, staged, backup}, arguments.codex_home)
+    if any(path.exists() for path in (staged, backup, receipt)):
+        fail("stage outputs must not already exist")
+    write_private(staged, staged_bytes)
+    write_private(backup, current_bytes)
+    record = {
+        "afterSHA256": digest(staged_bytes),
+        "beforeSHA256": digest(current_bytes),
+        "managedKeys": sorted(MANAGED),
+        "reviewedCommit": arguments.reviewed_commit,
+        "schema": 1,
+        "target": "config.toml",
+    }
+    write_private(receipt, (json.dumps(record, sort_keys=True, separators=(",", ":")) + "\n").encode())
+    print(json.dumps(record, sort_keys=True, separators=(",", ":")))
+
+
+def validated_receipt(path, reviewed_commit):
+    value = strict_json(Path(path))
+    if set(value) != {
+        "afterSHA256", "beforeSHA256", "managedKeys", "reviewedCommit",
+        "schema", "target",
+    }:
+        fail("unexpected receipt keys")
+    if value["schema"] != 1 or value["target"] != "config.toml":
+        fail("receipt contract mismatch")
+    if value["managedKeys"] != sorted(MANAGED):
+        fail("receipt managed-key mismatch")
+    if value["reviewedCommit"] != reviewed_commit or not COMMIT.fullmatch(reviewed_commit):
+        fail("receipt commit mismatch")
+    if not all(re.fullmatch(r"[0-9a-f]{64}", value[key]) for key in ("beforeSHA256", "afterSHA256")):
+        fail("receipt hash malformed")
+    return value
+
+
+def apply(arguments):
+    current = checked_target(arguments.current, arguments.codex_home)
+    staged = Path(arguments.staged)
+    if staged.is_symlink() or not staged.is_file():
+        fail("staged config unavailable")
+    value = validated_receipt(arguments.receipt, arguments.reviewed_commit)
+    before = current.read_bytes()
+    after = staged.read_bytes()
+    if digest(before) != value["beforeSHA256"] or digest(after) != value["afterSHA256"]:
+        fail("apply hash mismatch")
+    atomic_replace(current, after, current.stat().st_mode)
+    print(json.dumps({"applied": True, "afterSHA256": value["afterSHA256"]}, sort_keys=True, separators=(",", ":")))
+
+
+def rollback(arguments):
+    current = checked_target(arguments.current, arguments.codex_home)
+    backup = Path(arguments.backup)
+    if backup.is_symlink() or not backup.is_file():
+        fail("backup unavailable")
+    value = validated_receipt(arguments.receipt, arguments.reviewed_commit)
+    after = current.read_bytes()
+    before = backup.read_bytes()
+    if digest(after) != value["afterSHA256"] or digest(before) != value["beforeSHA256"]:
+        fail("rollback hash mismatch")
+    atomic_replace(current, before, current.stat().st_mode)
+    print(json.dumps({"rolledBack": True, "beforeSHA256": value["beforeSHA256"]}, sort_keys=True, separators=(",", ":")))
+
+
+def parser():
+    value = argparse.ArgumentParser()
+    commands = value.add_subparsers(dest="command", required=True)
+    staged = commands.add_parser("stage")
+    staged.add_argument("--codex-home", required=True)
+    staged.add_argument("--current", required=True)
+    staged.add_argument("--staged", required=True)
+    staged.add_argument("--backup", required=True)
+    staged.add_argument("--receipt", required=True)
+    staged.add_argument("--reviewed-commit", required=True)
+    staged.set_defaults(function=stage)
+    for name, function in (("apply", apply), ("rollback", rollback)):
+        command = commands.add_parser(name)
+        command.add_argument("--codex-home", required=True)
+        command.add_argument("--current", required=True)
+        command.add_argument("--receipt", required=True)
+        command.add_argument("--reviewed-commit", required=True)
+        command.add_argument("--staged" if name == "apply" else "--backup", required=True)
+        command.set_defaults(function=function)
+    return value
+
+
+def main():
+    arguments = parser().parse_args()
+    arguments.function(arguments)
+
+
+if __name__ == "__main__":
+    main()

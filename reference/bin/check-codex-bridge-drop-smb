@@ -1,0 +1,228 @@
+#!/usr/bin/python3
+from __future__ import annotations
+
+import json
+from pathlib import Path
+import re
+
+
+ROOT = Path(__file__).resolve().parents[1]
+
+
+def require(condition: bool, reason: str) -> None:
+    if not condition:
+        raise RuntimeError(reason)
+
+
+def main() -> None:
+    manifest_path = ROOT / "manifests" / "codex-bridge-drop-smb.json"
+    grants_path = ROOT / "manifests" / "tailscale-grants-windows-host.json"
+    module_path = ROOT / "darwin" / "codex-bridge-drop.nix"
+    automount_path = ROOT / "darwin" / "codex-bridge-drop-automount.sh"
+    runner_path = ROOT / "bin" / "codex-bridge-drop-smb"
+    docs_path = ROOT / "docs" / "codex-bridge-drop-smb.md"
+    architecture_path = ROOT / "ARCHITECTURE.md"
+    retired_policy = ROOT / "policy" / "windows" / "codex-bridge-drop-smb.ps1"
+
+    manifest = json.loads(manifest_path.read_text())
+    grants = json.loads(grants_path.read_text())
+    module = module_path.read_text()
+    automount = automount_path.read_text()
+    runner = runner_path.read_text()
+    docs = docs_path.read_text()
+    architecture = architecture_path.read_text()
+    flake = (ROOT / "flake.nix").read_text()
+
+    require(manifest["schema"] == 2, "schema")
+    require(manifest["profile"] == "codex-bridge-drop-smb", "profile")
+    require(manifest["profileActive"] is True, "profile_active")
+    require(manifest["scope"].startswith("one persistent localhost SSH tunnel"),
+            "scope")
+    require(manifest["managedTargets"] == [
+        "darwin/codex-bridge-drop.nix",
+        "darwin/codex-bridge-drop-automount.sh",
+        "one user LaunchAgent named com.aidev.codex-bridge.smb-tunnel",
+        "one user LaunchAgent named com.aidev.codex-bridge.smb-automount",
+        "one localhost-only listener on TCP 14445",
+        "one fixed empty pause marker below one dedicated user application-support directory after a failed mount",
+    ], "managed_targets")
+
+    remote = manifest["remoteDependency"]
+    require(remote["path"] == "C:\\CodexBridgeDrop", "remote_path")
+    require(remote["shareName"] == "CodexBridgeDrop", "share_name")
+    require(remote["managedByThisRepository"] is False, "separate_windows_owner")
+
+    smb = manifest["transports"]["smb"]
+    require(smb == {
+        "finderUrl": "smb://127.0.0.1:14445/CodexBridgeDrop",
+        "localBind": "127.0.0.1:14445",
+        "sshDestination": "127.0.0.1:445",
+        "directTailscaleTcp445Grant": False,
+        "windowsFirewallMutation": False,
+        "automaticMount": True,
+        "ownerCredentialActionRequiredOnFreshMac": True,
+        "ownerCredentialActionRemainingOnThisMac": False,
+        "savedCredentialRequiredForUnattendedMount": True,
+        "controlReadsCredential": False,
+    }, "smb_transport")
+    sftp = manifest["transports"]["sftp"]
+    require(sftp["endpoint"] == "existing strict windows-host SSH alias",
+            "sftp_alias")
+    require(sftp["remotePath"] == "/C:/CodexBridgeDrop", "sftp_path")
+    require(sftp["readsOrCopiesKeyMaterial"] is False, "sftp_key_boundary")
+
+    agent = manifest["launchAgent"]
+    require(agent["label"] == "com.aidev.codex-bridge.smb-tunnel",
+            "agent_label")
+    require(agent["program"] == "/usr/bin/ssh", "agent_program")
+    require(agent["arguments"] == [
+        "-N", "-T", "-o", "BatchMode=yes", "-o",
+        "ExitOnForwardFailure=yes", "-o", "ServerAliveInterval=30", "-o",
+        "ServerAliveCountMax=3", "-L",
+        "127.0.0.1:14445:127.0.0.1:445", "windows-host",
+    ], "agent_arguments")
+    require(agent["runAtLoad"] is True and agent["keepAlive"] is True,
+            "agent_lifetime")
+    require(agent["standardOutput"] == "/dev/null"
+            and agent["standardError"] == "/dev/null", "agent_logs")
+
+    automount_agent = manifest["automountAgent"]
+    require(automount_agent["label"] ==
+            "com.aidev.codex-bridge.smb-automount", "automount_label")
+    require(automount_agent["programSource"] ==
+            "darwin/codex-bridge-drop-automount.sh", "automount_source")
+    require(automount_agent["runAtLoad"] is True, "automount_run_at_load")
+    require(automount_agent["startIntervalSeconds"] == 60,
+            "automount_interval")
+    require(automount_agent["requiresFinderRunning"] is True,
+            "automount_finder_gate")
+    require(automount_agent["requiresLocalTunnelReachable"] is True,
+            "automount_tunnel_gate")
+    require(automount_agent["mountWaitSeconds"] == 20,
+            "automount_wait")
+    require(automount_agent["standardOutput"] == "/dev/null"
+            and automount_agent["standardError"] == "/dev/null",
+            "automount_logs")
+
+    boundary = manifest["dataBoundary"]
+    require(all(value is False for value in boundary.values()),
+            "data_boundary")
+    require(manifest["lifecycle"]["apply"].endswith(
+        "typed aid-admin apply-system"), "typed_apply")
+    require("disabled-state successor commit"
+            in manifest["lifecycle"]["rollback"], "rollback_contract")
+
+    require("./darwin/codex-bridge-drop.nix" in flake, "flake_module")
+    for needle in (
+        'Label = "com.aidev.codex-bridge.smb-tunnel";',
+        '"/usr/bin/ssh"',
+        '"BatchMode=yes"',
+        '"ExitOnForwardFailure=yes"',
+        '"127.0.0.1:14445:127.0.0.1:445"',
+        "RunAtLoad = true;",
+        "KeepAlive = true;",
+        "ThrottleInterval = 15;",
+        'StandardOutPath = "/dev/null";',
+        'StandardErrorPath = "/dev/null";',
+        'Label = "com.aidev.codex-bridge.smb-automount";',
+        "builtins.readFile ./codex-bridge-drop-automount.sh",
+        "StartInterval = 60;",
+    ):
+        require(needle in module, f"module_{needle}")
+
+    require(grants["targetPolicy"]["networkCapabilities"] == [
+        "tcp:22", "tcp:3389", "tcp:21118",
+    ], "grants_unchanged")
+    require(grants["policyTests"]["acceptPorts"] == [22, 3389, 21118],
+            "grants_tests_unchanged")
+    require("followOnSmbChange" not in grants, "no_smb_grant_follow_on")
+    require(not retired_policy.exists(), "duplicate_windows_owner")
+
+    for needle in (
+        "require_exact_commit",
+        "wrong_task_branch",
+        "dirty_worktree",
+        "/usr/local/libexec/aid-admin",
+        "apply-system",
+        "remote_smb_loopback_passes",
+        "sftp_probe",
+        "/usr/bin/sftp",
+        "launchd_pid",
+        "automount_program",
+        "automount_state_valid",
+        "finder_mount_active",
+        "automount_probe",
+        "listener_owned_by",
+        "postapply_failed_exact_rollback_commit_required",
+        '"firewall_mutation_count": 0',
+        '"tailscale_policy_mutation_count": 0',
+    ):
+        require(needle in runner, f"runner_{needle}")
+
+    for needle in (
+        "smb://127.0.0.1:14445/CodexBridgeDrop",
+        "/usr/bin/pgrep -x Finder",
+        "/usr/bin/nc -z -w 3 127.0.0.1 14445",
+        "automount-paused",
+        "umask 077",
+    ):
+        require(needle in automount, f"automount_{needle}")
+    require("security " not in automount, "automount_never_reads_keychain")
+
+    combined_runtime = "\n".join((module, automount, runner, docs))
+    for forbidden in (
+        "New-NetFirewallRule",
+        "Set-NetFirewall",
+        "Remove-NetFirewall",
+        "Set-SmbServerConfiguration",
+        "tailscale-grants-windows-host apply",
+        "ssh-ed25519 ",
+        "IdentityFile ",
+    ):
+        require(forbidden not in combined_runtime, f"forbidden_{forbidden}")
+
+    for needle in (
+        "SFTP and Finder SMB use the same Windows folder",
+        "does not add TCP 445 to Tailscale Grants",
+        "not a claim that the Windows SMB server is",
+        "disabled-state successor commit",
+        "Finder credential prompt",
+        "automatic reconnect",
+        "never reads the Keychain secret",
+    ):
+        require(needle in docs, f"docs_{needle}")
+    require("Codex Bridge SFTP and SSH-tunneled SMB exchange" in architecture,
+            "architecture")
+
+    combined_public = "\n".join((
+        manifest_path.read_text(),
+        docs,
+        architecture[-8000:],
+        module,
+        automount,
+    ))
+    require(not re.search(r"\b100\.(?:\d{1,3}\.){2}\d{1,3}\b",
+                          combined_public),
+            "specific_overlay_address_in_repository")
+    require(not re.search(
+        r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}",
+        combined_public,
+    ), "account_identifier_in_repository")
+    require(".ts.net" not in combined_public, "tailnet_name_in_repository")
+    require("PRIVATE KEY" not in combined_public, "private_key_material")
+
+    print(json.dumps({
+        "profile": manifest["profile"],
+        "result": "pass",
+        "schema": 2,
+        "systemMutationsPerformed": False,
+    }, sort_keys=True))
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except Exception as error:
+        print(json.dumps({"reason": str(error), "result": "fail"},
+                         sort_keys=True))
+        raise SystemExit(1)

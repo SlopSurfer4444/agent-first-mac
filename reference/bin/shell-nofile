@@ -1,0 +1,108 @@
+#!/usr/bin/python3
+"""Exact-source user-shell soft open-file limit lifecycle; no root changes."""
+import sys
+sys.dont_write_bytecode = True
+import argparse, fcntl, hashlib, json, os, pwd, re, stat, subprocess
+from pathlib import Path
+HERE = Path(__file__).resolve().parent.parent
+HOME = Path(pwd.getpwuid(os.getuid()).pw_dir)
+CONTROL = HOME / 'AIDev/control'
+MANIFEST = 'manifests/shell-nofile.json'
+PAYLOAD = b'''# Managed by AIDev/control: shell-nofile. Remove through its rollback command.
+# Raise only the soft limit; preserve larger limits and the existing hard limit.
+() {
+  local aid_nofile_soft=$(ulimit -Sn)
+  if [[ $aid_nofile_soft != unlimited && $aid_nofile_soft == <-> ]] && (( aid_nofile_soft < 4096 )); then
+    ulimit -Sn 4096 2>/dev/null || :
+  fi
+}
+'''
+
+def need(value, reason):
+    if not value: raise RuntimeError(reason)
+
+def run(args):
+    p = subprocess.run([str(a) for a in args], capture_output=True, timeout=600)
+    need(p.returncode == 0, 'command_failed')
+    return p.stdout.decode().strip()
+
+def gate(commit):
+    need(HERE == CONTROL and Path(__file__).absolute() == CONTROL/'bin/shell-nofile', 'canonical_source_required')
+    need(re.fullmatch('[0-9a-f]{40}', commit), 'invalid_commit')
+    def git(*args): return run(['/usr/bin/git', '-c', 'core.hooksPath=/dev/null', '-C', CONTROL, *args])
+    def exact():
+        need(git('rev-parse', 'HEAD') == commit and git('branch', '--show-current') == 'main' and not git('status', '--porcelain'), 'clean_exact_main_required')
+    exact()
+    d = json.loads(run([CONTROL/'bin/current-doctor', '--json']))
+    need(d.get('verdict') == 'PASS' and d.get('gitOnly') is False and all(d.get(k) is True for k in ('configurationSourceAccepted', 'currentSentinelReady', 'integratedMain')), 'fresh_accepted_doctor_required')
+    exact()
+
+def read_at(fd, name):
+    try: leaf = os.open(name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=fd)
+    except FileNotFoundError: return None
+    try:
+        s = os.fstat(leaf)
+        need(stat.S_ISREG(s.st_mode) and s.st_uid == os.getuid() and s.st_nlink == 1 and not s.st_mode & 0o022 and s.st_size < 8192, 'unsafe_file')
+        return os.read(leaf, 8192)
+    finally: os.close(leaf)
+
+def create_at(fd, name, data):
+    leaf = os.open(name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=fd)
+    try:
+        with os.fdopen(leaf, 'wb', closefd=False) as f:
+            f.write(data); f.flush(); os.fsync(leaf)
+    finally: os.close(leaf)
+
+def transaction(fd, operation, commit):
+    # One locked HOME directory descriptor prevents path redirection. No parent
+    # directories or receipt directories are created or adopted.
+    target = '.zshrc'; receipt = '.aid-shell-nofile-receipt.json'
+    current = read_at(fd, target); recorded = read_at(fd, receipt)
+    digest = hashlib.sha256(PAYLOAD).hexdigest()
+    if recorded is not None:
+        r = json.loads(recorded)
+        need(type(r) is dict and set(r) == {'schema', 'commit', 'sha256'} and type(r['schema']) is int and r['schema'] == 1 and isinstance(r['commit'], str) and re.fullmatch('[0-9a-f]{40}', r['commit']) and r['sha256'] == digest, 'receipt_drift')
+        need(current == PAYLOAD, 'target_drift')
+        if operation == 'rollback':
+            os.unlink(target, dir_fd=fd); os.unlink(receipt, dir_fd=fd)
+            return 'REMOVED'
+        return 'INSTALLED'
+    need(current is None, 'unowned_zshrc_collision')
+    if operation != 'apply': return 'ABSENT'
+    # Alternate user startup owners can redirect ZDOTDIR or supersede policy.
+    for name in ('.zshenv', '.zprofile'):
+        try: os.stat(name, dir_fd=fd, follow_symlinks=False)
+        except FileNotFoundError: continue
+        raise RuntimeError('user_startup_owner_collision')
+    body = json.dumps({'schema': 1, 'commit': commit, 'sha256': digest}, sort_keys=True).encode() + b'\n'
+    create_at(fd, target, PAYLOAD)
+    try: create_at(fd, receipt, body)
+    except Exception:
+        if read_at(fd, target) == PAYLOAD: os.unlink(target, dir_fd=fd)
+        raise
+    need(read_at(fd, target) == PAYLOAD and read_at(fd, receipt) == body, 'postcheck_failed')
+    return 'INSTALLED'
+
+def main():
+    p = argparse.ArgumentParser(description=__doc__)
+    p.add_argument('operation', choices=('apply', 'status', 'rollback'))
+    p.add_argument('--commit')
+    a = p.parse_args()
+    if a.operation != 'status': gate(a.commit or '')
+    need(not os.environ.get('ZDOTDIR') or Path(os.environ['ZDOTDIR']) == HOME, 'alternate_zdotdir')
+    m = json.loads((HERE/MANIFEST).read_text())
+    need(m['payloadSha256'] == hashlib.sha256(PAYLOAD).hexdigest(), 'manifest_drift')
+    fd = os.open(HOME, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        s = os.fstat(fd)
+        need(s.st_uid == os.getuid() and not s.st_mode & 0o022, 'unsafe_home')
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        verdict = transaction(fd, a.operation, a.commit)
+        print(json.dumps({'schema': 1, 'verdict': verdict, 'softLimitFloor': 4096, 'existingSessionsChanged': False}))
+    finally: os.close(fd)
+
+if __name__ == '__main__':
+    try: main()
+    except (OSError, ValueError, RuntimeError) as e:
+        print(json.dumps({'schema': 1, 'verdict': 'BLOCKED', 'reason': str(e) if isinstance(e, RuntimeError) else type(e).__name__}))
+        sys.exit(1)

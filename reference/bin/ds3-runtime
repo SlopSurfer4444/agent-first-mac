@@ -1,0 +1,1046 @@
+#!/usr/bin/python3
+"""Reviewed DS3-only adoption; preparation and installation never start a game."""
+import sys
+sys.dont_write_bytecode = True
+import fcntl, hashlib, json, os, pwd, re, shutil, stat, subprocess, tempfile
+import xml.etree.ElementTree as ET
+from pathlib import Path
+HOME = Path(pwd.getpwuid(os.getuid()).pw_dir)
+CONTROL = HOME/'AIDev/control'
+HERE = Path(__file__).resolve().parent.parent
+ROOT = HOME/'Library/Application Support/Adapted Games DS3'
+SOURCE = HOME/'Library/Application Support/Adapted Games'
+PREFIX = ROOT/'profiles/ds3'
+MANIFEST = 'manifests/ds3-marshal-fix.json'
+BORDERLESS_MANIFEST = 'manifests/ds3-borderless.json'
+BORDERLESS_SOURCE = 'bin/ds3-borderless-helper.c'
+BORDERLESS_FILES = {'helper.exe':'helperSha256','helper.c':'sourceSha256','build-provenance.json':'provenanceSha256','final-fixture-results.json':'fixtureReportSha256'}
+METAL = 'engine/lib/wine/x86_64-unix/winemetal.so'
+DONOR = 'engine/lib/wine/x86_64-unix/winemetal-airconv-original.so'
+NATIVE_LOADER = 'engine/lib/wine/x86_64-unix/wine'
+MAX_ENTRIES = 100000
+
+def admission(home,route,goal=None):
+    # Execute exactly the reviewed helper bytes from the stable installed route.
+    path=home/'AIDev/bin/game-launch-admission'
+    for parent in [*reversed(path.parents),path.parent]:
+        facts=parent.lstat()
+        if not stat.S_ISDIR(facts.st_mode) or facts.st_uid not in (0,os.getuid()) or facts.st_mode&0o022:
+            raise RuntimeError('unsafe_admission_directory')
+    fd=os.open(str(path),os.O_RDONLY|os.O_NOFOLLOW|os.O_NONBLOCK)
+    try:
+        facts=os.fstat(fd)
+        if not stat.S_ISREG(facts.st_mode) or facts.st_uid!=os.getuid() or facts.st_nlink!=1 or facts.st_mode&0o022 or facts.st_size>65536:
+            raise RuntimeError('unsafe_admission_helper')
+        with os.fdopen(os.dup(fd),'rb') as stream:raw=stream.read()
+        after=os.fstat(fd)
+        keys=('st_dev','st_ino','st_mode','st_uid','st_nlink','st_size','st_mtime_ns','st_ctime_ns')
+        if any(getattr(facts,k)!=getattr(after,k) for k in keys) or hashlib.sha256(raw).hexdigest()!='f0227b4f9e38671a58d6bbbb8ad86a58354c706d55a99521ee9ce973d4ed5750':
+            raise RuntimeError('admission_helper_changed')
+    finally:os.close(fd)
+    namespace={'__name__':'game_launch_admission','__admission_source':raw}
+    exec(compile(raw,str(path),'exec'),namespace)
+    return namespace['Admission'](home,route,goal)
+
+SOURCE_HUB_MANIFEST = 'manifests/ds3-source-hub-v1.json'
+RUNTIME_OVERLAY_POLICY = 'manifests/wine-runtime-overlay.json'
+RUNTIME_OVERLAY_POLICY_FIELDS = {'schema','id','owner','previousHubManifestSha256','previousDS3ManifestSha256','previousHubCriticalHashes','sourceHubManifestSha256','sourceCriticalHashes','desiredPEHashes','lifecycleSha256'}
+RUNTIME_OVERRIDE_PATHS = {'engine/lib/wine/i386-windows/winemac.drv', 'engine/lib/wine/x86_64-windows/winemac.drv'}
+DS3_MANIFEST_FIELDS = ['architecture', 'aspectFit', 'aspectPolicySha256', 'authorization', 'candidateBuildFiles', 'candidateSha256', 'candidateState', 'capabilities', 'dataBoundary', 'destination', 'donorSha256', 'followPolicySha256', 'fontPathCount', 'graphicsPolicy', 'id', 'marshalSources', 'owner', 'primaryOwner', 'processGate', 'provenance', 'provenanceSha256', 'remove', 'resolver', 'rollback', 'schema', 'singleLauncher', 'smokeTest', 'sourceCriticalHashes', 'sourceHubManifestSha256', 'versionPolicy', 'windowEnumEvidence', 'windowMode']
+
+def need(ok, reason):
+    if not ok: raise RuntimeError(reason)
+
+def run(args, timeout=600, env=None):
+    p = subprocess.run([str(x) for x in args], capture_output=True, timeout=timeout, env=env)
+    need(p.returncode == 0, 'command_failed_'+Path(args[0]).name)
+    need(len(p.stdout) <= 32*1024*1024, 'command_output_limit')
+    return p.stdout
+
+def safe_directory(p):
+    for x in [*reversed(p.parents), p]:
+        s = x.lstat()
+        need(stat.S_ISDIR(s.st_mode) and s.st_uid in (0, os.getuid()) and not s.st_mode & 0o002, 'unsafe_directory')
+
+def safe_file(p, allow_source_hardlinks=False):
+    safe_directory(p.parent)
+    s = p.lstat()
+    need(stat.S_ISREG(s.st_mode) and s.st_uid in (0, os.getuid()) and not s.st_mode & 0o022 and (s.st_nlink == 1 or allow_source_hardlinks), 'unsafe_file')
+
+def sha(p, allow_source_hardlinks=False):
+    safe_file(p, allow_source_hardlinks)
+    need(p.stat().st_size <= 2*1024*1024*1024, 'file_size_limit')
+    h = hashlib.sha256()
+    with p.open('rb') as f:
+        for b in iter(lambda: f.read(1048576), b''): h.update(b)
+    return h.hexdigest()
+
+def load(p):
+    safe_file(p)
+    need(p.stat().st_size <= 65536, 'metadata_limit')
+    def unique(rows):
+        out = {}
+        for k,v in rows:
+            need(k not in out, 'duplicate_json_key'); out[k] = v
+        return out
+    return json.loads(p.read_text(), object_pairs_hook=unique)
+
+def pinned(digest):
+    return type(digest) is str and re.fullmatch('[0-9a-f]{64}', digest) is not None
+
+def manifest(p):
+    m = load(p)
+    need(type(m) is dict and type(m.get('schema')) is int and m.get('schema') in (1,2) and m.get('id') == 'ds3-marshal-fix' and m.get('owner') == 'control-ds3-marshal-fix', 'manifest_identity')
+    allowed = set(DS3_MANIFEST_FIELDS) | ({'runtimeOverrides','runtimeOverlayPolicySha256'} if m['schema'] == 2 else set())
+    need(set(m) <= allowed and (m['schema'] == 2 or 'runtimeOverrides' not in m and 'runtimeOverlayPolicySha256' not in m), 'manifest_field_schema')
+    for k in ('candidateSha256', 'provenanceSha256'):
+        need(pinned(m.get(k)), 'candidate_pins_pending')
+    need(m.get('windowMode') == 'WINDOW', 'unsupported_graphics_policy')
+    need(pinned(m.get('sourceHubManifestSha256')), 'hub_manifest_pin')
+    expected = None
+    ancestry_source = CONTROL if m['schema'] == 2 else HERE
+    if HERE == CONTROL or m['schema'] == 2:
+        # Adoption ancestry remains the exact original reviewed hub blob.
+        original = load(ancestry_source/SOURCE_HUB_MANIFEST)
+        need(type(original) is dict and original.get('id') == 'games-hub' and original.get('owner') == 'control-games-hub', 'source_hub_identity')
+        need(m['sourceHubManifestSha256'] == sha(ancestry_source/SOURCE_HUB_MANIFEST), 'hub_manifest_pin')
+        expected = original.get('criticalHashes')
+    need(type(m.get('sourceCriticalHashes')) is dict and all(pinned(v) for v in m['sourceCriticalHashes'].values()), 'critical_pin_schema')
+    if expected is not None: need(m['sourceCriticalHashes'] == expected, 'hub_critical_pins_changed')
+    need(m['donorSha256'] == m['sourceCriticalHashes'].get(METAL), 'donor_pin')
+    need('engine/lib/wine/x86_64-windows/d3d11.dll' in m['sourceCriticalHashes'], 'd3d11_pin_required')
+    for rel in m['sourceCriticalHashes']:
+        need(type(rel) is str and not Path(rel).is_absolute() and '..' not in Path(rel).parts and rel.startswith('engine/'), 'unsafe_critical_path')
+    if m['schema'] == 2:
+        overrides = m.get('runtimeOverrides')
+        need(type(overrides) is dict and set(overrides) == RUNTIME_OVERRIDE_PATHS and all(pinned(v) for v in overrides.values()), 'runtime_override_schema')
+        policy = load(ancestry_source/RUNTIME_OVERLAY_POLICY)
+        need(type(policy) is dict and set(policy) == RUNTIME_OVERLAY_POLICY_FIELDS and type(policy.get('schema')) is int and policy.get('schema') == 1 and policy.get('id') == 'wine-runtime-overlay' and policy.get('owner') == 'control-games-hub', 'overlay_policy_identity')
+        need(pinned(m.get('runtimeOverlayPolicySha256')) and m['runtimeOverlayPolicySha256'] == sha(ancestry_source/RUNTIME_OVERLAY_POLICY), 'overlay_policy_pin')
+        need(pinned(policy.get('lifecycleSha256')) and policy['lifecycleSha256'] == sha(ancestry_source/'bin/ds3-runtime'), 'overlay_lifecycle_pin')
+        need(policy.get('desiredPEHashes') == overrides and policy.get('sourceHubManifestSha256') == m['sourceHubManifestSha256'] and policy.get('sourceCriticalHashes') == m['sourceCriticalHashes'], 'overlay_source_binding')
+        current_hub = load(ancestry_source/'manifests/games-hub.json')
+        need(type(current_hub) is dict and type(current_hub.get('criticalHashes')) is dict, 'current_hub_schema')
+        need(current_hub.get('runtimeOverlayPolicySha256') == m['runtimeOverlayPolicySha256'] and all(current_hub.get('criticalHashes',{}).get(rel) == value for rel,value in overrides.items()), 'overlay_hub_binding')
+    return m
+
+def installed_critical_hashes(m):
+    # Only the two reviewed PE pins override source ancestry. DXMT, donor,
+    # controller and every other inherited file remain separately pinned.
+    pins = dict(m['sourceCriticalHashes'])
+    pins[METAL] = m['candidateSha256']; pins[DONOR] = m['donorSha256']
+    if m['schema'] == 2: pins.update(m['runtimeOverrides'])
+    return pins
+
+def code_tree(p, allow_source_hardlinks=False, allow_installed_loader_hardlinks=False):
+    if allow_installed_loader_hardlinks: need(p == ROOT/'runtime' and not allow_source_hardlinks, 'invalid_installed_runtime_scope')
+    safe_directory(p); rows = []; total_bytes = 0
+    for i,x in enumerate(p.rglob('*')):
+        need(i < MAX_ENTRIES, 'runtime_entry_limit')
+        s = x.lstat(); rel = str(x.relative_to(p))
+        if stat.S_ISLNK(s.st_mode):
+            need(x.resolve(strict=True).is_relative_to(p), 'external_runtime_link')
+            rows.append([rel, 'link', os.readlink(x)])
+        elif stat.S_ISREG(s.st_mode):
+            total_bytes += s.st_size; need(total_bytes <= 8*1024*1024*1024, 'runtime_size_limit')
+            # Archived Wine loader.c create_preloader_link creates per-process
+            # macOS temporary hardlinks to this one native loader after launch.
+            # Keep its complete bytes/mode bound to the unchanged tree receipt.
+            loader_link = allow_installed_loader_hardlinks and rel == NATIVE_LOADER
+            rows.append([rel, s.st_mode & 0o777, sha(x,allow_source_hardlinks or loader_link)])
+        else: need(stat.S_ISDIR(s.st_mode), 'unsafe_runtime_entry')
+    rows.sort(key=lambda row:row[0])
+    return hashlib.sha256(json.dumps(rows, separators=(',', ':')).encode()).hexdigest()
+
+def snapshot(p):
+    # Opaque metadata only; never read credentials or saves.
+    safe_directory(p); rows = []
+    allowed = {'dosdevices/z:':'/', 'dosdevices/c:':'../drive_c', 'drive_c/users/crossover/Desktop/My Mac Desktop':str(HOME/'Desktop')}
+    for i,x in enumerate(p.rglob('*')):
+        need(i < MAX_ENTRIES, 'profile_entry_limit')
+        s = x.lstat(); rel = str(x.relative_to(p))
+        need(s.st_uid == os.getuid(), 'foreign_profile_owner')
+        if stat.S_ISLNK(s.st_mode):
+            target = os.readlink(x); need(allowed.get(rel) == target, 'unexpected_profile_link'); rows.append((rel,'link',target))
+        elif stat.S_ISREG(s.st_mode):
+            need(s.st_nlink == 1, 'profile_hardlink'); rows.append((rel,'file',s.st_size,s.st_mtime_ns))
+        else: need(stat.S_ISDIR(s.st_mode), 'unsupported_profile_entry')
+    rows.sort(key=lambda row:row[0])
+    return rows
+
+def wine_env(runtime, prefix, fix=False):
+    engine = runtime/'engine'; user = pwd.getpwuid(os.getuid()).pw_name
+    env = {'HOME':str(HOME), 'USER':user, 'LOGNAME':user, 'PATH':'/usr/bin:/bin:/usr/sbin:/sbin', 'LANG':'en_US.UTF-8',
+           'WINEPREFIX':str(prefix), 'WINESERVER':str(engine/'bin/wineserver'), 'WINELOADER':str(engine/'bin/wine'),
+           'WINEDLLPATH':str(engine/'lib/wine'), 'DYLD_FALLBACK_LIBRARY_PATH':str(runtime/'Frameworks')+':/usr/lib',
+           'WINEDLLOVERRIDES':'winemenubuilder.exe=;mscoree,mshtml=;dxgi,d3d11,d3d10core,winemetal=b;nvapi64,nvngx=',
+           'WINEDEBUG':'-all', 'WINEMSYNC':'1', 'WINEESYNC':'0', 'ROSETTA_ADVERTISE_AVX':'1',
+           'AOELAB_STEAM_SINGLEPROCESS':'1', 'MTL_HUD_ENABLED':'0'}
+    if fix: env['DXMT_DS3_MARSHAL_FIX'] = '1'
+    return env
+
+def inactive(runtime, prefix):
+    need(prefix.is_dir() and not prefix.is_symlink(), 'profile_missing')
+    safe_file(runtime/'engine/bin/wineserver',allow_source_hardlinks=(runtime == SOURCE/'runtime'))
+    try: run([runtime/'engine/bin/wineserver', '-w'], timeout=3, env=wine_env(runtime,prefix))
+    except subprocess.TimeoutExpired: raise RuntimeError('profile_active')
+
+def source_gate(commit):
+    need(HERE == CONTROL and Path(__file__).absolute() == CONTROL/'bin/ds3-runtime', 'canonical_source_required')
+    need(type(commit) is str and re.fullmatch('[0-9a-f]{40}',commit), 'invalid_commit')
+    def git(*a): return run(['/usr/bin/git','-c','core.hooksPath=/dev/null','-C',CONTROL,*a]).decode().strip()
+    def exact():
+        need(git('rev-parse','HEAD') == commit and git('branch','--show-current') == 'main' and not git('status','--porcelain'), 'clean_exact_main_required')
+    exact()
+    d = json.loads(run([CONTROL/'bin/current-doctor','--json']))
+    need(d.get('verdict') == 'PASS' and all(d.get(k) is True for k in ('configurationSourceAccepted','currentSentinelReady','integratedMain')) and d.get('gitOnly') is False, 'fresh_accepted_doctor_required')
+    exact()
+
+def source_check(m):
+    safe_directory(SOURCE)
+    need(sha(SOURCE/'manifest.json') == m['sourceHubManifestSha256'], 'source_hub_manifest_drift')
+    r = load(SOURCE/'receipt.json')
+    need(r.get('owner') == 'control-games-hub' and r.get('manifestSha256') == m['sourceHubManifestSha256'], 'source_owner_mismatch')
+    need(code_tree(SOURCE/'runtime',allow_source_hardlinks=True) == r.get('runtimeTreeSha256'), 'source_runtime_drift')
+    for rel,digest in m['sourceCriticalHashes'].items(): need(sha(SOURCE/'runtime'/rel,allow_source_hardlinks=True) == digest, 'source_critical_drift')
+    snapshot(SOURCE/'profiles/prince'); inactive(SOURCE/'runtime', SOURCE/'profiles/prince')
+    return r['runtimeTreeSha256']
+
+def candidate_check(m, candidate):
+    need(candidate.is_absolute(), 'absolute_candidate_required'); safe_directory(candidate)
+    need(sha(candidate/'winemetal.so') == m['candidateSha256'], 'candidate_hash_mismatch')
+    need(sha(candidate/'winemetal-airconv-original.so') == m['donorSha256'], 'donor_hash_mismatch')
+    need(sha(candidate/'provenance.json') == m['provenanceSha256'], 'provenance_hash_mismatch')
+    p = load(candidate/'provenance.json')
+    source_files = p.get('sourceFiles')
+    need(type(source_files) is dict and 0 < len(source_files) <= 1000, 'source_file_schema')
+    for rel,digest in source_files.items():
+        need(type(rel) is str and rel.startswith(('src/','include/')) and not Path(rel).is_absolute() and '..' not in Path(rel).parts and pinned(digest), 'unsafe_source_path')
+        need(sha(candidate/'source'/rel) == digest, 'candidate_source_drift')
+    for key,base in (('candidateBuildFiles',candidate),('marshalSources',candidate.parent)):
+        files = m.get(key)
+        need(type(files) is dict and 0 < len(files) <= 16, 'build_file_schema')
+        for name,digest in files.items():
+            need(type(name) is str and re.fullmatch('[A-Za-z0-9_.-]+',name) and name not in ('.','..') and pinned(digest), 'unsafe_build_path')
+            need(sha(base/name) == digest, 'build_source_drift')
+    need(p.get('candidate') == m['candidateSha256'] and p.get('donor') == m['donorSha256'] and p.get('d3d11') == m['sourceCriticalHashes']['engine/lib/wine/x86_64-windows/d3d11.dll'] and p.get('installed') is False, 'provenance_binding_mismatch')
+
+def borderless_manifest(p):
+    m = load(p)
+    fields = {'schema','id','owner','helperSha256','sourceSha256','provenanceSha256','fixtureReportSha256','compilerVersion','compilerTarSha256','target','nativeBinding','argv','timeoutSeconds'}
+    need(set(m) == fields and type(m['schema']) is int and m['schema'] == 1 and m['id'] == 'ds3-borderless' and m['owner'] == 'control-ds3-marshal-fix', 'borderless_manifest_schema')
+    need(all(pinned(m[k]) for k in BORDERLESS_FILES.values()) and pinned(m['compilerTarSha256']), 'borderless_pin_schema')
+    need(m['compilerVersion'] == '0.15.2' and m['target'] == 'x86_64-windows-gnu' and type(m['timeoutSeconds']) is int and (m['argv'],m['timeoutSeconds']) in ((['--apply','--wait','180'],190),(['--follow','--wait','900'],44110)), 'borderless_recipe_schema')
+    need(type(m['nativeBinding']) is dict and set(m['nativeBinding']) == {'winemetalSha256','donorSha256','d3d11Sha256'} and all(pinned(v) for v in m['nativeBinding'].values()), 'borderless_native_schema')
+    return m
+
+def borderless_candidate(m, candidate):
+    need(candidate.is_absolute(), 'absolute_candidate_required'); safe_directory(candidate)
+    for name,key in BORDERLESS_FILES.items(): need(sha(candidate/name) == m[key], 'borderless_candidate_drift')
+    need((candidate/'helper.exe').stat().st_size <= 4*1024*1024, 'borderless_size_limit')
+    pe = (candidate/'helper.exe').read_bytes(); offset = int.from_bytes(pe[60:64],'little')
+    need(pe[:2] == b'MZ' and 64 <= offset <= len(pe)-24 and pe[offset:offset+4] == b'PE\0\0' and int.from_bytes(pe[offset+4:offset+6],'little') == 0x8664 and not int.from_bytes(pe[offset+22:offset+24],'little') & 0x2000, 'borderless_pe_identity')
+    provenance = load(candidate/'build-provenance.json')
+    expected = {'schema':1,'sourceSha256':m['sourceSha256'],'helperSha256':m['helperSha256'],'compilerVersion':m['compilerVersion'],'compilerTarSha256':m['compilerTarSha256'],'target':m['target'],'flags':['-O2','-Wall','-Wextra','-Werror','-luser32','-ladvapi32'],'fixtureReportSha256':m['fixtureReportSha256']}
+    need(provenance == expected, 'borderless_provenance_binding')
+    report = load(candidate/'final-fixture-results.json')
+    need(report.get('sourceSha256') == m['sourceSha256'] and report.get('productionSha256') == m['helperSha256'] and report.get('fixturePrefixStopped') is True and report.get('realGameStarted') is False and report.get('targetProfileChanged') is False, 'borderless_fixture_binding')
+    need(type(report.get('cases')) is list and len(report['cases']) == 4 and all(r.get('pass') is True and r.get('exit') == r.get('expectedExit') for r in report['cases']), 'borderless_fixture_failure')
+
+def borderless_binding(m, base):
+    need(m['nativeBinding'] == {'winemetalSha256':base['candidateSha256'],'donorSha256':base['donorSha256'],'d3d11Sha256':base['sourceCriticalHashes']['engine/lib/wine/x86_64-windows/d3d11.dll']}, 'borderless_native_drift')
+
+def verify_borderless():
+    destination = ROOT/'borderless'; safe_directory(destination)
+    m = borderless_manifest(destination/'manifest.json'); receipt = load(destination/'receipt.json')
+    base = manifest(ROOT/'manifest.json'); current = load(ROOT/'receipt.json'); borderless_binding(m,base)
+    need(set(receipt) == {'schema','owner','commit','manifestSha256','baseRuntimeTreeSha256','baseManifestSha256'} and type(receipt['schema']) is int and receipt['schema'] == 1 and type(receipt['commit']) is str and re.fullmatch('[0-9a-f]{40}',receipt['commit']) is not None, 'borderless_receipt_schema')
+    need(receipt.get('owner') == m['owner'] and receipt.get('manifestSha256') == sha(destination/'manifest.json') and receipt.get('baseRuntimeTreeSha256') == current.get('runtimeTreeSha256') and receipt.get('baseManifestSha256') == current.get('manifestSha256'), 'borderless_installed_binding')
+    borderless_candidate(m,destination)
+    return m,receipt
+
+def install_borderless(commit,candidate):
+    source_gate(commit); base,current = verify_installed(); inactive(ROOT/'runtime',PREFIX)
+    m = borderless_manifest(HERE/BORDERLESS_MANIFEST); borderless_binding(m,base)
+    need(sha(HERE/BORDERLESS_SOURCE) == m['sourceSha256'], 'borderless_source_drift'); borderless_candidate(m,candidate)
+    destination = ROOT/'borderless'
+    if destination.exists() or destination.is_symlink():
+        safe_directory(destination); safe_file(destination/'manifest.json')
+        need((destination/'manifest.json').read_bytes() == (HERE/BORDERLESS_MANIFEST).read_bytes(), 'borderless_installed_manifest_drift')
+        verify_borderless(); return {'state':'BORDERLESS_INSTALLED','changed':False,'gameStarted':False}
+    stage = ROOT/('.borderless-stage-'+commit[:12]); need(not stage.exists() and not stage.is_symlink(), 'borderless_staging_collision')
+    stage.mkdir(mode=0o700)
+    for name in BORDERLESS_FILES:
+        shutil.copyfile(candidate/name,stage/name); (stage/name).chmod(0o600)
+    shutil.copyfile(HERE/BORDERLESS_MANIFEST,stage/'manifest.json'); (stage/'manifest.json').chmod(0o600)
+    borderless_candidate(m,stage)
+    receipt = {'schema':1,'owner':m['owner'],'commit':commit,'manifestSha256':sha(stage/'manifest.json'),'baseRuntimeTreeSha256':current['runtimeTreeSha256'],'baseManifestSha256':current['manifestSha256']}
+    (stage/'receipt.json').write_text(json.dumps(receipt,indent=2)+'\n'); (stage/'receipt.json').chmod(0o600)
+    need(not destination.exists() and not destination.is_symlink(), 'borderless_destination_collision')
+    os.rename(stage,destination)
+    try: verify_borderless()
+    except Exception:
+        # Retain the exact new payload for explicit recovery; never delete data.
+        need(not stage.exists() and not stage.is_symlink(), 'borderless_rollback_collision')
+        os.rename(destination,stage); raise
+    return {'state':'BORDERLESS_INSTALLED','changed':True,'gameStarted':False}
+
+def prepare(candidate):
+    m = manifest(HERE/MANIFEST); candidate_check(m,candidate); source_check(m)
+    return {'state':'PREPARED_SOURCE_ONLY', 'gameStarted':False, 'liveStateChanged':False}
+
+def copy(src,dst):
+    need(not dst.exists() and not dst.is_symlink(), 'destination_collision')
+    run(['/bin/cp','-cR',src,dst], timeout=1800)
+
+def shortcut_bytes(mode):
+    return ('#!/bin/zsh\nexec "$HOME/AIDev/bin/ds3-play" '+mode+'\n').encode()
+
+def shortcuts(m=None):
+    result = {'Dark Souls III.command':'play', 'Stop Dark Souls III.command':'stop'}
+    if m and m.get('aspectFit') is True and m.get('singleLauncher') is not True: result['Dark Souls III - 1080p.command'] = 'play-1080'
+    return result
+
+def verify_app_shortcuts(receipt, expected):
+    inventory = receipt.get('appLaunchers')
+    need(type(inventory) is dict and set(inventory) == set(expected), 'app_inventory_drift')
+    need(type(receipt.get('appPolicySha256')) is str and len(receipt['appPolicySha256']) == 64 and all(c in '0123456789abcdef' for c in receipt['appPolicySha256']), 'app_policy_binding')
+    files = {'Contents/Info.plist':0o600, 'Contents/MacOS/launcher':0o700, 'Contents/Resources/Game.icns':0o600}
+    for name in expected:
+        app = HOME/'Games'/name; safe_directory(app)
+        need(type(inventory[name]) is dict and set(inventory[name]) == set(files), 'app_inventory_drift')
+        observed_files = set(); observed_dirs = set()
+        for p in app.rglob('*'):
+            s = p.lstat(); rel = str(p.relative_to(app))
+            if stat.S_ISDIR(s.st_mode):
+                safe_directory(p); observed_dirs.add(rel)
+            else:
+                need(stat.S_ISREG(s.st_mode) and s.st_uid == os.getuid() and s.st_nlink == 1 and s.st_size <= 16*1024*1024, 'unsafe_app_file')
+                need(rel in files and s.st_mode & 0o777 == files[rel], 'app_mode_drift')
+                need(inventory[name][rel] == {'sha256':sha(p), 'mode':files[rel]}, 'app_file_drift')
+                observed_files.add(rel)
+        need(observed_files == set(files) and observed_dirs == {'Contents','Contents/MacOS','Contents/Resources'}, 'app_inventory_drift')
+    for name in expected.values():
+        p = HOME/'Games'/name; need(not p.exists() and not p.is_symlink(), 'legacy_shortcut_collision')
+
+def verify_installed():
+    safe_directory(ROOT); m = manifest(ROOT/'manifest.json'); r = load(ROOT/'receipt.json')
+    need(r.get('owner') == m['owner'] and r.get('manifestSha256') == sha(ROOT/'manifest.json'), 'installed_owner_or_manifest_drift')
+    for name,key in (('ds3-runtime','lifecycleSha256'),('ds3-play','launcherSha256')):
+        need(sha(ROOT/name) == r.get(key), 'installed_helper_drift')
+    expected = installed_critical_hashes(m)
+    for rel,digest in expected.items(): need(sha(ROOT/'runtime'/rel) == digest, 'installed_critical_drift')
+    need(code_tree(ROOT/'runtime',allow_installed_loader_hardlinks=True) == r.get('runtimeTreeSha256'), 'installed_runtime_drift')
+    snapshot(PREFIX); safe_directory(ROOT/'logs')
+    resolver = HOME/'AIDev/bin/ds3-play'
+    safe_directory(resolver.parent)
+    need(resolver.is_symlink() and resolver.resolve(strict=True) == ROOT/'ds3-play', 'resolver_drift')
+    if 'appLaunchers' in r:
+        need(m.get('singleLauncher') is True, 'app_follow_required')
+        verify_app_shortcuts(r,{'Dark Souls III.app':'Dark Souls III.command'})
+        for name in ('Stop Dark Souls III.command','Dark Souls III - 1080p.command'):
+            p = HOME/'Games'/name; need(not p.exists() and not p.is_symlink(), 'legacy_shortcut_collision')
+    else:
+        for name,mode in shortcuts(m).items():
+            p = HOME/'Games'/name; safe_file(p); need(p.read_bytes() == shortcut_bytes(mode), 'shortcut_drift')
+    return m,r
+
+def status():
+    verify_installed(); graphics = verify_window_config()
+    return dict({'state':'INSTALLED_CANDIDATE', 'runtimeVerified':True, 'gameplayVerified':False},**graphics)
+
+def rebase_fonts(prefix, expected):
+    old = ('Z:'+str(SOURCE/'runtime/engine/share/wine/fonts').replace('/','\\')).replace('\\','\\\\').encode()
+    new = ('Z:'+str(ROOT/'runtime/engine/share/wine/fonts').replace('/','\\')).replace('\\','\\\\').encode()
+    n = 0; planned = []
+    for name in ('system.reg','user.reg','userdef.reg'):
+        p = prefix/name; safe_file(p); need(p.stat().st_size <= 16*1024*1024, 'registry_size_limit'); raw = p.read_bytes(); n += raw.count(old); planned.append((p,raw.replace(old,new)))
+    need(n == expected, 'font_path_count_drift')
+    for p,data in planned: p.write_bytes(data)
+    return n
+
+CONFIG_REL = 'drive_c/users/crossover/AppData/Roaming/DarkSoulsIII/GraphicsConfig.xml'
+
+def window_config():
+    p = PREFIX/CONFIG_REL; safe_file(p); raw = p.read_bytes()
+    need(len(raw) <= 131072 and not raw.startswith(b'\xff\xfe') and not raw.startswith(b'\xfe\xff'), 'graphics_encoding_drift')
+    text = raw.decode('utf-16-le','strict')
+    def exact(tag,value):
+        need(text.count('<'+tag+'>') == 1 and text.count('</'+tag+'>') == 1 and ('<'+tag+'>'+value+'</'+tag+'>') in text, 'graphics_preimage_drift')
+    exact('ScreenMode','FULLSCREEN')
+    exact('Resolution-FullScreenWidth','1710'); exact('Resolution-FullScreenHeight','1068')
+    exact('Resolution-WindowScreenWidth','1680'); exact('Resolution-WindowScreenHeight','945')
+    after = text.replace('<ScreenMode>FULLSCREEN</ScreenMode>','<ScreenMode>WINDOW</ScreenMode>')
+    after = after.replace('<Resolution-WindowScreenWidth>1680</Resolution-WindowScreenWidth>','<Resolution-WindowScreenWidth>1710</Resolution-WindowScreenWidth>')
+    after = after.replace('<Resolution-WindowScreenHeight>945</Resolution-WindowScreenHeight>','<Resolution-WindowScreenHeight>1068</Resolution-WindowScreenHeight>')
+    backup = p.with_name(p.name+'.ds3-pre-window')
+    need(not backup.exists() and not backup.is_symlink(), 'graphics_backup_collision')
+    backup.write_bytes(raw); backup.chmod(0o600); p.write_bytes(after.encode('utf-16-le'))
+    return {'preimageSha256':hashlib.sha256(raw).hexdigest(),'postimageSha256':sha(p)}
+
+def verify_window_config():
+    # DS3 rewrites selected window dimensions during normal play. Bounds admit
+    # ordinary display sizes; they do not prove game support for arbitrary sizes.
+    p = PREFIX/CONFIG_REL; safe_file(p); raw = p.read_bytes()
+    need(len(raw) <= 131072, 'graphics_limit')
+    try:
+        text = raw.decode('utf-16-le','strict')
+        need('<!DOCTYPE' not in text and '<!ENTITY' not in text, 'ds3_window_config_drift')
+        tree = ET.fromstring(text)
+        need(tree.tag == 'config', 'ds3_window_config_drift')
+    except (UnicodeError,ET.ParseError): raise RuntimeError('ds3_window_config_drift')
+    def value(tag):
+        elements = [x for x in tree.iter() if x.tag == tag]
+        need(len(elements) == 1 and len(tree.findall(tag)) == 1 and not elements[0].attrib and len(elements[0]) == 0 and elements[0].text is not None, 'ds3_window_config_drift')
+        return elements[0].text.strip()
+    need(value('ScreenMode') == 'WINDOW', 'ds3_window_config_drift')
+    dimensions = []
+    for tag,minimum,maximum in (('Resolution-WindowScreenWidth',640,7680),('Resolution-WindowScreenHeight',360,4320)):
+        number = value(tag)
+        need(re.fullmatch('[1-9][0-9]{2,3}',number) is not None, 'ds3_window_config_drift')
+        number = int(number); need(minimum <= number <= maximum, 'ds3_window_config_drift'); dimensions.append(number)
+    return {'windowMode':'WINDOW','windowWidth':dimensions[0],'windowHeight':dimensions[1]}
+
+def install(commit, candidate):
+    source_gate(commit); m = manifest(HERE/MANIFEST)
+    if ROOT.exists() or ROOT.is_symlink():
+        need((ROOT/'manifest.json').read_bytes() == (HERE/MANIFEST).read_bytes(), 'installed_manifest_drift')
+        return dict(status(),changed=False,gameStarted=False)
+    source_tree = source_check(m); candidate_check(m,candidate)
+    for p in (ROOT.parent, HOME/'AIDev/bin', HOME/'Games'): safe_directory(p)
+    resolver = HOME/'AIDev/bin/ds3-play'
+    need(not resolver.exists() and not resolver.is_symlink(), 'resolver_collision')
+    for name in shortcuts():
+        p = HOME/'Games'/name; need(not p.exists() and not p.is_symlink(), 'shortcut_collision')
+    inactive(SOURCE/'runtime',SOURCE/'profiles/prince'); before = snapshot(SOURCE/'profiles/prince')
+    ROOT.mkdir(mode=0o700); (ROOT/'profiles').mkdir(mode=0o700)
+    copy(SOURCE/'runtime',ROOT/'runtime'); copy(SOURCE/'profiles/prince',PREFIX)
+    inactive(SOURCE/'runtime',SOURCE/'profiles/prince')
+    need(before == snapshot(SOURCE/'profiles/prince') == snapshot(PREFIX), 'profile_changed_during_copy')
+    need(code_tree(SOURCE/'runtime',allow_source_hardlinks=True) == source_tree == code_tree(ROOT/'runtime'), 'runtime_changed_during_copy')
+    candidate_check(m,candidate)
+    shutil.copyfile(candidate/'winemetal-airconv-original.so', ROOT/'runtime'/DONOR)
+    shutil.copyfile(candidate/'winemetal.so', ROOT/'runtime'/METAL)
+    provenance = ROOT/'runtime/sources/DS3MarshalFix'; (provenance/'bridge/source').mkdir(mode=0o700,parents=True)
+    shutil.copyfile(candidate/'provenance.json',provenance/'bridge/provenance.json')
+    for rel in load(candidate/'provenance.json')['sourceFiles']:
+        dst = provenance/'bridge/source'/rel; dst.parent.mkdir(mode=0o700,parents=True,exist_ok=True)
+        shutil.copyfile(candidate/'source'/rel,dst)
+    for name in m['candidateBuildFiles']: shutil.copyfile(candidate/name,provenance/'bridge'/name)
+    for name in m['marshalSources']: shutil.copyfile(candidate.parent/name,provenance/name)
+    candidate_check(m,candidate)
+    archived = load(provenance/'bridge/provenance.json')
+    need(sha(provenance/'bridge/provenance.json') == m['provenanceSha256'], 'archived_provenance_drift')
+    for rel,digest in archived['sourceFiles'].items(): need(sha(provenance/'bridge/source'/rel) == digest, 'archived_source_drift')
+    for name,digest in m['candidateBuildFiles'].items(): need(sha(provenance/'bridge'/name) == digest, 'archived_build_drift')
+    for name,digest in m['marshalSources'].items(): need(sha(provenance/name) == digest, 'archived_marshal_drift')
+    PREFIX.chmod(0o700); fonts = rebase_fonts(PREFIX,m['fontPathCount']); graphics = window_config()
+    (ROOT/'logs').mkdir(mode=0o700)
+    for name in ('ds3-runtime','ds3-play'):
+        shutil.copyfile(HERE/'bin'/name,ROOT/name); (ROOT/name).chmod(0o700)
+    shutil.copyfile(HERE/MANIFEST,ROOT/'manifest.json')
+    r = {'schema':1,'owner':m['owner'],'commit':commit,'manifestSha256':sha(ROOT/'manifest.json'),
+         'launcherSha256':sha(ROOT/'ds3-play'),'lifecycleSha256':sha(ROOT/'ds3-runtime'),
+         'runtimeTreeSha256':code_tree(ROOT/'runtime'),'sourceRuntimeTreeSha256':source_tree,'fontPathsRebased':fonts,'graphics':graphics}
+    (ROOT/'receipt.json').write_text(json.dumps(r,indent=2)+'\n')
+    resolver.symlink_to(ROOT/'ds3-play')
+    for name,mode in shortcuts().items():
+        p = HOME/'Games'/name; p.write_bytes(shortcut_bytes(mode)); p.chmod(0o700)
+    return dict(status(),changed=True,gameStarted=False)
+
+def refresh(commit):
+    """Replace only reviewed helpers/receipt, retaining runtime and private data."""
+    source_gate(commit); safe_directory(ROOT); safe_file(ROOT/'manifest.json')
+    need((ROOT/'manifest.json').read_bytes() == (HERE/MANIFEST).read_bytes(), 'installed_manifest_drift')
+    m,r = verify_installed(); inactive(ROOT/'runtime',PREFIX)
+    verify_borderless()
+    files = (('ds3-runtime','lifecycleSha256'),('ds3-play','launcherSha256'))
+    updated = dict(r); updated['commit'] = commit
+    after = {}
+    for name,key in files:
+        src = HERE/'bin'/name; digest = sha(src)
+        need(src.stat().st_size <= 262144, 'helper_size_limit')
+        after[name] = src.read_bytes(); need(hashlib.sha256(after[name]).hexdigest() == digest, 'source_helper_changed')
+        updated[key] = digest
+    if updated == r:
+        return dict(status(),changed=False,gameStarted=False)
+    after['receipt.json'] = (json.dumps(updated,indent=2)+'\n').encode()
+    names = ('ds3-runtime','ds3-play','receipt.json')
+    before = {}; old_hashes = {}; new_hashes = {}; modes = {}
+    for name in names:
+        p = ROOT/name; safe_file(p); need(p.stat().st_size <= 262144, 'helper_size_limit')
+        before[name] = p.read_bytes(); old_hashes[name] = hashlib.sha256(before[name]).hexdigest()
+        new_hashes[name] = hashlib.sha256(after[name]).hexdigest(); modes[name] = p.stat().st_mode & 0o777
+    transaction = ROOT/('.helper-refresh-'+commit[:12])
+    need(not transaction.exists() and not transaction.is_symlink(), 'refresh_backup_collision')
+    transaction.mkdir(mode=0o700)
+    for name in names:
+        for suffix,data in (('before',before[name]),('after',after[name])):
+            p = transaction/(name+'.'+suffix); p.write_bytes(data); p.chmod(modes[name] if suffix == 'before' else (0o600 if name == 'receipt.json' else 0o700))
+            need(sha(p) == (old_hashes[name] if suffix == 'before' else new_hashes[name]), 'refresh_staging_drift')
+    for name,key in files: need(sha(HERE/'bin'/name) == updated[key], 'source_helper_changed')
+    changed = []
+    try:
+        # Every file replacement is atomic; receipt publishes the new binding last.
+        # A crash between replacements fails closed and retains private backups.
+        for name in names:
+            need(sha(ROOT/name) == old_hashes[name], 'refresh_target_changed')
+            os.replace(transaction/(name+'.after'),ROOT/name); changed.append(name)
+        result = status()
+    except Exception:
+        for name in reversed(changed):
+            need(sha(ROOT/name) == new_hashes[name], 'helper_refresh_rollback_drift')
+            restore = transaction/(name+'.restore')
+            restore.write_bytes(before[name]); restore.chmod(modes[name])
+            need(sha(restore) == old_hashes[name], 'helper_refresh_rollback_drift')
+            os.replace(restore,ROOT/name)
+        raise
+    return dict(result,changed=True,gameStarted=False)
+
+def overlay_vdf(data):
+    """Bounded quoted Valve KeyValues syntax with exact scalar byte spans."""
+    need(type(data) is bytes and len(data) <= 8*1024*1024 and b'\0' not in data, 'overlay_vdf_limit')
+    pattern = re.compile(br'\s+|//[^\r\n]*|[{}]|"(?:\\[\s\S]|[^"\\])*"')
+    tokens = []; pos = 3 if data.startswith(b'\xef\xbb\xbf') else 0
+    while pos < len(data):
+        match = pattern.match(data,pos); need(match is not None, 'overlay_vdf_malformed')
+        token = match.group(); start = pos; pos = match.end()
+        if token[:1].isspace() or token.startswith(b'//'): continue
+        need(len(tokens) < 100000, 'overlay_vdf_limit'); tokens.append((token,start,pos))
+    index = 0
+    def block(depth, nested):
+        nonlocal index
+        need(depth <= 64, 'overlay_vdf_limit'); rows = []
+        while index < len(tokens):
+            token,start,end = tokens[index]
+            if token == b'}':
+                need(nested, 'overlay_vdf_malformed'); index += 1; return rows,start
+            need(token.startswith(b'"'), 'overlay_vdf_malformed'); key = token[1:-1]; index += 1
+            need(b'\\' not in key, 'overlay_vdf_key_escape')
+            need(index < len(tokens), 'overlay_vdf_malformed'); value,vstart,vend = tokens[index]; index += 1
+            if value == b'{':
+                children,closing = block(depth+1,True); rows.append((key,children,vstart,closing))
+            else:
+                need(value.startswith(b'"'), 'overlay_vdf_malformed'); rows.append((key,value[1:-1],vstart+1,vend-1))
+        need(not nested, 'overlay_vdf_malformed'); return rows,len(data)
+    rows,closing = block(0,False); return rows
+
+
+def overlay_off_plan(data):
+    rows = overlay_vdf(data)
+    for key in (b'UserLocalConfigStore',b'Software',b'Valve',b'Steam',b'apps',b'374320'):
+        matches = [r for r in rows if r[0].lower() == key.lower()]
+        need(len(matches) == 1 and type(matches[0][1]) is list, 'overlay_namespace_drift')
+        selected = matches[0]; rows = selected[1]
+    matches = [r for r in rows if r[0].lower() == b'overlayappenable']
+    need(len(matches) <= 1, 'overlay_duplicate_key')
+    if matches:
+        key,value,start,end = matches[0]
+        need(value in (b'0',b'1'), 'overlay_value_drift')
+        return data[:start]+b'0'+data[end:]
+    # Insert only one explicit DS3 override. All prior bytes stay exact.
+    closing = selected[3]; line = data.rfind(b'\n',0,closing)+1; indent = data[line:closing]
+    newline = b'\r\n' if b'\r\n' in data else b'\n'
+    if re.fullmatch(br'[ \t]*',indent):
+        insertion = indent+b'\t"OverlayAppEnable"\t\t"0"'+newline
+        return data[:line]+insertion+data[line:]
+    return data[:closing]+newline+b'\t"OverlayAppEnable"\t\t"0"'+newline+data[closing:]
+
+
+def overlay_config():
+    userdata = PREFIX/'drive_c/Program Files (x86)/Steam/userdata'; safe_directory(userdata)
+    found = []
+    for i,entry in enumerate(userdata.iterdir()):
+        need(i < 64, 'overlay_user_limit'); safe_directory(entry)
+        need(re.fullmatch('[0-9]{1,20}',entry.name) is not None, 'overlay_user_directory_drift')
+        config = entry/'config/localconfig.vdf'
+        if config.exists() or config.is_symlink():
+            safe_file(config); need(config.stat().st_uid == os.getuid() and config.stat().st_size <= 8*1024*1024, 'overlay_config_drift'); found.append(config)
+    need(len(found) == 1, 'overlay_config_count'); return found[0]
+
+
+def overlay_off(commit):
+    source_gate(commit); verify_installed(); inactive(ROOT/'runtime',PREFIX)
+    target = overlay_config(); before = target.read_bytes(); after = overlay_off_plan(before)
+    result = {'state':'DS3_OVERLAY_DISABLED','overlayEnabled':False,'gameStarted':False}
+    if after == before: return dict(result,changed=False)
+    transaction = ROOT/('.overlay-off-'+commit[:12])
+    need(not transaction.exists() and not transaction.is_symlink(), 'overlay_backup_collision'); transaction.mkdir(mode=0o700)
+    old_hash = hashlib.sha256(before).hexdigest(); new_hash = hashlib.sha256(after).hexdigest()
+    mode = target.stat().st_mode & 0o777
+    for suffix,data in (('before',before),('after',after)):
+        staged = transaction/('localconfig.vdf.'+suffix); staged.write_bytes(data); staged.chmod(0o600 if suffix == 'before' else mode)
+        need(sha(staged) == (old_hash if suffix == 'before' else new_hash), 'overlay_staging_drift')
+    changed = False
+    try:
+        need(overlay_config() == target and sha(target) == old_hash, 'overlay_target_changed')
+        os.replace(transaction/'localconfig.vdf.after',target); changed = True
+        need(overlay_config() == target and sha(target) == new_hash and overlay_off_plan(target.read_bytes()) == target.read_bytes(), 'overlay_postimage_drift')
+    except Exception:
+        if changed:
+            need(sha(target) == new_hash, 'overlay_rollback_drift')
+            restore = transaction/'localconfig.vdf.restore'; restore.write_bytes(before); restore.chmod(mode)
+            need(sha(restore) == old_hash, 'overlay_rollback_drift'); os.replace(restore,target)
+        raise
+    return dict(result,changed=True)
+
+
+def resolution_1080_plan(raw):
+    """Change only two exact UTF16LE window-resolution values."""
+    need(len(raw) <= 131072 and not raw.startswith((b'\xff\xfe',b'\xfe\xff')), 'resolution_encoding_drift')
+    try:
+        text = raw.decode('utf-16-le','strict')
+        need('<!DOCTYPE' not in text and '<!ENTITY' not in text, 'resolution_graphics_drift')
+        tree = ET.fromstring(text); need(tree.tag == 'config', 'resolution_graphics_drift')
+    except (UnicodeError,ET.ParseError): raise RuntimeError('resolution_graphics_drift')
+    def value(tag):
+        rows = [x for x in tree.iter() if x.tag == tag]
+        need(len(rows) == len(tree.findall(tag)) == 1 and not rows[0].attrib and len(rows[0]) == 0 and rows[0].text is not None, 'resolution_graphics_drift')
+        number = rows[0].text
+        need(text.count('<'+tag+'>'+number+'</'+tag+'>') == 1, 'resolution_graphics_drift'); return number
+    need(value('ScreenMode') == 'WINDOW', 'resolution_window_required')
+    width = value('Resolution-WindowScreenWidth'); height = value('Resolution-WindowScreenHeight')
+    need((width,height) in (('1680','945'),('1920','1080')), 'resolution_preimage_drift')
+    after = text.replace('<Resolution-WindowScreenWidth>'+width+'</Resolution-WindowScreenWidth>','<Resolution-WindowScreenWidth>1920</Resolution-WindowScreenWidth>',1)
+    after = after.replace('<Resolution-WindowScreenHeight>'+height+'</Resolution-WindowScreenHeight>','<Resolution-WindowScreenHeight>1080</Resolution-WindowScreenHeight>',1).encode('utf-16-le')
+    need(len(after) <= 131072, 'resolution_encoding_drift'); return after
+
+
+def resolution_1080(commit):
+    source_gate(commit); verify_installed(); verify_borderless(); inactive(ROOT/'runtime',PREFIX)
+    target = PREFIX/CONFIG_REL; safe_file(target); need(target.stat().st_size <= 131072, 'resolution_encoding_drift')
+    before = target.read_bytes(); after = resolution_1080_plan(before)
+    result = {'state':'DS3_RESOLUTION_CONFIGURED','windowMode':'WINDOW','windowWidth':1920,'windowHeight':1080,'gameStarted':False}
+    if after == before: return dict(result,changed=False)
+    transaction = ROOT/('.resolution-1080-'+commit[:12]); need(not transaction.exists() and not transaction.is_symlink(), 'resolution_backup_collision'); transaction.mkdir(mode=0o700)
+    mode = target.stat().st_mode & 0o777; old_hash = hashlib.sha256(before).hexdigest(); new_hash = hashlib.sha256(after).hexdigest()
+    for suffix,data in (('before',before),('after',after)):
+        staged = transaction/('GraphicsConfig.xml.'+suffix); staged.write_bytes(data); staged.chmod(0o600 if suffix == 'before' else mode)
+        need(sha(staged) == (old_hash if suffix == 'before' else new_hash), 'resolution_staging_drift')
+    changed = False
+    try:
+        need(sha(target) == old_hash, 'resolution_target_changed')
+        os.replace(transaction/'GraphicsConfig.xml.after',target); changed = True
+        need(sha(target) == new_hash and resolution_1080_plan(target.read_bytes()) == target.read_bytes(), 'resolution_postimage_drift')
+        observed = verify_window_config(); need(observed['windowWidth'] == 1920 and observed['windowHeight'] == 1080, 'resolution_postimage_drift')
+    except Exception:
+        if changed:
+            need(sha(target) == new_hash, 'resolution_rollback_drift')
+            restore = transaction/'GraphicsConfig.xml.restore'; restore.write_bytes(before); restore.chmod(mode)
+            need(sha(restore) == old_hash, 'resolution_rollback_drift'); os.replace(restore,target)
+        raise
+    return dict(result,changed=True)
+
+
+def large_window_plan(graphics, registry):
+    """Two exact byte edits; never normalize opaque registry/quality content."""
+    need(len(graphics) <= 131072 and len(registry) <= 16*1024*1024, 'display_size_limit')
+    try:
+        text = graphics.decode('utf-16-le','strict')
+        need('<!DOCTYPE' not in text and '<!ENTITY' not in text, 'display_graphics_drift')
+        tree = ET.fromstring(text); need(tree.tag == 'config', 'display_graphics_drift')
+    except (UnicodeError,ET.ParseError): raise RuntimeError('display_graphics_drift')
+    def value(tag):
+        all_rows = [x for x in tree.iter() if x.tag == tag]; rows = tree.findall(tag)
+        need(len(all_rows) == len(rows) == 1 and not rows[0].attrib and len(rows[0]) == 0 and rows[0].text is not None, 'display_graphics_drift')
+        return rows[0].text
+    mode = value('ScreenMode')
+    need(mode in ('FULLSCREEN','WINDOW') and value('Resolution-WindowScreenWidth') == '1680' and value('Resolution-WindowScreenHeight') == '945', 'display_graphics_drift')
+    needle = '<ScreenMode>'+mode+'</ScreenMode>'; need(text.count(needle) == 1, 'display_graphics_drift')
+    after_graphics = text.replace(needle,'<ScreenMode>WINDOW</ScreenMode>',1).encode('utf-16-le')
+    lines = registry.splitlines(keepends=True); header = br'[Software\\Wine\\Mac Driver]'
+    headers = [i for i,line in enumerate(lines) if line.startswith(header)]
+    need(len(headers) == 1 and re.fullmatch(re.escape(header)+br'(?: [0-9]+)?\r?\n?',lines[headers[0]]) is not None, 'retina_section_drift')
+    start = headers[0]+1; end = next((i for i in range(start,len(lines)) if lines[i].startswith(b'[')),len(lines))
+    entries = [i for i in range(start,end) if lines[i].lstrip().startswith(b'"RetinaMode"')]
+    need(len(entries) == 1 and re.fullmatch(br'"RetinaMode"="[YN]"(?:\r?\n)?',lines[entries[0]]) is not None, 'retina_value_drift')
+    lines[entries[0]] = lines[entries[0]].replace(b'"RetinaMode"="Y"',b'"RetinaMode"="N"',1)
+    return after_graphics,b''.join(lines)
+
+
+def large_window(commit):
+    source_gate(commit); verify_installed(); inactive(ROOT/'runtime',PREFIX)
+    # This works with the currently owned old helpers and FULLSCREEN prestate;
+    # do not invoke status() before making the authorized window correction.
+    targets = {'user.reg':PREFIX/'user.reg','GraphicsConfig.xml':PREFIX/CONFIG_REL}
+    before = {}; modes = {}
+    for name,p in targets.items():
+        safe_file(p); need(p.stat().st_size <= (131072 if name == 'GraphicsConfig.xml' else 16*1024*1024), 'display_size_limit')
+        before[name] = p.read_bytes(); modes[name] = p.stat().st_mode & 0o777
+    graphics,registry = large_window_plan(before['GraphicsConfig.xml'],before['user.reg'])
+    after = {'user.reg':registry,'GraphicsConfig.xml':graphics}
+    result = {'state':'LARGE_WINDOW_CONFIGURED','windowMode':'WINDOW','windowWidth':1680,'windowHeight':945,'retinaMode':'N','gameStarted':False}
+    if after == before: return dict(result,changed=False)
+    transaction = ROOT/('.large-window-'+commit[:12])
+    need(not transaction.exists() and not transaction.is_symlink(), 'display_backup_collision')
+    transaction.mkdir(mode=0o700)
+    hashes = {}
+    for name in targets:
+        hashes[name] = {}
+        for suffix,data in (('before',before[name]),('after',after[name])):
+            p = transaction/(name+'.'+suffix); p.write_bytes(data); p.chmod(modes[name])
+            hashes[name][suffix] = hashlib.sha256(data).hexdigest(); need(sha(p) == hashes[name][suffix], 'display_staging_drift')
+    changed = []
+    try:
+        # Registry first; the XML WINDOW state is published last. No game starts.
+        for name,p in targets.items():
+            need(sha(p) == hashes[name]['before'], 'display_target_changed')
+            os.replace(transaction/(name+'.after'),p); changed.append(name)
+        verify_window_config()
+        for name,p in targets.items(): need(sha(p) == hashes[name]['after'], 'display_postimage_drift')
+    except Exception:
+        for name in reversed(changed):
+            p = targets[name]; need(sha(p) == hashes[name]['after'], 'display_rollback_drift')
+            restore = transaction/(name+'.restore'); restore.write_bytes(before[name]); restore.chmod(modes[name])
+            need(sha(restore) == hashes[name]['before'], 'display_rollback_drift'); os.replace(restore,p)
+        raise
+    return dict(result,changed=True)
+
+
+ASPECT_MANIFEST = 'manifests/ds3-aspect-fit.json'
+
+def resolution_plan(raw, preset):
+    need(preset in ('1440','1080'), 'unsupported_resolution')
+    need(len(raw) <= 131072 and not raw.startswith((b'\xff\xfe',b'\xfe\xff')), 'resolution_encoding_drift')
+    try:
+        text = raw.decode('utf-16-le','strict')
+        need('<!DOCTYPE' not in text and '<!ENTITY' not in text, 'resolution_graphics_drift')
+        tree = ET.fromstring(text); need(tree.tag == 'config', 'resolution_graphics_drift')
+    except (UnicodeError,ET.ParseError): raise RuntimeError('resolution_graphics_drift')
+    def value(tag):
+        rows = list(tree.iter(tag))
+        need(len(rows) == len(tree.findall(tag)) == 1 and not rows[0].attrib and not len(rows[0]) and rows[0].text is not None, 'resolution_graphics_drift')
+        result = rows[0].text; need(text.count('<'+tag+'>'+result+'</'+tag+'>') == 1, 'resolution_graphics_drift'); return result
+    need(value('ScreenMode') == 'WINDOW', 'resolution_window_required')
+    dimensions = (2560,1440) if preset == '1440' else (1920,1080)
+    for tag,minimum,maximum,target in zip(('Resolution-WindowScreenWidth','Resolution-WindowScreenHeight'),(640,360),(7680,4320),dimensions):
+        number = value(tag); need(re.fullmatch('[1-9][0-9]{2,3}',number) is not None and minimum <= int(number) <= maximum, 'resolution_preimage_drift')
+        text = text.replace('<'+tag+'>'+number+'</'+tag+'>','<'+tag+'>'+str(target)+'</'+tag+'>',1)
+    return text.encode('utf-16-le')
+
+def retina_plan(raw):
+    need(len(raw) <= 16*1024*1024, 'registry_size_limit')
+    lines = raw.splitlines(keepends=True); header = br'[Software\\Wine\\Mac Driver]'
+    headers = [i for i,line in enumerate(lines) if line.startswith(header)]
+    need(len(headers) == 1 and re.fullmatch(re.escape(header)+br'(?: [0-9]+)?\r?\n?',lines[headers[0]]) is not None, 'retina_section_drift')
+    start = headers[0]+1; end = next((i for i in range(start,len(lines)) if lines[i].startswith(b'[')),len(lines))
+    entries = [i for i in range(start,end) if lines[i].lstrip().startswith(b'"RetinaMode"')]
+    need(len(entries) == 1 and re.fullmatch(br'"RetinaMode"="[YN]"(?:\r?\n)?',lines[entries[0]]) is not None, 'retina_value_drift')
+    lines[entries[0]] = lines[entries[0]].replace(b'"RetinaMode"="N"',b'"RetinaMode"="Y"',1)
+    return b''.join(lines)
+
+def select_resolution(preset):
+    # Routine owner-selected launch preference. The global lifecycle lock and
+    # stopped-prefix check in play cover this byte-preserving atomic edit.
+    registry = PREFIX/'user.reg'; safe_file(registry)
+    need(registry.read_bytes() == retina_plan(registry.read_bytes()), 'retina_not_enabled')
+    target = PREFIX/CONFIG_REL; safe_file(target); before = target.read_bytes(); after = resolution_plan(before,preset)
+    if after == before: return
+    fd,name = tempfile.mkstemp(prefix='.ds3-resolution-',dir=target.parent)
+    temporary = Path(name)
+    try:
+        with os.fdopen(fd,'wb') as out: out.write(after)
+        temporary.chmod(target.stat().st_mode & 0o777)
+        need(target.read_bytes() == before, 'resolution_target_changed')
+        os.replace(temporary,target)
+    finally:
+        if temporary.exists(): temporary.unlink()
+
+def aspect_targets():
+    return {'metal':ROOT/'runtime'/METAL,'graphics':PREFIX/CONFIG_REL,'registry':PREFIX/'user.reg',
+            'lifecycle':ROOT/'ds3-runtime','launcher':ROOT/'ds3-play',
+            'fallback':HOME/'Games/Dark Souls III - 1080p.command',
+            'manifest':ROOT/'manifest.json','borderless-manifest':ROOT/'borderless/manifest.json',
+            'borderless-receipt':ROOT/'borderless/receipt.json','receipt':ROOT/'receipt.json'}
+
+def digest_bytes(raw): return hashlib.sha256(raw).hexdigest()
+def json_bytes(value): return (json.dumps(value,indent=2)+'\n').encode()
+
+def aspect_restore(transaction, targets):
+    journal = load(transaction/'transaction.json')
+    need(set(journal) == set(targets), 'aspect_transaction_schema')
+    # Validate the entire set before any restoration; private/gameplay drift
+    # must never be replaced by an old profile snapshot.
+    for name,target in targets.items():
+        row = journal[name]
+        need(set(row) == {'before','after','mode'} and (row['before'] is None or pinned(row['before'])) and pinned(row['after']) and type(row['mode']) is int and 0 <= row['mode'] <= 0o777 and not row['mode'] & 0o022, 'aspect_transaction_schema')
+        if row['before'] is None:
+            need(name == 'fallback', 'aspect_absent_target')
+        else: need(sha(transaction/(name+'.before')) == row['before'], 'aspect_backup_drift')
+        if target.exists() or target.is_symlink(): need(sha(target) in (row['before'],row['after']), 'aspect_rollback_drift')
+        else: need(row['before'] is None, 'aspect_rollback_missing')
+    for name,target in reversed(list(targets.items())):
+        row = journal[name]
+        if row['before'] is None:
+            if target.exists(): target.unlink()
+        elif sha(target) != row['before']:
+            fd,path = tempfile.mkstemp(prefix='.aspect-restore-',dir=target.parent)
+            with os.fdopen(fd,'wb') as out: out.write((transaction/(name+'.before')).read_bytes())
+            Path(path).chmod(row['mode']); os.replace(path,target)
+
+def upgrade_aspect(commit,candidate):
+    source_gate(commit); old,receipt = verify_installed(); old_borderless,br = verify_borderless(); inactive(ROOT/'runtime',PREFIX)
+    policy = load(HERE/ASPECT_MANIFEST)
+    need(policy.get('schema') == 1 and policy.get('id') == 'ds3-aspect-fit' and policy.get('owner') == old['owner'], 'aspect_policy_identity')
+    if old.get('aspectFit') is True:
+        need(old.get('aspectPolicySha256') == sha(HERE/ASPECT_MANIFEST) and old['candidateSha256'] == policy['candidateSha256'], 'aspect_installed_policy_drift')
+        return {'state':'DS3_ASPECT_INSTALLED','changed':False,'gameStarted':False,'gameplayVerified':False}
+    need(sha(ROOT/'manifest.json') == policy['previousManifestSha256'] and sha(ROOT/'borderless/manifest.json') == policy['previousBorderlessManifestSha256'], 'aspect_previous_manifest_drift')
+    new = dict(old)
+    for key in ('candidateSha256','provenanceSha256','candidateBuildFiles','marshalSources'): new[key] = policy[key]
+    new.update(aspectFit=True,aspectPolicySha256=sha(HERE/ASPECT_MANIFEST))
+    candidate_check(new,candidate)
+    targets = aspect_targets(); before = {}; modes = {}
+    for name,target in targets.items():
+        if name == 'fallback':
+            need(not target.exists() and not target.is_symlink(), 'aspect_shortcut_collision'); safe_directory(target.parent)
+            before[name] = None; modes[name] = 0o700
+        else:
+            safe_file(target); need(target.stat().st_size <= 16*1024*1024, 'aspect_target_limit')
+            before[name] = target.read_bytes(); modes[name] = target.stat().st_mode & 0o777
+    new_br = dict(old_borderless); new_br['nativeBinding'] = dict(old_borderless['nativeBinding'],winemetalSha256=new['candidateSha256'])
+    after = {'metal':(candidate/'winemetal.so').read_bytes(),'graphics':resolution_plan(before['graphics'],'1440'),
+             'registry':retina_plan(before['registry']),'lifecycle':(HERE/'bin/ds3-runtime').read_bytes(),
+             'launcher':(HERE/'bin/ds3-play').read_bytes(),'fallback':shortcut_bytes('play-1080'),
+             'manifest':json_bytes(new),'borderless-manifest':json_bytes(new_br)}
+    transaction = ROOT/('.aspect-upgrade-'+commit)
+    need(not transaction.exists() and not transaction.is_symlink(), 'aspect_transaction_collision'); transaction.mkdir(mode=0o700)
+    # Retain exact corresponding source and build inputs independently of the
+    # old runtime source archive. Never copy unlisted candidate files.
+    archive = transaction/'source/bridge'; archive.mkdir(parents=True,mode=0o700)
+    for name in ('winemetal.so','winemetal-airconv-original.so','provenance.json',*new['candidateBuildFiles']):
+        shutil.copyfile(candidate/name,archive/name); (archive/name).chmod(0o600)
+    for rel in load(candidate/'provenance.json')['sourceFiles']:
+        dst = archive/'source'/rel; dst.parent.mkdir(parents=True,exist_ok=True,mode=0o700); shutil.copyfile(candidate/'source'/rel,dst); dst.chmod(0o600)
+    for name in new['marshalSources']: shutil.copyfile(candidate.parent/name,archive.parent/name); (archive.parent/name).chmod(0o600)
+    candidate_check(new,archive); candidate_check(new,candidate)
+    # Calculate the future tree without mutating it: only the bridge changes.
+    rows = []; runtime = ROOT/'runtime'
+    for path in runtime.rglob('*'):
+        relative = str(path.relative_to(runtime)); st = path.lstat()
+        if stat.S_ISLNK(st.st_mode): rows.append([relative,'link',os.readlink(path)])
+        elif stat.S_ISREG(st.st_mode): rows.append([relative,st.st_mode & 0o777,new['candidateSha256'] if relative == METAL else sha(path,relative == NATIVE_LOADER)])
+    rows.sort(key=lambda row:row[0]); tree_hash = digest_bytes(json.dumps(rows,separators=(',',':')).encode())
+    new_receipt = dict(receipt,commit=commit,manifestSha256=digest_bytes(after['manifest']),lifecycleSha256=digest_bytes(after['lifecycle']),launcherSha256=digest_bytes(after['launcher']),runtimeTreeSha256=tree_hash)
+    after['borderless-receipt'] = json_bytes(dict(br,commit=commit,manifestSha256=digest_bytes(after['borderless-manifest']),baseRuntimeTreeSha256=tree_hash,baseManifestSha256=digest_bytes(after['manifest'])))
+    after['receipt'] = json_bytes(new_receipt)
+    journal = {}
+    for name in targets:
+        for suffix,data in (('before',before[name]),('after',after[name])):
+            if data is not None:
+                staged = transaction/(name+'.'+suffix); staged.write_bytes(data); staged.chmod(modes[name]); need(sha(staged) == digest_bytes(data),'aspect_staging_drift')
+        journal[name] = {'before':None if before[name] is None else digest_bytes(before[name]),'after':digest_bytes(after[name]),'mode':modes[name]}
+    (transaction/'transaction.json').write_bytes(json_bytes(journal)); (transaction/'transaction.json').chmod(0o600)
+    changed = False
+    try:
+        # Detect drift after staging, before first mutation. Receipt publishes last.
+        verify_installed(); verify_borderless(); inactive(ROOT/'runtime',PREFIX)
+        for name,target in targets.items():
+            if before[name] is None: need(not target.exists() and not target.is_symlink(),'aspect_target_changed')
+            else: need(sha(target) == journal[name]['before'],'aspect_target_changed')
+        for name,target in targets.items():
+            os.replace(transaction/(name+'.after'),target); changed = True
+        verify_installed(); verify_borderless()
+        for name,target in targets.items(): need(sha(target) == journal[name]['after'],'aspect_postimage_drift')
+    except Exception:
+        if changed: aspect_restore(transaction,targets)
+        raise
+    return {'state':'DS3_ASPECT_INSTALLED','changed':True,'gameStarted':False,'gameplayVerified':False,'defaultResolution':[2560,1440],'fallbackResolution':[1920,1080],'retinaMode':'Y'}
+
+def rollback_aspect(commit,apply_commit):
+    need('appLaunchers' not in load(ROOT/'receipt.json'), 'rollback_game_apps_first')
+    source_gate(commit); need(type(apply_commit) is str and re.fullmatch('[0-9a-f]{40}',apply_commit) is not None,'invalid_apply_commit')
+    policy = load(HERE/ASPECT_MANIFEST); baseline = manifest(HERE/MANIFEST)
+    need(sha(ROOT/'runtime/engine/bin/wineserver') == baseline['sourceCriticalHashes']['engine/bin/wineserver'],'installed_server_drift')
+    inactive(ROOT/'runtime',PREFIX)
+    transaction = ROOT/('.aspect-upgrade-'+apply_commit); safe_directory(transaction)
+    need(sha(transaction/'manifest.before') == policy['previousManifestSha256'] and sha(transaction/'borderless-manifest.before') == policy['previousBorderlessManifestSha256'],'aspect_backup_identity')
+    aspect_restore(transaction,aspect_targets()); verify_installed(); verify_borderless()
+    return {'state':'DS3_ASPECT_ROLLED_BACK','gameStarted':False,'dataDeleted':False}
+
+
+FOLLOW_POLICY = 'manifests/ds3-follow-upgrade.json'
+
+def follow_targets():
+    targets = {'lifecycle':ROOT/'ds3-runtime','launcher':ROOT/'ds3-play','fallback':HOME/'Games/Dark Souls III - 1080p.command','manifest':ROOT/'manifest.json'}
+    targets.update({'helper-'+name:ROOT/'borderless'/name for name in BORDERLESS_FILES})
+    targets.update({'borderless-manifest':ROOT/'borderless/manifest.json','borderless-receipt':ROOT/'borderless/receipt.json','receipt':ROOT/'receipt.json'})
+    return targets
+
+def follow_restore(transaction, targets):
+    journal = load(transaction/'transaction.json')
+    need(set(journal) == set(targets),'follow_transaction_schema')
+    for name,target in targets.items():
+        row = journal[name]
+        need(set(row) == {'before','after','mode'} and pinned(row['before']) and (pinned(row['after']) or name == 'fallback' and row['after'] is None) and type(row['mode']) is int and 0 <= row['mode'] <= 0o777 and not row['mode'] & 0o022,'follow_transaction_schema')
+        need(sha(transaction/(name+'.before')) == row['before'],'follow_backup_drift')
+        if target.exists() or target.is_symlink(): need(sha(target) in (row['before'],row['after']),'follow_rollback_drift')
+        else: need(name == 'fallback' and row['after'] is None,'follow_rollback_missing')
+    for name,target in reversed(list(targets.items())):
+        row = journal[name]
+        if not target.exists() or sha(target) != row['before']:
+            fd,path = tempfile.mkstemp(prefix='.follow-restore-',dir=target.parent)
+            with os.fdopen(fd,'wb') as out: out.write((transaction/(name+'.before')).read_bytes())
+            Path(path).chmod(row['mode']); os.replace(path,target)
+
+def upgrade_follow(commit,candidate):
+    source_gate(commit); old,receipt = verify_installed(); previous,br = verify_borderless(); inactive(ROOT/'runtime',PREFIX)
+    policy = load(HERE/FOLLOW_POLICY)
+    need(policy.get('schema') == 1 and policy.get('id') == 'ds3-follow-upgrade' and policy.get('owner') == old['owner'],'follow_policy_identity')
+    new_helper = borderless_manifest(HERE/BORDERLESS_MANIFEST)
+    borderless_binding(new_helper,old); borderless_candidate(new_helper,candidate)
+    need(sha(HERE/BORDERLESS_SOURCE) == new_helper['sourceSha256'],'follow_source_drift')
+    if old.get('singleLauncher') is True:
+        need(old.get('followPolicySha256') == sha(HERE/FOLLOW_POLICY) and sha(ROOT/'borderless/manifest.json') == sha(HERE/BORDERLESS_MANIFEST) and sha(ROOT/'ds3-runtime') == sha(HERE/'bin/ds3-runtime') and sha(ROOT/'ds3-play') == sha(HERE/'bin/ds3-play'),'follow_installed_drift')
+        fallback = HOME/'Games/Dark Souls III - 1080p.command'
+        need(not fallback.exists() and not fallback.is_symlink(),'follow_shortcut_collision')
+        return {'state':'DS3_FOLLOW_INSTALLED','changed':False,'gameStarted':False,'gameplayVerified':False}
+    need(sha(ROOT/'manifest.json') == policy['previousManifestSha256'] and sha(ROOT/'borderless/manifest.json') == policy['previousBorderlessManifestSha256'],'follow_previous_manifest_drift')
+    targets = follow_targets(); before = {}; modes = {}
+    for name,target in targets.items():
+        safe_file(target); need(target.stat().st_size <= 16*1024*1024,'follow_target_limit')
+        before[name] = target.read_bytes(); modes[name] = target.stat().st_mode & 0o777
+    need(before['fallback'] == shortcut_bytes('play-1080'),'follow_shortcut_drift')
+    new = dict(old,singleLauncher=True,followPolicySha256=sha(HERE/FOLLOW_POLICY))
+    after = {'lifecycle':(HERE/'bin/ds3-runtime').read_bytes(),'launcher':(HERE/'bin/ds3-play').read_bytes(),'fallback':None,'manifest':json_bytes(new),'borderless-manifest':(HERE/BORDERLESS_MANIFEST).read_bytes()}
+    after.update({'helper-'+name:(candidate/name).read_bytes() for name in BORDERLESS_FILES})
+    after['receipt'] = json_bytes(dict(receipt,commit=commit,manifestSha256=digest_bytes(after['manifest']),lifecycleSha256=digest_bytes(after['lifecycle']),launcherSha256=digest_bytes(after['launcher'])))
+    after['borderless-receipt'] = json_bytes(dict(br,commit=commit,manifestSha256=digest_bytes(after['borderless-manifest']),baseManifestSha256=digest_bytes(after['manifest'])))
+    transaction = ROOT/('.follow-upgrade-'+commit)
+    need(not transaction.exists() and not transaction.is_symlink(),'follow_transaction_collision'); transaction.mkdir(mode=0o700)
+    journal = {}
+    for name in targets:
+        for suffix,data in (('before',before[name]),('after',after[name])):
+            if data is not None:
+                staged = transaction/(name+'.'+suffix); staged.write_bytes(data); staged.chmod(modes[name]); need(sha(staged) == digest_bytes(data),'follow_staging_drift')
+        journal[name] = {'before':digest_bytes(before[name]),'after':None if after[name] is None else digest_bytes(after[name]),'mode':modes[name]}
+    (transaction/'transaction.json').write_bytes(json_bytes(journal)); (transaction/'transaction.json').chmod(0o600)
+    changed = False
+    try:
+        verify_installed(); verify_borderless(); inactive(ROOT/'runtime',PREFIX)
+        for name,target in targets.items(): need(sha(target) == journal[name]['before'],'follow_target_changed')
+        for name,target in targets.items():
+            if after[name] is None: target.unlink()
+            else: os.replace(transaction/(name+'.after'),target)
+            changed = True
+        verify_installed(); verify_borderless()
+        for name,target in targets.items():
+            if after[name] is None: need(not target.exists() and not target.is_symlink(),'follow_postimage_drift')
+            else: need(sha(target) == journal[name]['after'],'follow_postimage_drift')
+    except Exception:
+        if changed: follow_restore(transaction,targets)
+        raise
+    return {'state':'DS3_FOLLOW_INSTALLED','changed':True,'gameStarted':False,'gameplayVerified':False,'resolutionPreserved':True}
+
+def rollback_follow(commit,apply_commit):
+    need('appLaunchers' not in load(ROOT/'receipt.json'), 'rollback_game_apps_first')
+    source_gate(commit); need(type(apply_commit) is str and re.fullmatch('[0-9a-f]{40}',apply_commit) is not None,'invalid_apply_commit')
+    baseline = manifest(HERE/MANIFEST)
+    need(sha(ROOT/'runtime/engine/bin/wineserver') == baseline['sourceCriticalHashes']['engine/bin/wineserver'],'installed_server_drift'); inactive(ROOT/'runtime',PREFIX)
+    policy = load(HERE/FOLLOW_POLICY); transaction = ROOT/('.follow-upgrade-'+apply_commit); safe_directory(transaction)
+    need(sha(transaction/'manifest.before') == policy['previousManifestSha256'] and sha(transaction/'borderless-manifest.before') == policy['previousBorderlessManifestSha256'],'follow_backup_identity')
+    follow_restore(transaction,follow_targets()); verify_installed(); verify_borderless()
+    return {'state':'DS3_FOLLOW_ROLLED_BACK','gameStarted':False,'dataDeleted':False}
+
+def no_foreign_steam():
+    need(not admission(HOME,'ds3').summary()['foreignSteam'], 'foreign_steam_active')
+
+def play(measure=False, preset=None):
+    need(type(measure) is bool, 'invalid_measure_mode')
+    base,_ = verify_installed(); graphics = verify_window_config(); borderless,receipt = verify_borderless()
+    request=admission(HOME,'ds3');request.reconcile()
+    session=request.allow_client()
+    if session['targetActive']:
+        return {'state':'DS3_ALREADY_RUNNING','gameplayVerified':False,'borderlessVerified':False}
+    # A client in another prefix can reroute -applaunch to its old session.
+    if SOURCE.exists() or SOURCE.is_symlink():
+        safe_directory(SOURCE); safe_directory(SOURCE/'profiles/prince')
+        # Foreign source is not a launch dependency, but never execute a drifted server.
+        m = manifest(ROOT/'manifest.json')
+        need(sha(SOURCE/'runtime/engine/bin/wineserver',allow_source_hardlinks=True) == m['sourceCriticalHashes']['engine/bin/wineserver'], 'source_server_drift')
+        inactive(SOURCE/'runtime', SOURCE/'profiles/prince')
+    if not session['clientActive']: inactive(ROOT/'runtime',PREFIX)
+    if preset is not None:
+        need(base.get('aspectFit') is True, 'resolution_preset_requires_aspect')
+        select_resolution(preset); graphics = verify_window_config()
+    exe = PREFIX/'drive_c/Program Files (x86)/Steam/steam.exe'; safe_file(exe)
+    logpath = ROOT/'logs/launch-ds3.log'
+    fd = os.open(logpath,os.O_WRONLY|os.O_APPEND|os.O_CREAT|os.O_NOFOLLOW,0o600)
+    s = os.fstat(fd); need(stat.S_ISREG(s.st_mode) and s.st_uid == os.getuid() and s.st_nlink == 1 and not s.st_mode & 0o077, 'unsafe_launch_log')
+    env = wine_env(ROOT/'runtime',PREFIX,True)
+    if base.get('aspectFit') is True: env['DXMT_DS3_ASPECT_FIT'] = '1'
+    if measure: env['MTL_HUD_ENABLED'] = '1'
+    helper_log = ROOT/'logs/borderless-latest.log'
+    if helper_log.exists() or helper_log.is_symlink(): safe_file(helper_log)
+    helper_fd = os.open(helper_log,os.O_WRONLY|os.O_CREAT|os.O_NOFOLLOW,0o600)
+    hs = os.fstat(helper_fd); need(stat.S_ISREG(hs.st_mode) and hs.st_uid == os.getuid() and hs.st_nlink == 1 and not hs.st_mode & 0o077, 'unsafe_borderless_log')
+    os.ftruncate(helper_fd,0)
+    helper_env = wine_env(ROOT/'runtime',PREFIX,False); helper_env['DXMT_DS3_MARSHAL_FIX'] = '0'
+    request.begin()
+    with os.fdopen(fd,'ab') as log,os.fdopen(helper_fd,'ab') as hlog:
+        helper = subprocess.Popen([str(ROOT/'runtime/engine/bin/wine'),str(ROOT/'borderless/helper.exe')]+borderless['argv'],
+                                  env=helper_env,cwd=ROOT/'borderless',stdin=subprocess.DEVNULL,stdout=hlog,stderr=hlog,start_new_session=True)
+        try:
+            steam=subprocess.Popen([str(ROOT/'runtime/engine/bin/wine'),str(exe),'-cef-disable-gpu','-applaunch','374320'],
+                             env=env,cwd=exe.parent,stdin=subprocess.DEVNULL,stdout=log,stderr=log,start_new_session=True)
+        except Exception:
+            helper.terminate(); raise RuntimeError('steam_launch_failed_borderless_cancel_requested')
+        request.dispatched([helper,steam])
+    return dict({'state':'DS3_LAUNCH_REQUESTED','gameplayVerified':False,'diagnosticHud':measure,'borderlessRequested':True,'borderlessVerified':False},**graphics)
+
+def stop_attestation():
+    # Emergency stop must not scan mutable profiles, full trees or shortcuts.
+    safe_directory(ROOT); safe_directory(PREFIX)
+    m = manifest(ROOT/'manifest.json'); r = load(ROOT/'receipt.json')
+    need(r.get('owner') == m['owner'] and r.get('manifestSha256') == sha(ROOT/'manifest.json'), 'installed_owner_or_manifest_drift')
+    need(sha(ROOT/'ds3-runtime') == r.get('lifecycleSha256'), 'installed_helper_drift')
+    need(sha(ROOT/'runtime/engine/bin/wineserver') == m['sourceCriticalHashes']['engine/bin/wineserver'], 'installed_server_drift')
+
+def stop():
+    stop_attestation(); env = wine_env(ROOT/'runtime',PREFIX,True)
+    p = subprocess.run([str(ROOT/'runtime/engine/bin/wineserver'),'-k'],capture_output=True,timeout=5,env=env)
+    # wineserver -k may return1 when already absent. The wait still has to prove inactivity.
+    need(p.returncode in (0,1), 'prefix_stop_failed')
+    inactive(ROOT/'runtime',PREFIX)
+    return {'state':'DS3_PREFIX_STOPPED'}
+
+def retire(commit):
+    need('appLaunchers' not in load(ROOT/'receipt.json'), 'rollback_game_apps_first')
+    source_gate(commit); verify_installed(); inactive(ROOT/'runtime',PREFIX)
+    archive = ROOT.with_name(ROOT.name+' retired '+commit[:12])
+    need(not archive.exists() and not archive.is_symlink(), 'archive_collision')
+    # Hash-bound removal of visible entrypoints only; retain all profile data.
+    (HOME/'AIDev/bin/ds3-play').unlink()
+    for name in shortcuts(manifest(ROOT/'manifest.json')): (HOME/'Games'/name).unlink()
+    ROOT.rename(archive)
+    return {'state':'RETIRED_DATA_RETAINED','profileDeleted':False}
+
+def main():
+    os.umask(0o077); args = sys.argv[1:]
+    need(args, 'usage: ds3-runtime prepare CANDIDATE | install COMMIT CANDIDATE | refresh COMMIT | install-borderless COMMIT CANDIDATE | large-window COMMIT | overlay-off COMMIT | resolution-1080 COMMIT | upgrade-aspect COMMIT CANDIDATE | rollback-aspect COMMIT APPLY_COMMIT | upgrade-follow COMMIT CANDIDATE | rollback-follow COMMIT APPLY_COMMIT | status | play | play-1080 | measure | stop | retire COMMIT')
+    lockdir = HOME/'AIDev/state'; safe_directory(lockdir)
+    fd = os.open(lockdir/'games-hub.lock',os.O_CREAT|os.O_RDWR|os.O_NOFOLLOW,0o600)
+    s = os.fstat(fd); need(stat.S_ISREG(s.st_mode) and s.st_uid == os.getuid() and s.st_nlink == 1 and not s.st_mode & 0o022,'unsafe_lock')
+    with os.fdopen(fd,'w') as f:
+        try: fcntl.flock(f,fcntl.LOCK_EX|fcntl.LOCK_NB)
+        except BlockingIOError: raise RuntimeError('launcher_busy') from None
+        if args[0] == 'prepare' and len(args) == 2: result = prepare(Path(args[1]))
+        elif args[0] == 'install' and len(args) == 3: result = install(args[1],Path(args[2]))
+        elif args[0] == 'install-borderless' and len(args) == 3: result = install_borderless(args[1],Path(args[2]))
+        elif args[0] == 'retire' and len(args) == 2: result = retire(args[1])
+        elif args[0] == 'upgrade-aspect' and len(args) == 3: result = upgrade_aspect(args[1],Path(args[2]))
+        elif args[0] == 'rollback-aspect' and len(args) == 3: result = rollback_aspect(args[1],args[2])
+        elif args[0] == 'upgrade-follow' and len(args) == 3: result = upgrade_follow(args[1],Path(args[2]))
+        elif args[0] == 'rollback-follow' and len(args) == 3: result = rollback_follow(args[1],args[2])
+        elif args[0] == 'play-1080' and len(args) == 1: result = play(preset='1080')
+        elif args[0] == 'refresh' and len(args) == 2: result = refresh(args[1])
+        elif args[0] == 'large-window' and len(args) == 2: result = large_window(args[1])
+        elif args[0] == 'overlay-off' and len(args) == 2: result = overlay_off(args[1])
+        elif args[0] == 'resolution-1080' and len(args) == 2: result = resolution_1080(args[1])
+        elif len(args) == 1 and args[0] in ('status','play','measure','stop'): result = {'status':status,'play':play,'measure':lambda:play(measure=True),'stop':stop}[args[0]]()
+        else: raise RuntimeError('usage')
+        print(json.dumps(result))
+if __name__ == '__main__':
+    try: main()
+    except Exception as e:
+        print(json.dumps({'state':'BLOCKED','reason':str(e) if isinstance(e,RuntimeError) else type(e).__name__})); sys.exit(1)

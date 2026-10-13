@@ -1,0 +1,327 @@
+#!/usr/bin/python3
+"""Exact user-owned loopback SSH server and reverse transport lifecycle."""
+from __future__ import annotations
+import argparse
+import base64
+import hashlib
+import json
+import os
+from pathlib import Path
+import plistlib
+import pwd
+import re
+import socket
+import stat
+import subprocess
+import sys
+import time
+
+ROOT = Path(__file__).resolve().parents[1]
+LABELS = ('com.aidev.windows-to-mac-sshd', 'com.aidev.windows-to-mac-tunnel')
+PORT = 22222
+
+class ContractError(RuntimeError):
+    pass
+
+def require(ok, reason):
+    if not ok:
+        raise ContractError(reason)
+
+def run(args, timeout=25):
+    return subprocess.run([str(x) for x in args], stdout=subprocess.PIPE,
+                          stderr=subprocess.PIPE, timeout=timeout, check=False)
+
+def digest(data):
+    return hashlib.sha256(data).hexdigest()
+
+def home():
+    require(os.geteuid() != 0, 'refusing_root')
+    value = Path(pwd.getpwuid(os.getuid()).pw_dir)
+    require(value == Path.home() and not value.is_symlink(), 'canonical_home')
+    return value
+
+def paths():
+    base = home()
+    state = base / 'AIDev/state/windows-to-mac-ssh'
+    return state, [base / 'Library/LaunchAgents' / (x + '.plist') for x in LABELS]
+
+def safe_chain(path):
+    for p in reversed((path, *path.parents)):
+        if p.exists() or p.is_symlink():
+            info = p.lstat()
+            require(stat.S_ISDIR(info.st_mode) and not p.is_symlink(), 'unsafe_directory')
+            require(info.st_uid in (0, os.getuid()) and not info.st_mode & 0o022,
+                    'unsafe_directory_permissions')
+        else:
+            raise ContractError('missing_parent_directory')
+
+def checked_file(path, mode):
+    info = path.lstat()
+    require(stat.S_ISREG(info.st_mode) and info.st_uid == os.getuid()
+            and stat.S_IMODE(info.st_mode) == mode, 'unsafe_file_metadata')
+
+def public_key(data):
+    require(len(data) <= 8192, 'public_key_too_large')
+    try:
+        line = data.decode('ascii').strip()
+        fields = line.split()
+        require(len(line.splitlines()) == 1 and len(fields) >= 2
+                and fields[0] == 'ssh-ed25519', 'invalid_public_key')
+        raw = base64.b64decode(fields[1], validate=True)
+        require(raw[:15] == b'\x00\x00\x00\x0bssh-ed25519'
+                and raw[15:19] == b'\x00\x00\x00 ' and len(raw) == 51,
+                'invalid_ed25519_blob')
+        return ('ssh-ed25519 ' + fields[1] + '\n').encode()
+    except (ValueError, UnicodeError) as exc:
+        raise ContractError('invalid_public_key') from exc
+
+def render_config(state, user):
+    require(re.fullmatch(r'[A-Za-z_][A-Za-z0-9_.-]*', user), 'invalid_owner_name')
+    require('"' not in str(state) and '\n' not in str(state), 'unsafe_runtime_path')
+    return f'''Port {PORT}
+ListenAddress 127.0.0.1
+HostKey "{state}/host_ed25519"
+AuthorizedKeysFile "{state}/authorized_keys"
+PidFile none
+AllowUsers {user}
+AuthenticationMethods publickey
+PubkeyAuthentication yes
+PasswordAuthentication no
+KbdInteractiveAuthentication no
+UsePAM no
+PermitRootLogin no
+PermitEmptyPasswords no
+StrictModes yes
+DisableForwarding yes
+X11Forwarding no
+PermitUserEnvironment no
+PermitUserRC no
+PrintMotd no
+PrintLastLog no
+Subsystem sftp internal-sftp
+'''.encode()
+
+def render_plist(label, args):
+    return plistlib.dumps({'Label': label, 'ProgramArguments': args,
+        'RunAtLoad': True, 'KeepAlive': True, 'ThrottleInterval': 10,
+        'ProcessType': 'Background', 'StandardOutPath': '/dev/null',
+        'StandardErrorPath': '/dev/null'}, sort_keys=True)
+
+def payload(state, plists, key):
+    return {
+        state / 'sshd_config': (render_config(state, pwd.getpwuid(os.getuid()).pw_name), 0o600),
+        state / 'authorized_keys': (key, 0o600),
+        plists[0]: (render_plist(LABELS[0], ['/usr/sbin/sshd', '-D', '-e', '-f', str(state / 'sshd_config')]), 0o644),
+        plists[1]: (render_plist(LABELS[1], ['/usr/bin/ssh', '-NT', '-o', 'BatchMode=yes',
+            '-o', 'ExitOnForwardFailure=yes', '-o', 'ServerAliveInterval=30',
+            '-o', 'ServerAliveCountMax=3', '-R', f'127.0.0.1:{PORT}:127.0.0.1:{PORT}', 'windows-host']), 0o644),
+    }
+
+def atomic_new(path, data, mode):
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, mode)
+    try:
+        with os.fdopen(fd, 'wb') as stream:
+            stream.write(data)
+            stream.flush()
+            os.fsync(stream.fileno())
+    except BaseException:
+        raise
+
+def save_receipt(state, receipt):
+    target = state / 'receipt.json'
+    if target.exists() or target.is_symlink():
+        checked_file(target, 0o600)
+    temporary = state / 'receipt.new'
+    atomic_new(temporary, (json.dumps(receipt, sort_keys=True, indent=2) + '\n').encode(), 0o600)
+    os.replace(temporary, target)
+
+def load_receipt(state, plists):
+    if not state.exists() and not state.is_symlink():
+        require(not any(p.exists() or p.is_symlink() for p in plists), 'unowned_plist')
+        return None
+    safe_chain(state)
+    require(stat.S_IMODE(state.stat().st_mode) == 0o700, 'state_permissions')
+    checked_file(state / 'receipt.json', 0o600)
+    value = json.loads((state / 'receipt.json').read_text())
+    require(set(value) == {'schema', 'commit', 'phase', 'files', 'hostPublicHash'}
+            and type(value['schema']) is int and value['schema'] == 1 and value['phase'] in ('pending', 'applied', 'stopped')
+            and re.fullmatch('[0-9a-f]{40}', value['commit']), 'invalid_receipt')
+    require(isinstance(value['hostPublicHash'], str) and (value['hostPublicHash'] == '' or re.fullmatch('[0-9a-f]{64}', value['hostPublicHash'])), 'receipt_host_hash')
+    allowed = {str(p) for p in payload(state, plists, b'')}
+    require(set(value['files']) <= allowed and (value['phase'] == 'stopped' or set(value['files']) == allowed), 'receipt_paths')
+    for name, record in value['files'].items():
+        p = Path(name)
+        require(set(record) == {'sha256', 'mode'} and re.fullmatch('[0-9a-f]{64}', record['sha256'])
+                and record['mode'] == (0o644 if p in plists else 0o600), 'receipt_file_record')
+        if p.exists() or p.is_symlink():
+            checked_file(p, record['mode'])
+            require(digest(p.read_bytes()) == record['sha256'], 'managed_file_drift')
+        else:
+            require(value['phase'] == 'pending', 'managed_file_missing')
+    for p in plists:
+        require(str(p) in value['files'] or not (p.exists() or p.is_symlink()), 'unowned_plist')
+    allowed_names = {'receipt.json', 'host_ed25519', 'host_ed25519.pub'} | {Path(x).name for x in value['files'] if Path(x).parent == state}
+    require({p.name for p in state.iterdir()} <= allowed_names, 'unknown_state_file')
+    if value['hostPublicHash']:
+        checked_file(state / 'host_ed25519', 0o600)
+        checked_file(state / 'host_ed25519.pub', 0o644)
+        require(digest((state / 'host_ed25519.pub').read_bytes()) == value['hostPublicHash'], 'host_public_key_drift')
+    else:
+        require(not (state / 'host_ed25519').exists() and not (state / 'host_ed25519.pub').exists(), 'incomplete_host_key_requires_review')
+    return value
+
+def loaded(label):
+    return run(['/bin/launchctl', 'print', f'gui/{os.getuid()}/{label}']).returncode == 0
+
+def remote_port():
+    code = f"$listeners = @(Get-NetTCPConnection -State Listen -LocalPort {PORT} -ErrorAction SilentlyContinue); if ($listeners.Count -eq 0) {{ 'free' }} elseif (@($listeners | Where-Object {{ $_.LocalAddress -ne '127.0.0.1' -and $_.LocalAddress -ne '::1' }}).Count -eq 0) {{ 'occupied' }} else {{ 'unsafe-bind' }}"
+    encoded = base64.b64encode(code.encode('utf-16le')).decode()
+    result = run(['/usr/bin/ssh', '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=10', 'windows-host',
+                  'powershell.exe -NoProfile -NonInteractive -EncodedCommand ' + encoded])
+    require(result.returncode == 0 and result.stdout.strip() in (b'free', b'occupied'), 'remote_port_probe_failed')
+    return result.stdout.strip() == b'occupied'
+
+def local_port():
+    with socket.socket() as sock:
+        sock.settimeout(2)
+        return sock.connect_ex(('127.0.0.1', PORT)) == 0
+
+def exact_commit(commit):
+    require(re.fullmatch('[0-9a-f]{40}', commit), 'invalid_commit')
+    require(ROOT == home() / 'AIDev/control', 'must_use_canonical_control')
+    def git(*args):
+        result = run(['/usr/bin/git', '-C', ROOT, *args])
+        require(result.returncode == 0, 'git_failed')
+        return result.stdout.decode().strip()
+    require(git('rev-parse', 'HEAD') == commit and git('branch', '--show-current') == 'main', 'commit_or_branch_mismatch')
+    require(not git('status', '--porcelain=v1', '--untracked-files=all'), 'dirty_source')
+
+def prepare():
+    state, plists = paths()
+    for binary in ('/usr/sbin/sshd', '/usr/bin/ssh', '/usr/bin/ssh-keygen', '/bin/launchctl'):
+        require(os.access(binary, os.X_OK), 'missing_binary')
+    for parent in (state.parent, plists[0].parent):
+        safe_chain(parent)
+    receipt = load_receipt(state, plists)
+    if receipt is None or receipt['phase'] == 'stopped':
+        require(not any(loaded(x) for x in LABELS), 'unowned_loaded_job')
+        require(not local_port() and not remote_port(), 'port_conflict')
+    return {'result': 'pass', 'phase': receipt['phase'] if receipt else 'absent'}
+
+def stop_and_remove(state, plists, receipt):
+    # Revalidate every managed byte before stopping or removing anything.
+    load_receipt(state, plists)
+    for label in reversed(LABELS):
+        if loaded(label):
+            result = run(['/bin/launchctl', 'bootout', f'gui/{os.getuid()}/{label}'])
+            require(result.returncode == 0 and not loaded(label), 'job_stop_failed')
+    receipt['phase'] = 'pending'
+    save_receipt(state, receipt)
+    for name, record in receipt['files'].items():
+        p = Path(name)
+        if p.exists() or p.is_symlink():
+            checked_file(p, record['mode'])
+            require(digest(p.read_bytes()) == record['sha256'], 'cleanup_drift')
+            p.unlink()
+    receipt['phase'], receipt['files'] = 'stopped', {}
+    save_receipt(state, receipt)
+
+def doctor():
+    state, plists = paths()
+    receipt = load_receipt(state, plists)
+    require(receipt and receipt['phase'] == 'applied', 'not_applied')
+    expected = payload(state, plists, (state / 'authorized_keys').read_bytes())
+    require(all(receipt['files'][str(p)]['sha256'] == digest(data) for p, (data, _) in expected.items()), 'runtime_not_current')
+    require(all(loaded(x) for x in LABELS) and local_port() and remote_port(), 'service_unavailable')
+    listeners = run(['/usr/sbin/lsof', '-nP', f'-iTCP:{PORT}', '-sTCP:LISTEN', '-Fn'])
+    require(listeners.returncode == 0 and {line for line in listeners.stdout.splitlines() if line.startswith(b'n')} == {f'n127.0.0.1:{PORT}'.encode()}, 'listener_not_exclusively_loopback')
+    require(run(['/usr/sbin/sshd', '-t', '-f', state / 'sshd_config']).returncode == 0, 'sshd_config_invalid')
+    return {'result': 'pass', 'phase': 'applied', 'jobsLoaded': True, 'loopbackPortsReachable': True,
+            'endToEndAuthenticationVerified': False}
+
+def apply(commit, key_file):
+    exact_commit(commit)
+    source = Path(key_file)
+    require(source.is_file() and not source.is_symlink() and source.stat().st_size <= 8192, 'unsafe_public_key_source')
+    key = public_key(source.read_bytes())
+    prepare()
+    state, plists = paths()
+    receipt = load_receipt(state, plists)
+    wanted = payload(state, plists, key)
+    records = {str(p): {'sha256': digest(data), 'mode': mode} for p, (data, mode) in wanted.items()}
+    if receipt and receipt['phase'] == 'applied':
+        require(receipt['commit'] == commit and receipt['files'] == records, 'installed_target_mismatch')
+        result = doctor()
+        result['applyNoop'] = True
+        return result
+    if receipt and receipt['phase'] == 'pending':
+        require(receipt['commit'] == commit and receipt['files'] == records, 'pending_target_mismatch')
+        stop_and_remove(state, plists, receipt)
+    if receipt is None:
+        state.mkdir(mode=0o700)
+        receipt = {'schema': 1, 'commit': commit, 'phase': 'stopped', 'files': {}, 'hostPublicHash': ''}
+        save_receipt(state, receipt)
+        result = run(['/usr/bin/ssh-keygen', '-q', '-t', 'ed25519', '-N', '', '-C', '', '-f', state / 'host_ed25519'])
+        require(result.returncode == 0, 'host_key_generation_failed')
+        public_path = state / 'host_ed25519.pub'
+        info = public_path.lstat()
+        require(stat.S_ISREG(info.st_mode) and info.st_uid == os.getuid(), 'unsafe_generated_public_key')
+        public_path.chmod(0o644)
+        receipt['hostPublicHash'] = digest((state / 'host_ed25519.pub').read_bytes())
+        save_receipt(state, receipt)
+    require(not local_port() and not remote_port(), 'port_conflict')
+    receipt.update(commit=commit, phase='pending', files=records)
+    save_receipt(state, receipt)
+    try:
+        for p, (data, mode) in wanted.items():
+            atomic_new(p, data, mode)
+        require(run(['/usr/sbin/sshd', '-t', '-f', state / 'sshd_config']).returncode == 0, 'sshd_config_invalid')
+        for p in plists:
+            require(run(['/bin/launchctl', 'bootstrap', f'gui/{os.getuid()}', p]).returncode == 0, 'bootstrap_failed')
+        for _ in range(10):
+            if local_port() and remote_port():
+                break
+            time.sleep(1)
+        receipt['phase'] = 'applied'
+        save_receipt(state, receipt)
+        result = doctor()
+        result['applyNoop'] = False
+        return result
+    except BaseException:
+        # Partial state is recorded before writes; no unknown path is removed.
+        if receipt['phase'] == 'applied':
+            receipt['phase'] = 'pending'
+            save_receipt(state, receipt)
+        stop_and_remove(state, plists, receipt)
+        raise
+
+def main():
+    parser = argparse.ArgumentParser()
+    sub = parser.add_subparsers(dest='command', required=True)
+    for name in ('prepare', 'doctor', 'rollback'):
+        sub.add_parser(name).add_argument('--json', action='store_true')
+    ap = sub.add_parser('apply')
+    ap.add_argument('--commit', required=True)
+    ap.add_argument('--public-key-file', required=True)
+    ap.add_argument('--json', action='store_true')
+    args = parser.parse_args()
+    if args.command == 'prepare':
+        value = prepare()
+    elif args.command == 'doctor':
+        value = doctor()
+    elif args.command == 'apply':
+        value = apply(args.commit, args.public_key_file)
+    else:
+        state, plists = paths()
+        receipt = load_receipt(state, plists)
+        require(receipt is not None, 'not_managed')
+        stop_and_remove(state, plists, receipt)
+        value = {'result': 'pass', 'phase': 'stopped', 'hostKeysPreserved': True}
+    print(json.dumps(value, sort_keys=True))
+
+if __name__ == '__main__':
+    try:
+        main()
+    except Exception as exc:
+        print(json.dumps({'result': 'fail', 'reason': str(exc) if isinstance(exc, ContractError) else type(exc).__name__}))
+        raise SystemExit(1)

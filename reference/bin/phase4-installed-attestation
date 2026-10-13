@@ -1,0 +1,70 @@
+#!/usr/bin/python3
+"""Read-only external comparison of installed artifacts to independently accepted hashes."""
+
+import hashlib
+import json
+from pathlib import Path
+import re
+import sys
+
+
+FILES = {
+    "binarySHA256": "/usr/local/libexec/aid-admin",
+    "policySHA256": "/etc/agent-first-mac/aid-admin-policy.json",
+    "sudoersSHA256": "/etc/sudoers.d/agent-first-mac-aid-admin",
+}
+ATTESTATION = "/etc/agent-first-mac/aid-admin-install.json"
+
+
+def digest(path):
+    value = hashlib.sha256()
+    with path.open("rb") as stream:
+        while chunk := stream.read(65536):
+            value.update(chunk)
+    return value.hexdigest()
+
+
+def under(root, logical):
+    return root / logical.removeprefix("/")
+
+
+def report(root, expected_path):
+    expected = json.loads(expected_path.read_text())
+    if not isinstance(expected, dict) or set(expected) != {"schema", *FILES.keys()} or expected["schema"] != 1:
+        raise RuntimeError("expected_manifest_schema")
+    if any(re.fullmatch(r"[0-9a-f]{64}", expected[key]) is None for key in FILES):
+        raise RuntimeError("expected_manifest_hash")
+    attestation = json.loads(under(root, ATTESTATION).read_text())
+    required = {"agentOwnerIdentity", "agentOwnerUID", "binarySHA256", "policySHA256", "schema", "sudoersSHA256"}
+    if not isinstance(attestation, dict) or set(attestation) != required or attestation["schema"] != 1:
+        raise RuntimeError("installed_attestation_schema")
+    checks = {}
+    for key, logical in FILES.items():
+        actual = digest(under(root, logical))
+        checks[key] = actual == expected[key] == attestation[key]
+    return {
+        "schema": 1,
+        "read_only": True,
+        "protected_content_emitted": False,
+        "system_mutations_performed": False,
+        "checks": checks,
+        "verdict": "INSTALLED_ARTIFACTS_MATCH_ACCEPTED_HASHES" if all(checks.values()) else "BLOCKED_HASH_DRIFT",
+    }
+
+
+def main():
+    args = sys.argv[1:]
+    if len(args) not in (2, 4) or args[0] != "--expected" or (len(args) == 4 and args[2] != "--root"):
+        raise SystemExit("usage: phase4-installed-attestation --expected <accepted.json> [--root <root>]")
+    root = Path(args[3] if len(args) == 4 else "/").resolve(strict=True)
+    value = report(root, Path(args[1]).resolve(strict=True))
+    print(json.dumps(value, indent=2, sort_keys=True))
+    raise SystemExit(0 if value["verdict"] == "INSTALLED_ARTIFACTS_MATCH_ACCEPTED_HASHES" else 1)
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except Exception as error:
+        print(json.dumps({"result": "fail", "reason": str(error)}, sort_keys=True))
+        raise SystemExit(1)

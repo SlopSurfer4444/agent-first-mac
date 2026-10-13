@@ -1,0 +1,43 @@
+#!/usr/bin/python3
+import json
+from pathlib import Path
+
+
+ROOT = Path(__file__).resolve().parents[1]
+manifest = json.loads((
+    ROOT / "manifests/codex-windows-host-ssh-app-server-holder.json"
+).read_text())
+runner = (ROOT / "bin/codex-windows-host-ssh-app-server-holder").read_text()
+payload = (
+    ROOT / "payload/macos/codex-windows-host-app-server-holder.sh"
+).read_text()
+docs = (ROOT / "docs/codex-windows-host-ssh-app-server-holder.md").read_text()
+
+assert manifest["schema"] == 1
+assert manifest["profile"] == "codex-windows-host-ssh-app-server-holder"
+assert manifest["platform"] == "macOS outbound-only user LaunchAgent"
+assert manifest["dataBoundary"]["codexPrivateStateRead"] is False
+assert manifest["dataBoundary"]["rawLogsRead"] is False
+assert "require_exact_commit" in runner
+assert "wrong_task_branch" in runner
+assert "dirty_worktree" in runner
+assert "replace_receipt" in runner
+assert "launchctl\", \"bootstrap" in runner
+assert "launchctl\", \"bootout" in runner
+assert "remote_proxy_handshake_passes" in runner
+assert "receipt_rebind_postcheck_failed_restored" in runner
+assert "CODEX_INTERNAL_APP_SERVER_REMOTE_CONTROL_DISABLED" in payload
+assert "CODEX_SSH_SKIP_APP_SERVER_BOOT" in payload
+assert "ServerAliveInterval=15" in payload
+assert "app-server --listen unix://" in payload
+assert "private key" in docs
+assert "foreground" in docs
+
+for forbidden in (
+    "authorized_keys", "ssh-keygen", "tailscale up", "sudo ",
+    "CODEX_HOME", "auth.json", "state_5.sqlite", "StandardOutPath\": \"/tmp",
+):
+    assert forbidden not in runner
+    assert forbidden not in payload
+
+print("codex-windows-host-ssh-app-server-holder static check: PASS")

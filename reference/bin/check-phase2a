@@ -1,0 +1,463 @@
+#!/bin/sh
+set -eu
+
+root=$(git rev-parse --show-toplevel)
+cd "$root"
+
+python3 - <<'PY'
+import json
+import pathlib
+import re
+
+root = pathlib.Path('.')
+for path in sorted(root.rglob('*.json')):
+    json.loads(path.read_text())
+
+manifest = json.loads((root / 'manifests/package-sources.json').read_text())
+workstation = json.loads((root / 'manifests/workstation.json').read_text())
+historical = json.loads((root / 'evidence/phase-2a/verification.json').read_text())
+phase2_evidence = json.loads((root / 'evidence/phase-2/verification.json').read_text())
+acceptance = json.loads((root / 'evidence/phase-2/acceptance.json').read_text())
+policy = manifest['policy']
+assert manifest['phase'] == 'phase2_package_bootstrap_apply'
+assert policy['bounded_apply_owner_authorized'] is True
+assert policy['current_checkpoint'] == 'phase2_accepted_l2_control_ready'
+assert policy['activation_allowed'] == 'phase2_complete_no_further_mutation_without_new_gate'
+assert policy['required_continuation_message'] == 'CONTINUE_AFTER_LOCK_REVIEW'
+assert policy['continuation_received'] is True
+assert policy['phase3_authorized'] is False
+assert manifest['policy']['curl_pipe_shell_allowed'] is False
+assert policy['flake_lock'] == {
+    'state': 'generated_independently_content_reviewed',
+    'commit': '171cf32e9b029d721387ae802abbc7797153fb16',
+}
+assert manifest['preflight']['evidence_class'] == 'historical_pre_lix_install_absent_state'
+assert manifest['preflight']['current_live_state_authority'] is False
+assert manifest['preflight']['lix_nix']['state'] == 'absent'
+assert manifest['preflight']['homebrew']['state'] == 'absent'
+assert manifest['preflight']['provenance_ambiguity'] is False
+
+assert workstation == {
+    'architecture_authority': {
+        'kind': 'repository_local',
+        'path': 'ARCHITECTURE.md',
+        'standalone': True,
+    },
+    'acceptance': {
+        'evidence': 'evidence/phase-2/acceptance.json',
+        'reviewed_head': 'e7beb60fb985ab053ab04f3de2ee379316126659',
+        'verdict': 'PASS',
+    },
+    'checkpoint': {
+        'applied_intent_commit': '432dfd719b53fff8a3fdf3dca45549a1e6f668e8',
+        'flake_lock': 'generated_independently_content_reviewed',
+        'flake_lock_commit': '171cf32e9b029d721387ae802abbc7797153fb16',
+        'home_manager_activation': 'embedded_in_nix_darwin_applied',
+        'home_manager_resolver': 'darwin_generation_activation_chain',
+        'homebrew': '5.1.15_canonical_empty',
+        'lix_version': '2.95.2',
+        'nix_darwin_activation': 'homebrew_enabled_target_applied',
+    },
+    'continuation': {
+        'received': True,
+        'required_message': 'CONTINUE_AFTER_LOCK_REVIEW',
+    },
+    'l2_claimed': True,
+    'owner_authorized_bounded_apply': True,
+    'phase': 'phase2_package_bootstrap_apply',
+    'phase_status': 'phase2_accepted_l2_control_ready',
+    'phase2_complete': True,
+    'recovery_policy': 'disabled_accepted_risk',
+    'schema': 1,
+}
+
+assert historical['phase'] == 'phase2a_package_bootstrap_preparation'
+assert historical['system_mutations']['performed'] is False
+assert historical['gate']['verdict'] == 'PREPARED_FOR_INDEPENDENT_REVIEW'
+assert phase2_evidence['schema'] == 1
+assert phase2_evidence['phase'] == 'phase2_package_bootstrap'
+assert phase2_evidence['applied_authority'] == {
+    'applied_intent_commit': '432dfd719b53fff8a3fdf3dca45549a1e6f668e8',
+    'continuation_message': 'CONTINUE_AFTER_LOCK_REVIEW',
+    'continuation_record_commit': '0d0c9435d56999e934c1e78549f208668c1fb86f',
+    'doctor_contract_commit': 'ce1feef19fa89b63396a51e0f936c759505fc4ee',
+    'flake_lock_commit': '171cf32e9b029d721387ae802abbc7797153fb16',
+    'previous_doctor_contract_commit': 'b98eda39dfa1c1224db9ed9f818c1beec3a4d0b0',
+}
+assert phase2_evidence['gate'] == {
+    'control_main_merge_allowed': False,
+    'l2_claimed': False,
+    'phase2_complete': False,
+    'verdict': 'READY_FOR_INDEPENDENT_PHASE2_REVIEW',
+}
+assert phase2_evidence['probes']['first_noop_attempt']['result'] == 'failure'
+assert phase2_evidence['probes']['first_noop_attempt']['fail_closed'] is True
+assert phase2_evidence['probes']['restoration_after_first_attempt']['result'] == 'pass'
+assert phase2_evidence['probes']['exact_intent_v2']['result'] == 'pass'
+assert phase2_evidence['rollback']['returned_to_accepted_generation'] is True
+assert phase2_evidence['home_manager']['legacy_profile']['classification'] == 'broken_non_authoritative'
+assert phase2_evidence['verification']['doctor_integration'] == {
+    'approved_branches': ['codex/phase-2-packages-apply', 'main'],
+    'detached_head': 'fail_closed_control_git',
+    'dirty_manifest': 'fail_closed',
+    'integrated_main_no_origin': 'pass',
+    'review_branch': 'pass',
+    'review_json_sha256': '64c4c027df0fa0f26b7f9d062e57520ca72ad8f9d1554d34a290b9738ba0ec9e',
+    'tampered_manifest_clean_commit': 'fail_closed',
+    'unexpected_branch': 'fail_closed_control_git',
+}
+assert phase2_evidence['verification']['system_state_unchanged_after_integration_tests'] is True
+assert phase2_evidence['redaction'] == {
+    'bounded': True,
+    'private_paths': False,
+    'raw_logs_committed': False,
+    'secrets_or_auth_state': False,
+    'stable_machine_identifiers': False,
+    'usernames': False,
+}
+assert acceptance['schema'] == 1
+assert acceptance['accepted_on'] == '2026-07-14'
+assert acceptance['gate'] == {
+    'l2_claimed': True,
+    'next_gate': 'phase3_permissions_preparation_not_started',
+    'phase2_complete': True,
+    'phase3_authorized': False,
+    'verdict': 'PASS',
+}
+assert acceptance['independent_review']['reviewed_head'] == \
+    'e7beb60fb985ab053ab04f3de2ee379316126659'
+assert acceptance['independent_review']['branch_matrix'] == {
+    'detached_head': 'fail_closed_control_git',
+    'dirty_worktree': 'fail_closed_control_git',
+    'integrated_main': 'pass',
+    'review_branch': 'pass_before_integration',
+    'tampered_manifest': 'fail_closed_standalone_contract',
+    'unexpected_branch': 'fail_closed_control_git',
+}
+assert acceptance['independent_review']['doctor_json_repeat_sha256'] == \
+    '64c4c027df0fa0f26b7f9d062e57520ca72ad8f9d1554d34a290b9738ba0ec9e'
+assert acceptance['integration'] == {
+    'control_main_fast_forwarded': True,
+    'main_head_before_acceptance_record': 'e7beb60fb985ab053ab04f3de2ee379316126659',
+    'method': 'fast_forward_only',
+    'remote_added': False,
+}
+assert acceptance['review_packet'] == {
+    'doctor_contract_commit': 'ce1feef19fa89b63396a51e0f936c759505fc4ee',
+    'doctor_evidence_commit': 'e7beb60fb985ab053ab04f3de2ee379316126659',
+    'path': 'evidence/phase-2/verification.json',
+}
+assert acceptance['system_mutation_during_independent_review'] is False
+assert acceptance['live_state']['temporary_mutation_processes'] == 0
+assert acceptance['live_state']['darwin'] == {
+    'current_generation': 2,
+    'previous_generation': 1,
+    'returned_to_accepted_generation': True,
+}
+
+architecture = (root / 'ARCHITECTURE.md').read_text()
+agents = (root / 'AGENTS.md').read_text()
+readme = (root / 'README.md').read_text()
+for required in (
+    'This repository alone is the operational authority',
+    'the newest explicit owner decision',
+    '$HOME/AIDev/control',
+    '/nix/store',
+    '/opt/homebrew',
+    '/Applications',
+    'exactly one primary installation/update owner',
+    'adopt before reinstalling',
+    '**Trusted control:**',
+    '**Trusted repository:**',
+    '**Quarantine:**',
+    '**External data:**',
+    'atomic intent commit',
+    'exact build before switch',
+    'read-only doctor',
+    'typed `aid-admin`',
+    'MUST NOT\ngrant `ALL`',
+    'disabled with accepted risk',
+    'Lix 2.95.2',
+    'CONTINUE_AFTER_LOCK_REVIEW',
+    'Homebrew 5.1.15',
+    'Accepted Phase 2 / L2 baseline',
+    'Phase 2 is closed as `PASS`',
+    'L2 Control-ready is claimed',
+    'evidence/phase-2/acceptance.json',
+    'does not authorize the next phase',
+    'darwin_generation_activation_chain'.replace('_', ' '),
+):
+    if required == 'darwin generation activation chain':
+        assert 'numbered Darwin generation\'s\n  activation chain' in architecture, required
+    else:
+        assert required in architecture, required
+assert agents.startswith('# Agent-First Mac control routing\n\n- Read the local `ARCHITECTURE.md` completely')
+assert 'durable normative operational contract' in agents
+assert 'This control repository is standalone' in agents
+assert 'Phase 2 is accepted and L2 is claimed' in agents
+assert 'Phase 3 preparation is independently\n  accepted' in agents
+assert 'permission ceremony\n  has not started' in agents
+assert 'L3 is not claimed' in agents
+for required in (
+    'This standalone repository is the Git authority',
+    'verified Lix 2.95.2',
+    'independently reviewed `flake.lock`',
+    'Phase 2 is `PASS`',
+    'L2 Control-ready is the current baseline',
+    './bin/check-phase2a',
+    './bin/phase2-doctor --json',
+    'CONTINUE_AFTER_LOCK_REVIEW',
+    'acceptance.json',
+    'new explicit gate',
+    'Phase 3 permission preparation is independently accepted',
+    'Phase 3 PASS and L3 are not claimed',
+):
+    assert required in readme, required
+
+operational_paths = [
+    path for path in sorted(root.rglob('*'))
+    if path.is_file() and '.git' not in path.parts and 'evidence' not in path.parts
+]
+operational_text = '\n'.join(path.read_text(errors='ignore') for path in operational_paths)
+for forbidden in (
+    'Migrate' + 'FromWindows',
+    '631' + '30a9',
+    '576' + '6357',
+):
+    assert forbidden not in operational_text, forbidden
+assert re.search(r'/Users/[A-Za-z0-9._-]+', operational_text) is None
+external_prerequisite = re.compile(
+    r'(?:requ' + r'ires?|depends' + r' on|prereq' + r'uisite:)'
+    r'.{0,40}(?:another|external|historical)'
+    r'.{0,40}(?:checkout|repository|repo|source)',
+    re.IGNORECASE | re.DOTALL,
+)
+assert external_prerequisite.search(operational_text) is None
+assert 'architecture_source' not in workstation
+
+sha256 = re.compile(r'^[0-9a-f]{64}$')
+revision = re.compile(r'^[0-9a-f]{40}$')
+nar_hash = re.compile(r'^sha256-[A-Za-z0-9+/]{43}=$')
+sources = manifest['sources']
+for name in ('lix_installer', 'lix_distribution', 'homebrew'):
+    assert sha256.fullmatch(sources[name]['sha256']), name
+for name in ('nixpkgs', 'nix_darwin', 'home_manager'):
+    assert revision.fullmatch(sources[name]['revision']), name
+    assert nar_hash.fullmatch(sources[name]['nar_hash']), name
+
+lix_installer = sources['lix_installer']
+lix_distribution = sources['lix_distribution']
+nixpkgs = sources['nixpkgs']
+assert revision.fullmatch(lix_distribution['annotated_tag_object'])
+assert revision.fullmatch(lix_distribution['peeled_commit'])
+assert lix_distribution['annotated_tag_object'] != lix_distribution['peeled_commit']
+assert re.fullmatch(r'[0-9]+\.[0-9]+\.[0-9]+', lix_installer['reported_installer_version'])
+assert lix_installer['reported_build'].endswith('-modified')
+assert lix_installer['clean_source_revision_claimed'] is False
+assert lix_installer['compiled_default_lix_version'] == lix_distribution['version']
+assert lix_installer['compiled_default_distribution_url'] == lix_distribution['download_url']
+assert lix_installer['retained_installer_path'] == '/nix/nix-installer'
+assert lix_installer['retained_receipt_path'] == '/nix/receipt.json'
+assert lix_distribution['checksum_url'] == lix_distribution['download_url'] + '.sha256'
+assert lix_distribution['matches_installer_compiled_default'] is True
+assert lix_distribution['version'] == nixpkgs['lix_package_version']
+
+flake = (root / 'flake.nix').read_text()
+flake_urls = re.findall(r'url\s*=\s*"(github:[^"]+)";', flake)
+assert len(flake_urls) == 3
+for url in flake_urls:
+    assert revision.fullmatch(url.rsplit('/', 1)[-1]), url
+assert set(flake_urls) == {
+    sources['nixpkgs']['flake_url'],
+    sources['nix_darwin']['flake_url'],
+    sources['home_manager']['flake_url'],
+}
+assert 'master' not in flake and 'main' not in flake and 'latest' not in flake
+
+lock = json.loads((root / 'flake.lock').read_text())
+assert lock['version'] == 7
+assert lock['root'] == 'root'
+assert set(lock['nodes']) == {'root', 'nixpkgs', 'nix-darwin', 'home-manager'}
+assert lock['nodes']['root'] == {'inputs': {
+    'home-manager': 'home-manager',
+    'nix-darwin': 'nix-darwin',
+    'nixpkgs': 'nixpkgs',
+}}
+lock_sources = {
+    'nixpkgs': ('NixOS', 'nixpkgs', sources['nixpkgs']),
+    'nix-darwin': ('nix-darwin', 'nix-darwin', sources['nix_darwin']),
+    'home-manager': ('nix-community', 'home-manager', sources['home_manager']),
+}
+for name, (owner, repo, source) in lock_sources.items():
+    node = lock['nodes'][name]
+    expected_original = {
+        'owner': owner,
+        'repo': repo,
+        'rev': source['revision'],
+        'type': 'github',
+    }
+    assert node['original'] == expected_original, name
+    assert node['locked'] == {
+        'lastModified': node['locked']['lastModified'],
+        'narHash': source['nar_hash'],
+        **expected_original,
+    }, name
+    assert isinstance(node['locked']['lastModified'], int)
+    assert node['locked']['lastModified'] > 0
+    assert source['official_repository'] == f'https://github.com/{owner}/{repo}'
+for name in ('nix-darwin', 'home-manager'):
+    assert lock['nodes'][name]['inputs'] == {'nixpkgs': ['nixpkgs']}
+assert 'inputs' not in lock['nodes']['nixpkgs']
+
+bootstrap = (root / 'darwin/bootstrap.nix').read_text()
+home_manager = (root / 'darwin/home-manager.nix').read_text()
+homebrew = (root / 'darwin/homebrew.nix').read_text()
+assert 'environment.systemPackages = [ ];' in bootstrap
+expected_lix_assignment = f"package = {nixpkgs['lix_package_attribute']};"
+assert expected_lix_assignment in bootstrap
+assert 'package = pkgs.lix;' not in bootstrap
+assert 'packages = [ ];' in home_manager
+for empty in ('taps = [ ];', 'brews = [ ];', 'casks = [ ];', 'masApps = { };'):
+    assert empty in homebrew, empty
+for nondestructive in (
+    'global.autoUpdate = false;',
+    'autoUpdate = false;',
+    'upgrade = false;',
+    'cleanup = "check";',
+):
+    assert nondestructive in homebrew, nondestructive
+
+operator_plan = (root / 'docs/phase-2a-operator-plan.md').read_text()
+for source in ('lix_installer', 'lix_distribution', 'homebrew'):
+    assert sources[source]['sha256'] in operator_plan, source
+assert sources['homebrew']['uninstall_script_sha256'] in operator_plan
+assert lix_installer['retained_installer_path'] in operator_plan
+assert lix_installer['retained_receipt_path'] in operator_plan
+assert '/nix/lix-installer' not in operator_plan
+assert 'sudo "$RETAINED_INSTALLER" uninstall /nix/receipt.json' in operator_plan
+for uninstall_check in (
+    lix_installer['sha256'],
+    str(lix_installer['size_bytes']),
+    'Mach-O 64-bit executable arm64',
+    'lix-installer 3.95.0: (built from git: 40ef289-modified)',
+):
+    assert uninstall_check in operator_plan
+version = lix_distribution['version']
+archive_name = f"lix-{version}-aarch64-darwin.tar.xz"
+assert lix_distribution['download_url'] in operator_plan
+assert lix_distribution['checksum_url'].rsplit('.sha256', 1)[0] in operator_plan
+assert archive_name in operator_plan
+assert str(lix_distribution['size_bytes']) in operator_plan
+assert lix_installer['reported_installer_version'] in operator_plan
+assert lix_installer['reported_build'] in operator_plan
+assert f"reports Lix {version}." in operator_plan
+assert f"Expected: Lix {version}," in operator_plan
+archive_versions = set(re.findall(r'lix-([0-9]+\.[0-9]+\.[0-9]+)-aarch64-darwin\.tar\.xz', operator_plan))
+reported_versions = set(re.findall(r'reports Lix ([0-9]+\.[0-9]+\.[0-9]+)', operator_plan))
+expected_versions = set(re.findall(r'Expected: Lix ([0-9]+\.[0-9]+\.[0-9]+)', operator_plan))
+assert archive_versions == {version}
+assert reported_versions == {version}
+assert expected_versions == {version}
+
+lock_review_command = 'git diff --no-index -- /dev/null flake.lock || test "$?" -eq 1'
+assert lock_review_command in operator_plan
+assert 'git diff -- flake.lock' not in operator_plan
+assert 'Exit 1 from `git diff --no-index` is the expected' in operator_plan
+assert re.search(r'any other\s+nonzero status fails the command', operator_plan)
+
+first_build = '.#darwinConfigurations.bootstrap.system'
+first_switch = '-- switch --flake .#bootstrap --impure'
+second_build = '.#darwinConfigurations.bootstrap-with-homebrew.system'
+second_switch = '.#bootstrap-with-homebrew --impure'
+assert operator_plan.index(first_build) < operator_plan.index(first_switch)
+assert operator_plan.index(second_build) < operator_plan.index(second_switch)
+for resolver_contract in (
+    '$HOME/.local/state/home-manager/gcroots/current-home',
+    "numbered Darwin generation's `activate` script",
+    '`home-manager-generation`',
+    'broken legacy `$HOME/.nix-profile` link is non-authoritative',
+    '--switch-generation N',
+    'isolated clean clone detached at the\n   applied intent commit',
+):
+    assert resolver_contract in operator_plan, resolver_contract
+assert '/etc/profiles/per-user/"$AID_BOOTSTRAP_USER"/bin/home-manager generations' not in operator_plan
+assert 'newer non-intent commit is not a no-op target' in operator_plan
+
+doctor = (root / 'bin/phase2-doctor').read_text()
+compile(doctor, 'bin/phase2-doctor', 'exec')
+for doctor_check in (
+    'lix_daemon_receipt_store',
+    'darwin_home_manager_generations',
+    'homebrew_empty_arm64',
+    'ownership_and_path',
+    'broken_non_authoritative',
+    'darwin_generation_activation_chain',
+    '432dfd719b53fff8a3fdf3dca45549a1e6f668e8',
+    'branch == "main"',
+    '"branch_class": "integrated_main"',
+    'e7beb60fb985ab053ab04f3de2ee379316126659',
+    'phase2_accepted_l2_control_ready',
+    'evidence/phase-2/acceptance.json',
+):
+    assert doctor_check in doctor, doctor_check
+for mutating in ('sudo ', 'nix build', 'darwin-rebuild switch', 'brew install', 'brew update'):
+    assert mutating not in doctor, mutating
+
+for path in sorted(list(root.rglob('*.nix'))):
+    text = path.read_text()
+    stack = []
+    pairs = {')': '(', ']': '[', '}': '{'}
+    opening = set(pairs.values())
+    in_string = False
+    escaped = False
+    in_comment = False
+    for char in text:
+        if in_comment:
+            if char == '\n':
+                in_comment = False
+            continue
+        if in_string:
+            if escaped:
+                escaped = False
+            elif char == '\\':
+                escaped = True
+            elif char == '"':
+                in_string = False
+            continue
+        if char == '#':
+            in_comment = True
+        elif char == '"':
+            in_string = True
+        elif char in opening:
+            stack.append(char)
+        elif char in pairs:
+            assert stack and stack.pop() == pairs[char], path
+    assert not in_string and not stack, path
+
+all_text = '\n'.join(
+    p.read_text(errors='ignore')
+    for p in root.rglob('*') if p.is_file() and '.git' not in p.parts
+)
+for forbidden in (
+    'BEGIN PRIVATE' + ' KEY',
+    'BEGIN OPENSSH PRIVATE' + ' KEY',
+    'NOPASSWD:' + ' ALL',
+    'curl' + ' | sh',
+    'curl' + '|sh',
+):
+    assert forbidden not in all_text, forbidden
+assert re.search(r'/Users/[A-Za-z0-9._-]+', all_text) is None
+assert re.search(r'\b[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[1-5][0-9A-Fa-f]{3}-[89ABab][0-9A-Fa-f]{3}-[0-9A-Fa-f]{12}\b', all_text) is None
+PY
+
+sh -n ./bin/check-phase2a
+git diff --check
+
+printf '%s\n' 'json=pass'
+printf '%s\n' 'standalone_contract=pass'
+printf '%s\n' 'historical_evidence=classified'
+printf '%s\n' 'flake_lock_checkpoint=pass'
+printf '%s\n' 'source_pins=pass'
+printf '%s\n' 'nix_static=structural_only_parser_unavailable'
+printf '%s\n' 'secret_identifier_scan=pass'
+printf '%s\n' 'git_diff_check=pass'

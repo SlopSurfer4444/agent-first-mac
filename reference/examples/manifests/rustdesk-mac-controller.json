@@ -1,0 +1,47 @@
+{
+  "publicReferenceOnly": true,
+  "warning": "Sanitized historical example. Not installation authority or current inventory.",
+  "example": {
+    "schema": 1,
+    "profile": "rustdesk-mac-controller",
+    "profileActive": true,
+    "source": {
+      "project": "RustDesk",
+      "version": "1.4.6",
+      "url": "https://github.com/rustdesk/rustdesk/releases/download/1.4.6/rustdesk-1.4.6-aarch64.dmg",
+      "sha256": "0cd498e3f99c878bfa3c54996089b9671fdd15aee5d1ac160444841f95ea01bc",
+      "nixHash": "sha256-DNSY4/mch4v6PFSZYIm5Zx/dFa7l0awWBESEH5XqAbw=",
+      "releaseDigestSource": "official GitHub release asset digest"
+    },
+    "application": {
+      "path": "/Applications/RustDesk.app",
+      "bundleIdentifier": "com.carriez.rustdesk",
+      "version": "1.4.6",
+      "build": "64",
+      "teamIdentifier": "HZF9JMC8YN",
+      "signer": "Developer ID Application: zhou huabing (HZF9JMC8YN)",
+      "architecture": "arm64",
+      "executable": "Contents/MacOS/RustDesk"
+    },
+    "roleBoundary": {
+      "macRole": "outbound controller only",
+      "windowsRole": "controlled endpoint",
+      "sessionTransport": "RustDesk direct IP over Tailscale",
+      "macUnattendedAccessEnabled": false,
+      "macInboundListenerRequired": false,
+      "macScreenRecordingRequired": false,
+      "macAccessibilityRequired": false,
+      "macInputMonitoringRequired": false
+    },
+    "dataBoundary": {
+      "userConfigInspected": false,
+      "applicationSupportDataRemoved": false
+    },
+    "lifecycle": {
+      "install": "verify the pinned official DMG digest and strict signed app identity, then copy only RustDesk.app through commit-bound aid-admin apply-system",
+      "smoke": "verify exact bundle, version, team, strict signature, Gatekeeper and managed marker; do not inspect configuration",
+      "rollback": "a reviewed disabled-state commit removes only the exact managed app and marker while preserving all per-user data",
+      "windowsConfiguration": "separate reviewed lifecycle; direct-IP listener and password are never configured by this Mac manifest"
+    }
+  }
+}

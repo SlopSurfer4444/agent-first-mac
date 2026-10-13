@@ -1,0 +1,453 @@
+#!/usr/bin/python3
+"""Read-only revision observation, never build/apply or runtime authority.
+
+The reviewed local program is the bootstrap trust boundary, as for current-doctor.
+Native transport reuses its fixed bounded direct-child owner. Cooperative bounds
+do not claim hard kernel deadlines, descendant supervision, or recovery on exit.
+Only inspect's injected adapter is a fixture seam; the CLI has no alternate root,
+marker, command, fixture, environment, or source-policy selection.
+"""
+import sys
+sys.dont_write_bytecode = True
+
+import hashlib
+import importlib.machinery
+import json
+import os
+from pathlib import Path
+import pwd
+import re
+import stat
+from types import SimpleNamespace
+
+SELF = "bin/system-revision-status"
+DESCRIPTOR = "manifests/system-input-closure.json"
+SCOPES = ["flake.nix", "flake.lock", "darwin", "modules"]
+CLAIM = "REVIEWED_COMPLETE_NIX_INPUT_GRAPH_WITH_REVISION_METADATA_ONLY"
+MAX_JSON = 1024 * 1024
+STATES = frozenset(("CURRENT_REVISION", "ACCEPTED_CONTROL_ONLY_SUCCESSOR", "CURRENT_CONTROL_ONLY_SUCCESSOR", "PENDING_APPLY", "UNKNOWN"))
+ADMISSION_MODES = frozenset(("historical-review", "current-state"))
+REASONS = frozenset(("exact_accepted_revision", "reviewed_system_inputs_unchanged",
+    "exact_admitted_revision", "current_system_inputs_unchanged",
+    "system_inputs_changed", "unwitnessed_system_inputs", "source_not_accepted",
+    "source_report_invalid", "noncanonical_source", "dirty_source", "invalid_marker",
+    "invalid_descriptor", "installed_commit_not_accepted", "observation_drift",
+    "observation_failed", "arguments", "ownership_unsettled"))
+SOURCE_TRUE = frozenset(("historicalPhase5Accepted", "phase5EngineUnchanged", "sentinelAccepted",
+    "exposureSourceIncluded", "exposureSourceAccepted", "configurationSourceIncluded",
+    "configurationSourceAccepted", "integratedMain", "repositoryChecksPassed", "gitOnly",
+    "childSettled", "sourceHandlesClosed"))
+SOURCE_FALSE = frozenset(("exposureStateChecked", "sentinelChecked", "currentSentinelReady",
+    "liveRuntimeChecked", "currentRuntimeReady", "wholeMachineHealthChecked", "executionAdmission",
+    "liveAdmission", "configMutationAuthorized", "trustMutationAuthorized", "rootAuthorized",
+    "phase6Allowed", "modelTaskAuthorized", "schedulerAuthorized", "l4Allowed"))
+SOURCE_META = {"schema", "probe", "scope", "verdict", "failureStage", "reasonCodes", "admissionMode"}
+
+
+class ObservationError(ValueError):
+    def __init__(self, reason):
+        self.reason = reason if reason in REASONS else "observation_failed"
+        super().__init__(self.reason)
+
+
+class StatusError(Exception):
+    """Private retention for an owner whose settlement/closure is not proven."""
+    def __init__(self, value, owner):
+        self.value, self.private_owner = value, owner
+        super().__init__("ownership_unsettled")
+
+
+def require(value, reason="observation_failed"):
+    if value is not True:
+        raise ObservationError(reason) from None
+
+
+def oid(value):
+    return type(value) is str and re.fullmatch(r"[0-9a-f]{40}", value) is not None
+
+
+def relative(value):
+    return (type(value) is str and 0 < len(value) <= 1024
+        and re.fullmatch(r"[A-Za-z0-9_.-]+(?:/[A-Za-z0-9_.-]+)*", value) is not None
+        and all(p not in (".", "..") for p in value.split("/")))
+
+
+def file_stamp(value):
+    # Reading a file/directory may legitimately advance atime; never bind that.
+    return tuple(getattr(value, key, None) for key in ("st_dev", "st_ino", "st_uid", "st_gid",
+        "st_mode", "st_nlink", "st_size", "st_mtime_ns", "st_ctime_ns", "st_flags"))
+
+
+def directory_stamp(value):
+    return tuple(getattr(value, key, None) for key in ("st_dev", "st_ino", "st_uid", "st_gid",
+        "st_mode", "st_flags"))
+
+
+def strict_json(raw, reason):
+    require(type(raw) is bytes and 0 < len(raw) <= MAX_JSON, reason)
+    def pairs(rows):
+        result = {}
+        for key, value in rows:
+            require(key not in result, reason)
+            result[key] = value
+        return result
+    def constant(_):
+        raise ObservationError(reason)
+    try:
+        return json.loads(raw.decode("utf-8", "strict"), object_pairs_hook=pairs,
+                          parse_constant=constant)
+    except (ValueError, UnicodeError, RecursionError):
+        raise ObservationError(reason) from None
+
+
+def marker(raw):
+    value = strict_json(raw, "invalid_marker")
+    require(type(value) is dict and set(value) == {
+        "configurationRevision", "darwinLabel", "darwinRevision", "nixpkgsRevision"}, "invalid_marker")
+    require(all(type(v) is str and 0 < len(v) <= 256 and all(32 <= ord(c) < 127 for c in v)
+                for v in value.values()) and oid(value["configurationRevision"]), "invalid_marker")
+    return value["configurationRevision"]
+
+
+def projection(tree):
+    require(type(tree) is dict and 0 < len(tree) <= 10000)
+    result = {}
+    for path, row in tree.items():
+        require(relative(path) and type(row) is tuple and len(row) == 2
+            and type(row[0]) is str and row[0] in ("100644", "100755", "120000") and oid(row[1]))
+        if path in SCOPES or path.startswith(("darwin/", "modules/")):
+            result[path] = {"mode": row[0], "oid": row[1]}
+    return result
+
+
+def descriptor(raw):
+    value = strict_json(raw, "invalid_descriptor")
+    require(type(value) is dict and set(value) == {"schema", "auditedRevision", "inputs", "graphScopes", "claim"}
+        and type(value["schema"]) is int and value["schema"] == 1
+        and oid(value["auditedRevision"]) and type(value["graphScopes"]) is list
+        and value["graphScopes"] == SCOPES and value["claim"] == CLAIM, "invalid_descriptor")
+    inputs = value["inputs"]
+    require(type(inputs) is dict and 2 <= len(inputs) <= 1024
+        and {"flake.nix", "flake.lock"} <= inputs.keys(), "invalid_descriptor")
+    for path, row in inputs.items():
+        require(relative(path) and (path in ("flake.nix", "flake.lock") or path.startswith(("darwin/", "modules/")))
+            and type(row) is dict and set(row) == {"mode", "oid"}
+            and type(row["mode"]) is str and row["mode"] in ("100644", "100755")
+            and oid(row["oid"]), "invalid_descriptor")
+    return value
+
+
+def source_report(code, raw):
+    value = strict_json(raw, "source_report_invalid")
+    require(type(code) is int and type(value) is dict
+        and set(value) == SOURCE_TRUE | SOURCE_FALSE | SOURCE_META
+        and type(value["schema"]) is int and value["schema"] == 1
+        and type(value["admissionMode"]) is str and value["admissionMode"] in ADMISSION_MODES
+        and value["probe"] == "current-doctor" and value["scope"] == "post-phase5-vendor-sentinel"
+        and type(value["reasonCodes"]) is list and value["reasonCodes"] == []
+        and all(type(value[k]) is bool for k in SOURCE_TRUE | SOURCE_FALSE)
+        and type(value["verdict"]) is str and value["verdict"] in (
+            "PASS", "GIT_ONLY_VALID", "NEEDS_REVIEW", "PREPARED_SOURCE_ONLY", "PREPARED_FOR_INDEPENDENT_REVIEW")
+        and (value["failureStage"] is None or type(value["failureStage"]) is str
+             and value["failureStage"] in ("arguments", "git", "historical", "acceptance", "source",
+                 "exposure", "configuration", "sentinel", "runtime", "final-recheck", "close", "native-unbound")),
+        "source_report_invalid")
+    accepted = (code == 0 and value["verdict"] == "GIT_ONLY_VALID" and value["failureStage"] is None
+        and all(value[k] is True for k in SOURCE_TRUE) and all(value[k] is False for k in SOURCE_FALSE))
+    return value, accepted
+
+
+def report(**updates):
+    result = {"schema": 1, "state": "UNKNOWN", "compatible": False, "revisionExact": False,
+        "sourceAccepted": False, "installedCommitAccepted": False, "systemInputsEqual": False,
+        "sourceRevision": None, "installedRevision": None, "sourceAdmissionMode": None, "reason": "observation_failed",
+        "readOnly": True, "systemMutationsPerformed": False,
+        "childSettled": True, "sourceHandlesClosed": True}
+    result.update(updates)
+    return result
+
+
+def public(value):
+    require(type(value) is dict and set(value) == set(report()))
+    require(type(value["schema"]) is int and value["schema"] == 1
+        and type(value["state"]) is str and value["state"] in STATES
+        and type(value["reason"]) is str and value["reason"] in REASONS
+        and (value["sourceAdmissionMode"] is None or type(value["sourceAdmissionMode"]) is str
+             and value["sourceAdmissionMode"] in ADMISSION_MODES)
+        and all(value[k] is None or oid(value[k]) for k in ("sourceRevision", "installedRevision"))
+        and all(type(value[k]) is bool for k in set(report()) - {
+            "schema", "state", "reason", "sourceRevision", "installedRevision", "sourceAdmissionMode"})
+        and value["readOnly"] is True and value["systemMutationsPerformed"] is False)
+    require(value["sourceAccepted"] is False or value["sourceAdmissionMode"] in ADMISSION_MODES)
+    positive = value["state"] in ("CURRENT_REVISION", "ACCEPTED_CONTROL_ONLY_SUCCESSOR", "CURRENT_CONTROL_ONLY_SUCCESSOR")
+    require(value["compatible"] is positive)
+    require(not positive or (all(value[k] is True for k in (
+        "sourceAccepted", "installedCommitAccepted", "systemInputsEqual", "childSettled", "sourceHandlesClosed"))
+        and value["sourceAdmissionMode"] in ADMISSION_MODES
+        and oid(value["sourceRevision"]) and oid(value["installedRevision"])
+        and value["revisionExact"] is (value["sourceRevision"] == value["installedRevision"])
+        and value["revisionExact"] is (value["state"] == "CURRENT_REVISION")))
+    if positive:
+        current_state = value["sourceAdmissionMode"] == "current-state"
+        require(value["reason"] == (("exact_admitted_revision" if current_state else "exact_accepted_revision")
+            if value["revisionExact"] else ("current_system_inputs_unchanged" if current_state
+                                            else "reviewed_system_inputs_unchanged")))
+        require(value["revisionExact"] or value["state"] == (
+            "CURRENT_CONTROL_ONLY_SUCCESSOR" if current_state else "ACCEPTED_CONTROL_ONLY_SUCCESSOR"))
+    if value["state"] == "PENDING_APPLY":
+        require(value["reason"] == "system_inputs_changed" and value["sourceAccepted"] is True
+            and value["installedCommitAccepted"] is True and value["systemInputsEqual"] is False
+            and value["revisionExact"] is False and oid(value["sourceRevision"])
+            and oid(value["installedRevision"]) and value["sourceRevision"] != value["installedRevision"])
+    return value
+
+
+def inspect(adapter):
+    """Injected fixed observations; no filesystem/process/import work on this seam."""
+    result = report()
+    try:
+        before = adapter.snapshot()
+        require(type(before) is dict and set(before) == {"head", "branch", "clean", "canonical", "identity"})
+        require(before["canonical"] is True and before["branch"] == "main", "noncanonical_source")
+        require(before["clean"] is True, "dirty_source")
+        require(oid(before["head"]))
+        result["sourceRevision"] = before["head"]
+        # Outer direct-child settlement cannot prove the doctor's internal ownership.
+        result.update(childSettled=False, sourceHandlesClosed=False)
+        first_report, accepted = source_report(*adapter.source_report())
+        result.update(childSettled=first_report["childSettled"], sourceHandlesClosed=first_report["sourceHandlesClosed"])
+        require(accepted, "source_not_accepted")
+        result["sourceAccepted"] = True
+        result["sourceAdmissionMode"] = first_report["admissionMode"]
+        current_state = first_report["admissionMode"] == "current-state"
+        current, accepted_commits, verified_history = adapter.configuration(before["head"])
+        if current_state:
+            # Routine admission does not manufacture historical receipt chains.
+            require(accepted_commits is None and verified_history is None)
+        else:
+            require(type(accepted_commits) is tuple and 0 < len(accepted_commits) <= 1024
+                and all(oid(v) for v in accepted_commits) and len(set(accepted_commits)) == len(accepted_commits)
+                and accepted_commits[-1] == before["head"])
+            require(type(verified_history) is tuple and 0 < len(verified_history) <= 4096
+                and all(oid(v) for v in verified_history) and len(set(verified_history)) == len(verified_history)
+                and set(accepted_commits) <= set(verified_history) and verified_history[-1] == before["head"])
+        first_marker = adapter.marker()
+        require(type(first_marker) is tuple and len(first_marker) == 2)
+        installed = marker(first_marker[0])
+        result["installedRevision"] = installed
+        require(adapter.admitted_revision(installed, accepted=True) is True if current_state
+                else installed in accepted_commits, "installed_commit_not_accepted")
+        result["installedCommitAccepted"] = True
+        result["revisionExact"] = installed == before["head"]
+        require(DESCRIPTOR in current and current[DESCRIPTOR][0] == "100644", "invalid_descriptor")
+        witness = descriptor(adapter.blob(current[DESCRIPTOR][1]))
+        current_inputs = projection(current)
+        installed_inputs = current_inputs if result["revisionExact"] else projection(adapter.tree(installed))
+        result["systemInputsEqual"] = current_inputs == installed_inputs
+        if result["revisionExact"]:
+            result.update(state="CURRENT_REVISION", reason="exact_admitted_revision" if current_state else "exact_accepted_revision", compatible=True)
+        elif not result["systemInputsEqual"]:
+            result.update(state="PENDING_APPLY", reason="system_inputs_changed")
+        else:
+            # A witness may describe a reviewed candidate within a fully accepted
+            # transition. It is not an installed-revision acceptance decision.
+            require(adapter.admitted_revision(witness["auditedRevision"], accepted=False) is True if current_state
+                    else witness["auditedRevision"] in verified_history, "invalid_descriptor")
+            audited = projection(adapter.tree(witness["auditedRevision"]))
+            if current_inputs == witness["inputs"] == audited:
+                result.update(state="CURRENT_CONTROL_ONLY_SUCCESSOR" if current_state else "ACCEPTED_CONTROL_ONLY_SUCCESSOR",
+                    reason="current_system_inputs_unchanged" if current_state else "reviewed_system_inputs_unchanged", compatible=True)
+            else:
+                result.update(state="UNKNOWN", reason="unwitnessed_system_inputs")
+        # Recheck even a well-formed negative; never return a stale positive.
+        require(adapter.snapshot() == before and adapter.marker() == first_marker, "observation_drift")
+        result.update(childSettled=False, sourceHandlesClosed=False)
+        final_report, accepted = source_report(*adapter.source_report())
+        result.update(childSettled=final_report["childSettled"], sourceHandlesClosed=final_report["sourceHandlesClosed"])
+        require(accepted and final_report == first_report and adapter.snapshot() == before
+            and adapter.marker() == first_marker, "observation_drift")
+    except (KeyboardInterrupt, SystemExit) as error:
+        error.private_owner = adapter
+        adapter.failure = error
+        result.update(state="UNKNOWN", compatible=False, reason="ownership_unsettled",
+            childSettled=False, sourceHandlesClosed=False)
+        error.revision_outcome = result
+        raise
+    except Exception as error:
+        result.update(state="UNKNOWN", compatible=False,
+            reason=error.reason if isinstance(error, ObservationError) else "observation_failed")
+        if result["reason"] == "observation_drift":
+            result["sourceAccepted"] = False
+        result["childSettled"] = result["childSettled"] and getattr(error, "child_settled", True) is True
+        result["sourceHandlesClosed"] = result["sourceHandlesClosed"] and getattr(error, "source_handles_closed", True) is True
+        # Keep exceptional process/file ownership reachable in the native adapter.
+        adapter.failure = error
+    return public(result)
+
+
+class Native:
+    """Only fixed local Git/doctor vectors and the exact installed marker."""
+    def __init__(self):
+        self.failure = None
+        uid = os.getuid()
+        home = pwd.getpwuid(uid).pw_dir
+        self.home, self.uid = home, uid
+        self.root = home + "/AIDev/control"
+        self.script = Path(__file__).absolute()
+        require(uid > 0 and str(self.script) == self.root + "/" + SELF
+            and self.script.resolve() == self.script and os.path.realpath(self.root) == self.root,
+            "noncanonical_source")
+        # Same reviewed-local-source bootstrap as current-doctor. No native work at import.
+        sys.path.insert(0, self.root)
+        self.doctor = importlib.machinery.SourceFileLoader(
+            "system_revision_source_doctor", self.root + "/bin/current-doctor").load_module()
+        self.budget = self.doctor.D.R.Budget(seconds=180)
+        self.git = self.doctor.D.NativeGit(home, self.root, self.budget)
+        self.own_raw, self.own_identity = self._file(str(self.script), installed=False)
+
+    def _file(self, path, *, installed):
+        """Bounded fixed-file observation; no fallback or repeated close after error."""
+        resolved = os.path.realpath(path)
+        require(not installed or resolved.startswith("/nix/store/"), "invalid_marker")
+        flags = os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW | os.O_CLOEXEC
+        fd = os.open(resolved if installed else path, flags)
+        try:
+            before = os.fstat(fd)
+            require(stat.S_ISREG(before.st_mode) and before.st_size <= (8192 if installed else MAX_JSON)
+                and not before.st_mode & 0o022 and before.st_uid == (0 if installed else os.getuid()))
+            raw = b""
+            while len(raw) <= (8192 if installed else MAX_JSON):
+                self.budget.check()
+                block = os.read(fd, 8192)
+                if not block:
+                    break
+                raw += block
+            maximum = 8192 if installed else MAX_JSON
+            require(len(raw) == before.st_size and len(raw) <= maximum
+                and file_stamp(os.fstat(fd)) == file_stamp(before)
+                and file_stamp(os.stat(resolved, follow_symlinks=False)) == file_stamp(before)
+                and os.path.realpath(path) == resolved, "observation_drift")
+            return raw, (resolved, file_stamp(before), hashlib.sha256(raw).hexdigest())
+        finally:
+            try:
+                os.close(fd)
+            except BaseException as error:
+                error.source_handles_closed = False
+                error.retained_fd = fd
+                raise
+
+    def snapshot(self):
+        raw, identity = self._file(str(self.script), installed=False)
+        require(raw == self.own_raw and identity == self.own_identity, "observation_drift")
+        roots = tuple(os.lstat(p) for p in (self.home, str(Path(self.root).parent), self.root, self.root + "/.git"))
+        require(all(stat.S_ISDIR(p.st_mode) and p.st_uid == self.uid and not p.st_mode & 0o022
+                    for p in roots), "noncanonical_source")
+        return {"head": self.git._text("rev-parse", "--verify", "HEAD"),
+            "branch": self.git._text("symbolic-ref", "--quiet", "--short", "HEAD"),
+            "clean": self.git._read("status", "--porcelain=v1", "-z", "--untracked-files=all")[1] == b"",
+            "canonical": os.path.realpath(self.root) == self.root
+                and self.git._text("rev-parse", "--show-toplevel") == self.root,
+            "identity": (tuple(directory_stamp(p) for p in roots), identity)}
+
+    def source_report(self):
+        launch = SimpleNamespace(argv=("/usr/bin/python3", self.root + "/bin/current-doctor", "--git-only", "--json"),
+            cwd=self.root, environment=dict(self.git.environment))
+        expected = (launch.argv, launch.cwd, dict(launch.environment))
+        def admit(value):
+            require((value.argv, value.cwd, value.environment) == expected)
+            self.budget.check()
+            return True
+        result = self.doctor.D.process.command(launch, self.budget, 180.0, admit_launch=admit,
+            catalog=self.doctor.D.R.catalog, process_factory=self.doctor.D.R.catalog.subprocess.Popen)
+        require(result.stderr == b"", "source_report_invalid")
+        return result.returncode, result.stdout
+
+    def configuration(self, head):
+        from lib import current_source_admission as admission
+        current = self.tree(head)
+        require(current.get(SELF) == ("100755", self.doctor.D.oid(self.own_raw)), "source_not_accepted")
+        if not admission.included(current):
+            # Before migration, preserve the historical acceptance-child route.
+            # A present but invalid migration receipt never reaches this branch.
+            from lib import config_transition_git as collector
+            from lib import config_transition_source as historical
+            observation = collector.observe(self.git, head, current)
+            require(historical.admit(observation, head, current, review=False)["accepted"] is True,
+                    "source_not_accepted")
+            accepted = tuple(item["acceptance_commit"] for item in observation["transitions"])
+            history = tuple(commit for item in observation["transitions"]
+                for commit in (*[row["commit"] for row in item["candidate_commits"]], item["acceptance_commit"]))
+            return current, accepted, history
+        observation = admission.observe(self.git, head, current)
+        require(admission.admit(observation, head, current)["accepted"] is True,
+                "source_not_accepted")
+        return current, None, None
+
+    def admitted_revision(self, commit, *, accepted):
+        from lib import current_source_admission as admission
+        require(oid(commit) and type(accepted) is bool)
+        return admission.admitted_revision(self.git, commit, accepted=accepted)
+
+    def tree(self, commit):
+        require(oid(commit))
+        return self.git._tree(commit)
+
+    def blob(self, object_id):
+        require(oid(object_id))
+        raw = self.git._read("cat-file", "blob", object_id)[1]
+        require(self.doctor.D.oid(raw) == object_id)
+        return raw
+
+    def marker(self):
+        return self._file("/run/current-system/darwin-version.json", installed=True)
+
+
+def native():
+    adapter = Native()
+    value = inspect(adapter)
+    if value["childSettled"] is not True or value["sourceHandlesClosed"] is not True:
+        raise StatusError(value, adapter) from None
+    return value
+
+
+def main(arguments=None, *, operation=None, emit=print):
+    args = sys.argv[1:] if arguments is None else arguments
+    if type(args) is not list or args not in ([], ["--json"]):
+        value, status, args = report(reason="arguments"), 2, ["--json"]
+    else:
+        try:
+            value = public((native if operation is None else operation)())
+        except StatusError as error:
+            stopped = SystemExit(1)
+            stopped.revision_outcome, stopped.private_owner = public(error.value), error.private_owner
+            raise stopped from None
+        except Exception as error:
+            value = report(reason=error.reason if isinstance(error, ObservationError) else "observation_failed",
+                childSettled=getattr(error, "child_settled", True) is True,
+                sourceHandlesClosed=getattr(error, "source_handles_closed", True) is True)
+            if value["childSettled"] is not True or value["sourceHandlesClosed"] is not True:
+                stopped = SystemExit(1)
+                stopped.revision_outcome, stopped.private_owner = value, error
+                raise stopped from None
+        status = 0 if value["compatible"] else 1
+    emit(json.dumps(value, sort_keys=True, separators=(",", ":")) if "--json" in args else
+        "System revision: " + value["state"] + "; reason=" + value["reason"]
+        + "; admission=" + str(value["sourceAdmissionMode"]) + "; read-only")
+    return status
+
+
+def entry():
+    try:
+        return main()
+    except (KeyboardInterrupt, SystemExit) as error:
+        value = getattr(error, "revision_outcome", report(reason="ownership_unsettled",
+            childSettled=False, sourceHandlesClosed=False))
+        print(json.dumps(public(value), sort_keys=True, separators=(",", ":")))
+        stopped = SystemExit(130 if isinstance(error, KeyboardInterrupt) else 1)
+        stopped.revision_outcome = value
+        stopped.private_owner = getattr(error, "private_owner", error)
+        raise stopped from None
+
+
+if __name__ == "__main__":
+    raise SystemExit(entry())

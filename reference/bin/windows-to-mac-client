@@ -1,0 +1,115 @@
+#!/bin/bash
+# Execute only through the authenticated Windows Git Bash SSH session.
+set -euo pipefail
+umask 077
+action=${1:-}
+dir="$HOME/.ssh/aidev-mac"
+config="$HOME/.ssh/config"
+prefix='Include ~/.ssh/aidev-mac/config'
+fail() { printf '%s\n' "client_error=$1" >&2; exit 1; }
+safe() { test -f "$1" && ! test -L "$1"; }
+owned() {
+  test -d "$dir" && ! test -L "$dir" && safe "$dir/owner" &&
+    test "$(cat "$dir/owner")" = windows-to-mac-ssh-v1
+}
+case "$action" in
+  inspect)
+    command -v ssh >/dev/null && command -v ssh-keygen >/dev/null
+    test ! -L "$HOME/.ssh" || fail ssh_directory_symlink
+    if test -e "$dir" || test -L "$dir"; then owned || fail unknown_client_directory; fi
+    printf 'client_available=true\n'
+    ;;
+  prepare)
+    test ! -L "$HOME/.ssh" || fail ssh_directory_symlink
+    mkdir -p "$HOME/.ssh"
+    if test -e "$dir" || test -L "$dir"; then
+      owned || fail unknown_client_directory
+    else
+      mkdir "$dir"
+      printf 'windows-to-mac-ssh-v1\n' > "$dir/owner"
+    fi
+    if test -e "$dir/id_ed25519" || test -L "$dir/id_ed25519"; then
+      safe "$dir/id_ed25519" && safe "$dir/id_ed25519.pub" || fail incomplete_keypair
+    else
+      test ! -e "$dir/id_ed25519.pub" && test ! -L "$dir/id_ed25519.pub" || fail public_key_collision
+      ssh-keygen -q -t ed25519 -N '' -C windows-to-mac -f "$dir/id_ed25519"
+    fi
+    chmod 600 "$dir/id_ed25519"
+    # The public key is consumed privately by the Mac coordinator; never a private read.
+    cat "$dir/id_ed25519.pub"
+    ;;
+  install)
+    owned || fail not_prepared
+    safe "$dir/id_ed25519" && safe "$dir/id_ed25519.pub" || fail missing_keypair
+    case "${MAC_USER:-}" in ''|*[!a-zA-Z0-9_.-]*) fail invalid_mac_user;; esac
+    test "${#MAC_HOST_PUBLIC_B64}" -lt 1024 || fail invalid_host_key
+    temp=$(mktemp -d "$dir/candidate.XXXXXXXX")
+    trap 'rm -f "$temp/host.pub" "$temp/config" "$temp/known_hosts" "$temp/main"; rmdir "$temp"' EXIT
+    printf '%s' "$MAC_HOST_PUBLIC_B64" | base64 -d > "$temp/host.pub"
+    test "$(wc -l < "$temp/host.pub" | tr -d ' ')" = 1 || fail invalid_host_key
+    test "$(awk '{print $1}' "$temp/host.pub")" = ssh-ed25519 || fail invalid_host_key
+    ssh-keygen -l -f "$temp/host.pub" >/dev/null || fail invalid_host_key
+    printf '[127.0.0.1]:22222 %s\n' "$(awk '{print $1 " " $2}' "$temp/host.pub")" > "$temp/known_hosts"
+    cat > "$temp/config" <<EOF
+Host mac
+    HostName 127.0.0.1
+    Port 22222
+    User $MAC_USER
+    IdentityFile ~/.ssh/aidev-mac/id_ed25519
+    UserKnownHostsFile ~/.ssh/aidev-mac/known_hosts
+    GlobalKnownHostsFile /dev/null
+    StrictHostKeyChecking yes
+    IdentitiesOnly yes
+    PreferredAuthentications publickey
+    PasswordAuthentication no
+    KbdInteractiveAuthentication no
+    ForwardAgent no
+    ConnectTimeout 10
+    ServerAliveInterval 15
+    ServerAliveCountMax 2
+EOF
+    if test -e "$dir/config" || test -e "$dir/known_hosts"; then
+      safe "$dir/config" && safe "$dir/known_hosts" || fail partial_client_config
+      cmp -s "$temp/config" "$dir/config" && cmp -s "$temp/known_hosts" "$dir/known_hosts" || fail client_config_drift
+    else
+      test ! -L "$dir/config" && test ! -L "$dir/known_hosts" || fail target_symlink
+      mv "$temp/config" "$dir/config"
+      mv "$temp/known_hosts" "$dir/known_hosts"
+    fi
+    if test -e "$config" || test -L "$config"; then
+      safe "$config" || fail unsafe_global_config
+      test "$(wc -c < "$config")" -lt 1048576 || fail oversized_config
+      if test "$(head -n 1 "$config" | tr -d '\r')" != "$prefix"; then
+        # Existing mac aliases and matching patterns must not be silently displaced.
+        effective=$(ssh -G mac 2>/dev/null | awk '$1 == "hostname" {print $2}')
+        test "$effective" = mac || fail existing_mac_alias
+        grep -Eiq '^[[:space:]]*(host|include)[[:space:]].*(mac|aidev)' "$config" && fail possible_alias_collision
+        cp "$config" "$temp/main"
+        { printf '%s\n' "$prefix"; cat "$temp/main"; } > "$temp/config"
+        cmp -s "$temp/main" "$config" || fail concurrent_config_change
+        mv "$temp/config" "$config"
+      fi
+    else
+      printf '%s\n' "$prefix" > "$config"
+    fi
+    printf 'client_configured=true\n'
+    ;;
+  doctor)
+    owned && safe "$dir/config" && safe "$dir/known_hosts" || fail not_configured
+    test "$(head -n 1 "$config" | tr -d '\r')" = "$prefix" || fail include_missing
+    result=$(ssh -o BatchMode=yes mac 'printf "MAC_SSH_OK\n"; uname -s') || fail login_failed
+    test "$result" = $'MAC_SSH_OK\nDarwin' || fail wrong_target
+    printf 'windows_to_mac_key_login=true\n'
+    ;;
+  rollback)
+    owned || fail unknown_client_directory
+    # Keep all keys, host pin and profile. Remove only our exact leading include.
+    if safe "$config" && test "$(head -n 1 "$config" | tr -d '\r')" = "$prefix"; then
+      temp=$(mktemp "$dir/rollback.XXXXXXXX")
+      tail -n +2 "$config" > "$temp"
+      mv "$temp" "$config"
+    fi
+    printf 'client_alias_disabled=true\n'
+    ;;
+  *) fail invalid_action;;
+esac

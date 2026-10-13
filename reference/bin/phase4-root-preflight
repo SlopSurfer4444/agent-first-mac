@@ -1,0 +1,83 @@
+#!/usr/bin/python3
+"""Read-only, redacted live preflight for the uninstalled Phase 4 broker."""
+
+import json
+import os
+from pathlib import Path
+import stat
+import sys
+
+
+EXPECTED = {
+    "attestation": (Path("/etc/agent-first-mac/aid-admin-install.json"), "file", 0o400),
+    "audit": (Path("/var/log/agent-first-mac/aid-admin"), "directory", 0o700),
+    "binary": (Path("/usr/local/libexec/aid-admin"), "file", 0o555),
+    "policy": (Path("/etc/agent-first-mac/aid-admin-policy.json"), "file", 0o444),
+    "staging": (Path("/var/db/agent-first-mac/staging"), "directory", 0o700),
+    "sudoers": (Path("/etc/sudoers.d/agent-first-mac-aid-admin"), "file", 0o440),
+}
+DISABLE = Path("/etc/agent-first-mac/aid-admin.disabled")
+
+
+def inspect(path, expected_kind, expected_mode):
+    try:
+        facts = path.lstat()
+    except FileNotFoundError:
+        return {"exists": False, "kind_expected": False, "mode_expected": False,
+                "root_owned": False, "symlink": False}
+    mode = stat.S_IMODE(facts.st_mode)
+    kind_ok = stat.S_ISDIR(facts.st_mode) if expected_kind == "directory" else stat.S_ISREG(facts.st_mode)
+    return {
+        "exists": True,
+        "kind_expected": kind_ok,
+        "mode_expected": mode == expected_mode,
+        "root_owned": facts.st_uid == 0,
+        "symlink": stat.S_ISLNK(facts.st_mode),
+    }
+
+
+def report():
+    paths = {name: inspect(*contract) for name, contract in sorted(EXPECTED.items())}
+    present = sum(value["exists"] for value in paths.values())
+    valid = all(value == {"exists": True, "kind_expected": True, "mode_expected": True,
+                          "root_owned": True, "symlink": False} for value in paths.values())
+    disabled = DISABLE.exists() or DISABLE.is_symlink()
+    if present == 0 and not disabled:
+        verdict = "NOT_INSTALLED_EXPECTED"
+    elif valid and not disabled:
+        verdict = "INSTALLED_REQUIRES_PHASE4_APPLY_REVIEW"
+    elif valid and disabled:
+        verdict = "EMERGENCY_DISABLED"
+    else:
+        verdict = "BLOCKED_PARTIAL_OR_MUTABLE_INSTALL"
+    return {
+        "schema": 1,
+        "phase": "phase4_root_broker_preparation",
+        "read_only": True,
+        "protected_content_read": False,
+        "sudo_requested": False,
+        "paths": paths,
+        "emergency_disable_present": disabled,
+        "system_mutations_performed": False,
+        "verdict": verdict,
+    }
+
+
+def main():
+    if sys.argv[1:] not in ([], ["--json"]):
+        raise SystemExit("usage: phase4-root-preflight [--json]")
+    value = report()
+    if sys.argv[1:] == ["--json"]:
+        print(json.dumps(value, indent=2, sort_keys=True))
+    else:
+        print(f"Phase 4 root broker preflight: {value['verdict']}")
+        print("read_only=true")
+        print("sudo_requested=false")
+        print("system_mutations_performed=false")
+    raise SystemExit(0 if value["verdict"] in {
+        "NOT_INSTALLED_EXPECTED", "INSTALLED_REQUIRES_PHASE4_APPLY_REVIEW", "EMERGENCY_DISABLED"
+    } else 1)
+
+
+if __name__ == "__main__":
+    main()

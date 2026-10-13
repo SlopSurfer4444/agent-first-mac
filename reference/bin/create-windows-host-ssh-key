@@ -1,0 +1,103 @@
+#!/bin/sh
+set -eu
+
+if [ "$#" -ne 0 ]; then
+  echo "usage: create-windows-host-ssh-key" >&2
+  exit 64
+fi
+if [ "$(/usr/bin/id -u)" -eq 0 ]; then
+  echo "refusing to create the Bridge client key as root" >&2
+  exit 1
+fi
+
+user_name=$(/usr/bin/id -un)
+canonical_home=$(/usr/bin/dscl . -read "/Users/$user_name" NFSHomeDirectory \
+  | /usr/bin/sed -n 's/^NFSHomeDirectory: //p')
+if [ -z "$canonical_home" ] || [ "$HOME" != "$canonical_home" ]; then
+  echo "canonical owner home mismatch" >&2
+  exit 1
+fi
+
+ssh_dir=$canonical_home/.ssh
+private_key=$ssh_dir/windows-host_ed25519
+public_key=$ssh_dir/windows-host_ed25519.pub
+created_ssh_dir=0
+private_created=0
+public_created=0
+staging=
+
+cleanup_failure() {
+  status=$?
+  trap - EXIT HUP INT TERM
+  if [ "$public_created" -eq 1 ]; then
+    /bin/rm -f -- "$public_key"
+  fi
+  if [ "$private_created" -eq 1 ]; then
+    /bin/rm -f -- "$private_key"
+  fi
+  if [ -n "$staging" ]; then
+    case "$staging" in
+      "$ssh_dir"/.windows-host-key.*) /bin/rm -rf -- "$staging" ;;
+      *) echo "refusing unsafe key staging cleanup" >&2 ;;
+    esac
+  fi
+  if [ "$created_ssh_dir" -eq 1 ]; then
+    /usr/bin/rmdir "$ssh_dir" >/dev/null 2>&1 || true
+  fi
+  exit "$status"
+}
+
+trap cleanup_failure EXIT HUP INT TERM
+umask 077
+
+if [ -L "$ssh_dir" ]; then
+  echo "refusing symlinked .ssh directory" >&2
+  exit 1
+fi
+if [ ! -e "$ssh_dir" ]; then
+  /bin/mkdir -m 0700 "$ssh_dir"
+  created_ssh_dir=1
+fi
+if [ ! -d "$ssh_dir" ] \
+    || [ "$(/usr/bin/stat -f '%u:%Lp' "$ssh_dir")" != "$(/usr/bin/id -u):700" ]; then
+  echo "the owner .ssh directory must be owned by the user with mode 0700" >&2
+  exit 1
+fi
+if [ -e "$private_key" ] || [ -L "$private_key" ] \
+    || [ -e "$public_key" ] || [ -L "$public_key" ]; then
+  echo "dedicated Bridge key path collision" >&2
+  exit 1
+fi
+
+staging=$(/usr/bin/mktemp -d "$ssh_dir/.windows-host-key.XXXXXX")
+case "$staging" in
+  "$ssh_dir"/.windows-host-key.*) ;;
+  *) echo "unsafe key staging path" >&2; exit 1 ;;
+esac
+/usr/bin/ssh-keygen -q -t ed25519 -N '' -C '' -f "$staging/key"
+[ -f "$staging/key" ] && [ ! -L "$staging/key" ]
+[ -f "$staging/key.pub" ] && [ ! -L "$staging/key.pub" ]
+[ "$(/usr/bin/stat -f '%Lp' "$staging/key")" = 600 ]
+
+/bin/ln "$staging/key" "$private_key"
+private_created=1
+/bin/ln "$staging/key.pub" "$public_key"
+public_created=1
+/bin/chmod 0600 "$private_key"
+/bin/chmod 0644 "$public_key"
+[ "$(/usr/bin/stat -f '%u:%Lp' "$private_key")" = "$(/usr/bin/id -u):600" ]
+[ "$(/usr/bin/stat -f '%u:%Lp' "$public_key")" = "$(/usr/bin/id -u):644" ]
+
+fingerprint=$(/usr/bin/ssh-keygen -l -E sha256 -f "$public_key" \
+  | /usr/bin/awk 'NR == 1 {print $2}')
+case "$fingerprint" in
+  SHA256:[A-Za-z0-9+/]*) ;;
+  *) echo "public fingerprint verification failed" >&2; exit 1 ;;
+esac
+
+/bin/rm -rf -- "$staging"
+staging=
+private_created=0
+public_created=0
+trap - EXIT HUP INT TERM
+printf 'fingerprint=%s\n' "$fingerprint"

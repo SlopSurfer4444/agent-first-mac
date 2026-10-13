@@ -1,0 +1,545 @@
+#!/usr/bin/python3
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import os
+from pathlib import Path
+import plistlib
+import pwd
+import re
+import selectors
+import subprocess
+import sys
+import tempfile
+import time
+
+
+ROOT = Path(__file__).resolve().parents[1]
+PROFILE = "codex-windows-host-ssh-app-server-holder"
+BRANCH = "codex/codex-windows-host-ssh-connector"
+LABEL = "com.aidev.codex-windows-host-app-server-holder"
+PAYLOAD = ROOT / "payload/macos/codex-windows-host-app-server-holder.sh"
+ISOLATION = ROOT / "bin/codex-windows-host-ssh-remote-control-isolation"
+COMPAT = ROOT / "bin/codex-windows-host-ssh-stdio-compat"
+COMMIT_RE = re.compile(r"^[0-9a-f]{40}$")
+
+
+class ContractError(RuntimeError):
+    pass
+
+
+def run(argv: list[str], *, timeout: float = 20,
+        input_bytes: bytes | None = None) -> subprocess.CompletedProcess:
+    return subprocess.run(
+        argv,
+        input=input_bytes,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        timeout=timeout,
+        check=False,
+    )
+
+
+def git(*args: str) -> str:
+    result = run(["/usr/bin/git", "-C", str(ROOT), *args])
+    if result.returncode != 0:
+        raise ContractError("git_command_failed")
+    return result.stdout.decode().strip()
+
+
+def require_exact_commit(expected: str) -> None:
+    if not COMMIT_RE.fullmatch(expected):
+        raise ContractError("invalid_commit")
+    if git("rev-parse", "--show-toplevel") != str(ROOT):
+        raise ContractError("wrong_control_root")
+    if git("rev-parse", "--abbrev-ref", "HEAD") != BRANCH:
+        raise ContractError("wrong_task_branch")
+    if git("rev-parse", "HEAD") != expected:
+        raise ContractError("commit_mismatch")
+    if git("status", "--porcelain=v1", "--untracked-files=all"):
+        raise ContractError("dirty_worktree")
+
+
+def canonical_home() -> Path:
+    if os.geteuid() == 0:
+        raise ContractError("refusing_root")
+    home = Path(pwd.getpwuid(os.getuid()).pw_dir)
+    if Path.home() != home or home.is_symlink():
+        raise ContractError("canonical_home_mismatch")
+    return home
+
+
+def layout() -> dict[str, Path]:
+    home = canonical_home()
+    return {
+        "runtime": home / "AIDev/bin/codex-windows-host-app-server-holder-runtime",
+        "plist": home / f"Library/LaunchAgents/{LABEL}.plist",
+        "state": home / f"AIDev/state/{PROFILE}",
+        "receipt": home / f"AIDev/state/{PROFILE}/receipt.json",
+    }
+
+
+def sha256(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+
+def payload_bytes() -> bytes:
+    if not PAYLOAD.is_file() or PAYLOAD.is_symlink():
+        raise ContractError("payload_missing_or_unsafe")
+    data = PAYLOAD.read_bytes()
+    if not data.startswith(b"#!/bin/sh\n"):
+        raise ContractError("payload_header_invalid")
+    return data
+
+
+def render_plist(runtime: Path) -> bytes:
+    payload = {
+        "Label": LABEL,
+        "ProgramArguments": [str(runtime)],
+        "RunAtLoad": True,
+        "KeepAlive": True,
+        "ThrottleInterval": 10,
+        "ProcessType": "Background",
+        "StandardOutPath": "/dev/null",
+        "StandardErrorPath": "/dev/null",
+    }
+    return plistlib.dumps(payload, fmt=plistlib.FMT_XML, sort_keys=True)
+
+
+def validate_parent(path: Path) -> None:
+    if not path.is_dir() or path.is_symlink():
+        raise ContractError("managed_parent_missing_or_unsafe")
+
+
+def load_receipt(path: Path) -> dict[str, object] | None:
+    if not path.exists() and not path.is_symlink():
+        return None
+    if not path.is_file() or path.is_symlink():
+        raise ContractError("invalid_receipt")
+    try:
+        data = json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ContractError("invalid_receipt") from exc
+    if (
+        data.get("schema") != 1
+        or data.get("profile") != PROFILE
+        or data.get("label") != LABEL
+        or not COMMIT_RE.fullmatch(str(data.get("commit", "")))
+        or not re.fullmatch(r"[0-9a-f]{64}", str(data.get("runtimeHash", "")))
+        or not re.fullmatch(r"[0-9a-f]{64}", str(data.get("plistHash", "")))
+    ):
+        raise ContractError("invalid_receipt")
+    return data
+
+
+def file_mode(path: Path) -> int:
+    return path.stat().st_mode & 0o777
+
+
+def filesystem_state() -> tuple[str, dict[str, object] | None]:
+    paths = layout()
+    receipt = load_receipt(paths["receipt"])
+    targets_exist = [
+        paths["runtime"].exists() or paths["runtime"].is_symlink(),
+        paths["plist"].exists() or paths["plist"].is_symlink(),
+        paths["state"].exists() or paths["state"].is_symlink(),
+    ]
+    if receipt is None and not any(targets_exist):
+        return "absent", None
+    if receipt is None:
+        return "conflict", None
+    runtime = paths["runtime"]
+    plist = paths["plist"]
+    if (
+        not runtime.is_file() or runtime.is_symlink()
+        or not plist.is_file() or plist.is_symlink()
+        or not paths["state"].is_dir() or paths["state"].is_symlink()
+        or file_mode(runtime) != 0o755
+        or file_mode(plist) != 0o644
+        or file_mode(paths["receipt"]) != 0o600
+    ):
+        return "conflict", receipt
+    if (
+        sha256(runtime.read_bytes()) != receipt["runtimeHash"]
+        or sha256(plist.read_bytes()) != receipt["plistHash"]
+        or runtime.read_bytes() != payload_bytes()
+        or plist.read_bytes() != render_plist(runtime)
+    ):
+        return "conflict", receipt
+    return "exact", receipt
+
+
+def launchd_loaded() -> bool:
+    domain = f"gui/{os.getuid()}/{LABEL}"
+    result = run(["/bin/launchctl", "print", domain], timeout=8)
+    return result.returncode == 0
+
+
+def helper_doctor_passes(path: Path, command: str) -> bool:
+    result = run([str(path), command, "--json"], timeout=50)
+    if result.returncode != 0:
+        return False
+    try:
+        payload = json.loads(result.stdout)
+    except json.JSONDecodeError:
+        return False
+    return payload.get("verdict") == "PASS"
+
+
+def session_flags_exact() -> bool:
+    command = (
+        "if [ \"${CODEX_INTERNAL_APP_SERVER_REMOTE_CONTROL_DISABLED:-}\" = 1 ] "
+        "&& [ \"${CODEX_SSH_SKIP_APP_SERVER_BOOT:-}\" = true ]; then "
+        "printf session_flags=exact; else printf session_flags=other; fi"
+    )
+    result = run([
+        "/usr/bin/ssh", "-T", "-o", "BatchMode=yes",
+        "-o", "PasswordAuthentication=no",
+        "-o", "KbdInteractiveAuthentication=no",
+        "-o", "ConnectTimeout=8", "windows-host", command,
+    ], timeout=15)
+    return result.returncode == 0 and result.stdout == b"session_flags=exact"
+
+
+def validate_websocket_upgrade(response: bytes) -> bool:
+    header = response.split(b"\r\n\r\n", 1)[0]
+    lines = header.split(b"\r\n")
+    lowered = {line.lower() for line in lines[1:]}
+    return (
+        bool(lines)
+        and lines[0].startswith(b"HTTP/1.1 101 ")
+        and b"upgrade: websocket" in lowered
+        and b"connection: upgrade" in lowered
+    )
+
+
+def remote_proxy_handshake_passes(timeout: float = 5) -> bool:
+    handshake = (
+        b"GET /rpc HTTP/1.1\r\n"
+        b"Host: codex-app-server\r\n"
+        b"Upgrade: websocket\r\n"
+        b"Connection: Upgrade\r\n"
+        b"Sec-WebSocket-Key: AQIDBAUGBwgJCgsMDQ4PEA==\r\n"
+        b"Sec-WebSocket-Version: 13\r\n\r\n"
+    )
+    process = subprocess.Popen(
+        [
+            "/usr/bin/ssh", "-T", "-o", "BatchMode=yes",
+            "-o", "PasswordAuthentication=no",
+            "-o", "KbdInteractiveAuthentication=no",
+            "-o", "ConnectTimeout=8", "windows-host",
+            "codex app-server proxy",
+        ],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+    )
+    selector = selectors.DefaultSelector()
+    try:
+        assert process.stdin is not None and process.stdout is not None
+        process.stdin.write(handshake)
+        process.stdin.flush()
+        selector.register(process.stdout, selectors.EVENT_READ)
+        response = bytearray()
+        deadline = time.monotonic() + timeout
+        while b"\r\n\r\n" not in response and time.monotonic() < deadline:
+            events = selector.select(timeout=max(0, deadline - time.monotonic()))
+            if not events:
+                break
+            chunk = os.read(process.stdout.fileno(), 8192)
+            if not chunk:
+                break
+            response.extend(chunk)
+            if len(response) > 16384:
+                return False
+        return validate_websocket_upgrade(bytes(response))
+    finally:
+        selector.close()
+        if process.poll() is None:
+            process.terminate()
+            try:
+                process.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait(timeout=2)
+
+
+def preflight() -> dict[str, object]:
+    state, _ = filesystem_state()
+    loaded = launchd_loaded()
+    proxy = remote_proxy_handshake_passes(timeout=3)
+    facts = {
+        "profile": PROFILE,
+        "native_transport_runtime_doctor_pass":
+            helper_doctor_passes(COMPAT, "runtime-doctor"),
+        "remote_isolation_doctor_pass":
+            helper_doctor_passes(ISOLATION, "doctor"),
+        "session_flags_exact": session_flags_exact(),
+        "filesystem_state": state,
+        "launchd_loaded": loaded,
+        "remote_proxy_websocket_pass": proxy,
+    }
+    ownership_valid = (
+        (state == "absent" and not loaded and not proxy)
+        or (state == "exact" and loaded and proxy)
+    )
+    facts["verdict"] = "PASS" if (
+        facts["native_transport_runtime_doctor_pass"]
+        and facts["remote_isolation_doctor_pass"]
+        and facts["session_flags_exact"]
+        and ownership_valid
+    ) else "BLOCKED"
+    return facts
+
+
+def doctor() -> dict[str, object]:
+    facts = preflight()
+    facts["verdict"] = "PASS" if (
+        facts["verdict"] == "PASS"
+        and facts["filesystem_state"] == "exact"
+        and facts["launchd_loaded"]
+        and facts["remote_proxy_websocket_pass"]
+    ) else "BLOCKED"
+    return facts
+
+
+def atomic_create(path: Path, data: bytes, mode: int) -> None:
+    if path.exists() or path.is_symlink():
+        raise ContractError("managed_target_collision")
+    validate_parent(path.parent)
+    descriptor, staged = tempfile.mkstemp(prefix=f".{PROFILE}.", dir=path.parent)
+    staged_path = Path(staged)
+    try:
+        os.fchmod(descriptor, mode)
+        with os.fdopen(descriptor, "wb", closefd=True) as handle:
+            handle.write(data)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(staged_path, path)
+    finally:
+        if staged_path.exists():
+            staged_path.unlink()
+
+
+def write_receipt(path: Path, commit: str, runtime_hash: str,
+                  plist_hash: str) -> None:
+    payload = {
+        "schema": 1,
+        "profile": PROFILE,
+        "commit": commit,
+        "label": LABEL,
+        "runtimeHash": runtime_hash,
+        "plistHash": plist_hash,
+    }
+    atomic_create(
+        path,
+        (json.dumps(payload, sort_keys=True, separators=(",", ":")) + "\n").encode(),
+        0o600,
+    )
+
+
+def replace_receipt(path: Path, commit: str, runtime_hash: str,
+                    plist_hash: str) -> None:
+    if not path.is_file() or path.is_symlink() or file_mode(path) != 0o600:
+        raise ContractError("receipt_rebind_target_not_exact")
+    payload = {
+        "schema": 1,
+        "profile": PROFILE,
+        "commit": commit,
+        "label": LABEL,
+        "runtimeHash": runtime_hash,
+        "plistHash": plist_hash,
+    }
+    descriptor, staged = tempfile.mkstemp(prefix=f".{PROFILE}.", dir=path.parent)
+    staged_path = Path(staged)
+    try:
+        os.fchmod(descriptor, 0o600)
+        with os.fdopen(descriptor, "wb", closefd=True) as handle:
+            handle.write((
+                json.dumps(payload, sort_keys=True, separators=(",", ":")) + "\n"
+            ).encode())
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(staged_path, path)
+    finally:
+        if staged_path.exists():
+            staged_path.unlink()
+
+
+def bootstrap(plist: Path) -> None:
+    result = run([
+        "/bin/launchctl", "bootstrap", f"gui/{os.getuid()}", str(plist)
+    ], timeout=15)
+    if result.returncode != 0:
+        raise ContractError("launchctl_bootstrap_failed")
+
+
+def bootout() -> bool:
+    result = run([
+        "/bin/launchctl", "bootout", f"gui/{os.getuid()}/{LABEL}"
+    ], timeout=15)
+    return result.returncode == 0
+
+
+def wait_for_proxy(expected: bool, seconds: float = 25) -> bool:
+    deadline = time.monotonic() + seconds
+    while time.monotonic() < deadline:
+        if remote_proxy_handshake_passes(timeout=3) is expected:
+            return True
+        time.sleep(1)
+    return False
+
+
+def remove_exact(path: Path, expected_hash: str) -> None:
+    if not path.is_file() or path.is_symlink():
+        raise ContractError("rollback_target_not_exact")
+    if sha256(path.read_bytes()) != expected_hash:
+        raise ContractError("rollback_target_hash_mismatch")
+    path.unlink()
+
+
+def apply(commit: str) -> dict[str, object]:
+    require_exact_commit(commit)
+    facts = preflight()
+    if facts["verdict"] != "PASS":
+        raise ContractError("preflight_blocked")
+    state, receipt = filesystem_state()
+    if state == "exact":
+        if receipt is None:
+            raise ContractError("receipt_missing")
+        previous_commit = str(receipt.get("commit", ""))
+        rebound = previous_commit != commit
+        if rebound:
+            replace_receipt(
+                layout()["receipt"], commit,
+                str(receipt["runtimeHash"]), str(receipt["plistHash"]),
+            )
+        result = doctor()
+        if result.get("verdict") != "PASS" and rebound:
+            replace_receipt(
+                layout()["receipt"], previous_commit,
+                str(receipt["runtimeHash"]), str(receipt["plistHash"]),
+            )
+            raise ContractError("receipt_rebind_postcheck_failed_restored")
+        result["apply_noop"] = True
+        result["receipt_rebound"] = rebound
+        return result
+    if state != "absent" or receipt is not None:
+        raise ContractError("ownership_conflict")
+    paths = layout()
+    for parent in (paths["runtime"].parent, paths["plist"].parent,
+                   paths["state"].parent):
+        validate_parent(parent)
+    runtime_bytes = payload_bytes()
+    plist_bytes = render_plist(paths["runtime"])
+    runtime_hash = sha256(runtime_bytes)
+    plist_hash = sha256(plist_bytes)
+    created: list[Path] = []
+    loaded = False
+    try:
+        paths["state"].mkdir(mode=0o700)
+        atomic_create(paths["runtime"], runtime_bytes, 0o755)
+        created.append(paths["runtime"])
+        atomic_create(paths["plist"], plist_bytes, 0o644)
+        created.append(paths["plist"])
+        bootstrap(paths["plist"])
+        loaded = True
+        if not wait_for_proxy(True):
+            raise ContractError("holder_proxy_start_failed")
+        write_receipt(paths["receipt"], commit, runtime_hash, plist_hash)
+        checked = doctor()
+        if checked["verdict"] != "PASS":
+            raise ContractError("postcheck_failed")
+        checked["apply_noop"] = False
+        return checked
+    except Exception as exc:
+        if loaded or launchd_loaded():
+            bootout()
+            stopped = wait_for_proxy(False, seconds=15)
+        else:
+            stopped = True
+        if not stopped:
+            raise ContractError("apply_failed_cleanup_blocked") from exc
+        if paths["receipt"].is_file() and not paths["receipt"].is_symlink():
+            paths["receipt"].unlink()
+        for path, expected in reversed([
+            (paths["runtime"], runtime_hash), (paths["plist"], plist_hash)
+        ]):
+            if path in created and path.exists():
+                remove_exact(path, expected)
+        if paths["state"].is_dir() and not any(paths["state"].iterdir()):
+            paths["state"].rmdir()
+        raise ContractError("apply_failed_rolled_back") from exc
+
+
+def rollback() -> dict[str, object]:
+    state, receipt = filesystem_state()
+    if state != "exact" or receipt is None or not launchd_loaded():
+        raise ContractError("rollback_state_mismatch")
+    paths = layout()
+    if not bootout() or not wait_for_proxy(False, seconds=20):
+        raise ContractError("rollback_stop_failed_state_preserved")
+    remove_exact(paths["runtime"], str(receipt["runtimeHash"]))
+    remove_exact(paths["plist"], str(receipt["plistHash"]))
+    paths["receipt"].unlink()
+    if any(paths["state"].iterdir()):
+        raise ContractError("rollback_state_directory_not_empty")
+    paths["state"].rmdir()
+    final_state, _ = filesystem_state()
+    facts = {
+        "profile": PROFILE,
+        "filesystem_absent": final_state == "absent",
+        "launchd_absent": not launchd_loaded(),
+        "remote_proxy_absent": not remote_proxy_handshake_passes(timeout=3),
+    }
+    facts["verdict"] = "PASS" if all(
+        value for key, value in facts.items()
+        if key not in {"profile", "verdict"}
+    ) else "BLOCKED"
+    return facts
+
+
+def emit(payload: dict[str, object], as_json: bool) -> None:
+    if as_json:
+        print(json.dumps(payload, sort_keys=True, separators=(",", ":")))
+        return
+    for key in sorted(payload):
+        value = payload[key]
+        if isinstance(value, bool):
+            value = str(value).lower()
+        print(f"{key}={value}")
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser()
+    subparsers = parser.add_subparsers(dest="command", required=True)
+    prepare_parser = subparsers.add_parser("prepare")
+    prepare_parser.add_argument("--json", action="store_true")
+    apply_parser = subparsers.add_parser("apply")
+    apply_parser.add_argument("--commit", required=True)
+    apply_parser.add_argument("--json", action="store_true")
+    doctor_parser = subparsers.add_parser("doctor")
+    doctor_parser.add_argument("--json", action="store_true")
+    rollback_parser = subparsers.add_parser("rollback")
+    rollback_parser.add_argument("--json", action="store_true")
+    args = parser.parse_args()
+    try:
+        if args.command == "prepare":
+            payload = preflight()
+        elif args.command == "apply":
+            payload = apply(args.commit)
+        elif args.command == "doctor":
+            payload = doctor()
+        else:
+            payload = rollback()
+        emit(payload, args.json)
+        return 0 if payload.get("verdict") == "PASS" else 1
+    except (ContractError, OSError, subprocess.SubprocessError) as exc:
+        print(f"blocked={exc}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

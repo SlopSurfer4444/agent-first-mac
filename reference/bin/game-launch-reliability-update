@@ -1,0 +1,390 @@
+#!/usr/bin/python3
+"""Fixed-path reviewed game launch deployment; never dispatches or stops games."""
+import sys
+sys.dont_write_bytecode=True
+import argparse,contextlib,fcntl,hashlib,importlib.machinery,importlib.util,json,os,pwd,re,stat,subprocess
+from pathlib import Path
+HOME=Path(pwd.getpwuid(os.getuid()).pw_dir)
+CONTROL=HOME/'AIDev/control'
+SOURCE_PATH=Path(__file__).absolute()
+HUB=HOME/'Library/Application Support/Adapted Games'
+DS3=HOME/'Library/Application Support/Adapted Games DS3'
+CS2=HOME/'Library/Application Support/CS2 Standalone'
+GAMES=HOME/'Games';BIN=HOME/'AIDev/bin';STATE=HOME/'AIDev/state'
+CANDIDATE=STATE/'game-launch-reliability-candidate'
+POLICY='manifests/game-launch-reliability.json'
+NATIVE_POLICY='manifests/game-app-launcher-errors.json'
+NAMESPACE='game-launch-reliability'
+OWNER=b'{"schema":1,"owner":"control-games-hub","purpose":"game-launch-reliability"}\n'
+APPS=('CS2.app','Prince — Ubisoft Connect.app','Steam — другие игры.app','Dark Souls III.app')
+TARGETS={'helper':'aid-bin/game-launch-admission','hub.launcher':'hub/games-play','cs2.launcher':'cs2/cs2-play','ds3.lifecycle':'ds3/ds3-runtime'}
+TARGETS.update({'native-'+str(i):'games/'+name+'/Contents/MacOS/launcher' for i,name in enumerate(APPS)})
+TARGETS.update({'hub.receipt':'hub/receipt.json','ds3.receipt':'ds3/receipt.json','cs2.receipt':'cs2/runtime/.owner.json'})
+ORDER=tuple(TARGETS)
+SOURCES={'helper':'bin/game-launch-admission','hub.launcher':'bin/games-play','cs2.launcher':'bin/cs2-play','ds3.lifecycle':'bin/ds3-runtime'}
+CANDIDATE_FILES={'helper':'game-launch-admission','hub.launcher':'games-play','cs2.launcher':'cs2-play','ds3.lifecycle':'ds3-runtime'}
+CANDIDATE_FILES.update({'native-'+str(i):name+'/Contents/MacOS/launcher' for i,name in enumerate(APPS)})
+GUARDS={'hub/manifest.json','ds3/manifest.json','cs2/runtime/.manifest.json','ds3/ds3-play',
+        'ds3/borderless/manifest.json','ds3/borderless/receipt.json','ds3/borderless/helper.exe',
+        'ds3/borderless/helper.c','ds3/borderless/build-provenance.json','ds3/borderless/final-fixture-results.json'}
+GUARDS.update('games/'+name+'/'+rel for name in APPS for rel in ('Contents/Info.plist','Contents/Resources/Game.icns'))
+FIELDS={'schema','id','owner','nativePolicySha256','previousNativePolicySha256','sourceFiles','previousFiles','desiredFiles','guards','servers'}
+class Blocked(RuntimeError):pass
+def need(ok,reason):
+    if not ok:raise Blocked(reason)
+def digest(raw):return hashlib.sha256(raw).hexdigest()
+def encode(value):return (json.dumps(value,sort_keys=True,indent=2,ensure_ascii=False)+'\n').encode()
+def pin(value,n=64):return type(value) is str and re.fullmatch('[0-9a-f]{'+str(n)+'}',value) is not None
+def decode(raw):
+    need(len(raw)<=1024*1024,'metadata_limit')
+    def pairs(rows):
+        value={}
+        for k,v in rows:need(k not in value,'duplicate_json_key');value[k]=v
+        return value
+    try:return json.loads(raw,object_pairs_hook=pairs)
+    except (ValueError,UnicodeError,RecursionError):raise Blocked('invalid_json') from None
+def command(argv,timeout=120,env=None):
+    result=subprocess.run([str(x) for x in argv],capture_output=True,timeout=timeout,env=env)
+    need(result.returncode==0 and len(result.stdout)<=2*1024*1024,'command_failed_'+Path(argv[0]).name)
+    return result.stdout
+
+def source_check(commit):
+    need(os.getuid()>0 and os.getuid()==os.geteuid(),'owner_required')
+    need(SOURCE_PATH==CONTROL/'bin/game-launch-reliability-update','canonical_source_required');need(pin(commit,40),'invalid_commit')
+    git=['/usr/bin/git','-c','core.hooksPath=/dev/null','-C',CONTROL]
+    need(command(git+['rev-parse','HEAD']).decode().strip()==commit and command(git+['branch','--show-current']).decode().strip()=='main'
+         and command(git+['status','--porcelain']).decode().strip()=='','clean_exact_main_required')
+
+def source_gate(commit):
+    source_check(commit);report=decode(command([CONTROL/'bin/current-doctor','--json']))
+    need(type(report) is dict and report.get('verdict')=='PASS' and report.get('gitOnly') is False
+         and all(report.get(k) is True for k in ('configurationSourceAccepted','currentSentinelReady','integratedMain')),'fresh_accepted_doctor_required');source_check(commit)
+
+def engine():
+    loader=importlib.machinery.SourceFileLoader('launch_descriptor_engine',str(CONTROL/'bin/wine-runtime-overlay'))
+    spec=importlib.util.spec_from_loader(loader.name,loader);module=importlib.util.module_from_spec(spec);loader.exec_module(module);return module
+
+def anchor(e,path):
+    obj=object.__new__(e.Root);obj.path=path;obj.chain=[];fd=os.open('/',os.O_RDONLY|os.O_DIRECTORY)
+    obj.chain.append((None,None,fd,e.identity(os.fstat(fd))))
+    try:
+        for part in path.parts[1:]:
+            parent=fd;fd=os.open(part,os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW,dir_fd=parent);facts=os.fstat(fd)
+            need(facts.st_uid in (0,os.getuid()) and not facts.st_mode&0o022,'unsafe_fixed_root')
+            obj.chain.append((parent,part,fd,e.identity(facts)))
+        obj.fd=fd;need(os.fstat(fd).st_uid==os.getuid(),'foreign_fixed_root');return obj
+    except BaseException:obj.close();raise
+
+def make_root(e):
+    class LiveRoot(e.Root):
+        def __init__(self):
+            self.anchors={}
+            try:
+                for key,path in (('hub',HUB),('ds3',DS3),('cs2',CS2),('games',GAMES),('aid-bin',BIN),('state',STATE),('candidate',CANDIDATE),('source',CONTROL)):
+                    self.anchors[key]=anchor(e,path)
+            except BaseException:self.close();raise
+        def close(self):
+            for root in self.anchors.values():root.close()
+            self.anchors={}
+        def bound(self):
+            for root in self.anchors.values():root.bound()
+        @contextlib.contextmanager
+        def parent(self,rel):
+            self.bound();base,inner=rel.split('/',1)
+            need(base in self.anchors,'unsupported_root')
+            if base=='state' and inner.startswith('transaction'):inner=NAMESPACE+'/'+inner
+            elif base=='state' and inner=='owner.json':inner=NAMESPACE+'/owner.json'
+            with self.anchors[base].parent(inner) as opened:yield opened
+        def exists(self,rel):
+            try:return super().exists(rel)
+            except FileNotFoundError:return False
+        def namespace(self):
+            state=self.anchors['state']
+            if state.exists(NAMESPACE):need(state.read(NAMESPACE+'/owner.json')[0]==OWNER,'state_namespace_collision')
+            else:state.mkdir(NAMESPACE);state.write_new(NAMESPACE+'/owner.json',OWNER)
+            with state.parent(NAMESPACE+'/.unused') as (fd,_,check):need(set(os.listdir(fd))<={'owner.json','transaction'},'state_namespace_drift');check()
+    return LiveRoot()
+
+def read(root,rel):return root.read(rel) if root.exists(rel) else None
+def image(value):return None if value is None else {'sha256':digest(value[0]),'mode':value[1]}
+def image_schema(value,absent=False):
+    need(absent and value is None or type(value) is dict and set(value)=={'sha256','mode'} and pin(value['sha256']) and type(value['mode']) is int
+         and 0<=value['mode']<=0o777 and not value['mode']&0o022,'image_schema')
+
+def policy(root):
+    raw=root.read('source/'+POLICY)[0];value=decode(raw)
+    need(type(value) is dict and set(value)==FIELDS and type(value['schema']) is int and value['schema']==1
+         and value['id']=='game-launch-reliability' and value['owner']=='control-games-hub','policy_schema')
+    need(pin(value['nativePolicySha256']) and pin(value['previousNativePolicySha256']),'native_policy_pin')
+    need(type(value['previousFiles']) is dict and set(value['previousFiles'])==set(TARGETS),'previous_scope')
+    need(type(value['desiredFiles']) is dict and set(value['desiredFiles'])==set(CANDIDATE_FILES),'desired_scope')
+    need(type(value['sourceFiles']) is dict and set(value['sourceFiles'])==set(SOURCES.values())|{'bin/game-app-launcher.m'} and all(pin(p) for p in value['sourceFiles'].values()),'source_scope')
+    for key,row in value['previousFiles'].items():image_schema(row,absent=(key=='helper'))
+    for row in value['desiredFiles'].values():image_schema(row)
+    need(value['previousFiles']['helper'] is None,'unexpected_helper_predecessor')
+    need(type(value['guards']) is dict and set(value['guards'])==GUARDS and type(value['servers']) is dict and set(value['servers'])=={'hub','ds3','cs2'},'guard_schema')
+    for row in value['guards'].values():image_schema(row)
+    for key,row in value['servers'].items():image_schema(row)
+    need(digest(root.read('source/manifests/game-app-launchers.json')[0])==value['previousNativePolicySha256'],'predecessor_native_policy_binding')
+    native_raw=root.read('source/'+NATIVE_POLICY)[0];native=decode(native_raw)
+    need(digest(native_raw)==value['nativePolicySha256'] and type(native) is dict and type(native.get('schema')) is int and native['schema']==1
+         and native.get('owner')=='control-game-app-launchers' and type(native.get('builtApps')) is dict and set(native['builtApps'])==set(APPS),'native_policy_binding')
+    need(native.get('sourceSha256')==value['sourceFiles']['bin/game-app-launcher.m'],'native_source_binding')
+    for i,name in enumerate(APPS):
+        need(native['builtApps'][name]['Contents/MacOS/launcher']==value['desiredFiles']['native-'+str(i)],'native_executable_binding')
+        for rel in ('Contents/Info.plist','Contents/Resources/Game.icns'):
+            need(value['guards'].get('games/'+name+'/'+rel)==native['builtApps'][name][rel],'native_opaque_guard')
+    for rel,expected in value['sourceFiles'].items():need(digest(root.read('source/'+rel)[0])==expected,'source_payload_drift')
+    for key,rel in CANDIDATE_FILES.items():need(image(root.read('candidate/'+rel))==value['desiredFiles'][key],'candidate_drift')
+    for key,rel in SOURCES.items():need(value['desiredFiles'][key]['sha256']==value['sourceFiles'][rel],'source_candidate_disagreement')
+    return value,native,digest(raw)
+
+def guards(root,value):
+    for rel,expected in value['guards'].items():need(image(root.read(rel))==expected,'guard_drift')
+    for name,base,target in (('games-play',HUB,'games-play'),('ds3-play',DS3,'ds3-play'),('cs2-play',CS2,'cs2-play')):
+        with root.parent('aid-bin/'+name) as (fd,leaf,check):
+            facts=os.stat(leaf,dir_fd=fd,follow_symlinks=False)
+            need(stat.S_ISLNK(facts.st_mode) and facts.st_uid==os.getuid() and os.readlink(leaf,dir_fd=fd)==str(base/target),'resolver_drift');check()
+
+def inactive(root,value):
+    need(not root.exists('state/game-launch-pending.json'),'launch_reservation_pending')
+    for name,base,prefix in (('hub',HUB,HUB/'profiles/prince'),('ds3',DS3,DS3/'profiles/ds3'),('cs2',CS2,CS2/'prefix')):
+        server=base/'runtime/engine/bin/wineserver'
+        need(image(root.read(name+'/runtime/engine/bin/wineserver'))==value['servers'][name],'unchanged_server_drift')
+        rel=name+('/prefix/.unused' if name=='cs2' else '/profiles/'+prefix.name+'/.unused')
+        with root.parent(rel) as (fd,_,check):
+            facts=os.fstat(fd);need(facts.st_uid==os.getuid() and not facts.st_mode&0o077,'prefix_not_private');check()
+        env={'HOME':str(HOME),'PATH':'/usr/bin:/bin:/usr/sbin:/sbin','LANG':'en_US.UTF-8','WINEPREFIX':str(prefix),'WINESERVER':str(server),
+             'DYLD_FALLBACK_LIBRARY_PATH':str(base/'runtime/Frameworks')+':/usr/lib'}
+        try:command([server,'-w'],timeout=3,env=env)
+        except subprocess.TimeoutExpired:raise Blocked('prefix_active') from None
+
+def gate(root,commit,value):source_gate(commit);guards(root,value);inactive(root,value)
+
+def local_gate(root,commit,value):
+    root._operation_lock_check()
+    source_check(commit)
+    current,_,_=policy(root)
+    need(current==value,'operation_policy_drift')
+    guards(root,value);inactive(root,value)
+
+@contextlib.contextmanager
+def locks(root):
+    held=[];bindings=[]
+    try:
+        # Same order as CS2 launcher: existing local lock before shared lock.
+        for rel in ('cs2/.launcher.lock','state/games-hub.lock'):
+            with root.parent(rel) as (fd,name,check):
+                lock=os.open(name,os.O_RDONLY|os.O_NOFOLLOW|os.O_NONBLOCK,dir_fd=fd);held.append(lock);facts=os.fstat(lock)
+                need(stat.S_ISREG(facts.st_mode) and facts.st_uid==os.getuid() and facts.st_nlink==1 and not facts.st_mode&0o077,'unsafe_lock')
+                try:fcntl.flock(lock,fcntl.LOCK_EX|fcntl.LOCK_NB)
+                except BlockingIOError:raise Blocked('launcher_busy') from None
+                check();need(os.stat(name,dir_fd=fd,follow_symlinks=False).st_ino==facts.st_ino,'lock_binding_drift')
+                def binding(rel=rel,ino=facts.st_ino):
+                    with root.parent(rel) as (parent,leaf,bound):
+                        bound();need(os.stat(leaf,dir_fd=parent,follow_symlinks=False).st_ino==ino,'lock_binding_drift')
+                bindings.append(binding)
+        def bound():
+            for binding in bindings:binding()
+        root._operation_lock_check=bound
+        try:yield;bound()
+        finally:del root._operation_lock_check
+    finally:
+        for fd in reversed(held):os.close(fd)
+
+def receipts(before,value,native,commit):
+    out={}
+    for key in ('hub.receipt','ds3.receipt','cs2.receipt'):
+        current=decode(before[key][0]);need(type(current) is dict,'receipt_schema')
+        if key=='cs2.receipt':
+            need(type(current.get('schemaVersion')) is int and current['schemaVersion']==1 and current.get('owner')=='control-cs2-standalone'
+                 and current.get('launcherSha256')==value['previousFiles']['cs2.launcher']['sha256'],'cs2_receipt_preimage')
+            wanted=dict(current,launcherSha256=value['desiredFiles']['cs2.launcher']['sha256'],launcherCommit=commit)
+        else:
+            names=[name for name in APPS if (name=='Dark Souls III.app')==(key=='ds3.receipt')]
+            need(type(current.get('schema')) is int and current['schema']==1 and current.get('owner')==('control-games-hub' if key=='hub.receipt' else 'control-ds3-marshal-fix')
+                 and current.get('appPolicySha256')==value['previousNativePolicySha256'],'app_receipt_preimage')
+            wanted=dict(current,appLaunchers={name:native['builtApps'][name] for name in names},appPolicySha256=value['nativePolicySha256'],appCommit=commit)
+            field,source=('launcherSha256','hub.launcher') if key=='hub.receipt' else ('lifecycleSha256','ds3.lifecycle')
+            need(current.get(field)==value['previousFiles'][source]['sha256'],'launcher_receipt_preimage')
+            wanted[field]=value['desiredFiles'][source]['sha256']
+            if key=='hub.receipt':wanted['launchAdmissionSha256']=value['desiredFiles']['helper']['sha256'];wanted['launchReliabilityCommit']=commit
+        out[key]=(encode(wanted),0o600)
+    return out
+
+def plan(root,commit,value,native,policy_sha):
+    before={key:read(root,rel) for key,rel in TARGETS.items()}
+    need(all(image(before[key])==value['previousFiles'][key] for key in TARGETS),'predecessor_drift')
+    after={key:root.read('candidate/'+rel) for key,rel in CANDIDATE_FILES.items()};after.update(receipts(before,value,native,commit))
+    result={'schema':1,'kind':'game-launch-reliability','acceptedCommit':commit,'policySha256':policy_sha,
+            'targets':{key:{'before':image(before[key]),'after':image(after[key])} for key in ORDER}}
+    return result,before,after
+
+def partial_write(root,rel,wanted):
+    if root.exists(rel):
+        current=root.read(rel);need(current[1]==wanted[1] and wanted[0].startswith(current[0]),'staging_unknown_drift')
+        if current==wanted:return
+        with root.parent(rel) as (fd,name,check):check();os.unlink(name,dir_fd=fd);os.fsync(fd)
+    root.write_new(rel,*wanted)
+
+def stage(root,p,before,after):
+    root.namespace()
+    if not root.exists('state/transaction'):root.mkdir('state/transaction')
+    expected={'plan.json','journal.json'}|{key+'.'+side for key in ORDER for side,images in (('before',before),('after',after)) if images[key] is not None}
+    with root.parent('state/transaction/.unused') as (fd,_,check):need(set(os.listdir(fd))<=expected,'staging_inventory_drift');check()
+    for key in ORDER:
+        for side,images in (('before',before),('after',after)):
+            if images[key] is not None:partial_write(root,'state/transaction/'+key+'.'+side,images[key])
+    raw=encode(p);partial_write(root,'state/transaction/plan.json',(raw,0o600))
+    partial_write(root,'state/transaction/journal.json',(encode({'schema':1,'planSha256':digest(raw),'phase':'prepared','intent':None}),0o600))
+
+def swap(root,rel,wanted,expected,event=lambda _:None,before_publish=lambda:None):
+    need(read(root,rel)==expected,'target_changed_before_replace')
+    if wanted==expected:return
+    if wanted is None:
+        with root.parent(rel) as (fd,name,check):check();need(read(root,rel)==expected,'target_changed_before_replace');event('before-replace:'+rel);before_publish();check();need(read(root,rel)==expected,'target_changed_before_replace');os.unlink(name,dir_fd=fd);os.fsync(fd)
+    else:
+        stage_rel=root.stage_name(rel)
+        if root.exists(stage_rel):need(root.read(stage_rel)==wanted,'replacement_stage_drift')
+        else:root.write_new(stage_rel,*wanted)
+        event('staged:'+rel)
+        with root.parent(rel) as (fd,name,check),root.parent(stage_rel) as (staged_fd,staged_name,staged_check):
+            check();staged_check();need(read(root,rel)==expected,'target_changed_before_replace');event('before-replace:'+rel);before_publish();check();staged_check()
+            need(read(root,rel)==expected and root.read(stage_rel)==wanted,'target_changed_before_replace')
+            need(os.fstat(fd).st_dev==os.fstat(staged_fd).st_dev,'cross_device_stage')
+            os.replace(staged_name,name,src_dir_fd=staged_fd,dst_dir_fd=fd);os.fsync(fd);os.fsync(staged_fd)
+    event('replaced:'+rel)
+
+class Transaction:
+    def __init__(self,root,expected,commit,value,native,policy_sha,event=lambda _:None):
+        need(pin(expected),'plan_pin_required');self.root=root;self.sha=expected;self.commit=commit;self.value=value;self.native=native;self.policy_sha=policy_sha;self.event=event
+        raw,_=root.read('state/transaction/plan.json');need(digest(raw)==expected,'plan_binding_drift');self.plan=decode(raw)
+        p=self.plan;need(type(p) is dict and set(p)=={'schema','kind','acceptedCommit','policySha256','targets'} and type(p['schema']) is int and p['schema']==1
+                        and p['kind']=='game-launch-reliability' and p['acceptedCommit']==commit and p['policySha256']==policy_sha
+                        and type(p['targets']) is dict and set(p['targets'])==set(TARGETS),'plan_schema')
+        self.images={};before={};after={}
+        for key in ORDER:
+            row=p['targets'][key];need(type(row) is dict and set(row)=={'before','after'},'target_schema');self.images[key]={}
+            need(row['before']==value['previousFiles'][key],'predecessor_plan_drift')
+            for side in ('before','after'):
+                image_schema(row[side],absent=(key=='helper' and side=='before'))
+                rel='state/transaction/'+key+'.'+side
+                data=None if row[side] is None else root.read(rel)
+                need(image(data)==row[side],'backup_drift');self.images[key][side]=data
+            before[key]=self.images[key]['before'];after[key]=self.images[key]['after']
+        expected_receipts=receipts(before,value,native,commit)
+        for key in ORDER:
+            wanted=expected_receipts[key] if key in expected_receipts else root.read('candidate/'+CANDIDATE_FILES[key])
+            need(after[key]==wanted,'afterimage_source_relation')
+        self.journal()
+
+    def journal(self):
+        value=decode(self.root.read('state/transaction/journal.json')[0])
+        need(type(value) is dict and set(value)=={'schema','planSha256','phase','intent'} and type(value['schema']) is int and value['schema']==1 and value['planSha256']==self.sha
+             and value['phase'] in ('prepared','applying','applied','rolling-back','rolled-back') and value['intent'] in (None,*ORDER),'journal_schema')
+        return value
+
+    def checkpoint(self,phase,intent=None):
+        rel='state/transaction/journal.json';old=self.root.read(rel)
+        wanted=(encode({'schema':1,'planSha256':self.sha,'phase':phase,'intent':intent}),0o600)
+        swap(self.root,rel,wanted,old,self.event);self.event('journal:'+phase+(':'+intent if intent else ''))
+
+    def reconcile_journal_stage(self):
+        rel='state/transaction/journal.json';stage_rel=self.root.stage_name(rel)
+        if not self.root.exists(stage_rel):return
+        current=self.journal();raw,mode=self.root.read(stage_rel);pending=decode(raw)
+        transitions={'prepared':{'applying','applied','rolled-back'},'applying':{'applying','applied'},'applied':{'rolling-back'},'rolling-back':{'rolling-back','rolled-back'},'rolled-back':{'applying'}}
+        need(type(pending) is dict and set(pending)==set(current) and type(pending['schema']) is int and pending['schema']==1
+             and pending['planSha256']==self.sha and type(pending['phase']) is str and pending['phase'] in transitions[current['phase']] and pending['intent'] in (None,*ORDER) and mode==0o600,'journal_stage_drift')
+        if pending['phase'] in ('applied','rolled-back'):
+            need(pending['intent'] is None and self.side('after' if pending['phase']=='applied' else 'before'),'journal_terminal_drift')
+        swap(self.root,rel,(raw,mode),self.root.read(rel),self.event)
+
+    def check_gate(self):gate(self.root,self.commit,self.value)
+
+    def verify(self):
+        self.check_gate()
+        expected={'plan.json','journal.json'}|{key+'.'+side for key in ORDER for side in ('before','after') if self.images[key][side] is not None}
+        stages={Path(self.root.stage_name(rel)).name for rel in (*TARGETS.values(),'state/transaction/journal.json')}
+        with self.root.parent('state/transaction/.unused') as (fd,_,check):
+            observed=set(os.listdir(fd));need(expected<=observed and observed<=expected|stages,'transaction_inventory_drift');check()
+        for key,rel in TARGETS.items():
+            need(read(self.root,rel) in tuple(self.images[key].values()),'target_unknown_drift')
+            staged=self.root.stage_name(rel)
+            if self.root.exists(staged):need(self.root.read(staged) in tuple(v for v in self.images[key].values() if v is not None),'replacement_stage_drift')
+            for side in ('before','after'):
+                if self.images[key][side] is not None:need(self.root.read('state/transaction/'+key+'.'+side)==self.images[key][side],'backup_drift')
+        self.journal()
+
+    def side(self,side):return all(read(self.root,rel)==self.images[key][side] for key,rel in TARGETS.items())
+
+    def run(self,side,recover=False):
+        self.verify();current=self.journal();stage_rel=self.root.stage_name('state/transaction/journal.json')
+        if recover:
+            if self.root.exists(stage_rel):self.reconcile_journal_stage();current=self.journal()
+            need(current['phase'] in ('applying','rolling-back','applied','rolled-back'),'no_interrupted_transaction')
+            side='after' if current['phase'] in ('applying','applied') else 'before'
+        else:
+            need(not self.root.exists(stage_rel) and current['phase'] not in ('applying','rolling-back'),'explicit_recovery_required')
+        start,end=('applying','applied') if side=='after' else ('rolling-back','rolled-back')
+        if self.side(side):
+            if current['phase']!=end:self.checkpoint(end)
+            return {'state':end.upper(),'changed':False,'liveStateChanged':False,'installedAcceptanceClaimed':False,'validationScope':'launch-closure-and-declared-guards','runtimeHealthClaimed':False,'sourceRollbackSuccessorRequired':side=='before'}
+        if not recover:need(self.side('before' if side=='after' else 'after'),'mixed_state_requires_recovery')
+        self.checkpoint(start)
+        try:
+            for key in (ORDER if side=='after' else tuple(reversed(ORDER))):
+                observed=read(self.root,TARGETS[key]);wanted=self.images[key][side]
+                if observed==wanted:continue
+                self.verify();self.checkpoint(start,key)
+                swap(self.root,TARGETS[key],wanted,observed,self.event,before_publish=self.check_gate)
+            self.verify();need(self.side(side),'postimage_mismatch');self.checkpoint(end)
+        except Exception:
+            # Keep durable direction and every exact backup. Explicit recovery
+            # follows that direction; no unverified automatic rollback occurs.
+            raise
+        return {'state':end.upper(),'changed':True,'liveStateChanged':True,'installedAcceptanceClaimed':False,
+                'sourceRollbackSuccessorRequired':side=='before','validationScope':'launch-closure-and-declared-guards','runtimeHealthClaimed':False}
+
+def operate(operation,commit,expected=None,event=lambda _:None):
+    need(operation in ('plan','apply','rollback','return','recover'),'unsupported_operation');source_check(commit)
+    e=engine();root=make_root(e)
+    try:
+        with locks(root):
+            source_gate(commit)
+            value,native,policy_sha=policy(root);local_gate(root,commit,value)
+            # Private invocation closure: full readiness was observed once
+            # under these locks; each callback freshly checks local drift.
+            class OperationTransaction(Transaction):
+                def check_gate(self):local_gate(root,commit,value)
+            journal_exists=root.exists('state/transaction/journal.json')
+            if operation=='plan':
+                if journal_exists:
+                    need(pin(expected),'existing_transaction_plan_pin_required');tx=OperationTransaction(root,expected,commit,value,native,policy_sha);tx.verify()
+                    return {'state':'PLANNED_EXISTING_TRANSACTION','planSha256':expected,'phase':tx.journal()['phase'],'changed':False,'liveStateChanged':False}
+                p,_,_=plan(root,commit,value,native,policy_sha)
+                return {'state':'PLANNED_READ_ONLY','planSha256':digest(encode(p)),'changed':False,'liveStateChanged':False}
+            need(pin(expected),'reviewed_plan_pin_required')
+            if operation=='apply' and journal_exists:
+                raw,mode=root.read('state/transaction/journal.json')
+                try:decode(raw)
+                except Blocked:
+                    p,before,after=plan(root,commit,value,native,policy_sha)
+                    need(digest(encode(p))==expected,'prestate_changed_since_plan')
+                    prepared=encode({'schema':1,'planSha256':expected,'phase':'prepared','intent':None})
+                    need(mode==0o600 and prepared.startswith(raw),'staging_unknown_drift')
+                    stage(root,p,before,after)
+            if operation=='apply' and not journal_exists:
+                p,before,after=plan(root,commit,value,native,policy_sha);need(digest(encode(p))==expected,'prestate_changed_since_plan')
+                stage(root,p,before,after)
+            tx=OperationTransaction(root,expected,commit,value,native,policy_sha,event)
+            return tx.run('before' if operation=='rollback' else 'after',recover=operation=='recover')
+    finally:root.close()
+
+def main():
+    os.umask(0o077);parser=argparse.ArgumentParser(description=__doc__);parser.add_argument('operation',choices=('plan','apply','rollback','return','recover'));parser.add_argument('commit');parser.add_argument('--plan-sha256')
+    args=parser.parse_args();print(json.dumps(operate(args.operation,args.commit,args.plan_sha256),sort_keys=True))
+if __name__=='__main__':
+    try:main()
+    except (OSError,RuntimeError,subprocess.SubprocessError,UnicodeError) as error:
+        print(json.dumps({'state':'BLOCKED','reason':str(error) if isinstance(error,RuntimeError) else type(error).__name__,'installedAcceptanceClaimed':False,'validationScope':'launch-closure-and-declared-guards','runtimeHealthClaimed':False},sort_keys=True));sys.exit(1)

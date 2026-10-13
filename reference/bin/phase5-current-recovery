@@ -1,0 +1,293 @@
+#!/usr/bin/python3
+"""Closed CLI; explicitly connected preservation-first recovery preparation.
+
+A reviewed root adapter must bind SOURCE_CLOSURE BEFORE importing this file and
+retain those exact source observations through recheck_source_closure(). That
+callback rechecks an independently admitted generation, never self-admits hashes.
+NativeRuntime retains its existing source pins/90-second cooperative Budget;
+new closure members are separate held observations, not extra runtime pin slots.
+No deadline promises interruption of synchronous process/kernel calls.
+
+Only connected() can allocate/capture or dispatch the exact selected lifecycle.
+It never resumes, retries, compensates, deletes artifacts, or dispatches a model.
+NONPASS retains private context/primary failures. Closing descriptor owners is
+not native-child settlement, cleanup of evidence, or recovery of unknown state.
+An interrupted or non-returning native observation has unconfirmed settlement
+even when synchronous creation never returned a process handle. The root adapter
+must retain this context/exception for external reconciliation; no PID discovery
+or retry is attempted here. False nativeChildrenSettled means NOT established,
+not proof that a child is still alive.
+"""
+
+import sys
+sys.dont_write_bytecode = True
+
+import importlib.machinery
+import json
+from pathlib import Path
+import re
+
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT))
+R = importlib.machinery.SourceFileLoader(
+    "phase5_recovery_readiness_definitions", str(ROOT / "bin/phase5-current-readiness")).load_module()
+from lib import phase5_runtime_directory as directory
+from lib import phase5_runtime_session as session
+from lib.phase5_runtime_store import DurableStore
+
+SOURCE_CLOSURE = tuple(dict.fromkeys(R.SOURCE_CLOSURE + (
+    "bin/phase5-current-recovery", "lib/phase5_runtime_directory.py",
+    "lib/phase5_runtime_store.py")))
+OPERATIONS = frozenset(("capture-noop", "rollback-return"))
+STAGES = frozenset(("closed", "source-bind", "target-read", "history-read", "collect",
+    "admission", "attestation", "allocation", "store", "capture", "handoff", "current-noop",
+    "rollback", "rollback-noop", "return", "return-noop", "current-admission", "final-recheck", "close"))
+
+
+class PrivateSession:
+    """Private retained custody, including uncertain allocation and native owner."""
+    def __init__(self, run_id):
+        self.run_id = run_id
+        self.targets = self.legacy = self.runtime = self.parent = self.store = None
+        self.bindings = None
+        self.failures, self.primary, self.pending_owner = [], None, None
+        self.settlement_confirmed, self.pending_native_operation = True, None
+
+    def __repr__(self):
+        return "<private recovery session>"
+
+
+class RecoveryError(Exception):
+    def __init__(self, report, context):
+        self.report, self.private_session = report, context
+        self.private_owner = context.pending_owner
+        self.settlement_failed = not context.settlement_confirmed
+        super().__init__("current_recovery_required")
+
+
+def public(verdict="closed", *, stage="closed", state="unknown", completed=0,
+           allocation=False, mutation=False, captured=False, returned=False, settled=True):
+    return {"schema": 1, "verdict": verdict, "stage": stage if stage in STAGES else "closed",
+            "state": state, "completedStages": completed, "allocationAttempted": allocation,
+            "targetMutationAttempted": mutation, "captureConfirmed": captured,
+            "returnConfirmed": returned, "nativeChildrenSettled": settled,
+            "executionAdmission": False, "liveAdmission": False, "phase5Accepted": False,
+            "phase6Allowed": False, "cleanupPerformed": False}
+
+
+class _BudgetBinding:
+    """Borrow the fixed-name target adapter; add no filesystem capability."""
+    def __init__(self, backend, budget):
+        self.backend, self.budget = backend, budget
+
+    def _call(self, method, *args):
+        self.budget.check()
+        value = getattr(self.backend, method)(*args)
+        self.budget.check()
+        return value
+
+    def verify(self): return self._call("verify")
+    def snapshot(self, name): return self._call("snapshot", name)
+    def sync(self): return self._call("sync")
+    def create_exclusive(self, name, data, mode): return self._call("create_exclusive", name, data, mode)
+    def swap(self, first, second): return self._call("swap", first, second)
+    def move_exclusive(self, first, second): return self._call("move_exclusive", first, second)
+
+
+def connected(home, uid, *, operation=None, run_id=None, runtime_factory=None,
+              recheck_source_closure=None, target_observer=R.targets.observe,
+              legacy_observer=R.legacy.observe, allocator=directory.allocate,
+              store_factory=DurableStore, budget=None):
+    """Root-only explicit invocation; injected factories are fake-test seams.
+
+Each callback/factory remains subject to external candidate admission. A True
+callback/test result grants no authority. Every acquired owner is closed once;
+records/displaced objects are retained, and uncertain errors keep private custody.
+"""
+    if (type(operation) is not str or operation not in OPERATIONS
+            or type(run_id) is not str or re.fullmatch(r"p5-[0-9a-f]{32}", run_id) is None
+            or run_id == directory.LEGACY_LEAF or not callable(runtime_factory)
+            or not callable(recheck_source_closure)):
+        return public()
+    budget = R.Budget() if budget is None else budget
+    context = PrivateSession(run_id)
+    stage, failure_stage, state = "source-bind", None, "unknown"
+    completed, allocation, mutation, captured, returned = 0, False, False, False, False
+    capture_attempted, expected_state = False, "current"
+
+    def failure(error):
+        nonlocal failure_stage
+        context.failures.append(error)
+        context.primary = R.earliest(context.primary, error)
+        owner = getattr(error, "private_owner", None)
+        if owner is None and context.runtime is not None:
+            owner = getattr(context.runtime, "pending_owner", None)
+        if context.pending_owner is None and owner is not None:
+            context.pending_owner = owner
+        # A None handle is not evidence that synchronous Popen never created a
+        # child. Underlying readers can lose that distinction before returning
+        # an interruption or normalized error; never rehabilitate it afterwards.
+        if (owner is not None or context.pending_native_operation is not None
+                or isinstance(error, (KeyboardInterrupt, SystemExit))
+                or getattr(error, "settlement_failed", False) is not False):
+            context.settlement_confirmed = False
+        if failure_stage is None:
+            failure_stage = stage
+
+    def dependencies():
+        budget.check()
+        R.require(recheck_source_closure(SOURCE_CLOSURE) is True)
+        if context.targets is not None:
+            if mutation:
+                R.require(context.bindings is not None)
+                for backend, _ in context.bindings.values():
+                    R.require(backend.verify() is True)
+            else:
+                R.require(context.targets.verify() is True)
+        for held in (context.legacy, context.runtime):
+            if held is not None:
+                R.require(held.verify() is True)
+        if context.parent is not None:
+            # AllocatedParent.verify intentionally returns None on success.
+            R.require(context.parent.verify() is not False)
+        if context.store is not None:
+            R.require(context.store.verify() is not False)
+        budget.check()
+        return True
+
+    def admitted(images):
+        return R.admit_current_round(images, home=home, runtime=context.runtime,
+            metadata_empty=context.targets.metadata_empty, recheck_dependencies=dependencies)
+
+    def postguard():
+        nonlocal state
+        state = "unknown"
+        dependencies()
+        if capture_attempted:
+            bindings = context.bindings if context.bindings is not None else context.targets.bindings
+            value = session.verify(bindings, context.store, state=expected_state)
+            R.require(value["verdict"] == "verified")
+            dependencies()
+            state = "rollback" if expected_state == "rollback" else "current"
+
+    def phase(name, operation_fn, check):
+        nonlocal stage, completed
+        stage = name
+        first = None
+        try:
+            dependencies()
+            check(operation_fn())
+        except BaseException as error:
+            failure(error)
+            first = error
+        try:
+            postguard()
+        except BaseException as error:
+            failure(error)
+            first = R.earliest(first, error)
+        if first is not None:
+            raise first
+        completed += 1
+
+    def verdict(expected):
+        return lambda value: R.require(type(value) is dict and value.get("verdict") == expected)
+
+    def native_observation(name, operation_fn):
+        context.pending_native_operation = name
+        value = operation_fn()
+        # Only a normal return from the reviewed reader proves its connected
+        # settlement boundary completed. Exceptions leave the marker intact.
+        context.pending_native_operation = None
+        return value
+
+    try:
+        dependencies()
+        stage = "target-read"
+        context.targets = target_observer(home, uid)
+        dependencies()
+        stage = "history-read"
+        context.legacy = legacy_observer(home, uid)
+        dependencies()
+        stage = "collect"
+        context.runtime = runtime_factory(home, uid, budget)
+        phase("collect", lambda: native_observation("collect", context.runtime.collect), lambda _: None)
+        phase("admission", lambda: R.capture.readiness(context.targets.bindings, context.legacy.receipt,
+            context.legacy.physical_before, context.legacy.physical_after,
+            admit_current=admitted, recheck_dependencies=dependencies), verdict("ready"))
+        phase("attestation", lambda: native_observation("attestation", context.runtime.final_attest), R.require)
+        stage = "allocation"
+        dependencies()
+        allocation = True
+        context.parent = allocator(home, uid, run_id)
+        postguard()
+        stage = "store"
+        context.store = store_factory(context.parent)
+        postguard()
+        capture_attempted = True
+        phase("capture", lambda: R.capture.capture(context.targets.bindings, context.store,
+            context.legacy.receipt, context.legacy.physical_before, context.legacy.physical_after,
+            session_id=run_id, admit_current=admitted, recheck_dependencies=dependencies), verdict("captured"))
+        captured = True
+        stage = "handoff"
+        bindings = context.targets.transition_bindings(run_id)
+        R.require(type(bindings) is dict and tuple(bindings) == R.capture.TARGET_IDS)
+        context.bindings = {key: (_BudgetBinding(backend, budget), name)
+                            for key, (backend, name) in bindings.items()}
+        postguard()
+        phase("current-noop", lambda: session.noop(context.bindings, context.store), verdict("noop"))
+        if operation == "rollback-return":
+            mutation, expected_state = True, "rollback"
+            phase("rollback", lambda: session.rollback(context.bindings, context.store), verdict("completed"))
+            phase("rollback-noop", lambda: session.noop(context.bindings, context.store, state="rollback"), verdict("noop"))
+            expected_state = "return"
+            phase("return", lambda: session.return_current(context.bindings, context.store), verdict("completed"))
+            phase("return-noop", lambda: session.noop(context.bindings, context.store, state="return"), verdict("noop"))
+            returned = True
+        # Only current/returned bytes are classified; never rolled-back scalars.
+        phase("current-admission", lambda: admitted({key: backend.snapshot(name)
+            for key, (backend, name) in context.bindings.items()}), R.require)
+        phase("attestation", lambda: native_observation("attestation", context.runtime.final_attest), R.require)
+    except BaseException as error:
+        if not any(error is previous for previous in context.failures):
+            failure(error)
+    finally:
+        stage = "final-recheck"
+        try:
+            postguard()
+        except BaseException as error:
+            failure(error)
+        stage = "close"
+        for held in (context.parent, context.runtime, context.legacy, context.targets):
+            if held is not None:
+                try:
+                    held.close()
+                except BaseException as error:
+                    failure(error)
+        try:
+            budget.check()
+        except BaseException as error:
+            state = "unknown"
+            failure(error)
+    result = public("completed" if context.primary is None else "recovery-required",
+        stage=failure_stage or "final-recheck", state=state, completed=completed,
+        allocation=allocation, mutation=mutation, captured=captured, returned=returned,
+        settled=context.settlement_confirmed)
+    if isinstance(context.primary, (KeyboardInterrupt, SystemExit)):
+        context.primary.private_session = context
+        context.primary.recovery_report = result
+        context.primary.private_owner = context.pending_owner
+        context.primary.settlement_failed = not context.settlement_confirmed
+        raise context.primary from None
+    if context.primary is not None:
+        raise RecoveryError(result, context) from None
+    return result
+
+
+def main():
+    # No flags or environment value opens a live path. Root imports connected.
+    print(json.dumps(public(), sort_keys=True, separators=(",", ":")))
+    return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

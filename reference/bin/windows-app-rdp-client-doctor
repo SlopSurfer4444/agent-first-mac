@@ -1,0 +1,83 @@
+#!/usr/bin/python3
+"""Read-only doctor for the managed Windows App macOS RDP client."""
+
+import json
+from pathlib import Path
+import re
+import subprocess
+
+
+ROOT = Path(__file__).resolve().parent.parent
+MANIFEST = ROOT / "manifests/windows-app-rdp-client.json"
+
+
+def run(argv):
+    return subprocess.run(argv, text=True, stdout=subprocess.PIPE,
+                          stderr=subprocess.STDOUT, check=False)
+
+
+def plist(app, key):
+    result = run(["/usr/bin/plutil", "-extract", key, "raw", "-o", "-",
+                  str(app / "Contents/Info.plist")])
+    return result.stdout.strip() if result.returncode == 0 else None
+
+
+def team_id(path):
+    result = run(["/usr/bin/codesign", "-d", "--verbose=4", str(path)])
+    match = re.search(r"^TeamIdentifier=([^\n]+)$", result.stdout, re.MULTILINE)
+    return match.group(1) if match else None
+
+
+def version_tuple(value):
+    if not value or not re.fullmatch(r"[0-9]+(?:\.[0-9]+)*", value):
+        return None
+    return tuple(int(part) for part in value.split("."))
+
+
+def main():
+    manifest = json.loads(MANIFEST.read_text())
+    app = Path(manifest["application"]["path"])
+    marker = Path("/var/db/agent-first-mac/windows-app/managed-source")
+    checks = {}
+    problems = []
+
+    def check(name, condition):
+        checks[name] = bool(condition)
+        if not condition:
+            problems.append(name)
+
+    check("application_present", app.is_dir())
+    check("bundle_identifier", plist(app, "CFBundleIdentifier") ==
+          manifest["application"]["bundleIdentifier"])
+    actual = version_tuple(plist(app, "CFBundleShortVersionString"))
+    floor = version_tuple(manifest["application"]["minimumVersion"])
+    check("version_floor", actual is not None and floor is not None and actual >= floor)
+    check("team_identifier", team_id(app) == manifest["application"]["teamIdentifier"])
+    check("strict_signature", run(["/usr/bin/codesign", "--verify", "--deep",
+                                    "--strict", str(app)]).returncode == 0)
+    check("gatekeeper", run(["/usr/sbin/spctl", "--assess", "--type", "execute",
+                             str(app)]).returncode == 0)
+    check("receipt", run(["/usr/sbin/pkgutil", "--pkg-info",
+                           manifest["source"]["packageIdentifier"]]).returncode == 0)
+    expected_marker = (manifest["source"]["version"] + "|" +
+                       manifest["source"]["sha256"])
+    try:
+        check("managed_marker", marker.read_text().strip() == expected_marker)
+    except OSError:
+        check("managed_marker", False)
+
+    print(json.dumps({
+        "schema": 1,
+        "result": "pass" if not problems else "fail",
+        "checks": checks,
+        "problems": sorted(problems),
+        "readOnly": True,
+        "systemMutationsPerformed": False,
+        "credentialsInspected": False,
+        "rdpBookmarkInspected": False,
+    }, indent=2, sort_keys=True))
+    raise SystemExit(0 if not problems else 1)
+
+
+if __name__ == "__main__":
+    main()

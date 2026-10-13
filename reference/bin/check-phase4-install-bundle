@@ -1,0 +1,793 @@
+#!/usr/bin/python3
+"""Fail-closed Phase 4 installation-bundle validator."""
+
+import hashlib
+import json
+import os
+from pathlib import Path
+import pwd
+import re
+import shutil
+import stat
+import subprocess
+import sys
+import tempfile
+
+
+ROOT = Path(__file__).resolve().parents[1]
+BASE = "217602def502f515f5c0c554f1d4c1d0aaabcb26"
+PREPARATION_HEAD = "82a30bd70ee1a693489127bb097adc511aadffe0"
+MIGRATION_AUTHORIZATION = "39f8a257da2181076d1e0cbb29d3a9ef1ddb6aaf"
+MIGRATION_MULTICALL_CORRECTION = "a68079a5539755b26e9051e5cea98a57e236d5b9"
+BRANCH = "codex/phase-4-root-broker-install-apply"
+INITIAL_IMPLEMENTATION = "b279f8630b27733e14315c9a629a87f331d5d8d2"
+INITIAL_EVIDENCE_COMMIT = "9db5882a93776d03e364a0eae74942e9e5444963"
+INITIAL_MARKER = "CHECKPOINT_PHASE4_INSTALL_BUNDLE_REVIEW"
+IDENTITY_MARKER = "CHECKPOINT_PHASE4_INSTALL_BUNDLE_CORRECTED_REVIEW"
+ACCEPTED_PREAPPLY_HEAD = "2d4241978d830902711c023c28e0d35f52ca5815"
+IDENTITY_IMPLEMENTATION = "56d33721afc2e27f0dc7f148d9abdcd4dc2a5252"
+IDENTITY_EVIDENCE_COMMIT = "8b82037a0b7ec2e45e546641fc8128eb58d9b2a1"
+PREAPPLY_TOOLING = "b1ad120a52c8488e81f1e01ce837c3acebffacbd"
+MARKER = "CHECKPOINT_PHASE4_MULTICALL_EXECUTION_CORRECTION_REVIEW"
+BUNDLE = ROOT / "install-bundles/phase-4/aid-admin"
+INITIAL_EVIDENCE = "evidence/phase-4/install-bundle-preparation.json"
+CORRECTION_EVIDENCE = "evidence/phase-4/install-bundle-correction.json"
+MULTICALL_EVIDENCE = "evidence/phase-4/multicall-execution-correction.json"
+GIT_PREFIX = ["/usr/bin/git", "-c", "core.fsmonitor=false", "-c",
+              "core.hooksPath=/dev/null"]
+IMPLEMENTATION_SCOPE = {
+    "AGENTS.md", "ARCHITECTURE.md", "Package.swift", "README.md",
+    "Sources/AidAdminApply/main.swift",
+    "Sources/AidAdminBootstrap/main.swift",
+    "Sources/AidAdminBootstrapCore/AidAdminBootstrapCore.swift",
+    "install-bundles/phase-4/aid-admin/agent-first-mac-aid-admin.sudoers-template",
+    "install-bundles/phase-4/aid-admin/aid-admin",
+    "install-bundles/phase-4/aid-admin/aid-admin-bootstrap",
+    "install-bundles/phase-4/aid-admin/aid-admin-policy.json",
+    "install-bundles/phase-4/aid-admin/install-inputs.json",
+    "install-bundles/phase-4/aid-admin/launch-owner-authenticated-install.zsh",
+    "install-bundles/phase-4/aid-admin/review-manifest.json",
+    "bin/build-phase4-install-bundle", "bin/check-phase4-install-bundle",
+    "bin/prepare-phase4-build-only-target",
+    "docs/phase-4-installation-bundle.md",
+    "policy/aid-admin-apply-policy.json",
+    "tests/AidAdminBootstrapTests/AidAdminBootstrapTests.swift",
+}
+CORRECTIVE_SCOPE = {
+    "AGENTS.md", "ARCHITECTURE.md", "README.md",
+    "Sources/AidAdminBootstrap/main.swift",
+    "Sources/AidAdminBootstrapCore/AidAdminBootstrapCore.swift",
+    "bin/build-phase4-install-bundle", "bin/check-phase4-install-bundle",
+    "docs/phase-4-installation-bundle.md",
+    "install-bundles/phase-4/aid-admin/aid-admin",
+    "install-bundles/phase-4/aid-admin/aid-admin-bootstrap",
+    "install-bundles/phase-4/aid-admin/install-inputs.json",
+    "install-bundles/phase-4/aid-admin/launch-owner-authenticated-install.zsh",
+    "install-bundles/phase-4/aid-admin/review-manifest.json",
+    "tests/AidAdminBootstrapTests/AidAdminBootstrapTests.swift",
+}
+MULTICALL_SCOPE = {
+    "AGENTS.md", "ARCHITECTURE.md", "README.md",
+    "Sources/AidAdminCore/AidAdminCore.swift",
+    "bin/build-phase4-install-bundle", "bin/check-phase4-install-bundle",
+    "docs/phase-4-installation-bundle.md",
+    "docs/phase-4-installed-root-phase-b.md",
+    "docs/phase-4-root-broker-preparation.md",
+    "install-bundles/phase-4/aid-admin/aid-admin",
+    "install-bundles/phase-4/aid-admin/aid-admin-bootstrap",
+    "install-bundles/phase-4/aid-admin/install-inputs.json",
+    "install-bundles/phase-4/aid-admin/launch-owner-authenticated-install.zsh",
+    "install-bundles/phase-4/aid-admin/review-manifest.json",
+    "tests/AidAdminCoreTests/AidAdminCoreTests.swift",
+}
+PREAPPLY_SCOPE = {
+    "bin/check-phase4-installed-root-preapply",
+    "bin/phase4-owner-rollback-return",
+    "docs/phase-4-installed-root-phase-b.md",
+}
+
+
+def require(condition, reason):
+    if not condition:
+        raise RuntimeError(reason)
+
+
+def run(argv, *, cwd=ROOT, env=None):
+    return subprocess.run([str(value) for value in argv], cwd=cwd, env=env, text=True,
+                          stdout=subprocess.PIPE, stderr=subprocess.STDOUT, check=False)
+
+
+def checked(argv, *, cwd=ROOT, env=None):
+    result = run(argv, cwd=cwd, env=env)
+    require(result.returncode == 0,
+            f"command_failed_{Path(str(argv[0])).name}: {result.stdout[-1600:]}")
+    return result.stdout
+
+
+def git(*args, cwd=ROOT):
+    return checked([*GIT_PREFIX, *args], cwd=cwd).strip()
+
+
+def digest(path):
+    value = hashlib.sha256()
+    with path.open("rb") as stream:
+        while chunk := stream.read(65536):
+            value.update(chunk)
+    return value.hexdigest()
+
+
+def commit_scope(commit):
+    return set(git("diff-tree", "--no-commit-id", "--name-only", "-r", commit).splitlines())
+
+
+def worktree_scope():
+    lines = checked([*GIT_PREFIX, "status", "--porcelain=v1",
+                     "--untracked-files=all"]).splitlines()
+    return {line[3:] for line in lines if len(line) > 3}
+
+
+def validate_initial_evidence():
+    value = json.loads((ROOT / INITIAL_EVIDENCE).read_text())
+    require(set(value) == {"schema", "phase", "base", "branch", "implementationCommit",
+                           "bundle", "tests", "buildOnlyTarget", "systemMutations",
+                           "rollback", "gate"}, "evidence_keys")
+    require(value["schema"] == 1 and value["phase"] == "phase4_install_bundle_preparation",
+            "evidence_header")
+    require(value["base"] == BASE and value["branch"] == BRANCH and
+            value["implementationCommit"] == INITIAL_IMPLEMENTATION, "evidence_provenance")
+    require(value["gate"] == {
+        "independentReviewRequired": True,
+        "l3Claimed": False,
+        "liveApplyAuthorized": False,
+        "marker": INITIAL_MARKER,
+        "maximumVerdict": "INSTALL_BUNDLE_PREPARED_FOR_INDEPENDENT_REVIEW",
+        "phase4PassClaimed": False,
+        "phase5Authorized": False,
+        "rootInstallAuthorized": False,
+    }, "evidence_gate")
+    require(value["systemMutations"]["sudoOrPasswordPrompt"] is False and
+            value["systemMutations"]["rootExecution"] is False and
+            value["systemMutations"]["installation"] is False and
+            value["systemMutations"]["activation"] is False,
+            "evidence_forbidden_mutation")
+    require(value["rollback"] == {
+        "acceptedGenerationsDeleted": False,
+        "fixtureExactAbsentAndInstalledRollback": True,
+        "liveRollbackRequired": False,
+        "protectedMainUnchanged": True,
+    }, "evidence_rollback")
+    require(all(value["tests"].values()), "evidence_tests")
+    return value
+
+
+def validate_correction_evidence(implementation):
+    value = json.loads((ROOT / CORRECTION_EVIDENCE).read_text())
+    require(set(value) == {"schema", "phase", "base", "branch", "priorEvidenceCommit",
+                           "correctionImplementationCommit", "bundle", "tests",
+                           "buildOnlyTarget", "systemMutations", "rollback", "gate"},
+            "correction_evidence_keys")
+    require(value["schema"] == 1 and
+            value["phase"] == "phase4_install_bundle_identity_correction",
+            "correction_evidence_header")
+    require(value["base"] == BASE and value["branch"] == BRANCH and
+            value["priorEvidenceCommit"] == INITIAL_EVIDENCE_COMMIT and
+            value["correctionImplementationCommit"] == implementation,
+            "correction_evidence_provenance")
+    require(value["gate"] == {
+        "independentReviewRequired": True,
+        "l3Claimed": False,
+        "liveApplyAuthorized": False,
+        "marker": IDENTITY_MARKER,
+        "maximumVerdict": "INSTALL_BUNDLE_PREPARED_FOR_INDEPENDENT_REVIEW",
+        "phase4PassClaimed": False,
+        "phase5Authorized": False,
+        "rootInstallAuthorized": False,
+    }, "correction_evidence_gate")
+    require(value["systemMutations"]["sudoOrPasswordPrompt"] is False and
+            value["systemMutations"]["rootExecution"] is False and
+            value["systemMutations"]["installation"] is False and
+            value["systemMutations"]["activation"] is False,
+            "correction_evidence_forbidden_mutation")
+    require(value["rollback"] == {
+        "acceptedGenerationsDeleted": False,
+        "fixtureExactAbsentAndInstalledRollback": True,
+        "liveRollbackRequired": False,
+        "protectedMainUnchanged": True,
+    }, "correction_evidence_rollback")
+    require(all(value["tests"].values()), "correction_evidence_tests")
+    return value
+
+
+def validate_multicall_evidence(implementation):
+    value = json.loads((ROOT / MULTICALL_EVIDENCE).read_text())
+    require(set(value) == {"schema", "phase", "base", "branch", "acceptedPreapplyHead",
+                           "correctionImplementationCommit", "bundle", "tests", "liveSmoke",
+                           "liveState", "systemMutations", "rollback", "gate"},
+            "multicall_evidence_keys")
+    require(value["schema"] == 1 and
+            value["phase"] == "phase4_multicall_execution_correction" and
+            value["base"] == BASE and value["branch"] == BRANCH and
+            value["acceptedPreapplyHead"] == ACCEPTED_PREAPPLY_HEAD and
+            value["correctionImplementationCommit"] == implementation,
+            "multicall_evidence_provenance")
+    require(value["gate"] == {
+        "independentReviewRequired": True,
+        "l3Claimed": False,
+        "liveApplyRetryAuthorized": False,
+        "marker": MARKER,
+        "maximumVerdict": "CORRECTION_PREPARED_FOR_INDEPENDENT_REVIEW",
+        "phase4PassClaimed": False,
+        "phase5Authorized": False,
+        "reinstallAuthorized": False,
+    }, "multicall_evidence_gate")
+    require(value["systemMutations"] == {
+        "activation": False,
+        "consumedReceiptModified": False,
+        "installedArtifactsModified": False,
+        "liveNixEnvExecuted": False,
+        "profileOrCurrentSystemModified": False,
+        "rootExecution": False,
+        "sudoOrPasswordPrompt": False,
+    }, "multicall_evidence_system_mutations")
+    require(value["rollback"] == {
+        "acceptedGenerationsDeleted": False,
+        "currentGeneration": 2,
+        "numberedGenerations": [1, 2],
+        "ownerRollbackReturnExecuted": False,
+        "reviewedTargetNumbered": False,
+    }, "multicall_evidence_rollback")
+    require(all(value["tests"].values()) and all(value["liveSmoke"].values()) and
+            all(value["liveState"].values()), "multicall_evidence_results")
+    return value
+
+
+def validate_git(mode):
+    require(git("branch", "--show-current") == BRANCH, "wrong_branch")
+    require(run([*GIT_PREFIX, "merge-base", "--is-ancestor", BASE, "HEAD"]).returncode == 0,
+            "base_not_ancestor")
+    require(git("rev-parse", f"{INITIAL_IMPLEMENTATION}^") == BASE and
+            commit_scope(INITIAL_IMPLEMENTATION) == IMPLEMENTATION_SCOPE,
+            "initial_implementation_history")
+    require(git("rev-parse", f"{INITIAL_EVIDENCE_COMMIT}^") == INITIAL_IMPLEMENTATION and
+            commit_scope(INITIAL_EVIDENCE_COMMIT) == {INITIAL_EVIDENCE},
+            "initial_evidence_history")
+    _ = validate_initial_evidence()
+    require(git("rev-parse", f"{IDENTITY_IMPLEMENTATION}^") == INITIAL_EVIDENCE_COMMIT and
+            commit_scope(IDENTITY_IMPLEMENTATION) == CORRECTIVE_SCOPE,
+            "identity_implementation_history")
+    require(git("rev-parse", f"{IDENTITY_EVIDENCE_COMMIT}^") == IDENTITY_IMPLEMENTATION and
+            commit_scope(IDENTITY_EVIDENCE_COMMIT) == {CORRECTION_EVIDENCE},
+            "identity_evidence_history")
+    _ = validate_correction_evidence(IDENTITY_IMPLEMENTATION)
+    require(git("rev-parse", f"{PREAPPLY_TOOLING}^") == IDENTITY_EVIDENCE_COMMIT and
+            commit_scope(PREAPPLY_TOOLING) == PREAPPLY_SCOPE,
+            "preapply_tooling_history")
+    require(git("rev-parse", f"{ACCEPTED_PREAPPLY_HEAD}^") == PREAPPLY_TOOLING and
+            commit_scope(ACCEPTED_PREAPPLY_HEAD) == {
+                "evidence/phase-4/installed-root-preapply.json"},
+            "preapply_evidence_history")
+
+    if mode == "multicall-contract":
+        require(git("rev-parse", "HEAD") == ACCEPTED_PREAPPLY_HEAD,
+                "multicall_contract_base")
+        require(worktree_scope() == MULTICALL_SCOPE, "multicall_contract_scope")
+        return None, None
+
+    require(git("status", "--porcelain=v1", "--untracked-files=all") == "", "dirty_worktree")
+    if mode == "multicall-implementation":
+        implementation = git("rev-parse", "HEAD")
+        require(git("rev-parse", "HEAD^") == ACCEPTED_PREAPPLY_HEAD,
+                "multicall_implementation_parent")
+        require(commit_scope(implementation) == MULTICALL_SCOPE,
+                "multicall_implementation_scope")
+        return implementation, None
+
+    require(git("rev-list", "--count", f"{BASE}..HEAD") == "8", "final_history_count")
+    evidence_commit = git("rev-parse", "HEAD")
+    implementation = git("rev-parse", "HEAD^")
+    require(git("rev-parse", f"{implementation}^") == ACCEPTED_PREAPPLY_HEAD,
+            "final_multicall_implementation_parent")
+    require(commit_scope(implementation) == MULTICALL_SCOPE,
+            "final_multicall_implementation_scope")
+    require(commit_scope(evidence_commit) == {MULTICALL_EVIDENCE},
+            "multicall_evidence_commit_scope")
+    evidence = validate_multicall_evidence(implementation)
+    if mode in ("clone", "clone-git-only"):
+        require(git("remote") == "", "clone_has_remote")
+    return implementation, evidence
+
+
+def validate_policy():
+    preparation = json.loads((ROOT / "policy/aid-admin-policy.json").read_text())
+    apply = json.loads((ROOT / "policy/aid-admin-apply-policy.json").read_text())
+    expected = json.loads(json.dumps(preparation))
+    expected["preparationOnly"] = False
+    expected["apply"]["applyGateAccepted"] = True
+    require(apply == expected, "apply_policy_delta")
+    require(apply["allowedCommands"] == ["apply-system", "doctor-root"], "command_surface")
+    require(not apply["preparationOnly"] and apply["apply"]["applyGateAccepted"],
+            "apply_policy_gate")
+    value = digest(ROOT / "policy/aid-admin-apply-policy.json")
+    source = (ROOT / "Sources/AidAdminApply/main.swift").read_text()
+    require(f'applyPolicySHA256 = "{value}"' in source, "compiled_apply_policy_hash")
+    require(checked([*GIT_PREFIX, "show", f"{BASE}:policy/aid-admin-policy.json"]) ==
+            (ROOT / "policy/aid-admin-policy.json").read_text(), "preparation_policy_drift")
+    for path in ("Sources/AidAdmin/main.swift", "policy/aid-admin-policy.json",
+                 "policy/aid-admin-apply-policy.json", "Sources/AidAdminApply/main.swift"):
+        require(run([*GIT_PREFIX, "diff", "--quiet", ACCEPTED_PREAPPLY_HEAD, "--", path]).returncode == 0,
+                f"closed_policy_or_surface_drift_{path}")
+    return value
+
+
+def validate_pin(path, value):
+    require(set(value) >= {"path", "sha256", "size", "modeClass"}, "artifact_pin_keys")
+    require(re.fullmatch(r"[A-Za-z0-9._+-]+", value["path"]) is not None,
+            "artifact_relative_path")
+    artifact = path / value["path"]
+    require(artifact.is_file() and not artifact.is_symlink(), "artifact_type")
+    require(digest(artifact) == value["sha256"] and artifact.stat().st_size == value["size"],
+            "artifact_hash_size")
+    mode = stat.S_IMODE(artifact.stat().st_mode)
+    require(mode & 0o022 == 0, "artifact_group_or_world_writable")
+    if value["modeClass"].startswith("executable"):
+        require(mode & 0o111 != 0, "artifact_not_executable")
+    else:
+        require(mode & 0o111 == 0, "artifact_unexpected_executable")
+
+
+def validate_bundle(policy_hash):
+    manifest_path = BUNDLE / "review-manifest.json"
+    manifest = json.loads(manifest_path.read_text())
+    require(set(manifest) == {"acceptedBases", "architecture", "artifactSet", "artifacts",
+                              "buildProvenance", "commandSurface", "futureLauncher", "gates",
+                              "installPaths", "multicallExecution", "privacy", "renderedSudoers",
+                              "reviewMarker", "rollback", "schema", "verdict"},
+            "review_manifest_keys")
+    require(manifest["schema"] == 1 and
+            manifest["artifactSet"] == "phase4-aid-admin-install-bundle-v1" and
+            manifest["verdict"] == "CORRECTION_PREPARED_FOR_INDEPENDENT_REVIEW" and
+            manifest["reviewMarker"] == MARKER,
+            "review_manifest_header")
+    require(manifest["acceptedBases"] == {
+        "acceptedLevel": "L2", "acceptedPreparationHead": PREPARATION_HEAD,
+        "acceptedInstalledRootPreapplyHead": ACCEPTED_PREAPPLY_HEAD,
+        "controlMain": BASE, "migrationOwnerAuthorization": MIGRATION_AUTHORIZATION,
+        "migrationMulticallCorrection": MIGRATION_MULTICALL_CORRECTION,
+        "phase2": "PASS", "phase3": "PASS",
+    }, "accepted_bases")
+    require(manifest["architecture"] == "arm64-darwin", "manifest_architecture")
+    require(manifest["commandSurface"] == [
+        "doctor-root", "apply-system <40-lowercase-hex-control-commit>"], "manifest_commands")
+    require(manifest["gates"] == {"applyGateAccepted": True, "preparationOnly": False,
+                                  "liveApplyRetryAuthorized": False,
+                                  "reinstallAuthorized": False,
+                                  "phase4PassClaimed": False, "l3Claimed": False,
+                                  "phase5Authorized": False}, "manifest_gates")
+    require(manifest["multicallExecution"] == {
+        "applets": ["nix-env", "nix-store"],
+        "canonicalCommonBinaryValidationPreserved": True,
+        "dispatchUsesImmutableAppletSibling": True,
+        "exactAppletBasenamePreserved": True,
+        "gitAndActivationDispatchUnchanged": True,
+        "liveNixEnvExecuted": False,
+        "wrongNestedOrDriftingSiblingRejected": True,
+    }, "manifest_multicall_execution")
+    require(manifest["privacy"] == {"environmentRetained": False, "hostnameRetained": False,
+                                    "ownerIdentityRetained": False, "ownerUIDRetained": False,
+                                    "rawStorePathRetained": False, "secretsRetained": False},
+            "manifest_privacy")
+    for value in manifest["artifacts"].values():
+        validate_pin(BUNDLE, value)
+    require(manifest["artifacts"]["policy"]["sha256"] == policy_hash,
+            "bundle_policy_hash")
+
+    inputs = json.loads((BUNDLE / "install-inputs.json").read_text())
+    require(set(inputs) == {"artifactSet", "bootstrap", "broker", "policy",
+                            "renderedSudoers", "schema", "sudoersTemplate"},
+            "install_inputs_keys")
+    for input_key, artifact_key in (("bootstrap", "bootstrap"), ("broker", "broker"),
+                                    ("policy", "policy"),
+                                    ("sudoersTemplate", "sudoersTemplate")):
+        artifact = manifest["artifacts"][artifact_key]
+        require(inputs[input_key] == {"sha256": artifact["sha256"], "size": artifact["size"]},
+                f"install_inputs_binding_{input_key}")
+
+    owner_name = pwd.getpwuid(os.getuid()).pw_name
+    require(re.fullmatch(r"[a-z_][a-z0-9_-]{0,31}", owner_name) is not None,
+            "live_owner_identity_class")
+    template = (BUNDLE / manifest["artifacts"]["sudoersTemplate"]["path"]).read_text()
+    rendered = template.replace("@@AGENT_OWNER@@", owner_name).encode()
+    rendered_fact = {"sha256": hashlib.sha256(rendered).hexdigest(), "size": len(rendered)}
+    require(inputs["renderedSudoers"] == rendered_fact and
+            manifest["renderedSudoers"]["sha256"] == rendered_fact["sha256"] and
+            manifest["renderedSudoers"]["size"] == rendered_fact["size"],
+            "exact_owner_rendered_hash")
+    require(manifest["renderedSudoers"] == {
+        **rendered_fact,
+        "bytesRetained": False,
+        "directInvocationWithoutSudoProvenanceRejected": True,
+        "exactOwnerBound": True,
+        "identityAuthority": "standard-sudo-provenance-plus-canonical-passwd",
+        "requestFieldsAreAssertionsOnly": True,
+        "visudoRequired": True,
+    },
+            "rendered_sudoers_privacy")
+    with tempfile.NamedTemporaryFile(prefix="phase4-rendered-sudoers.", delete=False) as temporary:
+        temporary.write(rendered)
+        rendered_path = Path(temporary.name)
+    try:
+        rendered_path.chmod(0o440)
+        require(run(["/usr/sbin/visudo", "-cf", rendered_path]).returncode == 0,
+                "rendered_sudoers_visudo")
+    finally:
+        rendered_path.unlink(missing_ok=True)
+
+    launcher = BUNDLE / manifest["futureLauncher"]["path"]
+    future = manifest["futureLauncher"]
+    require(digest(launcher) == future["sha256"] and launcher.stat().st_size == future["size"],
+            "launcher_hash_size")
+    text = launcher.read_text()
+    require(text.count("/usr/bin/sudo") == 1 and "sudo -k --" in text and
+            text.count("/usr/bin/id") == 2 and "exec /usr/bin/sudo" in text,
+            "launcher_fixed_commands")
+    require(future["standardSudoOnly"] is True and
+            future["ownerFieldsAreAssertionsOnly"] is True and
+            future["expectedPasswordPrompts"] == 1,
+            "launcher_identity_authority")
+    require(all(value not in text for value in (" read ", "security ", "echo ", "osascript",
+                                                 "NOPASSWD: ALL", "/bin/sh")),
+            "launcher_password_or_backend_surface")
+    require(run(["/bin/zsh", "-n", launcher]).returncode == 0, "launcher_syntax")
+    for key in ("bootstrap", "broker"):
+        artifact = BUNDLE / manifest["artifacts"][key]["path"]
+        require("Mach-O 64-bit executable arm64" in checked(["/usr/bin/file", "-b", artifact]),
+                f"architecture_{key}")
+    provenance = manifest["buildProvenance"]
+    require(provenance["behaviorIdentical"] is True and provenance["selectedBuild"] == "A" and
+            provenance["buildA"]["broker"]["sha256"] ==
+            manifest["artifacts"]["broker"]["sha256"] and
+            provenance["buildA"]["bootstrap"]["sha256"] ==
+            manifest["artifacts"]["bootstrap"]["sha256"], "build_provenance")
+    for path, expected in provenance["sourceFileSHA256"].items():
+        require(digest(ROOT / path) == expected, f"source_hash_{path}")
+    return manifest
+
+
+def validate_static():
+    for path in ROOT.rglob("*.json"):
+        if ".build" not in path.parts:
+            json.loads(path.read_text())
+    for path in (ROOT / "bin").iterdir():
+        if path.is_file() and path.read_bytes().startswith(b"#!/usr/bin/python3"):
+            compile(path.read_text(), str(path), "exec")
+    swift = "\n".join((ROOT / path).read_text() for path in (
+        "Sources/AidAdminApply/main.swift", "Sources/AidAdminBootstrap/main.swift",
+        "Sources/AidAdminBootstrapCore/AidAdminBootstrapCore.swift",
+        "Sources/AidAdminCore/AidAdminCore.swift"))
+    for forbidden in (r"\bsystem\s*\(", r"\bpopen\s*\("):
+        require(re.search(forbidden, swift) is None, f"swift_shell_{forbidden}")
+    for required in ("O_NOFOLLOW", "/usr/sbin/visudo", "install_temporary_exists",
+                     "rollback_file_verification", "source_race", "trusted_file_race",
+                     "sudoers_direct_backend", "fchown", "sudoers",
+                     "deriveStandardSudoInvokingOwner", "SUDO_UID", "SUDO_USER",
+                     "getpwuid", "getpwnam", "request_owner_name_mismatch",
+                     "request_owner_uid_mismatch", "sudoers_identity_not_exact_invoker"):
+        require(required in swift, f"bootstrap_boundary_{required}")
+    main_source = (ROOT / "Sources/AidAdminBootstrap/main.swift").read_text()
+    require("deriveStandardSudoInvokingOwner" in main_source and
+            main_source.index("deriveStandardSudoInvokingOwner") <
+            main_source.index("BootstrapInstaller(context: context).install(request)"),
+            "production_invoker_derivation_wiring")
+    core_source = (ROOT / "Sources/AidAdminBootstrapCore/AidAdminBootstrapCore.swift").read_text()
+    require("request.ownerName == context.invokingOwner.name" in core_source and
+            "request.ownerUID == context.invokingOwner.uid" in core_source and
+            'request.sudoersIdentity == "name:" + context.invokingOwner.name' in core_source and
+            '"agentOwnerIdentity": owner.name' in core_source and
+            '"agentOwnerUID": owner.uid' in core_source,
+            "validated_invoker_semantic_binding")
+    broker_source = (ROOT / "Sources/AidAdminCore/AidAdminCore.swift").read_text()
+    broker_tests = (ROOT / "tests/AidAdminCoreTests/AidAdminCoreTests.swift").read_text()
+    for required in ("physicalValidatedNixApplet", "nix_applet_logical_identity",
+                     "nix_applet_not_direct_common_binary", "nix_applet_symlink_drift",
+                     "return applet"):
+        require(required in broker_source, f"multicall_source_semantic_{required}")
+    for required in ("canonical_multicall_target_dispatched", "nix-env", "nix-store",
+                     "nix-malicious", "nix_applet_drift_reached_mutation"):
+        require(required in broker_tests, f"multicall_test_semantic_{required}")
+    tracked = set(git("ls-files").splitlines()) | IMPLEMENTATION_SCOPE | CORRECTIVE_SCOPE
+    content = "\n".join((ROOT / path).read_text(errors="ignore") for path in sorted(tracked)
+                        if (ROOT / path).is_file() and
+                        not path.startswith("install-bundles/phase-4/aid-admin/aid-admin"))
+    require(re.search(r"/Users/[A-Za-z0-9._-]+", content) is None, "private_path_retained")
+    require(re.search(r"\b(?:serial|hardware_uuid|machine_uuid|hostname)\s*[:=]",
+                      content, re.IGNORECASE) is None, "stable_identifier_retained")
+    require("Migrate" + "FromWindows" not in content, "external_operational_dependency")
+    require("BEGIN " + "PRIVATE KEY" not in content and "NOPASSWD: ALL" not in
+            (ROOT / "policy/aid-admin-apply-policy.json").read_text(), "secret_or_all_sudoers")
+    for router in ("ARCHITECTURE.md", "AGENTS.md", "README.md"):
+        text = (ROOT / router).read_text()
+        for required in ("CORRECTION_PREPARED_FOR_INDEPENDENT_REVIEW", MARKER,
+                         "phase4_pass_claimed=false", "l3_claimed=false"):
+            require(required in text, f"router_{router}_{required}")
+    require(os.access(ROOT / "bin/build-phase4-install-bundle", os.X_OK) and
+            os.access(ROOT / "bin/check-phase4-install-bundle", os.X_OK),
+            "validator_or_builder_not_executable")
+    require(run([*GIT_PREFIX, "diff", "--check", BASE]).returncode == 0, "diff_check")
+    require(run([*GIT_PREFIX, "fsck", "--full"]).returncode == 0, "git_fsck")
+
+
+def negative_cli(binary, cases):
+    values = []
+    environment = {"HOME": "/var/empty", "LANG": "C", "LC_ALL": "C",
+                   "PATH": "/usr/bin:/bin", "TMPDIR": "/var/empty",
+                   "SECRET_TOKEN": "must-not-appear"}
+    for arguments in cases:
+        result = run([binary, *arguments], env=environment)
+        require(result.returncode != 0 and "must-not-appear" not in result.stdout,
+                f"negative_cli_{arguments}")
+        values.append((arguments, result.returncode, result.stdout))
+    return values
+
+
+def validate_no_sudo_provenance(binary):
+    environment = {"HOME": "/var/empty", "LANG": "C", "LC_ALL": "C",
+                   "PATH": "/usr/bin:/bin", "TMPDIR": "/var/empty"}
+    result = run([
+        binary, "install", "/tmp/reviewed-broker", "/tmp/reviewed-policy",
+        "/tmp/reviewed-sudoers", "/tmp/reviewed-inputs",
+        "0" * 64, "1", "agentowner", "12345", "name:agentowner",
+    ], env=environment)
+    require(result.returncode != 0 and "sudo_provenance_missing" in result.stdout,
+            "direct_invocation_without_sudo_provenance_accepted")
+
+
+def validate_builds_and_tests():
+    generated = Path(tempfile.mkdtemp(prefix="phase4-install-bundle-rebuild.")) / "bundle"
+    tests = Path(tempfile.mkdtemp(prefix="phase4-install-bundle-tests."))
+    try:
+        build_output = checked([ROOT / "bin/build-phase4-install-bundle", "--output", generated])
+        build_value = json.loads(build_output.splitlines()[-1])
+        require(build_value["result"] == "pass" and
+                build_value["owner_identity_retained"] is False, "two_clean_builds")
+        accepted_tests = checked(["/usr/bin/swift", "run", "-c", "release", "--scratch-path",
+                                  tests, "aid-admin-tests"])
+        bootstrap_tests = checked(["/usr/bin/swift", "run", "-c", "release", "--scratch-path",
+                                   tests, "aid-admin-bootstrap-tests"])
+        require('{"result":"pass","tests":15}' in accepted_tests, "accepted_broker_tests")
+        require('{"invokerSemanticCases":20,"result":"pass","tests":14}' in
+                bootstrap_tests, "bootstrap_semantic_tests")
+        broker_cases = [[], ["unknown"], ["install-pkg"], ["apply-system"],
+                        ["apply-system", "abc"], ["apply-system", "A" * 40],
+                        ["apply-system", "a" * 40, "extra"],
+                        ["apply-system", "a" * 40], ["doctor-root", "--json"]]
+        bootstrap_cases = [[], ["unknown"], ["install"], ["install", "extra"]]
+        committed_broker = negative_cli(BUNDLE / "aid-admin", broker_cases)
+        generated_broker = negative_cli(generated / "aid-admin", broker_cases)
+        committed_bootstrap = negative_cli(BUNDLE / "aid-admin-bootstrap", bootstrap_cases)
+        generated_bootstrap = negative_cli(generated / "aid-admin-bootstrap", bootstrap_cases)
+        require(committed_broker == generated_broker and
+                committed_bootstrap == generated_bootstrap, "rebuilt_behavior_drift")
+        validate_no_sudo_provenance(BUNDLE / "aid-admin-bootstrap")
+        validate_no_sudo_provenance(generated / "aid-admin-bootstrap")
+        return {"acceptedBrokerTests": 15, "bootstrapFixtureGroups": 14,
+                "invokerSemanticCases": 20,
+                "multicallSemanticCases": 6,
+                "directInvocationWithoutSudoProvenanceRejected": True,
+                "brokerBehaviorCases": len(broker_cases),
+                "bootstrapBehaviorCases": len(bootstrap_cases),
+                "twoCleanReleaseBuilds": True}
+    finally:
+        shutil.rmtree(generated.parent, ignore_errors=True)
+        shutil.rmtree(tests, ignore_errors=True)
+
+
+def validate_live_applet(name):
+    require(name in ("nix-store", "nix-env"), "live_applet_name")
+    logical = Path("/nix/var/nix/profiles/default/bin") / name
+    parent = logical.parent.resolve(strict=True)
+    sibling = parent / name
+    common = parent / "nix"
+    logical_facts = logical.lstat()
+    sibling_facts = sibling.lstat()
+    common_facts = common.lstat()
+    parent_facts = parent.lstat()
+    require(str(parent).startswith("/nix/store/") and parent.name == "bin" and
+            stat.S_ISDIR(parent_facts.st_mode) and parent_facts.st_uid == 0 and
+            stat.S_IMODE(parent_facts.st_mode) & 0o022 == 0,
+            "live_applet_parent")
+    require(stat.S_ISLNK(logical_facts.st_mode) and stat.S_ISLNK(sibling_facts.st_mode) and
+            logical_facts.st_uid == sibling_facts.st_uid == 0 and
+            (logical_facts.st_dev, logical_facts.st_ino) ==
+            (sibling_facts.st_dev, sibling_facts.st_ino), "live_applet_link_identity")
+    require(os.readlink(sibling) == "nix" and sibling.resolve(strict=True) == common,
+            "live_applet_direct_common_link")
+    require(stat.S_ISREG(common_facts.st_mode) and common_facts.st_uid == 0 and
+            stat.S_IMODE(common_facts.st_mode) & 0o022 == 0 and
+            stat.S_IMODE(common_facts.st_mode) & 0o111 != 0,
+            "live_common_binary")
+    return sibling
+
+
+def validate_live_multicall_smoke():
+    commit = BASE
+    receipt_path = (Path.home() / "AIDev/state/phase-4/apply-receipts" /
+                    f"{commit}.json")
+    facts = receipt_path.lstat()
+    data = receipt_path.read_bytes()
+    require(stat.S_ISREG(facts.st_mode) and not receipt_path.is_symlink() and
+            facts.st_uid == os.getuid() and stat.S_IMODE(facts.st_mode) == 0o400 and
+            len(data) == 431 and digest(receipt_path) ==
+            "cf5e95fd3bf33fc34794055a80865fde9feaeccac4b271aa30561e42ca30a725",
+            "live_consumed_receipt")
+    receipt = json.loads(data)
+    require(receipt["controlCommit"] == commit and receipt["reviewed"] is True and
+            receipt["schema"] == 1, "live_consumed_receipt_binding")
+    nix_store = validate_live_applet("nix-store")
+    _ = validate_live_applet("nix-env")
+    environment = {"HOME": str(Path.home()), "LANG": "C", "LC_ALL": "C",
+                   "PATH": "/usr/bin:/bin", "TMPDIR": tempfile.gettempdir()}
+    verify = run([nix_store, "--verify-path", receipt["targetSystemPath"]], env=environment)
+    query = run([nix_store, "--query", "--hash", receipt["targetSystemPath"]], env=environment)
+    require(verify.returncode == 0 and query.returncode == 0 and
+            query.stdout.strip() == receipt["targetSystemNarHash"],
+            "live_nix_store_applet_smoke")
+    return {"exactImmutableNixStoreApplet": True, "verifyPath": True,
+            "queryHashMatchesReceipt": True, "nixEnvStructureValidatedNotExecuted": True,
+            "systemMutationsPerformed": False}
+
+
+def validate_compatibility():
+    main = Path.home() / "AIDev/control"
+    require(git("rev-parse", "HEAD", cwd=main) == BASE and
+            git("status", "--porcelain=v1", cwd=main) == "", "protected_main")
+    worktree_output = git("worktree", "list", "--porcelain")
+    worktrees = [Path(line.removeprefix("worktree ")) for line in worktree_output.splitlines()
+                 if line.startswith("worktree ")]
+    for worktree in worktrees:
+        if worktree.resolve() != ROOT.resolve():
+            require(git("status", "--porcelain=v1", "--untracked-files=all",
+                        cwd=worktree) == "", f"unrelated_worktree_dirty_{worktree.name}")
+    def live_stat(path, mode, kind):
+        facts = Path(path).lstat()
+        require(facts.st_uid == 0 and stat.S_IMODE(facts.st_mode) == mode and
+                ((kind == "file" and stat.S_ISREG(facts.st_mode)) or
+                 (kind == "directory" and stat.S_ISDIR(facts.st_mode))) and
+                not Path(path).is_symlink(), f"live_{kind}_contract")
+        return facts
+
+    binary = Path("/usr/local/libexec/aid-admin")
+    policy = Path("/etc/agent-first-mac/aid-admin-policy.json")
+    require(live_stat(binary, 0o555, "file").st_size == 466544 and
+            digest(binary) == "adc6c151e89420159a6c807b267694030663572c9638a4c8763c1828d6b6a4a8",
+            "installed_broker_drift")
+    require(live_stat(policy, 0o444, "file").st_size == 1617 and
+            digest(policy) == "2555b3f0ed1f75cd26bc41af6512ecc30d444ba1b0113458f72efcfccc304225",
+            "installed_policy_drift")
+    require(live_stat("/etc/agent-first-mac/aid-admin-install.json", 0o400, "file").st_size == 341,
+            "installed_attestation_drift")
+    require(live_stat("/etc/sudoers.d/agent-first-mac-aid-admin", 0o440, "file").st_size == 122,
+            "installed_sudoers_drift")
+    staging = live_stat("/var/db/agent-first-mac/staging", 0o700, "directory")
+    audit = live_stat("/var/log/agent-first-mac/aid-admin", 0o700, "directory")
+    require(staging.st_size == 96 and audit.st_size == 64,
+            "retained_staging_or_audit_state_drift")
+    require(not os.path.lexists("/etc/agent-first-mac/aid-admin.disabled") and
+            not os.path.lexists("/etc/sudoers.d/agent-first-mac-aid-admin.disabled"),
+            "emergency_disable_drift")
+
+    profile = Path("/nix/var/nix/profiles/system")
+    require(profile.is_symlink() and Path(os.readlink(profile)).name == "system-2-link",
+            "live_profile_generation")
+    generation_targets = {}
+    for entry in profile.parent.glob("system-*-link"):
+        match = re.fullmatch(r"system-([1-9][0-9]{0,8})-link", entry.name)
+        if match:
+            generation_targets[int(match.group(1))] = entry.resolve(strict=True)
+    require(set(generation_targets) == {1, 2} and
+            Path("/run/current-system").resolve(strict=True) == generation_targets[2],
+            "live_generation_state")
+    receipt = json.loads((Path.home() / "AIDev/state/phase-4/apply-receipts" /
+                          f"{BASE}.json").read_text())
+    require(Path(receipt["targetSystemPath"]).resolve(strict=True) not in
+            set(generation_targets.values()), "reviewed_target_numbered")
+
+    processes = run(["/bin/ps", "-axo", "comm="])
+    blocked = {"aid-admin", "darwin-rebuild", "nix-env", "AidAdminBootstrap", "sudo"}
+    require(processes.returncode == 0 and not any(
+        Path(line.strip()).name in blocked for line in processes.stdout.splitlines()),
+        "stale_phase4_process")
+    checked([main / "bin/check-phase4-root-broker-prep", "--git-only"], cwd=main)
+    checked([main / "bin/check-phase2a"], cwd=main)
+    doctor_one = checked([main / "bin/phase2-doctor", "--json"], cwd=main)
+    doctor_two = checked([main / "bin/phase2-doctor", "--json"], cwd=main)
+    require(doctor_one == doctor_two and json.loads(doctor_one)["verdict"] == "PASS",
+            "phase2_live_doctor")
+    require(run([*GIT_PREFIX, "diff", "--quiet", BASE, "--", "evidence/phase-2",
+                 "evidence/phase-3", "evidence/phase-4/preparation-acceptance.json"]).returncode == 0,
+            "accepted_evidence_changed")
+    return {"phase2DoctorSHA256": hashlib.sha256(doctor_one.encode()).hexdigest(),
+            "installedBrokerUnchanged": True, "consumedReceiptUnchanged": True,
+            "generation2Current": True, "stagingEvidenceRetained": True,
+            "auditRecordAbsent": True, "staleProcessesAbsent": True}
+
+
+def validate_git_matrix():
+    workspace = Path(tempfile.mkdtemp(prefix="phase4-install-git-matrix."))
+    try:
+        clean = workspace / "clean"
+        checked([*GIT_PREFIX, "clone", "--no-local", "--quiet", ROOT, clean])
+        checked([*GIT_PREFIX, "remote", "remove", "origin"], cwd=clean)
+        require(run([clean / "bin/check-phase4-install-bundle", "--clone"],
+                    cwd=clean).returncode == 0, "clean_no_origin_clone_full")
+        require(run([clean / "bin/check-phase4-install-bundle", "--clone-git-only"],
+                    cwd=clean).returncode == 0, "clean_no_origin_clone")
+        marker = workspace / "fsmonitor-executed"
+        malicious = clean / ".git/malicious-fsmonitor"
+        malicious.write_text("#!/bin/sh\n/usr/bin/touch '" + str(marker) + "'\nexit 0\n")
+        malicious.chmod(0o755)
+        checked([*GIT_PREFIX, "config", "core.fsmonitor", str(malicious)], cwd=clean)
+        checked([*GIT_PREFIX, "config", "core.hooksPath", str(clean / ".git/hooks")], cwd=clean)
+        require(run([clean / "bin/check-phase4-install-bundle", "--clone-git-only"],
+                    cwd=clean).returncode == 0 and not marker.exists(),
+                "malicious_git_config_executed")
+        (clean / "dirty").write_text("dirty\n")
+        require(run([clean / "bin/check-phase4-install-bundle", "--git-only"],
+                    cwd=clean).returncode != 0, "dirty_clone_accepted")
+        (clean / "dirty").unlink()
+        checked([*GIT_PREFIX, "checkout", "-q", "--detach"], cwd=clean)
+        require(run([clean / "bin/check-phase4-install-bundle", "--git-only"],
+                    cwd=clean).returncode != 0, "detached_clone_accepted")
+        checked([*GIT_PREFIX, "checkout", "-q", BRANCH], cwd=clean)
+        checked([*GIT_PREFIX, "checkout", "-q", "-b", "unexpected"], cwd=clean)
+        require(run([clean / "bin/check-phase4-install-bundle", "--git-only"],
+                    cwd=clean).returncode != 0, "wrong_branch_accepted")
+        return 5
+    finally:
+        shutil.rmtree(workspace, ignore_errors=True)
+
+
+def main():
+    args = sys.argv[1:]
+    require(args in ([], ["--multicall-contract"], ["--multicall-implementation"],
+                     ["--git-only"],
+                     ["--clone"], ["--clone-git-only"]), "usage")
+    mode = "final" if not args else args[0].removeprefix("--")
+    implementation, evidence = validate_git(mode)
+    if mode in ("git-only", "clone-git-only"):
+        print(json.dumps({"schema": 1, "result": "pass", "implementationCommit": implementation,
+                          "verdict": "CORRECTION_PREPARED_FOR_INDEPENDENT_REVIEW",
+                          "marker": MARKER}, indent=2, sort_keys=True))
+        return
+    policy_hash = validate_policy()
+    manifest = validate_bundle(policy_hash)
+    validate_static()
+    build = validate_builds_and_tests()
+    live_smoke = validate_live_multicall_smoke()
+    compatibility = validate_compatibility()
+    matrix = validate_git_matrix() if mode == "final" else None
+    if evidence is not None:
+        require(evidence["bundle"]["reviewManifestSHA256"] ==
+                digest(BUNDLE / "review-manifest.json") and
+                evidence["bundle"]["brokerSHA256"] ==
+                manifest["artifacts"]["broker"]["sha256"],
+                "multicall_evidence_bundle_hash")
+    print(json.dumps({
+        "schema": 1, "result": "pass", "mode": mode,
+        "implementationCommit": implementation,
+        "bundle": {"brokerSHA256": manifest["artifacts"]["broker"]["sha256"],
+                   "bootstrapSHA256": manifest["artifacts"]["bootstrap"]["sha256"],
+                   "reviewManifestSHA256": digest(BUNDLE / "review-manifest.json")},
+        "buildAndTests": build, "gitMatrixCases": matrix,
+        "liveMulticallSmoke": live_smoke, "compatibility": compatibility,
+        "sudoRequested": False, "rootExecution": False, "installation": False,
+        "activation": False, "verdict": "CORRECTION_PREPARED_FOR_INDEPENDENT_REVIEW",
+        "marker": MARKER,
+    }, indent=2, sort_keys=True))
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except Exception as error:
+        print(json.dumps({"result": "fail", "reason": str(error)}, sort_keys=True))
+        raise SystemExit(1)

@@ -1,0 +1,56 @@
+#!/usr/bin/python3
+import json
+from pathlib import Path
+
+
+ROOT = Path(__file__).resolve().parents[1]
+manifest = json.loads((
+    ROOT / "manifests/codex-windows-host-ssh-remote-control-isolation.json"
+).read_text())
+runner = (ROOT / "bin/codex-windows-host-ssh-remote-control-isolation").read_text()
+policy = (
+    ROOT / "policy/windows/codex-windows-host-ssh-remote-control-isolation.ps1"
+).read_text()
+docs = (
+    ROOT / "docs/codex-windows-host-ssh-remote-control-isolation.md"
+).read_text()
+
+assert manifest["schema"] == 1
+assert manifest["profile"] == "codex-windows-host-ssh-remote-control-isolation"
+assert manifest["scope"] == "New inbound OpenSSH sessions only"
+assert manifest["dataBoundary"]["rawLogsRead"] is False
+assert manifest["dataBoundary"]["codexPrivateStateRead"] is False
+assert "CODEX_INTERNAL_APP_SERVER_REMOTE_CONTROL_DISABLED" in runner
+assert "CODEX_INTERNAL_APP_SERVER_REMOTE_CONTROL_DISABLED" in policy
+assert "CODEX_SSH_SKIP_APP_SERVER_BOOT" in runner
+assert "CODEX_SSH_SKIP_APP_SERVER_BOOT" in policy
+assert "SetEnv" in policy
+assert "Restart-Service -Name \"sshd\"" in policy
+assert "[IO.File]::Replace" in policy
+assert "$Backup" in policy
+assert "replace_cleanup_failed" in policy
+assert "candidate_syntax_failed" in policy
+assert "apply_failed_rolled_back" in policy
+assert "rollback_hash_mismatch" in policy
+assert "$ExactFlagLines" in policy
+assert "receipt_commit_mismatch" in policy
+assert "legacy_exact" in policy
+assert "split_exact" in policy
+assert "legacy_restored" in policy
+assert "$CombinedDirective" in policy
+assert "ConvertTo-Json -Compress" in policy
+assert "'\"status\":\"disabled\"'" in runner
+assert "account, host, request, and server identifiers never enter" in runner
+assert "child sessions" in docs
+assert "Windows desktop app's own" in docs
+assert "receipt" in docs
+assert "bootstrap" in docs
+
+for forbidden in (
+    "authorized_keys", "administrators_authorized_keys", "New-NetFirewallRule",
+    "Remove-NetFirewallRule", "Set-Service -Name \"sshd\"",
+    "CODEX_HOME", "auth.json", "state_5.sqlite", "tailscale up",
+):
+    assert forbidden not in policy
+
+print("codex-windows-host-ssh-remote-control-isolation static check: PASS")

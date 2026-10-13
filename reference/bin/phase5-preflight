@@ -1,0 +1,1395 @@
+#!/usr/bin/python3
+"""Bounded read-only inventory for Phase 5 Codex contract preparation."""
+
+import argparse
+import json
+import os
+from pathlib import Path
+import plistlib
+import pwd
+import re
+import stat
+import subprocess
+import sys
+
+
+ROOT = Path(__file__).resolve().parents[1]
+MANIFEST = ROOT / "manifests/codex-contract.json"
+CODEX = Path("/Applications/ChatGPT.app/Contents/Resources/codex")
+APP_RESOURCES = CODEX.parent
+APP_BUNDLE = CODEX.parents[2]
+MANAGED_VALUES = {
+    "approval_policy": "never",
+    "sandbox_mode": "danger-full-access",
+}
+MANAGED_EXACT = re.compile(
+    r'^\s*(approval_policy|sandbox_mode)\s*=\s*"([^"\\\r\n]*)"\s*(?:#.*)?$'
+)
+MANAGED_PREFIX = re.compile(r"^\s*(approval_policy|sandbox_mode)(?:\s|=|\.)")
+TABLE_HEADER = re.compile(r"^\s*\[\[?\s*([A-Za-z0-9_-]+)")
+PLUGIN_ROW_KEYS = {
+    "authPolicy",
+    "enabled",
+    "installPolicy",
+    "installed",
+    "marketplaceName",
+    "name",
+    "pluginId",
+    "source",
+    "version",
+}
+MCP_ROW_KEYS = {
+    "auth_status",
+    "disabled_reason",
+    "enabled",
+    "name",
+    "startup_timeout_sec",
+    "tool_timeout_sec",
+    "transport",
+}
+PLUGIN_MANIFEST_KEYS = {
+    "approvalPolicyObserved",
+    "enabledObserved",
+    "enabledTools",
+    "id",
+    "installPolicyObserved",
+    "observedVersion",
+    "owner",
+    "policy",
+    "smoke",
+    "source",
+}
+MCP_MANIFEST_KEYS = {
+    "auth",
+    "disabledReasonObserved",
+    "enabledObserved",
+    "enabledTools",
+    "id",
+    "policy",
+    "smoke",
+    "startupHealth",
+    "startupTimeoutSecObserved",
+    "toolTimeoutSecObserved",
+    "transport",
+}
+PLUGIN_SOURCE_KEYS = {
+    "marketplace",
+    "marketplaceSourceClass",
+    "pathClass",
+    "relativePath",
+    "sourceType",
+}
+MCP_STDIO_CONTRACT_KEYS = {
+    "args",
+    "commandRelative",
+    "commandResolver",
+    "cwdPolicy",
+    "envKeys",
+    "envMode",
+    "envValueClasses",
+    "forwardedEnvKeys",
+    "type",
+}
+MCP_HTTP_CONTRACT_KEYS = {
+    "bearerTokenEnvVar",
+    "envHttpHeaders",
+    "httpHeaders",
+    "type",
+    "url",
+}
+
+
+def parsed_numeric_version(value):
+    """Return a strict comparable numeric vendor version, or None."""
+    if not isinstance(value, str):
+        return None
+    match = re.fullmatch(r"(?:codex-cli )?([0-9]+(?:\.[0-9]+)+(?:-[0-9A-Za-z.]+)?)", value)
+    if match is None:
+        return None
+    numeric, suffix = match.group(1).split("-", 1)[0], match.group(1).partition("-")[2]
+    parts = tuple(int(item) for item in numeric.split("."))
+    return parts, suffix
+
+
+def version_at_or_above(observed, floor):
+    observed_value = parsed_numeric_version(observed)
+    floor_value = parsed_numeric_version(floor)
+    if observed_value is None or floor_value is None:
+        return observed == floor
+    observed_parts, observed_suffix = observed_value
+    floor_parts, floor_suffix = floor_value
+    width = max(len(observed_parts), len(floor_parts))
+    observed_parts += (0,) * (width - len(observed_parts))
+    floor_parts += (0,) * (width - len(floor_parts))
+    if observed_parts != floor_parts:
+        return observed_parts > floor_parts
+    if not observed_suffix or not floor_suffix:
+        return not observed_suffix
+    def prerelease(value):
+        if not value or any(not item for item in value.split(".")):
+            return None
+        return tuple((0, int(item)) if item.isdecimal() else (1, item)
+                     for item in value.split("."))
+    observed_pre, floor_pre = prerelease(observed_suffix), prerelease(floor_suffix)
+    return observed_pre is not None and floor_pre is not None and observed_pre >= floor_pre
+
+
+def numeric_version_at_or_above(observed, floor, *, minimum_components=1):
+    """Compare unsigned numeric versions without an opaque-string fallback."""
+    if (
+        type(observed) is not str
+        or type(floor) is not str
+        or type(minimum_components) is not int
+        or minimum_components < 1
+    ):
+        return False
+
+    # Keep conversion bounded as well as grammar-exact; these strings come
+    # from signed bundle metadata but remain untrusted input to the parser.
+    pattern = r"[0-9]{1,20}(?:\.[0-9]{1,20}){0,15}"
+    if re.fullmatch(pattern, observed) is None or re.fullmatch(pattern, floor) is None:
+        return False
+    observed_parts = tuple(int(item) for item in observed.split("."))
+    floor_parts = tuple(int(item) for item in floor.split("."))
+    if len(observed_parts) < minimum_components or len(floor_parts) < minimum_components:
+        return False
+    width = max(len(observed_parts), len(floor_parts))
+    observed_parts += (0,) * (width - len(observed_parts))
+    floor_parts += (0,) * (width - len(floor_parts))
+    return observed_parts >= floor_parts
+
+
+def numeric_version_valid(value, *, minimum_components=1):
+    """Return whether a value is valid input to the strict numeric policy."""
+    return numeric_version_at_or_above(
+        value,
+        value,
+        minimum_components=minimum_components,
+    )
+
+
+def _app_metadata(facts):
+    return (
+        facts.st_dev,
+        facts.st_ino,
+        facts.st_uid,
+        facts.st_gid,
+        facts.st_mode,
+        facts.st_nlink,
+        facts.st_size,
+        facts.st_mtime_ns,
+        facts.st_ctime_ns,
+    )
+
+
+def _app_parent_identity(facts):
+    return (
+        facts.st_dev,
+        facts.st_ino,
+        facts.st_uid,
+        facts.st_gid,
+        stat.S_IFMT(facts.st_mode),
+        stat.S_IMODE(facts.st_mode),
+    )
+
+
+def _read_app_info(descriptor, maximum=1024 * 1024):
+    os.lseek(descriptor, 0, os.SEEK_SET)
+    value = bytearray()
+    while len(value) <= maximum:
+        chunk = os.read(descriptor, min(65536, maximum + 1 - len(value)))
+        if not chunk:
+            return bytes(value)
+        value.extend(chunk)
+    raise OSError("app info too large")
+
+
+class _AppBundleObservation:
+    """Keep one app/plist generation bound across pathname signing checks."""
+
+    DIRECTORY_FLAGS = (
+        os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+    )
+    FILE_FLAGS = os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK
+
+    def __init__(self, bundle):
+        self.bundle = Path(bundle)
+        self.descriptors = []
+        try:
+            self.parent = os.open(self.bundle.parent, self.DIRECTORY_FLAGS)
+            self.descriptors.append(self.parent)
+            self.bundle_descriptor = os.open(
+                self.bundle.name,
+                self.DIRECTORY_FLAGS,
+                dir_fd=self.parent,
+            )
+            self.descriptors.append(self.bundle_descriptor)
+            self.contents_descriptor = os.open(
+                "Contents",
+                self.DIRECTORY_FLAGS,
+                dir_fd=self.bundle_descriptor,
+            )
+            self.descriptors.append(self.contents_descriptor)
+            self.info_descriptor = os.open(
+                "Info.plist",
+                self.FILE_FLAGS,
+                dir_fd=self.contents_descriptor,
+            )
+            self.descriptors.append(self.info_descriptor)
+
+            parent = os.fstat(self.parent)
+            bundle_facts = os.fstat(self.bundle_descriptor)
+            contents_facts = os.fstat(self.contents_descriptor)
+            info_facts = os.fstat(self.info_descriptor)
+            if (
+                not self.bundle.is_absolute()
+                or not stat.S_ISDIR(bundle_facts.st_mode)
+                or not stat.S_ISDIR(contents_facts.st_mode)
+                or not stat.S_ISREG(info_facts.st_mode)
+                or info_facts.st_nlink != 1
+                or info_facts.st_size < 1
+                or info_facts.st_size > 1024 * 1024
+                or bundle_facts.st_mode & 0o022
+                or contents_facts.st_mode & 0o022
+                or info_facts.st_mode & 0o022
+            ):
+                raise OSError("unsafe app metadata")
+            self.parent_identity = _app_parent_identity(parent)
+            self.bound_metadata = (
+                _app_metadata(bundle_facts),
+                _app_metadata(contents_facts),
+                _app_metadata(info_facts),
+            )
+            self.plist_bytes = _read_app_info(self.info_descriptor)
+            self.recheck()
+        except BaseException:
+            # Constructor assignment has not completed at the caller. Release
+            # owned handles even on interruption, then preserve that signal.
+            self.close()
+            raise
+
+    def recheck(self):
+        parent = os.stat(self.bundle.parent, follow_symlinks=False)
+        relative = (
+            os.stat(self.bundle.name, dir_fd=self.parent, follow_symlinks=False),
+            os.stat("Contents", dir_fd=self.bundle_descriptor, follow_symlinks=False),
+            os.stat("Info.plist", dir_fd=self.contents_descriptor, follow_symlinks=False),
+        )
+        absolute = (
+            os.stat(self.bundle, follow_symlinks=False),
+            os.stat(self.bundle / "Contents", follow_symlinks=False),
+            os.stat(self.bundle / "Contents/Info.plist", follow_symlinks=False),
+        )
+        descriptors = (
+            os.fstat(self.bundle_descriptor),
+            os.fstat(self.contents_descriptor),
+            os.fstat(self.info_descriptor),
+        )
+        if (
+            _app_parent_identity(os.fstat(self.parent)) != self.parent_identity
+            or _app_parent_identity(parent) != self.parent_identity
+            or any(
+                tuple(_app_metadata(item) for item in group) != self.bound_metadata
+                for group in (relative, absolute, descriptors)
+            )
+            or _read_app_info(self.info_descriptor) != self.plist_bytes
+        ):
+            raise OSError("app changed during attestation")
+
+    def close(self):
+        while self.descriptors:
+            try:
+                os.close(self.descriptors.pop())
+            except OSError:
+                pass
+
+
+def app_attestation(manifest):
+    runtime = manifest.get("runtime") if isinstance(manifest, dict) else None
+    if not isinstance(runtime, dict) or set(runtime) != {
+        "appMinimumVersion", "appVersionPolicy", "cliVersionPolicy",
+        "observedAppBuild", "observedAppVersion", "bundleId", "teamId",
+        "designatedRequirement",
+    } or any(type(value) is not str for value in runtime.values()):
+        return None
+    observation = None
+    try:
+        observation = _AppBundleObservation(APP_BUNDLE)
+        info = plistlib.loads(observation.plist_bytes)
+        if not isinstance(info, dict):
+            return None
+        version = info.get("CFBundleShortVersionString")
+        build = info.get("CFBundleVersion")
+        bundle = info.get("CFBundleIdentifier")
+        results = []
+        for arguments in (
+            ["/usr/bin/codesign", "-dvv", str(APP_BUNDLE)],
+            ["/usr/bin/codesign", "-dr", "-", str(APP_BUNDLE)],
+            ["/usr/bin/codesign", "--verify", "--deep", "--strict", str(APP_BUNDLE)],
+            ["/usr/sbin/spctl", "--assess", "--type", "execute", str(APP_BUNDLE)],
+        ):
+            observation.recheck()
+            results.append(run(arguments))
+            observation.recheck()
+        identity, designated, verify, gatekeeper = results
+        designated_lines = [item.strip() for item in designated.stdout.splitlines()
+                            if item.strip().startswith("designated =>")]
+        team_lines = [item.strip() for item in identity.stdout.splitlines()
+                      if item.strip().startswith("TeamIdentifier=")]
+    except Exception:
+        return None
+    finally:
+        if observation is not None:
+            observation.close()
+    return version if (
+        type(version) is str
+        and type(build) is str
+        and numeric_version_valid(build)
+        and bundle == runtime["bundleId"]
+        and runtime["appVersionPolicy"] == runtime["cliVersionPolicy"] == "signed-vendor-floor"
+        and numeric_version_at_or_above(
+            version, runtime["appMinimumVersion"], minimum_components=2
+        )
+        and verify.returncode == 0
+        and gatekeeper.returncode == 0
+        and identity.returncode == 0
+        and designated.returncode == 0
+        and designated_lines == [runtime["designatedRequirement"]]
+        and team_lines == ["TeamIdentifier=" + runtime["teamId"]]
+    ) else None
+
+
+def run(arguments, environment=None):
+    return subprocess.run(
+        [str(item) for item in arguments],
+        env=environment,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        check=False,
+    )
+
+
+def command_json(arguments, expected_shape, environment=None):
+    """Return JSON only for exit-zero commands with the expected bounded shape."""
+    result = run(arguments, environment=environment)
+    if result.returncode != 0:
+        return None
+    try:
+        value = json.loads(result.stdout)
+    except Exception:
+        return None
+    return value if expected_shape(value) else None
+
+
+def plugins_shape(value):
+    return (
+        isinstance(value, dict)
+        and set(value) == {"available", "installed"}
+        and value["available"] == []
+        and isinstance(value["installed"], list)
+        and all(isinstance(item, dict) for item in value["installed"])
+    )
+
+
+def mcp_shape(value):
+    return isinstance(value, list) and all(isinstance(item, dict) for item in value)
+
+
+def doctor_contract(value):
+    """Keep only the config-load observation used by the Phase 5 gate."""
+    try:
+        checks = value["checks"]
+        config_load = checks["config.load"]
+    except Exception:
+        return None
+    if not (
+        isinstance(value, dict)
+        and isinstance(checks, dict)
+        and isinstance(config_load, dict)
+        and config_load.get("status") in {"ok", "warning", "fail"}
+    ):
+        return None
+    return {"configLoad": config_load["status"]}
+
+
+def doctor_report(environment):
+    """Read only config.load; unrelated doctor failures may make exit one."""
+    result = run([CODEX, "doctor", "--json"], environment=environment)
+    if result.returncode not in (0, 1):
+        return None
+    try:
+        value = json.loads(result.stdout)
+    except Exception:
+        return None
+    return doctor_contract(value)
+
+
+def canonical_home():
+    return Path(pwd.getpwuid(os.getuid()).pw_dir)
+
+
+def cli_environment():
+    home = canonical_home()
+    return {
+        "CODEX_HOME": str(home / ".codex"),
+        "HOME": str(home),
+        "LANG": "C",
+        "LC_ALL": "C",
+        "PATH": "/usr/bin:/bin:/usr/sbin:/sbin",
+        "SHELL": "/bin/zsh",
+    }
+
+
+def load_manifest():
+    def unique(pairs):
+        value = {}
+        for key, item in pairs:
+            if key in value:
+                raise ValueError("duplicate manifest key")
+            value[key] = item
+        return value
+
+    try:
+        value = json.loads(MANIFEST.read_text(), object_pairs_hook=unique)
+        extensions = value["extensions"]
+        plugins = extensions["plugins"]
+        mcp = extensions["mcp"]
+        if not (
+            isinstance(value, dict)
+            and isinstance(value["cli"], dict)
+            and isinstance(value["gate"], dict)
+            and isinstance(value["preparationOnly"], bool)
+            and isinstance(plugins, list)
+            and isinstance(mcp, list)
+            and all(
+                isinstance(item, dict)
+                and isinstance(item.get("id"), str)
+                and isinstance(item.get("enabledObserved"), bool)
+                and isinstance(item.get("observedVersion"), str)
+                for item in plugins
+            )
+            and all(
+                isinstance(item, dict)
+                and isinstance(item.get("id"), str)
+                and isinstance(item.get("enabledObserved"), bool)
+                for item in mcp
+            )
+        ):
+            return None
+        return value
+    except Exception:
+        return None
+
+
+def top_level_managed_facts(text, config_load_ok=True):
+    """Recognize only simple managed scalars before the first TOML table."""
+    root_open = True
+    invalid = not config_load_ok
+    values = {}
+    table_names = set()
+    for line in text.splitlines():
+        stripped = line.lstrip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        table = TABLE_HEADER.match(line)
+        if stripped.startswith("["):
+            root_open = False
+            if table:
+                table_names.add(table.group(1))
+            continue
+        if not root_open or not MANAGED_PREFIX.match(line):
+            continue
+        match = MANAGED_EXACT.fullmatch(line)
+        if not match:
+            invalid = True
+            continue
+        key, value = match.groups()
+        if key in values:
+            invalid = True
+            continue
+        values[key] = value
+    exact = not invalid and values == MANAGED_VALUES
+    return {
+        "appManagedOrUserStatePresent": bool(
+            table_names & {"desktop", "marketplaces", "mcp_servers", "plugins", "projects"}
+        ),
+        "managedKeysExactTopLevel": exact,
+        "managedKeysStructurallyValid": not invalid,
+        "shellEnvironmentPolicyPresent": "shell_environment_policy" in table_names,
+        "trustedBaseline": exact,
+    }
+
+
+def active_config_facts(config_load_ok):
+    codex_home = canonical_home() / ".codex"
+    path = codex_home / "config.toml"
+    if (
+        codex_home.is_symlink()
+        or not codex_home.is_dir()
+        or path.is_symlink()
+        or not path.is_file()
+    ):
+        return {
+            "appManagedOrUserStatePresent": False,
+            "exists": False,
+            "managedKeysExactTopLevel": False,
+            "managedKeysStructurallyValid": False,
+            "shellEnvironmentPolicyPresent": False,
+            "trustedBaseline": False,
+        }
+    try:
+        text = path.read_text(errors="strict")
+    except Exception:
+        text = ""
+        config_load_ok = False
+    facts = top_level_managed_facts(text, config_load_ok=config_load_ok)
+    facts["exists"] = True
+    return facts
+
+
+def canonical_cli_valid():
+    try:
+        mode = CODEX.lstat().st_mode
+    except OSError:
+        return False
+    return (
+        stat.S_ISREG(mode)
+        and not CODEX.is_symlink()
+        and os.access(CODEX, os.X_OK)
+        and CODEX.resolve() == CODEX
+    )
+
+
+def expected_plugin_inventory(manifest):
+    if manifest["extensions"].get("pluginCanonicalOwnerRoot") != "$HOME":
+        raise ValueError("plugin owner root")
+    expected = []
+    source_classes = {
+        "openai-bundled": (
+            "codex-home-app-managed-bundled-marketplace",
+            "codex-home-app-managed-bundled-plugin",
+        ),
+        "openai-curated": (
+            "not-exposed",
+            "codex-home-app-managed-curated-plugin",
+        ),
+        "openai-primary-runtime": (
+            "owner-home-primary-runtime-marketplace",
+            "owner-home-primary-runtime-plugin",
+        ),
+    }
+    for item in manifest["extensions"]["plugins"]:
+        if not isinstance(item, dict) or set(item) != PLUGIN_MANIFEST_KEYS:
+            raise ValueError("plugin manifest shape")
+        identifier = item["id"]
+        if not isinstance(identifier, str) or identifier.count("@") != 1:
+            raise ValueError("plugin manifest identity")
+        name, marketplace = identifier.split("@")
+        source = item["source"]
+        if (
+            marketplace not in source_classes
+            or not name
+            or not isinstance(source, dict)
+            or set(source) != PLUGIN_SOURCE_KEYS
+            or source
+            != {
+                "marketplace": marketplace,
+                "marketplaceSourceClass": source_classes[marketplace][0],
+                "pathClass": source_classes[marketplace][1],
+                "relativePath": "plugins/" + name,
+                "sourceType": "local",
+            }
+            or item["owner"] != "openai"
+            or item["enabledObserved"] is not True
+            or item["enabledTools"]
+            != "not-exposed-by-installed-cli-apply-gate-required"
+            or item["installPolicyObserved"] != "AVAILABLE"
+            or item["approvalPolicyObserved"]
+            != ("ON_USE" if marketplace == "openai-primary-runtime" else "ON_INSTALL")
+            or item["policy"] != "preserve-installed-observed"
+            or item["smoke"] != "apply-gate-required"
+            or not isinstance(item["observedVersion"], str)
+            or not item["observedVersion"]
+        ):
+            raise ValueError("plugin manifest contract")
+        expected.append(
+            {
+                "approvalPolicyObserved": item["approvalPolicyObserved"],
+                "enabled": item["enabledObserved"],
+                "id": identifier,
+                "installPolicyObserved": item["installPolicyObserved"],
+                "installed": True,
+                "owner": item["owner"],
+                "ownerRoot": "$HOME",
+                "source": source,
+                "minimumVersion": item["observedVersion"],
+            }
+        )
+    identifiers = [item["id"] for item in expected]
+    if len(set(identifiers)) != len(identifiers):
+        raise ValueError("plugin manifest duplicate")
+    return expected
+
+
+def expected_mcp_inventory(manifest):
+    expected = []
+    for item in manifest["extensions"]["mcp"]:
+        if not isinstance(item, dict) or set(item) != MCP_MANIFEST_KEYS:
+            raise ValueError("MCP manifest shape")
+        auth = item["auth"]
+        transport = item["transport"]
+        if (
+            not isinstance(item["id"], str)
+            or not item["id"]
+            or not isinstance(item["enabledObserved"], bool)
+            or item["disabledReasonObserved"] is not None
+            or auth
+            != {
+                "credentialMaterialAuthorized": False,
+                "statusObserved": "unsupported",
+                "storageClass": "not-exposed-by-installed-cli",
+            }
+            or item["enabledTools"]
+            != "not-exposed-by-installed-cli-apply-gate-required"
+            or item["policy"] != "preserve-current-no-auth"
+            or item["smoke"] != "apply-gate-required"
+            or item["startupHealth"] != "apply-gate-required"
+            or (
+                item["startupTimeoutSecObserved"] is not None
+                and type(item["startupTimeoutSecObserved"]) is not float
+            )
+            or item["toolTimeoutSecObserved"] is not None
+            or not mcp_contract_transport_valid(transport)
+        ):
+            raise ValueError("MCP manifest contract")
+        expected.append(
+            {
+                "auth": auth,
+                "disabledReasonObserved": None,
+                "enabled": item["enabledObserved"],
+                "id": item["id"],
+                "startupTimeoutSecObserved": item["startupTimeoutSecObserved"],
+                "toolTimeoutSecObserved": item["toolTimeoutSecObserved"],
+                "transport": transport,
+            }
+        )
+    identifiers = [item["id"] for item in expected]
+    if len(set(identifiers)) != len(identifiers):
+        raise ValueError("MCP manifest duplicate")
+    return sorted(expected, key=lambda item: item["id"])
+
+
+def string_map(value):
+    return (
+        isinstance(value, dict)
+        and all(isinstance(key, str) and isinstance(item, str) for key, item in value.items())
+    )
+
+
+def string_list(value):
+    return isinstance(value, list) and all(isinstance(item, str) for item in value)
+
+
+def bounded_text(value, allow_space=True):
+    if not isinstance(value, str) or not value or len(value) > 4096:
+        return False
+    if any(ord(character) < 32 or ord(character) == 127 for character in value):
+        return False
+    return allow_space or " " not in value
+
+
+def safe_existing_path(value, kind):
+    if not isinstance(value, (str, Path)):
+        return False
+    text = str(value)
+    if not bounded_text(text) or not Path(text).is_absolute():
+        return False
+    path = Path(text)
+    if ".." in path.parts:
+        return False
+    try:
+        current = Path(path.anchor)
+        for part in path.parts[1:]:
+            current = current / part
+            mode = current.lstat().st_mode
+            if stat.S_ISLNK(mode):
+                return False
+        if path.resolve(strict=True) != path:
+            return False
+        mode = path.lstat().st_mode
+    except OSError:
+        return False
+    return (
+        kind == "directory"
+        and stat.S_ISDIR(mode)
+        or kind == "file"
+        and stat.S_ISREG(mode)
+        or kind == "executable"
+        and stat.S_ISREG(mode)
+        and os.access(path, os.X_OK)
+    )
+
+
+def plugin_source_contract(item, owner_home=None):
+    owner_home = Path(owner_home) if owner_home is not None else canonical_home()
+    identifier = item["pluginId"]
+    if identifier.count("@") != 1:
+        return None
+    name, marketplace = identifier.split("@")
+    if item["name"] != name or item["marketplaceName"] != marketplace:
+        return None
+    source = item["source"]
+    if source["source"] != "local":
+        return None
+    if marketplace == "openai-bundled":
+        marketplace_root = (
+            owner_home
+            / ".codex/.tmp/bundled-marketplaces"
+            / marketplace
+        )
+        source_class = "codex-home-app-managed-bundled-plugin"
+        marketplace_source_class = "codex-home-app-managed-bundled-marketplace"
+        marketplace_source = item.get("marketplaceSource")
+    elif marketplace == "openai-curated":
+        marketplace_root = owner_home / ".codex/.tmp/plugins"
+        source_class = "codex-home-app-managed-curated-plugin"
+        marketplace_source_class = "not-exposed"
+        if "marketplaceSource" in item:
+            return None
+        marketplace_source = None
+    elif marketplace == "openai-primary-runtime":
+        marketplace_root = (
+            owner_home
+            / ".cache/codex-runtimes/codex-primary-runtime/plugins"
+            / marketplace
+        )
+        source_class = "owner-home-primary-runtime-plugin"
+        marketplace_source_class = "owner-home-primary-runtime-marketplace"
+        marketplace_source = item.get("marketplaceSource")
+    else:
+        return None
+    plugin_path = marketplace_root / "plugins" / name
+    if (
+        source["path"] != str(plugin_path)
+        or not safe_existing_path(plugin_path, "directory")
+    ):
+        return None
+    if marketplace_source is not None:
+        if (
+            not isinstance(marketplace_source, dict)
+            or set(marketplace_source) != {"source", "sourceType"}
+            or marketplace_source["sourceType"] != "local"
+            or marketplace_source["source"] != str(marketplace_root)
+            or not safe_existing_path(marketplace_root, "directory")
+        ):
+            return None
+    return {
+        "marketplace": marketplace,
+        "marketplaceSourceClass": marketplace_source_class,
+        "pathClass": source_class,
+        "relativePath": "plugins/" + name,
+        "sourceType": "local",
+    }
+
+
+def plugin_row_valid(item):
+    keys = set(item) if isinstance(item, dict) else set()
+    if keys not in (PLUGIN_ROW_KEYS, PLUGIN_ROW_KEYS | {"marketplaceSource"}):
+        return False
+    if not (
+        isinstance(item["authPolicy"], str)
+        and isinstance(item["enabled"], bool)
+        and isinstance(item["installPolicy"], str)
+        and item["installed"] is True
+        and isinstance(item["marketplaceName"], str)
+        and bool(item["marketplaceName"])
+        and isinstance(item["name"], str)
+        and bool(item["name"])
+        and isinstance(item["pluginId"], str)
+        and bool(item["pluginId"])
+        and isinstance(item["version"], str)
+        and bool(item["version"])
+        and isinstance(item["source"], dict)
+        and set(item["source"]) == {"path", "source"}
+        and string_map(item["source"])
+        and all(bool(value) for value in item["source"].values())
+    ):
+        return False
+    return "marketplaceSource" not in item or (
+        isinstance(item["marketplaceSource"], dict)
+        and set(item["marketplaceSource"]) == {"source", "sourceType"}
+        and string_map(item["marketplaceSource"])
+        and all(bool(value) for value in item["marketplaceSource"].values())
+    )
+
+
+def mcp_contract_transport_valid(value):
+    if not isinstance(value, dict):
+        return False
+    if set(value) == MCP_STDIO_CONTRACT_KEYS:
+        env_keys = value["envKeys"]
+        env_classes = value["envValueClasses"]
+        return (
+            value["type"] == "stdio"
+            and string_list(value["args"])
+            and all(bounded_text(item) for item in value["args"])
+            and bounded_text(value["commandRelative"])
+            and not Path(value["commandRelative"]).is_absolute()
+            and ".." not in Path(value["commandRelative"]).parts
+            and value["commandResolver"]
+            in {"chatgpt-app-resources", "disabled-cwd-relative-observed"}
+            and value["cwdPolicy"] in {"none", "relative-dot-observed-disabled"}
+            and value["envMode"] in {"none", "explicit-map"}
+            and string_list(env_keys)
+            and env_keys == sorted(set(env_keys))
+            and isinstance(env_classes, dict)
+            and set(env_classes) == set(env_keys)
+            and all(
+                isinstance(key, str)
+                and bounded_text(key, allow_space=False)
+                and isinstance(item, str)
+                and bounded_text(item, allow_space=False)
+                for key, item in env_classes.items()
+            )
+            and string_list(value["forwardedEnvKeys"])
+        )
+    if set(value) == MCP_HTTP_CONTRACT_KEYS:
+        return (
+            value["type"] == "streamable_http"
+            and value["bearerTokenEnvVar"] is None
+            and value["envHttpHeaders"] == "none"
+            and value["httpHeaders"] == "none"
+            and isinstance(value["url"], str)
+            and re.fullmatch(r"https://[A-Za-z0-9.-]+(?::[0-9]+)?/[A-Za-z0-9._~/-]*", value["url"])
+            is not None
+        )
+    return False
+
+
+def mcp_transport_valid(value):
+    if not isinstance(value, dict) or not isinstance(value.get("type"), str):
+        return False
+    if set(value) == {"args", "command", "cwd", "env", "env_vars", "type"}:
+        return (
+            value["type"] == "stdio"
+            and isinstance(value["command"], str)
+            and bool(value["command"])
+            and string_list(value["args"])
+            and (value["cwd"] is None or isinstance(value["cwd"], str))
+            and (value["env"] is None or string_map(value["env"]))
+            and string_list(value["env_vars"])
+        )
+    if set(value) == {
+        "bearer_token_env_var",
+        "env_http_headers",
+        "http_headers",
+        "type",
+        "url",
+    }:
+        return (
+            value["type"] == "streamable_http"
+            and isinstance(value["url"], str)
+            and bool(value["url"])
+            and value["bearer_token_env_var"] is None
+            and value["env_http_headers"] is None
+            and value["http_headers"] is None
+        )
+    return False
+
+
+def mcp_row_valid(item):
+    return (
+        isinstance(item, dict)
+        and set(item) == MCP_ROW_KEYS
+        and isinstance(item["auth_status"], str)
+        and item["disabled_reason"] is None
+        and isinstance(item["enabled"], bool)
+        and isinstance(item["name"], str)
+        and bool(item["name"])
+        and (
+            item["startup_timeout_sec"] is None
+            or type(item["startup_timeout_sec"]) is float
+        )
+        and item["tool_timeout_sec"] is None
+        and mcp_transport_valid(item["transport"])
+    )
+
+
+def classify_mcp_env_value(key, value, owner_home, app_resources, cli_path):
+    if not isinstance(value, str):
+        return None
+    if key == "BROWSER_USE_AVAILABLE_BACKENDS":
+        parts = value.split(",")
+        return (
+            "comma-separated-safe-identifiers"
+            if 1 <= len(parts) <= 16
+            and len(set(parts)) == len(parts)
+            and all(re.fullmatch(r"[A-Za-z0-9_.-]+", part) for part in parts)
+            else None
+        )
+    if key == "BROWSER_USE_CODEX_APP_BUILD_FLAVOR":
+        return (
+            "bounded-safe-token"
+            if re.fullmatch(r"[A-Za-z0-9_.@/+-]{1,64}", value)
+            else None
+        )
+    if key == "BROWSER_USE_CODEX_APP_VERSION":
+        return (
+            "dotted-version"
+            if re.fullmatch(r"[0-9]+(?:\.[0-9]+)+", value)
+            else None
+        )
+    if key == "CODEX_CLI_PATH":
+        return (
+            "canonical-chatgpt-cli"
+            if value == str(cli_path)
+            and safe_existing_path(cli_path, "executable")
+            else None
+        )
+    if key in {"CODEX_HOME", "NODE_REPL_TRUSTED_CODE_PATHS"}:
+        codex_home = owner_home / ".codex"
+        return (
+            "canonical-codex-home"
+            if value == str(codex_home)
+            and safe_existing_path(codex_home, "directory")
+            else None
+        )
+    if key.startswith("NODE_REPL_INSTRUCTIONS_USE_CASE_"):
+        return (
+            "bounded-single-line-instruction"
+            if 1 <= len(value) <= 4096
+            and "\r" not in value
+            and "\n" not in value
+            and value.isprintable()
+            else None
+        )
+    if key == "NODE_REPL_NATIVE_PIPE_CONNECT_TIMEOUT_MS":
+        return (
+            "positive-decimal-milliseconds"
+            if re.fullmatch(r"[0-9]{1,9}", value)
+            and 1 <= int(value) <= 600000
+            else None
+        )
+    if key in {"NODE_REPL_NODE_MODULE_DIRS", "NODE_REPL_NODE_PATH"}:
+        path = Path(value)
+        try:
+            relative = path.relative_to(app_resources)
+        except ValueError:
+            return None
+        if not relative.parts or ".." in relative.parts:
+            return None
+        kind = "directory" if key.endswith("MODULE_DIRS") else "file"
+        return (
+            "chatgpt-resource-" + kind
+            if safe_existing_path(path, kind)
+            else None
+        )
+    if key == "NODE_REPL_TRUSTED_BROWSER_CLIENT_SHA256S":
+        parts = value.split(",")
+        return (
+            "comma-separated-sha256"
+            if 1 <= len(parts) <= 16
+            and len(set(parts)) == len(parts)
+            and all(re.fullmatch(r"[0-9a-f]{64}", part) for part in parts)
+            else None
+        )
+    if key == "SKY_CUA_SERVICE_PATH":
+        root = owner_home / ".codex/computer-use"
+        path = Path(value)
+        try:
+            relative = path.relative_to(root)
+        except ValueError:
+            return None
+        return (
+            "owner-home-codex-computer-use-app"
+            if len(relative.parts) == 1
+            and re.fullmatch(r"[A-Za-z0-9._ -]+", relative.parts[0])
+            and relative.parts[0] not in {".", ".."}
+            and safe_existing_path(path, "directory")
+            else None
+        )
+    return None
+
+
+def normalized_mcp_transport(
+    item,
+    owner_home=None,
+    app_resources=None,
+    cli_path=None,
+):
+    owner_home = Path(owner_home) if owner_home is not None else canonical_home()
+    app_resources = Path(app_resources) if app_resources is not None else APP_RESOURCES
+    cli_path = Path(cli_path) if cli_path is not None else CODEX
+    value = item["transport"]
+    if value["type"] == "stdio":
+        if item["name"] == "computer-use":
+            relative = (
+                "Codex Computer Use.app/Contents/SharedSupport/"
+                "SkyComputerUseClient.app/Contents/MacOS/SkyComputerUseClient"
+            )
+            if (
+                item["enabled"] is not False
+                or value["command"] != "./" + relative
+                or value["cwd"] != "."
+                or value["env"] is not None
+            ):
+                return None
+            resolver = "disabled-cwd-relative-observed"
+            cwd_policy = "relative-dot-observed-disabled"
+            env_mode = "none"
+            env_keys = []
+            env_classes = {}
+        elif item["name"] == "node_repl":
+            relative = "cua_node/bin/node_repl"
+            command = app_resources / relative
+            if (
+                value["command"] != str(command)
+                or not safe_existing_path(command, "executable")
+                or value["cwd"] is not None
+                or not isinstance(value["env"], dict)
+            ):
+                return None
+            resolver = "chatgpt-app-resources"
+            cwd_policy = "none"
+            env_mode = "explicit-map"
+            env_keys = sorted(value["env"])
+            env_classes = {}
+            for key in env_keys:
+                value_class = classify_mcp_env_value(
+                    key,
+                    value["env"][key],
+                    owner_home,
+                    app_resources,
+                    cli_path,
+                )
+                if value_class is None:
+                    return None
+                env_classes[key] = value_class
+        else:
+            return None
+        return {
+            "args": value["args"],
+            "commandRelative": relative,
+            "commandResolver": resolver,
+            "cwdPolicy": cwd_policy,
+            "envKeys": env_keys,
+            "envMode": env_mode,
+            "envValueClasses": env_classes,
+            "forwardedEnvKeys": value["env_vars"],
+            "type": "stdio",
+        }
+    if value["type"] == "streamable_http":
+        if item["name"] != "openaiDeveloperDocs":
+            return None
+        return {
+            "bearerTokenEnvVar": None,
+            "envHttpHeaders": "none",
+            "httpHeaders": "none",
+            "type": "streamable_http",
+            "url": value["url"],
+        }
+    return None
+
+
+def mcp_app_version_matches_attestation(rows, attested_version):
+    """Check one private MCP field against fresh app evidence; admit nothing."""
+    if (
+        not isinstance(rows, list)
+        or not numeric_version_valid(attested_version, minimum_components=2)
+    ):
+        return False
+    observed = []
+    for row in rows:
+        if not isinstance(row, dict) or row.get("name") != "node_repl":
+            continue
+        transport = row.get("transport")
+        environment = transport.get("env") if isinstance(transport, dict) else None
+        if not isinstance(environment, dict):
+            return False
+        value = environment.get("BROWSER_USE_CODEX_APP_VERSION")
+        if type(value) is not str:
+            return False
+        observed.append(value)
+    return len(observed) == 1 and observed[0] == attested_version
+
+
+def observed_plugin_inventory(value, expected, owner_home=None):
+    """Return the exact expected inventory or None; never filter malformed rows."""
+    if not plugins_shape(value) or not all(plugin_row_valid(item) for item in value["installed"]):
+        return None
+    identifiers = [item["pluginId"] for item in value["installed"]]
+    if len(set(identifiers)) != len(identifiers):
+        return None
+    normalized = []
+    for item in value["installed"]:
+        source = plugin_source_contract(item, owner_home=owner_home)
+        if source is None:
+            return None
+        normalized.append(
+            {
+                "approvalPolicyObserved": item["authPolicy"],
+                "enabled": item["enabled"],
+                "id": item["pluginId"],
+                "installPolicyObserved": item["installPolicy"],
+                "installed": item["installed"],
+                "owner": "openai",
+                "ownerRoot": "$HOME",
+                "source": source,
+                "versionObserved": item["version"],
+            }
+        )
+    if len(normalized) != len(expected):
+        return None
+    for observed, contract in zip(normalized, expected):
+        if observed["id"] != contract["id"]:
+            return None
+        if {key: value for key, value in observed.items() if key != "versionObserved"} != {
+            key: value for key, value in contract.items() if key != "minimumVersion"
+        }:
+            return None
+        if not version_at_or_above(observed["versionObserved"], contract["minimumVersion"]):
+            return None
+    return normalized
+
+
+def observed_mcp_inventory(
+    value,
+    expected,
+    owner_home=None,
+    app_resources=None,
+    cli_path=None,
+):
+    """Return the exact expected inventory or None; never filter malformed rows."""
+    if not mcp_shape(value) or not all(mcp_row_valid(item) for item in value):
+        return None
+    identifiers = [item["name"] for item in value]
+    if len(set(identifiers)) != len(identifiers):
+        return None
+    normalized = []
+    for item in value:
+        transport = normalized_mcp_transport(
+            item,
+            owner_home=owner_home,
+            app_resources=app_resources,
+            cli_path=cli_path,
+        )
+        if transport is None:
+            return None
+        normalized.append(
+            {
+                "auth": {
+                    "credentialMaterialAuthorized": False,
+                    "statusObserved": item["auth_status"],
+                    "storageClass": "not-exposed-by-installed-cli",
+                },
+                "disabledReasonObserved": item["disabled_reason"],
+                "enabled": item["enabled"],
+                "id": item["name"],
+                "startupTimeoutSecObserved": item["startup_timeout_sec"],
+                "toolTimeoutSecObserved": item["tool_timeout_sec"],
+                "transport": transport,
+            }
+        )
+    normalized.sort(key=lambda item: item["id"])
+    return normalized if normalized == expected else None
+
+
+def unavailable_result():
+    return {
+        "activeConfig": {
+            "appManagedOrUserStatePresent": False,
+            "exists": False,
+            "managedKeysExactTopLevel": False,
+            "managedKeysStructurallyValid": False,
+            "shellEnvironmentPolicyPresent": False,
+            "trustedBaseline": False,
+        },
+        "checks": {
+            "activeConfigLoads": False,
+            "canonicalCliExecutable": False,
+            "canonicalCliSourceVersion": False,
+            "installedMcpExact": False,
+            "installedPluginsExact": False,
+            "permissionProbeExposed": False,
+            "preparationOnly": False,
+            "quarantineFlagsExposed": False,
+            "trustedBaselinePreserved": False,
+        },
+        "cli": {
+            "configLoadObserved": None,
+            "path": str(CODEX),
+            "source": "chatgpt-app-bundle",
+            "version": None,
+        },
+        "inventory": {"mcp": [], "plugins": []},
+        "limitations": {
+            "appsAndModelToolAvailability": "apply-gate-required",
+            "mcpServerVersions": "not-exposed-by-installed-cli",
+            "mcpStartupHealthEnabledToolsAndSmoke": "apply-gate-required",
+            "pluginEnabledToolsAndSmoke": "apply-gate-required",
+        },
+        "overall": "PHASE5_PREPARATION_PREFLIGHT_FAIL",
+        "phase": "phase5_codex_contract_preparation",
+        "redactions": {
+            "authValuesRecorded": False,
+            "privatePathsRecorded": False,
+            "rawConfigValuesRecorded": False,
+            "stableIdentifiersRecorded": False,
+        },
+        "schema": 1,
+    }
+
+
+DOCTOR_LIVE = object()
+
+
+def collect(doctor_value=DOCTOR_LIVE):
+    manifest = load_manifest()
+    if manifest is None:
+        return unavailable_result()
+    if not canonical_cli_valid():
+        return unavailable_result()
+
+    environment = cli_environment()
+    try:
+        expected_plugins = expected_plugin_inventory(manifest)
+        expected_mcp = expected_mcp_inventory(manifest)
+    except Exception:
+        return unavailable_result()
+    app_version = app_attestation(manifest)
+    version_result = run([CODEX, "--version"], environment=environment)
+    help_result = run([CODEX, "exec", "--help"], environment=environment)
+    sandbox_help = run([CODEX, "sandbox", "--help"], environment=environment)
+    plugins = command_json(
+        [CODEX, "plugin", "list", "--json"],
+        lambda value: observed_plugin_inventory(value, expected_plugins) is not None,
+        environment=environment,
+    )
+    mcp = command_json(
+        [CODEX, "mcp", "list", "--json"],
+        lambda value: observed_mcp_inventory(value, expected_mcp) is not None,
+        environment=environment,
+    )
+    doctor = (
+        doctor_report(environment)
+        if doctor_value is DOCTOR_LIVE
+        else doctor_contract(doctor_value)
+    )
+
+    plugin_inventory = (
+        observed_plugin_inventory(plugins, expected_plugins)
+        if plugins is not None
+        else None
+    )
+    mcp_inventory = (
+        observed_mcp_inventory(mcp, expected_mcp) if mcp is not None else None
+    )
+    config_load_ok = doctor is not None and doctor["configLoad"] == "ok"
+    config_facts = active_config_facts(config_load_ok)
+    exec_help = help_result.stdout if help_result.returncode == 0 else ""
+    sandbox_text = sandbox_help.stdout if sandbox_help.returncode == 0 else ""
+    version = version_result.stdout.strip() if version_result.returncode == 0 else None
+    checks = {
+        "activeConfigLoads": config_load_ok,
+        "canonicalCliExecutable": True,
+        "canonicalCliSourceVersion": (
+            str(CODEX) == manifest["cli"]["canonicalPath"]
+            and manifest["cli"]["source"] == "chatgpt-app-bundle"
+            and version_at_or_above(version, manifest["cli"]["observedVersion"])
+        ),
+        "appIdentityAndSignature": app_version is not None,
+        "appVersionFloor": app_version is not None,
+        "browserChromeCoupled": (
+            app_version is not None and plugin_inventory is not None and
+            {item["id"]: item["versionObserved"] for item in plugin_inventory}.get(
+                "browser@openai-bundled") == app_version and
+            {item["id"]: item["versionObserved"] for item in plugin_inventory}.get(
+                "chrome@openai-bundled") == app_version
+        ),
+        "installedMcpExact": (
+            mcp_inventory is not None
+            and mcp_app_version_matches_attestation(mcp, app_version)
+        ),
+        "installedPluginsExact": plugin_inventory is not None,
+        "permissionProbeExposed": "--permission-profile" in sandbox_text,
+        "preparationOnly": (
+            manifest["preparationOnly"] is True
+            and manifest["gate"]["applyAuthorized"] is False
+        ),
+        "quarantineFlagsExposed": all(
+            flag in exec_help
+            for flag in (
+                "--ignore-user-config",
+                "--ignore-rules",
+                "--ephemeral",
+                "--profile",
+                "--cd",
+            )
+        ),
+        "trustedBaselinePreserved": config_facts["trustedBaseline"],
+    }
+    return {
+        "activeConfig": config_facts,
+        "checks": checks,
+        "cli": {
+            "configLoadObserved": doctor["configLoad"] if doctor else None,
+            "path": str(CODEX),
+            "source": "chatgpt-app-bundle",
+            "version": version,
+        },
+        "inventory": {
+            "mcp": mcp_inventory or [],
+            "plugins": plugin_inventory or [],
+        },
+        "limitations": {
+            "appsAndModelToolAvailability": "apply-gate-required",
+            "mcpServerVersions": "not-exposed-by-installed-cli",
+            "mcpStartupHealthEnabledToolsAndSmoke": "apply-gate-required",
+            "pluginEnabledToolsAndSmoke": "apply-gate-required",
+        },
+        "overall": (
+            "PHASE5_PREPARATION_PREFLIGHT_PASS"
+            if all(checks.values())
+            else "PHASE5_PREPARATION_PREFLIGHT_FAIL"
+        ),
+        "phase": "phase5_codex_contract_preparation",
+        "redactions": {
+            "authValuesRecorded": False,
+            "privatePathsRecorded": False,
+            "rawConfigValuesRecorded": False,
+            "stableIdentifiersRecorded": False,
+        },
+        "schema": 1,
+    }
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--json", action="store_true")
+    arguments = parser.parse_args()
+    value = collect()
+    if arguments.json:
+        print(json.dumps(value, sort_keys=True, separators=(",", ":")))
+    else:
+        print("Phase 5 Codex preparation preflight")
+        print("overall: " + value["overall"])
+        print("cli: " + str(value["cli"]["version"]))
+        print("source: " + value["cli"]["source"])
+        print(
+            "trusted baseline: "
+            + ("pass" if value["checks"]["trustedBaselinePreserved"] else "fail")
+        )
+        print("named plugins: " + str(len(value["inventory"]["plugins"])))
+        print("named MCP servers: " + str(len(value["inventory"]["mcp"])))
+        print(
+            "doctor config load: "
+            + ("pass" if value["checks"]["activeConfigLoads"] else "fail")
+        )
+        print("system mutations: none")
+        print("apply authorized: false")
+    return 0 if value["overall"].endswith("_PASS") else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

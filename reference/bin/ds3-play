@@ -1,0 +1,19 @@
+#!/usr/bin/python3
+"""DS3 resolver; only the verified isolated lifecycle may launch or stop Wine."""
+import sys
+sys.dont_write_bytecode = True
+import os, pwd, stat
+from pathlib import Path
+root = Path(pwd.getpwuid(os.getuid()).pw_dir)/'Library/Application Support/Adapted Games DS3'
+try:
+    if len(sys.argv) not in (1,2) or (len(sys.argv)==2 and sys.argv[1] not in ('play','play-1080','measure','stop')): raise RuntimeError('usage: ds3-play [play|play-1080|measure|stop]')
+    p = root/'ds3-runtime'
+    for x in [*reversed(p.parents),p.parent]:
+        s = x.lstat()
+        if not stat.S_ISDIR(s.st_mode) or s.st_uid not in (0,os.getuid()) or s.st_mode&0o002: raise RuntimeError('unsafe_isolated_runtime')
+    s = p.lstat()
+    if not stat.S_ISREG(s.st_mode) or s.st_uid != os.getuid() or s.st_mode&0o022 or s.st_nlink != 1: raise RuntimeError('unsafe_isolated_lifecycle')
+    env = {'HOME':str(pwd.getpwuid(os.getuid()).pw_dir),'PATH':'/usr/bin:/bin:/usr/sbin:/sbin','LANG':'en_US.UTF-8'}
+    os.execve(str(p),[str(p),sys.argv[1] if len(sys.argv)==2 else 'play'],env)
+except Exception as e:
+    print(str(e) if type(e) is RuntimeError else type(e).__name__);sys.exit(1)

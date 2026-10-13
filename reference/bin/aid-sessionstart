@@ -1,0 +1,298 @@
+#!/usr/bin/python3
+"""Pure, byte-preserving SessionStart insertion; never installs or trusts hooks.
+
+The optional CLI reads explicitly named source fixtures only. Original/postimage
+bytes belong to the caller and must not be serialized into public evidence.
+"""
+
+import argparse
+from dataclasses import dataclass
+import json
+import math
+from pathlib import Path
+import shlex
+
+
+LIMIT = 256 * 1024
+DEPTH = 64
+STATUS = "Workstation compatibility reminder"
+MATCHER = "startup|resume|clear|compact"
+
+
+class PlanError(ValueError):
+    def __init__(self):
+        super().__init__("sessionstart_plan_refused")
+
+
+def require(value):
+    if not value:
+        raise PlanError() from None
+
+
+def _pairs(pairs):
+    result = {}
+    for key, value in pairs:
+        require(key not in result)
+        result[key] = value
+    return result
+
+
+def _number(value):
+    result = float(value)
+    require(math.isfinite(result))
+    return result
+
+
+def _integer(value):
+    require(len(value) <= 128)
+    return int(value)
+
+
+def _bounded(value):
+    pending = [(value, 0)]
+    visited = 0
+    while pending:
+        item, depth = pending.pop()
+        visited += 1
+        require(depth <= DEPTH and visited <= LIMIT)
+        if type(item) is dict:
+            require(len(item) <= LIMIT and all(type(key) is str and len(key) <= LIMIT for key in item))
+            pending.extend((v, depth + 1) for v in item.values())
+        elif type(item) is list:
+            require(len(item) <= LIMIT)
+            pending.extend((v, depth + 1) for v in item)
+        else:
+            require(type(item) in (str, int, float, bool, type(None)))
+            require(type(item) is not float or math.isfinite(item))
+            require(type(item) is not str or len(item) <= LIMIT)
+            require(type(item) is not int or item.bit_length() <= 512)
+
+
+def parse_json(raw):
+    """Bounded strict JSON; every ordinary parser failure has fixed text."""
+    try:
+        require(type(raw) is bytes and 0 < len(raw) <= LIMIT)
+        value = json.loads(raw.decode("utf-8"), object_pairs_hook=_pairs,
+                           parse_float=_number, parse_int=_integer,
+                           parse_constant=lambda _: require(False))
+        _bounded(value)
+        return value
+    except Exception:
+        raise PlanError() from None
+
+
+def _wire(value):
+    try:
+        _bounded(value)
+        raw = json.dumps(value, sort_keys=True, separators=(",", ":"),
+                         ensure_ascii=True, allow_nan=False).encode("ascii")
+        require(len(raw) <= LIMIT)
+        return raw
+    except Exception:
+        raise PlanError() from None
+
+
+def _definition(manifest):
+    require(type(manifest) is dict)
+    manifest = parse_json(_wire(manifest))  # detach caller-owned mutable input
+    require(set(manifest) == {"schema", "item_id", "owner", "versionPolicy", "target",
+                              "expectedContext", "definition", "policy", "lifecycle"}
+            and type(manifest["schema"]) is int and manifest["schema"] == 1)
+    require(manifest["item_id"] == "vendor-sentinel-sessionstart-context"
+            and manifest["owner"] == "control" and manifest["target"] == "{ownerHome}/.codex/hooks.json"
+            and manifest["versionPolicy"] == "immutable-lock-or-checksum")
+    expected_policy = {"advisoryOnly": True, "blocksDevelopment": False, "blocksCommits": False,
+        "checksVendorAtStartup": False, "readsSessionInput": False, "modelRequests": 0,
+        "networkRequests": 0, "changesExistingHandlers": False, "automaticallyTrustsDefinition": False}
+    require(_wire(manifest["policy"]) == _wire(expected_policy))
+    lifecycle = manifest["lifecycle"]
+    require(type(lifecycle) is dict and set(lifecycle) == {"install", "verify", "remove", "rollback", "update"}
+            and all(type(v) is str and 0 < len(v) <= 1024 for v in lifecycle.values()))
+    definition = manifest.get("definition")
+    require(type(definition) is dict and set(definition) == {"matcher", "hooks"}
+            and definition["matcher"] == MATCHER
+            and type(definition["hooks"]) is list and len(definition["hooks"]) == 1)
+    handler = definition["hooks"][0]
+    require(type(handler) is dict and set(handler) == {
+        "type", "command", "timeout", "statusMessage"})
+    require(handler["type"] == "command" and type(handler["timeout"]) is int
+            and handler["timeout"] == 2 and handler["statusMessage"] == STATUS)
+    command = handler["command"]
+    require(type(command) is str and len(command) <= 16384)
+    try:
+        argv = shlex.split(command, posix=True)
+        require(len(argv) == 3 and argv[:2] == ["/usr/bin/printf", "%s\\n"])
+        require(command == " ".join(shlex.quote(arg) for arg in argv))
+        output = parse_json(argv[2].encode("utf-8"))
+    except Exception:
+        raise PlanError() from None
+    require(type(output) is dict and set(output) == {"hookSpecificOutput"})
+    specific = output["hookSpecificOutput"]
+    require(type(specific) is dict and set(specific) == {"hookEventName", "additionalContext"}
+            and specific["hookEventName"] == "SessionStart")
+    context = specific["additionalContext"]
+    require(type(context) is str and 0 < len(context) <= 1600 and context.strip() == context
+            and context == manifest["expectedContext"])
+    return manifest["item_id"], definition
+
+
+def _groups(raw):
+    value = parse_json(raw)
+    require(type(value) is dict and type(value.get("hooks")) is dict)
+    groups = value["hooks"].get("SessionStart")
+    require(type(groups) is list and bool(groups) and all(type(g) is dict for g in groups))
+    return value, groups
+
+
+def _managed(value, groups, item_id, definition):
+    """Reject collisions anywhere, including another event or changed group."""
+    expected = _wire(definition)
+    exact = [i for i, group in enumerate(groups) if _wire(group) == expected]
+    require(len(exact) <= 1)
+    pending, markers = [value], 0
+    while pending:
+        item = pending.pop()
+        if type(item) is dict:
+            require(not any(item.get(k) == item_id for k in ("item_id", "itemId", "id")))
+            if item.get("statusMessage") == STATUS:
+                markers += 1
+            pending.extend(item.values())
+        elif type(item) is list:
+            pending.extend(item)
+    require(markers == len(exact))
+    return bool(exact)
+
+
+def _array_close(raw):
+    """Lexical byte walk of already validated JSON, returning the exact ']'."""
+    found = []
+
+    def space(i):
+        while i < len(raw) and raw[i] in b" \r\n\t":
+            i += 1
+        return i
+
+    def string(i):
+        i += 1
+        while raw[i] != 34:
+            i += 2 if raw[i] == 92 else 1
+        return i + 1
+
+    def walk(i, path):
+        i = space(i)
+        if raw[i] == 34:
+            return string(i)
+        if raw[i] == 123:
+            i = space(i + 1)
+            while raw[i] != 125:
+                end = string(i)
+                key = json.loads(raw[i:end].decode("utf-8"))
+                i = space(walk(space(end) + 1, path + (key,)))
+                if raw[i] == 44:
+                    i = space(i + 1)
+                else:
+                    break
+            return i + 1
+        if raw[i] == 91:
+            i = space(i + 1)
+            while raw[i] != 93:
+                i = space(walk(i, path + (None,)))
+                if raw[i] == 44:
+                    i = space(i + 1)
+                else:
+                    break
+            if path == ("hooks", "SessionStart"):
+                found.append(i)
+            return i + 1
+        while i < len(raw) and raw[i] not in b" \r\n\t,]}":
+            i += 1
+        return i
+
+    walk(0, ())
+    require(len(found) == 1)
+    return found[0]
+
+
+@dataclass(frozen=True, repr=False)
+class Plan:
+    before: bytes
+    after: bytes
+    offset: int
+    insertion: bytes
+    groups_before: int
+    changed: bool
+
+    def __repr__(self):
+        return "<private SessionStart plan>"
+
+    def public_report(self):
+        return {"status": "PLANNED" if self.changed else "ALREADY_PRESENT",
+                "changed": self.changed, "groupsBefore": self.groups_before,
+                "groupsAfter": self.groups_before + int(self.changed)}
+
+
+def build_plan(before, manifest):
+    """Return private images and a single insertion, or a byte-exact no-op."""
+    item_id, definition = _definition(manifest)
+    value, groups = _groups(before)
+    present = _managed(value, groups, item_id, definition)
+    offset = _array_close(before)
+    insertion = b"" if present else b"," + _wire(definition)
+    after = before[:offset] + insertion + before[offset:]
+    require(len(after) <= LIMIT)
+    after_value, after_groups = _groups(after)
+    require(_managed(after_value, after_groups, item_id, definition))
+    return Plan(before, after, offset, insertion, len(groups), not present)
+
+
+def verify(after, manifest, original=None):
+    """Unique exact group only without original; original proves preservation."""
+    try:
+        item_id, definition = _definition(manifest)
+        value, groups = _groups(after)
+        require(_managed(value, groups, item_id, definition))
+        if original is not None:
+            require(build_plan(original, manifest).after == after)
+        return True
+    except Exception:
+        return False
+
+
+def undo(after, plan):
+    """Pure exact inverse: never overwrite a concurrent or unknown postimage."""
+    require(type(plan) is Plan and type(after) is bytes and after == plan.after)
+    require(type(plan.before) is bytes and type(plan.insertion) is bytes
+            and type(plan.offset) is int and 0 <= plan.offset < len(plan.before))
+    require(plan.before[:plan.offset] + plan.insertion + plan.before[plan.offset:] == after)
+    return plan.before
+
+
+def main(arguments=None, *, emit=print):
+    try:
+        class Parser(argparse.ArgumentParser):
+            def error(self, message):
+                raise PlanError() from None
+        parser = Parser(add_help=False)
+        parser.add_argument("action", choices=("plan", "check"))
+        parser.add_argument("--source-fixture", required=True)
+        parser.add_argument("--manifest", required=True)
+        args = parser.parse_args(arguments)
+        def read(path):
+            # Explicit caller-selected fixture only; no implicit live target.
+            with Path(path).open("rb") as stream:
+                raw = stream.read(LIMIT + 1)
+            require(len(raw) <= LIMIT)
+            return raw
+        raw, manifest = read(args.source_fixture), parse_json(read(args.manifest))
+        plan = build_plan(raw, manifest)
+        if args.action == "check":
+            require(not plan.changed)
+        result, code = plan.public_report(), 0
+    except Exception:
+        result, code = {"status": "REFUSED"}, 1
+    emit(json.dumps(result, sort_keys=True, separators=(",", ":")))
+    return code
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

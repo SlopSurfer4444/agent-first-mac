@@ -1,0 +1,268 @@
+#!/usr/bin/python3
+"""Compact fail-closed validator for the Phase 3 apply review packet."""
+
+from copy import deepcopy
+import hashlib
+import json
+from pathlib import Path
+import re
+import runpy
+import subprocess
+import sys
+
+ROOT = Path(__file__).resolve().parents[1]
+BASE = "46597a386212e8007e1fa4ef2decddbcbc5c99a2"
+PREP = "9602193d730d73517cf2a8442d2b109b6fab317b"
+OVERRIDE = "579bfefd76e7331c7333f66947639daadfc46506"
+BRANCH = "codex/phase-3-permissions-apply"
+MARKER = "READY_FOR_INDEPENDENT_PHASE3_ACCEPTANCE_REVIEW"
+PLAN = ROOT / "manifests/phase3-permissions-apply.json"
+EVIDENCE = ROOT / "evidence/phase-3/permissions-apply-verification.json"
+INTENT = ROOT / "manifests/phase3-ceremony-intent.json"
+PREP_SCOPE = {
+    "bin/check-phase3-permissions-apply", "bin/phase3-ceremony-preflight",
+    "bin/phase3-permissions-doctor", "docs/phase-3-permissions-apply.md",
+    "manifests/phase3-permissions-apply.json",
+}
+REVIEW_SCOPE = PREP_SCOPE | {
+    "AGENTS.md", "ARCHITECTURE.md", "README.md",
+    "evidence/phase-3/permissions-apply-verification.json",
+}
+CONTRACTS = {
+    "ARCHITECTURE.md": "0607f1e68dda991b46ef2947d6972ce86a3ea1a3d6abcfb9496899d2d3bda0eb",
+    "manifests/phase3-capabilities.json": "32af04cbb21815630e256252e79a8ec96198ce3ac679b91f58167a15c399f4a0",
+    "manifests/phase3-ceremony-intent.json": "e3148a49e122aeef666a033593aef29f359ba7eff66dba6dc7fde76ed8ff3308",
+    "evidence/phase-3/ceremony-intent-acceptance.json": "305a6d0d9682c002e934190b331b2177d1a66735a20427b82832025281bc4e95",
+}
+PROBES = {
+    "prepared_protected_test_file_create_stat_remove",
+    "textedit_accessibility_tree_click_and_fixed_text",
+    "prepared_textedit_window_capture_boolean_only",
+    "harmless_local_build_run_and_apple_signed_debugger",
+    "operate_textedit_without_prompt",
+    "operate_chrome_example_com_without_history_or_profile_read",
+    "locked_use_active_trusted_turn_unlock_cover_displays_and_local_input_relock",
+}
+
+
+def require(condition, message):
+    if not condition:
+        raise ValueError(message)
+
+
+def run(argv):
+    return subprocess.run([str(v) for v in argv], cwd=ROOT, text=True,
+                          stdout=subprocess.PIPE, stderr=subprocess.STDOUT, check=False)
+
+
+def git(*args):
+    result = run(["/usr/bin/git", *args])
+    require(result.returncode == 0, f"git_{args[0]}")
+    return result.stdout.strip()
+
+
+def blob(commit, path):
+    result = subprocess.run(["/usr/bin/git", "show", f"{commit}:{path}"], cwd=ROOT,
+                            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, check=False)
+    require(result.returncode == 0, f"missing_{path}")
+    return result.stdout
+
+
+def exact_bools(value, true_keys, false_keys=()):
+    true_keys, false_keys = set(true_keys), set(false_keys)
+    return (set(value) == true_keys | false_keys and
+            all(value[key] is True for key in true_keys) and
+            all(value[key] is False for key in false_keys))
+
+
+def validate_evidence(value):
+    require(set(value) == {"schema", "phase", "provenance", "ceremony",
+            "complete_cycle_1", "targeted_repeats", "owner_override", "cleanup",
+            "redaction", "scope", "gate"}, "evidence_fields")
+    require(value["schema"] == 1 and
+            value["phase"] == "phase3_permission_ceremony_apply_verification",
+            "evidence_header")
+    require(value["provenance"] == {
+        "accepted_control_main": BASE, "reviewed_apply_intent_commit": PREP,
+        "owner_override_provenance_commit": OVERRIDE,
+        "owner_override_is_provenance_only": True,
+        "external_operational_dependency": False}, "provenance")
+    require(exact_bools(value["ceremony"], {
+        "action_time_confirmation_received", "locked_use_aligned_and_reconciliation_skipped",
+        "full_disk_access_attested_chatgpt_codex", "accessibility_attested_computer_use_runtime",
+        "screen_recording_attested_computer_use_runtime", "developer_tools_attested_chatgpt_codex",
+        "devtools_security_enabled", "textedit_target_policy_proven",
+        "chrome_target_policy_proven", "single_supported_restart_completed",
+        "input_monitoring_unchanged", "ceremony_system_mutations_bounded_to_reviewed_intent"}),
+        "ceremony")
+    require(exact_bools(value["complete_cycle_1"], PROBES | {
+        "prompt_free", "physical_lock_observed", "locked_use_cover_seen",
+        "local_input_ended_protected_control", "owner_returned_normally"},
+        {"permission_or_authentication_prompt_seen"}), "cycle")
+    require(exact_bools(value["targeted_repeats"], {
+        "prompt_free", "protected_file_create", "protected_file_stat", "protected_file_remove",
+        "textedit_accessibility", "textedit_prepared_capture", "textedit_operate",
+        "compiler_resolved_from_accepted_toolchain", "sdk_resolved", "compile_succeeded",
+        "executable_ran_succeeded", "lldb_identity_valid", "lldb_anchor_apple",
+        "debugger_launched", "debugger_exited_cleanly", "temporary_artifacts_removed",
+        "fresh_chrome_example_com"}, {"textedit_permission_prompt_seen",
+        "developer_probe_authentication_or_permission_prompt_seen", "chrome_network_error_seen",
+        "chrome_permission_prompt_seen"}), "targeted_repeats")
+    require(value["owner_override"] == {
+        "one_complete_seven_probe_cycle_accepted": True,
+        "targeted_repeats_of_six_ordinary_probes_accepted": True,
+        "second_identical_locked_use_cycle_waived": True,
+        "commissioning_override_explicit": True,
+        "synthetic_lock_used_as_evidence": False}, "override")
+    require(value["cleanup"] == {"textedit_probe_text_saved": False,
+            "unsaved_in_memory_cleanup_confirmation_unavailable": True}, "cleanup")
+    require(exact_bools(value["redaction"], {"booleans_only_probe_results"},
+        {"screenshots_or_raw_ui_retained", "protected_contents_retained",
+         "raw_tcc_or_logs_retained", "private_paths_or_stable_identifiers_retained"}), "redaction")
+    require(exact_bools(value["scope"], set(), {
+        "vpn_profile_or_session_mutated", "hooks_skills_or_codex_config_mutated",
+        "aid_admin_or_root_broker_mutated", "backup_or_cloud_mutated",
+        "repository_migration_or_next_phase_started"}), "scope")
+    require(value["gate"] == {"independent_acceptance_review_required": True,
+            "phase3_pass_claimed": False, "l2_remains_claimed": True,
+            "l3_claimed": False, "verdict": MARKER}, "gate")
+
+
+def validate_plan(value, intent):
+    require(set(value) == {"schema", "phase", "authority", "accepted_contracts",
+            "reviewed_identity_checkpoint", "reviewed_action_order", "probe_boolean_keys",
+            "evidence_contract", "execution_review", "failure_policy",
+            "explicitly_excluded"}, "plan_fields")
+    require(value["schema"] == 1 and
+            value["phase"] == "phase3_permission_ceremony_apply_review_packet", "plan_header")
+    require(value["authority"] == {
+        "accepted_control_base": BASE, "branch": BRANCH,
+        "reviewed_apply_intent_commit": PREP, "owner_override_provenance_commit": OVERRIDE,
+        "owner_override_is_provenance_only": True, "external_operational_dependency": False,
+        "checkpoint_marker": MARKER, "phase3_pass_claimed": False,
+        "l2_remains_claimed": True, "l3_claimed": False}, "authority")
+    require({item["path"]: item["sha256"] for item in value["accepted_contracts"]}
+            == CONTRACTS and len(value["accepted_contracts"]) == len(CONTRACTS), "contracts")
+    checkpoint = value["reviewed_identity_checkpoint"]
+    require(checkpoint["reviewed_at_commit"] == PREP and checkpoint["passed"] is True and
+            checkpoint["required_verdict"] == "CEREMONY_IDENTITY_READY" and
+            checkpoint["locked_use"] == {"aligned": True, "reconciliation_required": False,
+            "action": "skip_already_aligned"}, "identity_checkpoint")
+    actions = value["reviewed_action_order"]
+    require([item["sequence"] for item in actions] == list(range(1, 12)) and
+            [item["id"] for item in actions] == ["action_time_confirmation",
+            "locked_use_aligned_skip", "full_disk_access_codex", "accessibility_computer_use",
+            "screen_recording_computer_use", "developer_tools_codex",
+            "devtoolssecurity_enable_if_disabled", "computer_use_reviewed_targets",
+            "single_supported_restart", "prompt_free_probe_cycle_1",
+            "prompt_free_probe_cycle_2"], "action_order")
+    require(set(value["probe_boolean_keys"]) == PROBES ==
+            set(intent["functional_cycles"]["probes"]), "probe_map")
+    require(value["evidence_contract"] == {
+        "source": "evidence/phase-3/permissions-apply-verification.json",
+        "intent_source": "manifests/phase3-ceremony-intent.json#evidence_schema",
+        "probe_value_type": "boolean", "complete_cycles_verified": 1,
+        "targeted_ordinary_probe_repeats_verified": 6,
+        "second_identical_locked_use_cycle_waived": True,
+        "prompt_free_required": True, "locked_use_reconciled": False,
+        "locked_use_aligned_and_skipped": True, "maximum_verdict": MARKER}, "evidence_contract")
+    require(value["execution_review"] == {
+        "one_complete_seven_probe_cycle": True,
+        "targeted_repeats_of_six_ordinary_probes": True,
+        "second_identical_locked_use_cycle_waived_by_owner": True,
+        "synthetic_lock_used_as_evidence": False, "independent_acceptance_required": True,
+        "phase3_pass_claimed": False, "l2_remains_claimed": True, "l3_claimed": False},
+        "execution_review")
+    require(value["failure_policy"]["phase3_pass_or_l3_claimed"] is False and
+            "input_monitoring" in value["explicitly_excluded"], "failure_boundary")
+
+
+def validate_files():
+    accepted = runpy.run_path(str(ROOT / "bin/check-phase3-ceremony-intent"),
+                              run_name="accepted_phase3_validator")
+    intent = json.loads(INTENT.read_text())
+    accepted["validate_intent"](intent)
+    accepted["validate_programs"]()
+    for path, digest in CONTRACTS.items():
+        require(hashlib.sha256(blob(PREP, path)).hexdigest() == digest, "historical_contract")
+        if path != "ARCHITECTURE.md":
+            require((ROOT / path).read_bytes() == blob(PREP, path), "immutable_contract")
+    require((ROOT / "bin/phase3-ceremony-preflight").read_bytes() ==
+            blob(PREP, "bin/phase3-ceremony-preflight"), "preflight")
+    combined = "\n".join((ROOT / path).read_text() for path in REVIEW_SCOPE)
+    private_marker = "PRIVATE" + " KEY"
+    for pattern in (r"/Users" + r"/[A-Za-z0-9._-]+", "BEGIN .*" + private_marker,
+                    r"\b[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[1-5][0-9A-Fa-f]{3}-[89ABab][0-9A-Fa-f]{3}-[0-9A-Fa-f]{12}\b"):
+        require(re.search(pattern, combined) is None, "redaction_scan")
+    require(("Migrate" + "FromWindows") not in combined and ("http" + "://") not in combined
+            and ("https" + "://") not in combined, "external_dependency")
+    doctor = (ROOT / "bin/phase3-permissions-doctor").read_text()
+    for pattern in (r"\btccutil\b", r"\bosascript\b", r"\bsudo\b",
+                    r"DevToolsSecurity[^\n]*-enable", r"defaults\s+write", r"\b(?:kill|pkill)\b"):
+        require(re.search(pattern, doctor) is None, "mutating_doctor")
+    compile(doctor, "phase3-permissions-doctor", "exec")
+    document = (ROOT / "docs/phase-3-permissions-apply.md").read_text()
+    require(all(text in document for text in (MARKER, PREP, OVERRIDE, "Synthetic",
+            "is not evidence", "unsaved_in_memory_cleanup_confirmation_unavailable=true")),
+            "document")
+    require(all(MARKER in (ROOT / path).read_text()
+                for path in ("ARCHITECTURE.md", "AGENTS.md", "README.md")), "routers")
+    return intent
+
+
+def validate_git(contract_only=False):
+    require(git("branch", "--show-current") == BRANCH, "wrong_branch")
+    require(run(["/usr/bin/git", "merge-base", "--is-ancestor", BASE, "HEAD"]).returncode == 0,
+            "accepted_main_mismatch")
+    require(git("rev-parse", f"{PREP}^") == BASE, "intent_parent")
+    require(set(git("diff-tree", "--no-commit-id", "--name-only", "-r", PREP).splitlines())
+            == PREP_SCOPE, "intent_scope")
+    changed = run(["/usr/bin/git", "diff", "--name-only", BASE]).stdout
+    untracked = run(["/usr/bin/git", "ls-files", "--others", "--exclude-standard"]).stdout
+    require(set(filter(None, (changed + untracked).splitlines())) == REVIEW_SCOPE, "review_scope")
+    require(run(["/usr/bin/git", "diff", "--check", BASE]).returncode == 0, "diff_check")
+    if not contract_only:
+        require(git("status", "--porcelain") == "", "dirty")
+        require(git("rev-list", "--count", f"{BASE}..HEAD") == "2" and
+                git("rev-parse", "HEAD^") == PREP, "review_history")
+
+
+def self_test(intent, plan, evidence):
+    cases = []
+    for name, target, mutate in (
+        ("override_drift", evidence, lambda v: v["provenance"].update(owner_override_provenance_commit=BASE)),
+        ("phase3_claim", evidence, lambda v: v["gate"].update(phase3_pass_claimed=True)),
+        ("synthetic_lock", evidence, lambda v: v["owner_override"].update(synthetic_lock_used_as_evidence=True)),
+        ("cleanup_overclaim", evidence, lambda v: v["cleanup"].update(unsaved_in_memory_cleanup_confirmation_unavailable=False)),
+        ("waiver_drift", plan, lambda v: v["evidence_contract"].update(second_identical_locked_use_cycle_waived=False))):
+        altered = deepcopy(target)
+        mutate(altered)
+        try:
+            validate_evidence(altered) if target is evidence else validate_plan(altered, intent)
+        except Exception:
+            cases.append(name)
+        else:
+            raise ValueError(f"negative_{name}")
+    return cases
+
+
+def main():
+    modes = set(sys.argv[1:])
+    require(modes <= {"--contract-only", "--self-test"} and
+            not ({"--contract-only", "--self-test"} <= modes), "usage")
+    plan, evidence = json.loads(PLAN.read_text()), json.loads(EVIDENCE.read_text())
+    intent = validate_files()
+    validate_plan(plan, intent)
+    validate_evidence(evidence)
+    validate_git("--contract-only" in modes)
+    cases = self_test(intent, plan, evidence) if "--self-test" in modes else []
+    print(json.dumps({"schema": 1, "result": "pass", "negative_tests": cases,
+        "live_capability_probe_performed": False, "verdict": MARKER}, indent=2, sort_keys=True))
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except Exception as error:
+        print(f"phase3 permissions apply validation failed: {error}", file=sys.stderr)
+        raise SystemExit(1)

@@ -1,0 +1,26 @@
+{
+  "publicReferenceOnly": true,
+  "warning": "Sanitized historical example. Not installation authority or current inventory.",
+  "example": {
+    "schema": 1,
+    "id": "ds3-borderless",
+    "helperSha256": "8d043f2a23d9ca8f2bedfad8341dd72048abd74d956d3b317f41a9bdd5bc12e2",
+    "sourceSha256": "126847cd6150a19971de944d64c792b3f2b1cbe7aaa4352431e6b45c40c09a81",
+    "provenanceSha256": "a4cc9d95524691142ba3f766e0f8f8dcca32e9df44d0855245622baf8bd3179f",
+    "fixtureReportSha256": "f6fafeb7e693821c879fe0f0ca72071425b06860d261b8dae1bc17307ede1733",
+    "compilerVersion": "0.15.2",
+    "compilerTarSha256": "3cc2bab367e185cdfb27501c4b30b1b0653c28d9f73df8dc91488e66ece5fa6b",
+    "target": "x86_64-windows-gnu",
+    "nativeBinding": {
+      "winemetalSha256": "8c45335bc2d826b255b1a31ffd53fd71c561ef4987cef773ed3a36c4fc266a88",
+      "donorSha256": "5e38be88867deb7b56833e28e2cf9e59188dee779ba323adbcb428eb31dfd540",
+      "d3d11Sha256": "032dc8ee989648f31f15be15b7a478c043ff528134a461f4b0e3029fb3d114f5"
+    },
+    "argv": [
+      "--follow",
+      "--wait",
+      "900"
+    ],
+    "timeoutSeconds": 44110
+  }
+}

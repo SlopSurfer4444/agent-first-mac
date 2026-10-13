@@ -1,0 +1,118 @@
+{
+  "schema": 1,
+  "developer_group_present": true,
+  "devtools_security": "disabled",
+  "gatekeeper_enabled": true,
+  "google_updater_loaded": true,
+  "identities": {
+    "authorization_plugin_embedded": {
+      "bundle_id": "com.openai.sky.CUAService.AuthorizationPlugin",
+      "designated_requirement": "identifier \"com.openai.sky.CUAService.AuthorizationPlugin\" and anchor apple generic and certificate 1[field.1.2.840.113635.100.6.2.6] /* exists */ and certificate leaf[field.1.2.840.113635.100.6.1.13] /* exists */ and certificate leaf[subject.OU] = \"2DC432GLL2\"",
+      "gatekeeper_assessment": "accepted",
+      "signature_valid": true,
+      "team_id": "2DC432GLL2",
+      "version": "26.710.1000387"
+    },
+    "authorization_plugin_installed": {
+      "bundle_id": "com.openai.sky.CUAService.AuthorizationPlugin",
+      "designated_requirement": "identifier \"com.openai.sky.CUAService.AuthorizationPlugin\" and anchor apple generic and certificate 1[field.1.2.840.113635.100.6.2.6] /* exists */ and certificate leaf[field.1.2.840.113635.100.6.1.13] /* exists */ and certificate leaf[subject.OU] = \"2DC432GLL2\"",
+      "gatekeeper_assessment": "accepted",
+      "signature_valid": true,
+      "team_id": "2DC432GLL2",
+      "version": "26.708.1000366"
+    },
+    "codex_desktop": {
+      "bundle_id": "com.openai.codex",
+      "designated_requirement": "identifier \"com.openai.codex\" and anchor apple generic and certificate 1[field.1.2.840.113635.100.6.2.6] /* exists */ and certificate leaf[field.1.2.840.113635.100.6.1.13] /* exists */ and certificate leaf[subject.OU] = \"2DC432GLL2\"",
+      "gatekeeper_assessment": "accepted",
+      "signature_valid": true,
+      "team_id": "2DC432GLL2",
+      "version": "26.707.71524"
+    },
+    "computer_use_client": {
+      "bundle_id": "com.openai.sky.CUAService.cli",
+      "designated_requirement": "identifier \"com.openai.sky.CUAService.cli\" and anchor apple generic and certificate 1[field.1.2.840.113635.100.6.2.6] /* exists */ and certificate leaf[field.1.2.840.113635.100.6.1.13] /* exists */ and certificate leaf[subject.OU] = \"2DC432GLL2\"",
+      "gatekeeper_assessment": "accepted",
+      "signature_valid": true,
+      "team_id": "2DC432GLL2",
+      "version": "26.710.1000387"
+    },
+    "computer_use_guardian": {
+      "bundle_id": "com.openai.sky.CUAService.guardian",
+      "designated_requirement": "identifier \"com.openai.sky.CUAService.guardian\" and anchor apple generic and certificate 1[field.1.2.840.113635.100.6.2.6] /* exists */ and certificate leaf[field.1.2.840.113635.100.6.1.13] /* exists */ and certificate leaf[subject.OU] = \"2DC432GLL2\"",
+      "gatekeeper_assessment": "accepted",
+      "signature_valid": true,
+      "team_id": "2DC432GLL2",
+      "version": "26.710.1000387"
+    },
+    "computer_use_installer": {
+      "bundle_id": "com.openai.sky.CUAService.AuthorizationPluginInstaller",
+      "designated_requirement": "identifier \"com.openai.sky.CUAService.AuthorizationPluginInstaller\" and anchor apple generic and certificate 1[field.1.2.840.113635.100.6.2.6] /* exists */ and certificate leaf[field.1.2.840.113635.100.6.1.13] /* exists */ and certificate leaf[subject.OU] = \"2DC432GLL2\"",
+      "gatekeeper_assessment": "accepted",
+      "signature_valid": true,
+      "team_id": "2DC432GLL2",
+      "version": "26.710.1000387"
+    },
+    "computer_use_runtime": {
+      "bundle_id": "com.openai.sky.CUAService",
+      "designated_requirement": "identifier \"com.openai.sky.CUAService\" and anchor apple generic and certificate 1[field.1.2.840.113635.100.6.2.6] /* exists */ and certificate leaf[field.1.2.840.113635.100.6.1.13] /* exists */ and certificate leaf[subject.OU] = \"2DC432GLL2\"",
+      "gatekeeper_assessment": "accepted",
+      "signature_valid": true,
+      "team_id": "2DC432GLL2",
+      "version": "26.710.1000387"
+    },
+    "google_chrome": {
+      "bundle_id": "com.google.Chrome",
+      "designated_requirement": "(identifier \"com.google.Chrome\" or identifier \"com.google.Chrome.beta\" or identifier \"com.google.Chrome.dev\" or identifier \"com.google.Chrome.canary\") and anchor apple generic and certificate 1[field.1.2.840.113635.100.6.2.6] /* exists */ and certificate leaf[field.1.2.840.113635.100.6.1.13] /* exists */ and certificate leaf[subject.OU] = EQHXZ8M8AV",
+      "gatekeeper_assessment": "accepted",
+      "signature_valid": true,
+      "team_id": "EQHXZ8M8AV",
+      "version": "150.0.7871.115"
+    },
+    "google_updater": {
+      "bundle_id": "com.google.GoogleUpdater",
+      "designated_requirement": "identifier \"com.google.GoogleUpdater\" and anchor apple generic and certificate 1[field.1.2.840.113635.100.6.2.6] /* exists */ and certificate leaf[field.1.2.840.113635.100.6.1.13] /* exists */ and certificate leaf[subject.OU] = EQHXZ8M8AV",
+      "gatekeeper_assessment": "accepted",
+      "signature_valid": true,
+      "team_id": "EQHXZ8M8AV",
+      "version": "151.0.7910.2"
+    },
+    "happ_app": {
+      "app_store_item_id": "6504287215",
+      "app_store_receipt_present": true,
+      "bundle_id": "su.ffg.happ",
+      "designated_requirement": "(anchor apple generic and certificate leaf[field.1.2.840.113635.100.6.1.9] /* exists */ or anchor apple generic and certificate 1[field.1.2.840.113635.100.6.2.6] /* exists */ and certificate leaf[field.1.2.840.113635.100.6.1.13] /* exists */ and certificate leaf[subject.OU] = A6NW69KD84) and identifier \"su.ffg.happ\"",
+      "gatekeeper_assessment": "accepted",
+      "signature_valid": true,
+      "team_id": "A6NW69KD84",
+      "version": "4.14.0"
+    },
+    "happ_tunnel_extension": {
+      "bundle_id": "su.ffg.happ.tunnel",
+      "designated_requirement": "(anchor apple generic and certificate leaf[field.1.2.840.113635.100.6.1.9] /* exists */ or anchor apple generic and certificate 1[field.1.2.840.113635.100.6.2.6] /* exists */ and certificate leaf[field.1.2.840.113635.100.6.1.13] /* exists */ and certificate leaf[subject.OU] = A6NW69KD84) and identifier \"su.ffg.happ.tunnel\"",
+      "gatekeeper_assessment": "not_applicable_embedded_or_plugin",
+      "signature_valid": true,
+      "team_id": "A6NW69KD84",
+      "version": "4.14.0"
+    },
+    "amnezia_app": {
+      "architecture_class": "arm64_ios_style_wrapper",
+      "bundle_id": "org.amnezia.AmneziaVPN",
+      "designated_requirement": "anchor apple generic and certificate leaf[field.1.2.840.113635.100.6.1.3] /* exists */ and identifier \"org.amnezia.AmneziaVPN\"",
+      "gatekeeper_assessment": "rejected_or_unavailable",
+      "signature_failure_class": "obsolete_custom_omit_rules",
+      "signature_valid": false,
+      "team_id": "X7UJ388FXK",
+      "version": "4.8.19"
+    },
+    "amnezia_network_extension": {
+      "bundle_id": "org.amnezia.AmneziaVPN.network-extension",
+      "designated_requirement": "anchor apple generic and certificate leaf[field.1.2.840.113635.100.6.1.3] /* exists */ and identifier \"org.amnezia.AmneziaVPN.network-extension\"",
+      "gatekeeper_assessment": "not_applicable_embedded_or_plugin",
+      "signature_failure_class": "obsolete_custom_omit_rules",
+      "signature_valid": false,
+      "team_id": "X7UJ388FXK",
+      "version": "4.8.19"
+    }
+  }
+}

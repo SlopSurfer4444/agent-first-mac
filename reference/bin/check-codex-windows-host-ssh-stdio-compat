@@ -1,0 +1,62 @@
+#!/usr/bin/python3
+from __future__ import annotations
+
+import json
+from pathlib import Path
+import re
+
+
+ROOT = Path(__file__).resolve().parents[1]
+manifest = json.loads((
+    ROOT / "manifests/codex-windows-host-ssh-stdio-compat.json"
+).read_text())
+script = (ROOT / "bin/codex-windows-host-ssh-stdio-compat").read_text()
+docs = (ROOT / "docs/codex-windows-host-ssh-stdio-compat.md").read_text()
+
+assert manifest["profile"] == "codex-windows-host-ssh-stdio-compat"
+assert manifest["compatibility"]["environmentVariable"] == \
+    "CODEX_APP_SERVER_FORCE_CLI"
+assert manifest["compatibility"]["desiredEnvironmentState"] == "absent"
+assert manifest["compatibility"]["rollbackEnvironmentValue"] == "1"
+assert manifest["compatibility"]["sessionScoped"] is True
+assert manifest["compatibility"]["requiresDesktopRestart"] is True
+assert manifest["dataBoundary"]["privateKeyReadOrCopied"] is False
+assert manifest["dataBoundary"]["codexPrivateStateRead"] is False
+assert manifest["dataBoundary"]["rawLogsRead"] is False
+
+for needle in (
+    "require_exact_commit",
+    "dirty_worktree",
+    "app_signature_valid",
+    "remote_native_websocket_handshake_passes",
+    "remote_stdio_initialize_passes",
+    "native_state_commit_mismatch",
+    "unowned_or_inconsistent_prestate",
+    "rollback_refuses_environment_drift",
+    '"/bin/launchctl", "unsetenv", FLAG',
+    '"/bin/launchctl", "setenv", FLAG, VALUE',
+    'rm -rf -- "$probe_home"',
+    "app-server proxy",
+    "local_desktop_app_server_is_single",
+):
+    assert needle in script
+
+for needle in (
+    "session-scoped",
+    "native ssh websocket-over-unix-socket",
+    "disposable remote",
+    "restart",
+    "rollback",
+    "does not persist across logout",
+):
+    assert needle.lower() in docs.lower()
+
+combined = "\n".join((json.dumps(manifest), script, docs))
+assert not re.search(r"\b100\.(?:\d{1,3}\.){2}\d{1,3}\b", combined)
+assert not re.search(r"SHA256:[A-Za-z0-9+/]{30,}", combined)
+assert not re.search(r"[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-", combined)
+assert ".ts.net" not in combined
+assert "auth.json" not in combined
+assert "state_5.sqlite" not in combined
+
+print("validator_pass=true")

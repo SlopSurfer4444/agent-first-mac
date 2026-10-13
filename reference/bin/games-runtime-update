@@ -1,0 +1,480 @@
+#!/usr/bin/python3
+"""Fixed-path reviewed Wine PE update adapter. Source preparation is not apply authority."""
+import sys
+sys.dont_write_bytecode = True
+import argparse
+import contextlib
+import hashlib
+import importlib.machinery
+import importlib.util
+import json
+import os
+from pathlib import Path
+import pwd
+import re
+import stat
+import subprocess
+
+HOME = Path(pwd.getpwuid(os.getuid()).pw_dir)
+CONTROL = HOME/'AIDev/control'
+SOURCE_PATH = Path(__file__).absolute()
+HUB = HOME/'Library/Application Support/Adapted Games'
+DS3 = HOME/'Library/Application Support/Adapted Games DS3'
+STATE = HOME/'AIDev/state'
+CANDIDATE = STATE/'wine-runtime-overlay-candidate'
+NAMESPACE = 'wine-runtime-overlay'
+ARCHIVES = 'wine-runtime-overlay-archives'
+OWNER_BYTES = b'{"schema":1,"owner":"control-games-hub","purpose":"wine-runtime-overlay"}\n'
+ARCHIVE_OWNER_BYTES = b'{"schema":1,"owner":"control-games-hub","purpose":"wine-runtime-overlay-archives"}\n'
+POLICY = 'manifests/wine-runtime-overlay.json'
+DELIVERY = 'manifests/wine-runtime-update.json'
+ADMISSION = HOME/'AIDev/bin/game-launch-admission'
+DELIVERY_FIELDS = {'schema','id','owner','overlayPolicySha256','candidateFiles','requiredLaunchAdmissionSha256'}
+CANDIDATE_FILES = {'winemac-i386.drv','winemac-x86_64.drv','wine-source.tar.gz','source.patch','build-provenance.json','LGPL-NOTICE.txt'}
+PE32 = 'engine/lib/wine/i386-windows/winemac.drv'
+PE64 = 'engine/lib/wine/x86_64-windows/winemac.drv'
+ARCHIVE_IMMUTABLE_SOURCE = (POLICY,DELIVERY,'manifests/games-hub.json','manifests/ds3-marshal-fix.json',
+                            'manifests/ds3-source-hub-v1.json','bin/ds3-runtime','bin/ds3-play',
+                            'bin/games-play','bin/game-launch-admission')
+
+
+class Blocked(RuntimeError):
+    pass
+
+
+def need(ok, reason):
+    if not ok:
+        raise Blocked(reason)
+
+
+def pin(value, length=64):
+    return type(value) is str and re.fullmatch('[0-9a-f]{'+str(length)+'}',value) is not None
+
+
+def digest(data):
+    return hashlib.sha256(data).hexdigest()
+
+
+def run(argv, timeout=120, env=None):
+    result=subprocess.run([str(x) for x in argv],capture_output=True,timeout=timeout,env=env)
+    need(result.returncode == 0,'command_failed_'+Path(argv[0]).name)
+    need(len(result.stdout) <= 2*1024*1024,'command_output_limit')
+    return result.stdout
+
+
+def source_check(commit):
+    need(SOURCE_PATH == CONTROL/'bin/games-runtime-update','canonical_source_required')
+    need(pin(commit,40),'invalid_commit')
+    def git(*args):
+        return run(['/usr/bin/git','-c','core.hooksPath=/dev/null','-C',CONTROL,*args]).decode().strip()
+    need(git('rev-parse','HEAD') == commit and git('branch','--show-current') == 'main'
+         and git('status','--porcelain') == '', 'clean_exact_main_required')
+
+
+def source_gate(commit):
+    source_check(commit)
+    try:
+        report=json.loads(run([CONTROL/'bin/current-doctor','--json']))
+    except (ValueError,UnicodeError):
+        raise Blocked('invalid_doctor_response')
+    need(type(report) is dict and report.get('verdict') == 'PASS' and report.get('gitOnly') is False
+         and all(report.get(key) is True for key in ('configurationSourceAccepted','currentSentinelReady','integratedMain')), 'fresh_accepted_doctor_required')
+    source_check(commit)
+
+
+def load_engine():
+    loader=importlib.machinery.SourceFileLoader('reviewed_wine_runtime_overlay',str(CONTROL/'bin/wine-runtime-overlay'))
+    spec=importlib.util.spec_from_loader(loader.name,loader)
+    module=importlib.util.module_from_spec(spec)
+    loader.exec_module(module)
+    return module
+
+
+def anchor(engine,path):
+    """Open a fixed native root, retaining every no-follow ancestor descriptor."""
+    need(path.is_absolute(),'absolute_fixed_root_required')
+    obj=object.__new__(engine.Root)
+    obj.path=path
+    obj.chain=[]
+    fd=os.open('/',os.O_RDONLY|os.O_DIRECTORY)
+    obj.chain.append((None,None,fd,engine.identity(os.fstat(fd))))
+    try:
+        for name in path.parts[1:]:
+            parent=fd
+            fd=os.open(name,os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW,dir_fd=parent)
+            info=os.fstat(fd)
+            need(info.st_uid in (0,os.getuid()) and not info.st_mode & 0o022,'unsafe_fixed_root')
+            obj.chain.append((parent,name,fd,engine.identity(info)))
+        obj.fd=fd
+        need(os.fstat(fd).st_uid == os.getuid(),'foreign_fixed_root')
+        return obj
+    except BaseException:
+        obj.close()
+        raise
+
+
+def make_root(engine):
+    class LiveRoot(engine.Root):
+        def __init__(self):
+            self.anchors={}
+            try:
+                for name,path in (('hub',HUB),('ds3',DS3),('state',STATE),('candidate',CANDIDATE),
+                                  ('control',CONTROL),('admission',ADMISSION.parent)):
+                    self.anchors[name]=anchor(engine,path)
+            except BaseException:
+                self.close();raise
+
+        def bound(self):
+            for value in self.anchors.values():
+                value.bound()
+
+        def lock(self):
+            # The engine also enters its lock. Reuse this root's already held
+            # operation lock, not a second independently opened flock.
+            return read_only_lock(self)
+
+        def replace(self,rel,data,mode,expected,event=lambda _:None):
+            def publication(name):
+                event(name)
+                if name.startswith('before-replace:'):
+                    # Only operate installs this private closure. Direct
+                    # engine users retain their legacy explicit gate contract.
+                    check=getattr(self,'_publication_check',None)
+                    if check is not None:check()
+            return super().replace(rel,data,mode,expected,event=publication)
+
+        def close(self):
+            for value in self.anchors.values():
+                value.close()
+            self.anchors={}
+
+        @contextlib.contextmanager
+        def parent(self,rel):
+            self.bound()
+            if rel.startswith('hub/') or rel.startswith('ds3/'):
+                base,inner=rel.split('/',1)
+            elif rel == 'state/games-hub.lock' or rel == 'state/game-launch-pending.json':
+                base,inner='state',rel.split('/',1)[1]
+            elif rel.startswith('state/transaction'):
+                need(rel == 'state/transaction' or rel.startswith('state/transaction/'),'unsupported_state_path')
+                base,inner='state',NAMESPACE+'/'+rel.split('/',1)[1]
+            elif rel == 'state/owner.json':
+                base,inner='state',NAMESPACE+'/owner.json'
+            elif rel == 'admission/helper':
+                base,inner='admission',ADMISSION.name
+            elif rel.startswith('payload/candidate/'):
+                base,inner='candidate',rel.removeprefix('payload/candidate/')
+                need(inner in CANDIDATE_FILES,'candidate_path_not_declared')
+            elif rel == 'payload/policy.json':
+                base,inner='control',POLICY
+            elif rel == 'payload/update-policy.json':
+                base,inner='control',DELIVERY
+            elif rel == 'payload/current-hub-manifest.json':
+                base,inner='control','manifests/games-hub.json'
+            elif rel == 'payload/source-hub-v1.json':
+                base,inner='control','manifests/ds3-source-hub-v1.json'
+            elif rel == 'payload/ds3-runtime':
+                base,inner='control','bin/ds3-runtime'
+            elif rel in ('payload/winemac-i386.drv','payload/winemac-x86_64.drv'):
+                base,inner='candidate',rel.removeprefix('payload/')
+            else:
+                raise Blocked('unsupported_fixed_path')
+            with self.anchors[base].parent(inner) as opened:
+                yield opened
+
+        def exists(self,rel):
+            try:
+                return super().exists(rel)
+            except FileNotFoundError:
+                return False
+
+        def ensure_namespace(self):
+            state=self.anchors['state']
+            if state.exists(NAMESPACE):
+                need(state.read(NAMESPACE+'/owner.json')[0] == OWNER_BYTES,'state_namespace_collision')
+            else:
+                state.mkdir(NAMESPACE)
+                state.write_new(NAMESPACE+'/owner.json',OWNER_BYTES)
+            self.validate_namespace()
+
+        def validate_namespace(self):
+            state=self.anchors['state']
+            need(state.read(NAMESPACE+'/owner.json')[0] == OWNER_BYTES,'state_namespace_collision')
+            with state.parent(NAMESPACE+'/.unused') as (fd,_,check):
+                need(set(os.listdir(fd)) <= {'owner.json','transaction'},'state_namespace_drift')
+                check()
+    return LiveRoot()
+
+
+def delivery(engine,root):
+    definition=engine.decode(root.read('payload/update-policy.json')[0])
+    need(type(definition) is dict and set(definition) == DELIVERY_FIELDS and type(definition['schema']) is int and definition['schema'] == 1
+         and definition['id'] == 'wine-runtime-update' and definition['owner'] == 'control-games-hub','delivery_policy_schema')
+    need(pin(definition['overlayPolicySha256']) and pin(definition['requiredLaunchAdmissionSha256'])
+         and type(definition['candidateFiles']) is dict and set(definition['candidateFiles']) == CANDIDATE_FILES
+         and all(pin(value) for value in definition['candidateFiles'].values()),'delivery_pin_schema')
+    raw=root.read('payload/policy.json')[0]
+    need(digest(raw) == definition['overlayPolicySha256'],'overlay_policy_pin_mismatch')
+    policy=engine.decode(raw)
+    need(type(policy) is dict and set(policy) == engine.POLICY_FIELDS and type(policy.get('schema')) is int and policy['schema'] == 1
+         and policy['id'] == 'wine-runtime-overlay' and policy['owner'] == 'control-games-hub','overlay_policy_schema')
+    need(type(policy['desiredPEHashes']) is dict and set(policy['desiredPEHashes']) == {PE32,PE64}
+         and all(pin(value) for value in policy['desiredPEHashes'].values())
+         and policy['desiredPEHashes'][PE32] == definition['candidateFiles']['winemac-i386.drv']
+         and policy['desiredPEHashes'][PE64] == definition['candidateFiles']['winemac-x86_64.drv'],'overlay_delivery_disagreement')
+    # Hub status keeps its exact source/installed byte equality. The accepted
+    # source must declare the precise successor this planner will publish.
+    installed_hub=engine.decode(root.read('hub/manifest.json')[0])
+    need(type(installed_hub) is dict and type(policy.get('previousHubCriticalHashes')) is dict,'hub_manifest_schema')
+    desired_hub=dict(installed_hub,criticalHashes=dict(policy['previousHubCriticalHashes'],**policy['desiredPEHashes']),runtimeOverlayPolicySha256=definition['overlayPolicySha256'])
+    need(root.read('payload/current-hub-manifest.json')[0] == engine.encode(desired_hub),'declared_hub_source_successor_drift')
+    for name,expected in definition['candidateFiles'].items():
+        need(digest(root.read('payload/candidate/'+name)[0]) == expected,'candidate_source_drift')
+    provenance=engine.decode(root.read('payload/candidate/build-provenance.json')[0])
+    fields={'schema','peHashes','sourceArchiveSha256','patchSha256','upstreamCommit','installed'}
+    need(type(provenance) is dict and set(provenance) == fields and type(provenance['schema']) is int and provenance['schema'] == 1
+         and provenance['peHashes'] == policy['desiredPEHashes'] and provenance['sourceArchiveSha256'] == definition['candidateFiles']['wine-source.tar.gz']
+         and provenance['patchSha256'] == definition['candidateFiles']['source.patch'] and (provenance['upstreamCommit'] is None or pin(provenance['upstreamCommit'],40))
+         and provenance['installed'] is False,'candidate_provenance_binding')
+    need(digest(root.read('admission/helper')[0]) == definition['requiredLaunchAdmissionSha256'],'launch_admission_prerequisite')
+    return definition,policy
+
+
+def inactive(root,policy):
+    # Prefix availability metadata only; never recurse into profiles or open
+    # a registry, account, save, configuration or game content file.
+    need(not root.exists('state/game-launch-pending.json'),'launch_reservation_pending')
+    server='engine/bin/wineserver'
+    pins=policy.get('previousHubCriticalHashes')
+    need(type(pins) is dict and pin(pins.get(server)),'server_pin_missing')
+    for name,base,prefix in (('hub',HUB,HUB/'profiles/prince'),('ds3',DS3,DS3/'profiles/ds3')):
+        need(digest(root.read(name+'/runtime/'+server)[0]) == pins[server],'unchanged_server_drift')
+        with root.parent(name+'/profiles/.unused') as (fd,_,check):
+            info=os.stat(prefix.name,dir_fd=fd,follow_symlinks=False)
+            need(stat.S_ISDIR(info.st_mode) and info.st_uid == os.getuid() and not info.st_mode & 0o022,'prefix_unavailable')
+            check()
+        env={'HOME':str(HOME),'PATH':'/usr/bin:/bin','WINEPREFIX':str(prefix),'WINESERVER':str(base/'runtime'/server)}
+        try:
+            run([base/'runtime'/server,'-w'],timeout=3,env=env)
+        except subprocess.TimeoutExpired:
+            raise Blocked('prefix_active')
+
+
+def gate(engine,root,commit):
+    source_gate(commit)
+    return local_gate(engine,root,commit)
+
+
+def local_gate(engine,root,commit):
+    held=getattr(root,'_operation_lock_check',None)
+    if held is not None:held()
+    source_check(commit)
+    if root.exists('state/transaction'):root.validate_namespace()
+    _,policy=delivery(engine,root)
+    inactive(root,policy)
+    return {'sourceAccepted':True,'doctorReady':True,'prefixesInactive':True}
+
+
+@contextlib.contextmanager
+def read_only_lock(root):
+    # Plan creates neither a lock nor a transaction namespace.
+    held=getattr(root,'_operation_lock_check',None)
+    if held is not None:
+        held()
+        yield
+        held()
+        return
+    with root.parent('state/games-hub.lock') as (parent,name,check):
+        fd=os.open(name,os.O_RDONLY|os.O_NOFOLLOW,dir_fd=parent)
+        try:
+            info=os.fstat(fd)
+            need(stat.S_ISREG(info.st_mode) and info.st_uid == os.getuid() and info.st_nlink == 1 and not info.st_mode & 0o022,'unsafe_lock')
+            import fcntl
+            fcntl.flock(fd,fcntl.LOCK_EX|fcntl.LOCK_NB)
+            check()
+            need(os.stat(name,dir_fd=parent,follow_symlinks=False).st_ino == info.st_ino,'lock_binding_drift')
+            def bound():
+                check()
+                need(os.stat(name,dir_fd=parent,follow_symlinks=False).st_ino == info.st_ino,'lock_binding_drift')
+            root._operation_lock_check=bound
+            try:
+                yield
+                bound()
+            finally:
+                del root._operation_lock_check
+        finally:
+            os.close(fd)
+
+
+def exclusive_rename(source_parent,source_name,destination_parent,destination_name):
+    """Darwin's real atomic exclusive rename; never emulate check-then-rename."""
+    need(sys.platform == 'darwin','exclusive_rename_unavailable')
+    need('/' not in source_name and '/' not in destination_name,'invalid_archive_basename')
+    import ctypes
+    library=ctypes.CDLL('/usr/lib/libSystem.B.dylib',use_errno=True)
+    function=library.renameatx_np
+    function.argtypes=(ctypes.c_int,ctypes.c_char_p,ctypes.c_int,ctypes.c_char_p,ctypes.c_uint)
+    function.restype=ctypes.c_int
+    # macOS SDK sys/stdio.h declares RENAME_EXCL = 0x00000004.
+    status=function(source_parent,os.fsencode(source_name),destination_parent,os.fsencode(destination_name),0x00000004)
+    if status != 0:
+        number=ctypes.get_errno()
+        raise OSError(number,os.strerror(number))
+
+
+def archive_source_ancestry(engine,root,old_commit,current_commit):
+    need(pin(old_commit,40) and old_commit != current_commit,'distinct_old_source_commit_required')
+    git=['/usr/bin/git','-c','core.hooksPath=/dev/null','-C',CONTROL]
+    need(run(git+['cat-file','-t',old_commit]).decode().strip() == 'commit','old_source_commit_missing')
+    try:
+        run(git+['merge-base','--is-ancestor',old_commit,current_commit])
+    except Blocked:
+        raise Blocked('old_source_not_ancestor')
+    for path in ARCHIVE_IMMUTABLE_SOURCE:
+        need(run(git+['show',old_commit+':'+path]) == root.anchors['control'].read(path)[0],
+             'archive_source_scope_changed')
+
+
+def archive_prepared(engine,root,current_commit,old_commit,expected_plan):
+    """Retain only this exact old prepared namespace; never rebind its source."""
+    need(pin(expected_plan) and pin(old_commit,40),'archive_old_binding_required')
+    with read_only_lock(root):
+        source_gate(current_commit)
+        fresh=lambda _: local_gate(engine,root,current_commit)
+        fresh(current_commit)
+        archive_source_ancestry(engine,root,old_commit,current_commit)
+        state=root.anchors['state']
+        def prepared_records(tx):
+            root.validate_namespace()
+            with state.parent(NAMESPACE+'/.unused') as (fd,_,check):
+                need(stat.S_IMODE(os.fstat(fd).st_mode) == 0o700,'namespace_not_private')
+                need(set(os.listdir(fd)) == {'owner.json','transaction'},'archive_namespace_inventory')
+                check()
+            need(state.read(NAMESPACE+'/owner.json')[1] == 0o600,'archive_owner_mode')
+            journal=tx.journal()
+            need(journal['phase'] == 'prepared' and journal['intent'] is None,'archive_requires_prepared_null_intent')
+            need(root.read('state/transaction/journal.json')[1] == 0o600,'archive_journal_mode')
+            expected={'plan.json','journal.json'}|{key+'.'+side for key in engine.ORDER for side in ('before','after')}
+            with root.parent('state/transaction/.unused') as (fd,_,check):
+                need(stat.S_IMODE(os.fstat(fd).st_mode) == 0o700,'transaction_not_private')
+                need(set(os.listdir(fd)) == expected,'archive_requires_no_stages')
+                check()
+        def exact_prepared():
+            root.validate_namespace()
+            raw,mode=root.read('state/transaction/plan.json')
+            need(engine.MAX_METADATA_BYTES < len(raw) <= engine.MAX_PLAN_BYTES and mode == 0o600,'archive_not_large_plan_repair')
+            tx=engine.Transaction(root,expected_plan,gate=fresh,source_only=False)
+            need(tx.plan['acceptedCommit'] == old_commit,'archive_old_source_binding')
+            prepared_records(tx)
+            tx.preflight(mixed=False)
+            need(tx.side('before'),'archive_requires_complete_before')
+            for name in ('hub','ds3'):
+                need(engine.tree_rows(root,name+'/runtime') == tx.plan['runtimeRows'][name]['before'],
+                     'archive_runtime_not_before')
+            # Fresh gates are observations, not a lease on journal/inventory.
+            # Re-read the exact records after the gate, before claiming prepared.
+            prepared_records(tx)
+            return tx
+        exact_prepared()
+        # Capture the bound source directory identity before creating archive
+        # state. All payload/prefix/namespace checks are repeated before rename.
+        with state.parent(NAMESPACE) as (source_parent,source_name,source_check):
+            source_identity=engine.identity(os.stat(source_name,dir_fd=source_parent,follow_symlinks=False))
+            if not state.exists(ARCHIVES):
+                state.mkdir(ARCHIVES)
+                state.write_new(ARCHIVES+'/owner.json',ARCHIVE_OWNER_BYTES)
+            need(state.read(ARCHIVES+'/owner.json') == (ARCHIVE_OWNER_BYTES,0o600),'archive_parent_owner')
+            with state.parent(ARCHIVES+'/.unused') as (destination_parent,_,destination_check):
+                need(stat.S_IMODE(os.fstat(destination_parent).st_mode) == 0o700,'archive_parent_not_private')
+                for name in os.listdir(destination_parent):
+                    if name == 'owner.json':continue
+                    need(re.fullmatch('[0-9a-f]{40}-[0-9a-f]{64}',name) is not None,'archive_parent_inventory')
+                    info=os.stat(name,dir_fd=destination_parent,follow_symlinks=False)
+                    need(stat.S_ISDIR(info.st_mode) and info.st_uid == os.getuid() and stat.S_IMODE(info.st_mode) == 0o700,'archive_parent_entry')
+                destination_name=old_commit+'-'+expected_plan
+                tx=exact_prepared()
+                archive_source_ancestry(engine,root,old_commit,current_commit)
+                source_check();destination_check()
+                need(engine.identity(os.stat(source_name,dir_fd=source_parent,follow_symlinks=False)) == source_identity,
+                     'archive_source_directory_drift')
+                need(os.fstat(source_parent).st_dev == os.fstat(destination_parent).st_dev,'cross_device_archive')
+                fresh(current_commit)
+                prepared_records(tx)
+                exclusive_rename(source_parent,source_name,destination_parent,destination_name)
+                os.fsync(source_parent);os.fsync(destination_parent)
+                need(engine.identity(os.stat(destination_name,dir_fd=destination_parent,follow_symlinks=False)) == source_identity,
+                     'archive_published_identity_drift')
+                source_check();destination_check()
+        return {'state':'PREPARED_TRANSACTION_ARCHIVED','changed':True,'liveStateChanged':True,'installedTargetsChanged':False,
+                'oldSourceCommit':old_commit,'currentSourceCommit':current_commit,'planSha256':expected_plan,
+                'oldTransactionRebound':False,'installedAcceptanceClaimed':False}
+
+
+def operate(operation,commit,expected_plan=None,old_commit=None):
+    need(operation in ('plan','apply','rollback','return','recover','archive-prepared'),'unsupported_operation')
+    need(operation == 'archive-prepared' or old_commit is None,'old_binding_archive_only')
+    source_check(commit)
+    engine=load_engine()
+    root=make_root(engine)
+    try:
+        if operation == 'archive-prepared':return archive_prepared(engine,root,commit,old_commit,expected_plan)
+        with read_only_lock(root):
+            source_gate(commit)
+            # Made only after this invocation's full doctor PASS under lock.
+            # No persisted or caller-supplied PASS exists.
+            fresh=lambda exact: local_gate(engine,root,exact)
+            root._publication_check=lambda: fresh(commit)
+            if operation == 'plan':
+                fresh(commit)
+                definition,policy=delivery(engine,root)
+                if root.exists('state/transaction'):
+                    root.validate_namespace()
+                    need(pin(expected_plan),'existing_transaction_plan_pin_required')
+                    tx=engine.Transaction(root,expected_plan,gate=fresh,source_only=False)
+                    need(tx.plan['acceptedCommit'] == commit,'transaction_source_commit_drift')
+                    tx.preflight(mixed=True)
+                    return {'state':'PLANNED_EXISTING_TRANSACTION','changed':False,'liveStateChanged':False,'journalPhase':tx.journal()['phase'],'planSha256':expected_plan}
+                return engine.build(root,commit,policy['desiredPEHashes'][PE32],policy['desiredPEHashes'][PE64],definition['overlayPolicySha256'],publish=False,source_only=False)
+            need(pin(expected_plan),'reviewed_plan_pin_required')
+            if operation == 'apply' and not root.exists('state/transaction'):
+                fresh(commit)
+                definition,policy=delivery(engine,root)
+                planned=engine.build(root,commit,policy['desiredPEHashes'][PE32],policy['desiredPEHashes'][PE64],definition['overlayPolicySha256'],publish=False,source_only=False)
+                need(planned['planSha256'] == expected_plan,'prestate_changed_since_plan')
+                root.ensure_namespace()
+                prepared=engine.build(root,commit,policy['desiredPEHashes'][PE32],policy['desiredPEHashes'][PE64],definition['overlayPolicySha256'],source_only=False)
+                need(prepared['planSha256'] == expected_plan,'prepared_plan_drift')
+            tx=engine.Transaction(root,expected_plan,gate=fresh,source_only=False)
+            root.validate_namespace()
+            need(tx.plan['acceptedCommit'] == commit,'transaction_source_commit_drift')
+            result=tx.run('before' if operation == 'rollback' else 'after',recover=operation == 'recover')
+            # The engine's fixture report always says liveStateChanged=false.
+            # This fixed-path route separately reports installed mutation.
+            result['liveStateChanged']=result['changed']
+            result['sourceCommitUnchanged']=True
+            result['installedAcceptanceClaimed']=False
+            if result['state'] == 'ROLLED-BACK':
+                result['sourceRollbackSuccessorRequired']=True
+            return result
+    finally:
+        root.close()
+
+
+def main():
+    parser=argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('operation',choices=('plan','apply','rollback','return','recover','archive-prepared'))
+    parser.add_argument('accepted_commit')
+    parser.add_argument('--plan-sha256')
+    parser.add_argument('--old-commit')
+    args=parser.parse_args()
+    os.umask(0o077)
+    print(json.dumps(operate(args.operation,args.accepted_commit,args.plan_sha256,args.old_commit)))
+
+
+if __name__ == '__main__':
+    try:
+        main()
+    except Exception as error:
+        print(json.dumps({'state':'BLOCKED','reason':str(error) if isinstance(error,Blocked) or type(error).__name__ == 'Blocked' else type(error).__name__,
+                          'installedAcceptanceClaimed':False}))
+        sys.exit(1)

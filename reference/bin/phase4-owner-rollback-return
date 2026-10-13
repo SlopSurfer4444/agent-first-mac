@@ -1,0 +1,163 @@
+#!/usr/bin/python3
+"""Exact owner-operated rollback/return action; never run before independent acceptance."""
+
+import hashlib
+import json
+import os
+from pathlib import Path
+import re
+import stat
+import subprocess
+import sys
+
+
+CONTROL_COMMIT = "217602def502f515f5c0c554f1d4c1d0aaabcb26"
+RECEIPT_SHA256 = "cf5e95fd3bf33fc34794055a80865fde9feaeccac4b271aa30561e42ca30a725"
+TARGET_PATH_SHA256 = "ab0a4216e4dd81dfc10f18cd2d6999e5d73b3c719f8a465852118ae35233ecb7"
+PREVIOUS_GENERATION = 2
+PREVIOUS_TARGET_PATH_SHA256 = "97b12222d8587afe9b558e15585490c70065f9e4474799a7ea24b1cef5338c6b"
+PROFILE = Path("/nix/var/nix/profiles/system")
+CURRENT_SYSTEM = Path("/run/current-system")
+SUDO = "/usr/bin/sudo"
+
+
+def require(condition, reason):
+    if not condition:
+        raise RuntimeError(reason)
+
+
+def digest_bytes(value):
+    return hashlib.sha256(value).hexdigest()
+
+
+def path_digest(path):
+    return digest_bytes(str(path).encode())
+
+
+def generation_state(identifier):
+    require(re.fullmatch(r"[1-9][0-9]{0,8}", str(identifier)) is not None,
+            "generation_identifier")
+    link = PROFILE.parent / f"system-{identifier}-link"
+    facts = link.lstat()
+    require(stat.S_ISLNK(facts.st_mode) and facts.st_uid == 0, "generation_link")
+    target = link.resolve(strict=True)
+    require(str(target).startswith("/nix/store/"), "generation_target")
+    return target
+
+
+def current_generation():
+    destination = os.readlink(PROFILE)
+    match = re.fullmatch(r"system-([1-9][0-9]{0,8})-link", Path(destination).name)
+    require(match is not None, "current_profile_link")
+    identifier = int(match.group(1))
+    target = generation_state(identifier)
+    require(CURRENT_SYSTEM.resolve(strict=True) == target, "current_system_mismatch")
+    return identifier, target
+
+
+def receipt(path):
+    facts = path.lstat()
+    require(stat.S_ISREG(facts.st_mode) and not path.is_symlink() and
+            facts.st_uid == os.getuid() and stat.S_IMODE(facts.st_mode) == 0o400,
+            "receipt_owner_mode")
+    data = path.read_bytes()
+    require(digest_bytes(data) == RECEIPT_SHA256, "receipt_hash")
+    value = json.loads(data)
+    require(set(value) == {"controlCommit", "controlTree", "policyHash", "reviewed", "schema",
+                           "targetSystemNarHash", "targetSystemPath"}, "receipt_schema")
+    require(value["schema"] == 1 and value["reviewed"] is True and
+            value["controlCommit"] == CONTROL_COMMIT, "receipt_binding")
+    target = Path(value["targetSystemPath"])
+    require(path_digest(target) == TARGET_PATH_SHA256, "reviewed_target_path")
+    target_facts = target.stat()
+    require(target.is_dir() and target_facts.st_uid == 0 and
+            target_facts.st_mode & 0o022 == 0, "reviewed_target_immutable")
+    return target.resolve(strict=True)
+
+
+def fixed_activation(target):
+    executable = (target / "sw/bin/darwin-rebuild").resolve(strict=True)
+    require(str(executable).startswith("/nix/store/"), "activation_path")
+    facts = executable.stat()
+    require(stat.S_ISREG(facts.st_mode) and facts.st_uid == 0 and
+            facts.st_mode & 0o022 == 0 and facts.st_mode & 0o111,
+            "activation_executable")
+    return str(executable)
+
+
+def run_sudo(arguments, invalidate=False):
+    command = [SUDO]
+    if invalidate:
+        command.append("-k")
+    command.extend(["--", *arguments])
+    environment = {"HOME": str(Path.home()), "LANG": "C", "LC_ALL": "C",
+                   "PATH": "/usr/bin:/bin", "TMPDIR": "/tmp"}
+    return subprocess.run(command, env=environment, check=False).returncode
+
+
+def preflight():
+    home = Path.home().resolve(strict=True)
+    scratch = home / "AIDev/scratch/phase-4-install-bundle-review" / f"{CONTROL_COMMIT}.json"
+    reviewed_target = receipt(scratch)
+    current_identifier, current_target = current_generation()
+    require(current_identifier == PREVIOUS_GENERATION, "preflight_previous_generation")
+    require(path_digest(current_target) == PREVIOUS_TARGET_PATH_SHA256,
+            "preflight_previous_target")
+    require(reviewed_target != current_target, "preflight_target_already_current")
+    print("OWNER_ROLLBACK_RETURN_ACTION_PREPARED")
+    print("password_prompts_expected=1")
+    print("system_mutations_performed=false")
+
+
+def execute():
+    require(os.getuid() != 0 and os.geteuid() == os.getuid(), "owner_execution_required")
+    home = Path.home().resolve(strict=True)
+    consumed = home / "AIDev/state/phase-4/apply-receipts" / f"{CONTROL_COMMIT}.json"
+    reviewed_target = receipt(consumed)
+    new_identifier, new_target = current_generation()
+    require(new_identifier != PREVIOUS_GENERATION and new_target == reviewed_target,
+            "reviewed_generation_not_current")
+    previous_target = generation_state(PREVIOUS_GENERATION)
+    require(path_digest(previous_target) == PREVIOUS_TARGET_PATH_SHA256,
+            "previous_generation_drift")
+    activation = fixed_activation(new_target)
+
+    rollback_status = run_sudo([activation, "--switch-generation",
+                                str(PREVIOUS_GENERATION)], invalidate=True)
+    if rollback_status != 0:
+        subprocess.run([SUDO, "-k"], check=False)
+        raise RuntimeError("rollback_command_failed")
+
+    rollback_verified = False
+    try:
+        identifier, target = current_generation()
+        rollback_verified = identifier == PREVIOUS_GENERATION and target == previous_target
+    finally:
+        return_status = run_sudo([activation, "--switch-generation", str(new_identifier)])
+        subprocess.run([SUDO, "-k"], check=False)
+
+    require(rollback_verified, "rollback_verification_failed")
+    require(return_status == 0, "return_command_failed_previous_generation_remains_usable")
+    returned_identifier, returned_target = current_generation()
+    require(returned_identifier == new_identifier and returned_target == new_target,
+            "return_verification_failed")
+    print("ROLLBACK_TO_PREVIOUS_VERIFIED")
+    print("RETURN_TO_REVIEWED_GENERATION_VERIFIED")
+    print("sudo_timestamp_cleared=true")
+
+
+def main():
+    if sys.argv[1:] == ["--preflight"]:
+        preflight()
+    elif sys.argv[1:] == []:
+        execute()
+    else:
+        raise RuntimeError("usage")
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except Exception as error:
+        print(json.dumps({"result": "fail", "reason": str(error)}, sort_keys=True))
+        raise SystemExit(1)
