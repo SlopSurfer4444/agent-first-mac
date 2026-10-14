@@ -2,6 +2,7 @@
 """Build two clean candidates and emit one bounded immutable Phase 4 review bundle."""
 
 import hashlib
+import copy
 import json
 import os
 from pathlib import Path
@@ -29,12 +30,20 @@ SOURCE_FILES = (
     "Sources/AidAdminBootstrap/main.swift",
     "Sources/AidAdminBootstrapCore/AidAdminBootstrapCore.swift",
     "Sources/AidAdminCore/AidAdminCore.swift",
+    "Sources/AidAdminCore/OperationJournal.swift",
+    "Sources/AidAdminCore/ResumeLaunchd.swift",
+    "Sources/AidAdminCore/ResumeHomeManager.swift",
+    "Sources/AidAdminRuntime/BoundedProcess.swift",
     "bin/build-phase4-install-bundle",
     "bin/check-phase4-install-bundle",
     "policy/aid-admin-apply-policy.json",
     "policy/sudoers.d/agent-first-mac-aid-admin",
     "tests/AidAdminBootstrapTests/AidAdminBootstrapTests.swift",
     "tests/AidAdminCoreTests/AidAdminCoreTests.swift",
+    "tests/AidAdminRuntimeTests/AidAdminRuntimeTests.swift",
+    "tests/AidAdminResumeLaunchdTests/AidAdminResumeLaunchdTests.swift",
+    "tests/AidAdminResumeHomeManagerTests/AidAdminResumeHomeManagerTests.swift",
+    "tests/test_root_bundle_successor.py",
 )
 
 
@@ -43,11 +52,29 @@ def require(condition, reason):
         raise RuntimeError(reason)
 
 
-def run(argv, cwd=ROOT):
+def cache_environment(cache_root):
+    cache_root = Path(cache_root)
+    locations = {
+        "HOME": cache_root / "home", "TMPDIR": cache_root / "tmp",
+        "XDG_CACHE_HOME": cache_root / "xdg",
+        "CLANG_MODULE_CACHE_PATH": cache_root / "clang-module-cache",
+        "SWIFT_MODULECACHE_PATH": cache_root / "swift-module-cache",
+        "SWIFTPM_MODULECACHE_OVERRIDE": cache_root / "swift-module-cache",
+        "SWIFTPM_CUSTOM_CACHE_PATH": cache_root / "swiftpm-cache",
+    }
+    for path in locations.values():
+        path.mkdir(mode=0o700, parents=True, exist_ok=True)
+    return {**{key: str(path) for key, path in locations.items()},
+            "LANG": "C", "LC_ALL": "C", "PATH": "/usr/bin:/bin"}
+
+
+def run(argv, cwd=ROOT, cache_root=None):
+    environment = (cache_environment(cache_root) if cache_root is not None else
+                   {"HOME": "/var/empty", "LANG": "C", "LC_ALL": "C",
+                    "PATH": "/usr/bin:/bin", "TMPDIR": tempfile.gettempdir()})
     result = subprocess.run([str(value) for value in argv], cwd=cwd, text=True,
                             stdout=subprocess.PIPE, stderr=subprocess.STDOUT, check=False,
-                            env={"HOME": str(Path.home()), "LANG": "C", "LC_ALL": "C",
-                                 "PATH": "/usr/bin:/bin", "TMPDIR": tempfile.gettempdir()})
+                            env=environment)
     require(result.returncode == 0,
             f"command_failed_{Path(str(argv[0])).name}: {result.stdout[-1200:]}")
     return result.stdout
@@ -81,9 +108,15 @@ def behavior(path, cases):
 
 
 def clean_build(scratch):
-    run(["/usr/bin/swift", "build", "-c", "release", "--scratch-path", scratch])
-    bin_path = Path(run(["/usr/bin/swift", "build", "-c", "release", "--show-bin-path",
-                         "--scratch-path", scratch]).strip())
+    cache_root = scratch / "cache"
+    arguments = ["/usr/bin/swift", "build", "--disable-sandbox", "-c", "release",
+                 "--scratch-path", scratch / "build", "--cache-path", cache_root / "swiftpm-cache",
+                 "-Xswiftc", "-module-cache-path", "-Xswiftc", cache_root / "swift-module-cache"]
+    # Build only this stage's dependency closure. Emergency pins bind the new
+    # broker in stage two and must not feed back into this source snapshot.
+    for product in ("aid-admin-apply", "aid-admin-bootstrap"):
+        run([*arguments, "--product", product], cache_root=cache_root)
+    bin_path = Path(run([*arguments, "--show-bin-path"], cache_root=cache_root).strip())
     broker = bin_path / "aid-admin-apply"
     bootstrap = bin_path / "aid-admin-bootstrap"
     require(broker.is_file() and bootstrap.is_file(), "release_candidate_missing")
@@ -101,11 +134,57 @@ def write_json(path, value, mode=0o444):
     path.chmod(mode)
 
 
+def parse_args(args):
+    successor = bool(args and args[0] == "--successor")
+    if successor:
+        require(len(args) == 3 and args[1] == "--output", "usage")
+        output_arg = args[2]
+    else:
+        require(args == [] or (len(args) == 2 and args[0] == "--output"), "usage")
+        output_arg = args[1] if args else None
+    require(output_arg is None or (bool(output_arg) and not output_arg.startswith("--")), "output_path_required")
+    requested_output = Path(output_arg) if output_arg is not None else DEFAULT_OUTPUT
+    require(not os.path.lexists(requested_output), "output_already_exists")
+    output = requested_output.resolve()
+    require(not successor or output != DEFAULT_OUTPUT.resolve(), "successor_historical_output_forbidden")
+    require(not os.path.lexists(output), "output_already_exists")
+    return successor, output
+
+
+def source_snapshot():
+    head = run(["/usr/bin/git", "rev-parse", "--verify", "HEAD"]).strip()
+    require(re.fullmatch(r"[0-9a-f]{40}", head) is not None, "candidate_git_head_invalid")
+    return {"gitHEAD": head, "sourceFileSHA256": {path: digest(ROOT / path) for path in SOURCE_FILES},
+            "isAcceptance": False}
+
+
+def successor_manifest(historical, candidate):
+    value = copy.deepcopy(historical)
+    provenance = value["buildProvenance"]
+    value["historicalPredecessor"] = {
+        "role": "predecessor-only",
+        "acceptedBases": value.pop("acceptedBases"),
+        "sourceBase": provenance.pop("sourceBase"),
+        "reviewMarker": value.pop("reviewMarker"),
+        "verdict": value.pop("verdict"),
+    }
+    value["candidateSource"] = candidate
+    value["artifactSet"] = "phase4-aid-admin-install-successor-candidate-v1"
+    value["schema"] = 2
+    value["acceptanceState"] = "not-accepted"
+    value["installationState"] = "not-installed"
+    value["gates"].update(preparationOnly=True, applyGateAccepted=False, accepted=False,
+                          installed=False, independentReviewRequired=True,
+                          compiledBindingsAccepted=False, compiledBindingsRequireRebinding=True)
+    value["futureLauncher"]["executionAuthorized"] = False
+    value["reviewMarker"] = "CHECKPOINT_ROOT_SUCCESSOR_SOURCE_REVIEW"
+    value["verdict"] = "SOURCE_ONLY_SUCCESSOR_CANDIDATE_NOT_ACCEPTED"
+    return value
+
+
 def main():
-    args = sys.argv[1:]
-    require(args in ([], ["--output", args[1]] if len(args) == 2 else []), "usage")
-    output = Path(args[1]).resolve() if args else DEFAULT_OUTPUT
-    require(not output.exists(), "output_already_exists")
+    successor, output = parse_args(sys.argv[1:])
+    candidate = source_snapshot() if successor else None
     output.parent.mkdir(parents=True, exist_ok=True)
     scratch_a = Path(tempfile.mkdtemp(prefix="aid-admin-install-build-a."))
     scratch_b = Path(tempfile.mkdtemp(prefix="aid-admin-install-build-b."))
@@ -129,6 +208,8 @@ def main():
                 "broker_architecture_drift")
         require(architecture(bootstrap_a) == architecture(bootstrap_b) == "arm64-darwin",
                 "bootstrap_architecture_drift")
+        if successor:
+            require(source_snapshot() == candidate, "candidate_source_changed_during_build")
 
         output.mkdir(mode=0o755)
         broker = output / "aid-admin"
@@ -181,9 +262,9 @@ def main():
         )
         launcher.chmod(0o555)
 
-        swift_version = run(["/usr/bin/swift", "--version"]).splitlines()[0]
+        swift_version = run(["/usr/bin/swift", "--version"], cache_root=scratch_a / "cache").splitlines()[0]
         review = output / "review-manifest.json"
-        write_json(review, {
+        review_data = {
             "acceptedBases": {
                 "acceptedPreparationHead": PREPARATION_HEAD,
                 "acceptedInstalledRootPreapplyHead": ACCEPTED_PREAPPLY_HEAD,
@@ -216,8 +297,8 @@ def main():
                 "behaviorIdentical": True,
                 "brokerBehaviorCases": len(broker_cases),
                 "commands": [
-                    "/usr/bin/swift build -c release --scratch-path <clean-a>",
-                    "/usr/bin/swift build -c release --scratch-path <clean-b>",
+                    "/usr/bin/swift build --disable-sandbox -c release --scratch-path <clean-a>/build --cache-path <clean-a>/cache/swiftpm-cache -Xswiftc -module-cache-path -Xswiftc <clean-a>/cache/swift-module-cache --product <aid-admin-apply|aid-admin-bootstrap> (one invocation per product)",
+                    "/usr/bin/swift build --disable-sandbox -c release --scratch-path <clean-b>/build --cache-path <clean-b>/cache/swiftpm-cache -Xswiftc -module-cache-path -Xswiftc <clean-b>/cache/swift-module-cache --product <aid-admin-apply|aid-admin-bootstrap> (one invocation per product)",
                 ],
                 "selectedBuild": "A",
                 "sourceBase": CONTROL_BASE,
@@ -267,9 +348,13 @@ def main():
             "reviewMarker": CORRECTION_MARKER,
             "schema": 1,
             "verdict": "CORRECTION_PREPARED_FOR_INDEPENDENT_REVIEW",
-        })
+        }
+        if successor:
+            require(source_snapshot() == candidate, "candidate_source_changed_during_publication")
+            review_data = successor_manifest(review_data, candidate)
+        write_json(review, review_data)
         print(json.dumps({
-            "result": "pass", "output": "install-bundles/phase-4/aid-admin",
+            "result": "pass", "output": str(output),
             "broker_sha256": digest(broker), "bootstrap_sha256": digest(bootstrap),
             "review_manifest_sha256": digest(review), "owner_identity_retained": False,
         }, sort_keys=True))

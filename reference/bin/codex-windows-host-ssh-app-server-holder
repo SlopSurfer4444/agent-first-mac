@@ -2,6 +2,10 @@
 from __future__ import annotations
 
 import argparse
+import base64
+from contextlib import contextmanager
+import ctypes
+import fcntl
 import hashlib
 import json
 import os
@@ -9,21 +13,26 @@ from pathlib import Path
 import plistlib
 import pwd
 import re
+import secrets
 import selectors
+import stat
+import struct
 import subprocess
 import sys
-import tempfile
 import time
 
 
 ROOT = Path(__file__).resolve().parents[1]
 PROFILE = "codex-windows-host-ssh-app-server-holder"
-BRANCH = "codex/codex-windows-host-ssh-connector"
 LABEL = "com.aidev.codex-windows-host-app-server-holder"
 PAYLOAD = ROOT / "payload/macos/codex-windows-host-app-server-holder.sh"
 ISOLATION = ROOT / "bin/codex-windows-host-ssh-remote-control-isolation"
 COMPAT = ROOT / "bin/codex-windows-host-ssh-stdio-compat"
 COMMIT_RE = re.compile(r"^[0-9a-f]{40}$")
+SOURCE_EXPECTED = None
+# A reviewed positive endpoint-absence observer has not yet been established.
+# This is source capability, never an environment/caller-supplied authorization.
+REMOTE_ABSENCE_SUPPORTED = False
 
 
 class ContractError(RuntimeError):
@@ -43,7 +52,9 @@ def run(argv: list[str], *, timeout: float = 20,
 
 
 def git(*args: str) -> str:
-    result = run(["/usr/bin/git", "-C", str(ROOT), *args])
+    result = run(["/usr/bin/git", "-c", "core.fsmonitor=false",
+                  "-c", "core.hooksPath=/dev/null", "-c", "core.untrackedCache=false",
+                  "-C", str(ROOT), *args])
     if result.returncode != 0:
         raise ContractError("git_command_failed")
     return result.stdout.decode().strip()
@@ -54,12 +65,16 @@ def require_exact_commit(expected: str) -> None:
         raise ContractError("invalid_commit")
     if git("rev-parse", "--show-toplevel") != str(ROOT):
         raise ContractError("wrong_control_root")
-    if git("rev-parse", "--abbrev-ref", "HEAD") != BRANCH:
-        raise ContractError("wrong_task_branch")
+    if ROOT != canonical_home() / "AIDev/control":
+        raise ContractError("canonical_control_required")
+    if git("rev-parse", "--abbrev-ref", "HEAD") != "main":
+        raise ContractError("canonical_main_required")
     if git("rev-parse", "HEAD") != expected:
         raise ContractError("commit_mismatch")
     if git("status", "--porcelain=v1", "--untracked-files=all"):
         raise ContractError("dirty_worktree")
+    if SOURCE_EXPECTED is not None and source_binding() != SOURCE_EXPECTED:
+        raise ContractError("holder_physical_source_changed")
 
 
 def canonical_home() -> Path:
@@ -78,6 +93,8 @@ def layout() -> dict[str, Path]:
         "plist": home / f"Library/LaunchAgents/{LABEL}.plist",
         "state": home / f"AIDev/state/{PROFILE}",
         "receipt": home / f"AIDev/state/{PROFILE}/receipt.json",
+        "journal": home / f"AIDev/state/.{PROFILE}-operation.json",
+        "lock": home / f"AIDev/state/.{PROFILE}-operation.lock",
     }
 
 
@@ -113,17 +130,133 @@ def validate_parent(path: Path) -> None:
         raise ContractError("managed_parent_missing_or_unsafe")
 
 
+class HeldParent:
+    """Hold every ancestor without following links; mutation uses its dirfd."""
+    def __init__(self, path: Path):
+        if not path.is_absolute() or ".." in path.parts:
+            raise ContractError("noncanonical_parent")
+        self.chain = []
+        descriptor = os.open("/", os.O_RDONLY | os.O_DIRECTORY)
+        self.chain.append((descriptor, None, None, os.fstat(descriptor)))
+        try:
+            for part in path.parts[1:]:
+                parent = descriptor
+                descriptor = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                                     dir_fd=parent)
+                self.chain.append((descriptor, parent, part, os.fstat(descriptor)))
+            self.fd = descriptor
+            if os.fstat(descriptor).st_uid != os.getuid():
+                raise ContractError("managed_parent_owner")
+        except BaseException:
+            self.close()
+            raise
+
+    def verify(self):
+        for descriptor, parent, name, bound in self.chain:
+            current = os.fstat(descriptor) if parent is None else os.stat(
+                name, dir_fd=parent, follow_symlinks=False)
+            if (current.st_dev, current.st_ino, current.st_uid, current.st_mode) != (
+                    bound.st_dev, bound.st_ino, bound.st_uid, bound.st_mode):
+                raise ContractError("managed_parent_changed")
+
+    def close(self):
+        for descriptor, _, _, _ in reversed(self.chain):
+            os.close(descriptor)
+        self.chain = []
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        self.close()
+
+
+def read_bound(parent: HeldParent, name: str) -> tuple[bytes, dict]:
+    parent.verify()
+    descriptor = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=parent.fd)
+    try:
+        before = os.fstat(descriptor)
+        if (not stat.S_ISREG(before.st_mode) or before.st_uid != os.getuid()
+                or before.st_nlink != 1 or before.st_size > 131072):
+            raise ContractError("managed_file_metadata")
+        data = bytearray()
+        while True:
+            chunk = os.read(descriptor, 8192)
+            if not chunk:
+                break
+            data.extend(chunk)
+            if len(data) > 131072:
+                raise ContractError("managed_file_oversize")
+        after = os.fstat(descriptor)
+        visible = os.stat(name, dir_fd=parent.fd, follow_symlinks=False)
+        identity = lambda s: (s.st_dev, s.st_ino, s.st_uid, s.st_mode,
+                              s.st_size, s.st_mtime_ns, s.st_ctime_ns)
+        if identity(before) != identity(after) or identity(after) != identity(visible):
+            raise ContractError("managed_file_changed")
+        parent.verify()
+        return bytes(data), {"device": after.st_dev, "inode": after.st_ino,
+                            "owner": after.st_uid, "mode": after.st_mode & 0o777,
+                            "hash": sha256(bytes(data))}
+    finally:
+        os.close(descriptor)
+
+
+def rename_exclusive(parent: HeldParent, source: str, target: str):
+    """Atomic rename without clobbering a concurrent custody/target entry."""
+    parent.verify()
+    library = ctypes.CDLL(None, use_errno=True)
+    if sys.platform == "darwin":
+        rename = library.renameatx_np
+        flag = 4  # RENAME_EXCL
+    elif sys.platform.startswith("linux") and hasattr(library, "renameat2"):
+        rename = library.renameat2
+        flag = 1  # RENAME_NOREPLACE
+    else:
+        raise ContractError("exclusive_rename_unavailable")
+    rename.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_uint]
+    rename.restype = ctypes.c_int
+    if rename(parent.fd, os.fsencode(source), parent.fd, os.fsencode(target), flag) != 0:
+        raise ContractError("exclusive_rename_failed")
+    os.fsync(parent.fd)
+    parent.verify()
+
+
+@contextmanager
+def lifecycle_lock():
+    path = layout()["lock"]
+    with HeldParent(path.parent) as parent:
+        descriptor = os.open(path.name, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK,
+                             0o600, dir_fd=parent.fd)
+        try:
+            value = os.fstat(descriptor)
+            if (not stat.S_ISREG(value.st_mode) or value.st_uid != os.getuid()
+                    or value.st_nlink != 1 or value.st_mode & 0o777 != 0o600):
+                raise ContractError("operation_lock_unsafe")
+            try:
+                fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError as exc:
+                raise ContractError("holder_operation_busy") from exc
+            parent.verify()
+            yield
+            parent.verify()
+        finally:
+            os.close(descriptor)
+
+
 def load_receipt(path: Path) -> dict[str, object] | None:
     if not path.exists() and not path.is_symlink():
         return None
     if not path.is_file() or path.is_symlink():
         raise ContractError("invalid_receipt")
     try:
-        data = json.loads(path.read_text())
+        raw, identity = bound_file(path)
+        data = json.loads(raw)
     except (OSError, json.JSONDecodeError) as exc:
         raise ContractError("invalid_receipt") from exc
     if (
-        data.get("schema") != 1
+        type(data) is not dict
+        or type(data.get("schema")) is not int or data.get("schema") != 1
+        or identity["mode"] != 0o600
         or data.get("profile") != PROFILE
         or data.get("label") != LABEL
         or not COMMIT_RE.fullmatch(str(data.get("commit", "")))
@@ -140,12 +273,26 @@ def file_mode(path: Path) -> int:
 
 def filesystem_state() -> tuple[str, dict[str, object] | None]:
     paths = layout()
+    journal = load_journal()
+    if journal is not None and journal["phase"] != "complete" and ACTIVE_JOURNAL is None:
+        return "incomplete", None
     receipt = load_receipt(paths["receipt"])
     targets_exist = [
         paths["runtime"].exists() or paths["runtime"].is_symlink(),
         paths["plist"].exists() or paths["plist"].is_symlink(),
         paths["state"].exists() or paths["state"].is_symlink(),
     ]
+    if (receipt is None and not any(targets_exist[:2]) and journal is not None
+            and journal["operation"] == "rollback" and journal["phase"] == "complete"):
+        if targets_exist[2]:
+            verify_state_identity(journal)
+            expected_names = {record["custody"] for name, record in
+                              journal.get("withdrawals", {}).items()
+                              if Path(name).parent == paths["state"]}
+            with HeldParent(paths["state"]) as parent:
+                if set(os.listdir(parent.fd)) != expected_names:
+                    return "conflict", None
+        return "absent", None
     if receipt is None and not any(targets_exist):
         return "absent", None
     if receipt is None:
@@ -162,19 +309,35 @@ def filesystem_state() -> tuple[str, dict[str, object] | None]:
     ):
         return "conflict", receipt
     if (
-        sha256(runtime.read_bytes()) != receipt["runtimeHash"]
-        or sha256(plist.read_bytes()) != receipt["plistHash"]
-        or runtime.read_bytes() != payload_bytes()
-        or plist.read_bytes() != render_plist(runtime)
+        bound_file(runtime)[1]["hash"] != receipt["runtimeHash"]
+        or bound_file(plist)[1]["hash"] != receipt["plistHash"]
+        or bound_file(runtime)[0] != payload_bytes()
+        or bound_file(plist)[0] != render_plist(runtime)
     ):
         return "conflict", receipt
     return "exact", receipt
 
 
-def launchd_loaded() -> bool:
+def observe_launchd() -> str:
     domain = f"gui/{os.getuid()}/{LABEL}"
-    result = run(["/bin/launchctl", "print", domain], timeout=8)
-    return result.returncode == 0
+    try:
+        result = run(["/bin/launchctl", "print", domain], timeout=8)
+    except (OSError, subprocess.SubprocessError):
+        return "UNKNOWN"
+    if result.returncode == 0:
+        return "PRESENT"
+    # Match the command's precise service-not-found observation, not every
+    # nonzero exit. A missing GUI domain, permissions and timeouts are unknown.
+    expected = f'Could not find service "{LABEL}" in domain for user gui: {os.getuid()}'
+    if result.returncode == 113 and result.stderr.decode(errors="replace").strip() in {
+            expected, "Bad request.\n" + expected}:
+        return "ABSENT"
+    return "UNKNOWN"
+
+
+def launchd_loaded() -> bool:
+    """Compatibility predicate; never use its false result as absence proof."""
+    return observe_launchd() == "PRESENT"
 
 
 def helper_doctor_passes(path: Path, command: str) -> bool:
@@ -203,41 +366,141 @@ def session_flags_exact() -> bool:
     return result.returncode == 0 and result.stdout == b"session_flags=exact"
 
 
-def validate_websocket_upgrade(response: bytes) -> bool:
+def validate_websocket_upgrade(response: bytes, key: str) -> bool:
+    if type(response) is not bytes or type(key) is not str:
+        return False
+    if b"\r\n\r\n" not in response or len(response.split(b"\r\n\r\n", 1)[0]) > 16384:
+        return False
+    try:
+        if len(base64.b64decode(key, validate=True)) != 16:
+            return False
+        expected = base64.b64encode(hashlib.sha1((key +
+            "258EAFA5-E914-47DA-95CA-C5AB0DC85B11").encode("ascii")).digest())
+    except (ValueError, UnicodeError):
+        return False
     header = response.split(b"\r\n\r\n", 1)[0]
     lines = header.split(b"\r\n")
-    lowered = {line.lower() for line in lines[1:]}
-    return (
-        bool(lines)
-        and lines[0].startswith(b"HTTP/1.1 101 ")
-        and b"upgrade: websocket" in lowered
-        and b"connection: upgrade" in lowered
-    )
+    if not re.fullmatch(rb"HTTP/1\.1 101(?: [\x20-\x7e]*)?", lines[0]):
+        return False
+    headers: dict[bytes, bytes] = {}
+    for line in lines[1:]:
+        if b":" not in line:
+            return False
+        name, value = line.split(b":", 1)
+        if not re.fullmatch(rb"[!#$%&'*+.^_`|~0-9A-Za-z-]+", name):
+            return False
+        name = name.lower()
+        if name in headers or any(c < 32 and c != 9 or c == 127 for c in value):
+            return False
+        headers[name] = value.strip()
+    return (headers.get(b"upgrade", b"").lower() == b"websocket"
+            and b"upgrade" in {token.strip().lower() for token in
+                              headers.get(b"connection", b"").split(b",")}
+            and headers.get(b"sec-websocket-accept") == expected
+            and b"sec-websocket-extensions" not in headers
+            and b"sec-websocket-protocol" not in headers)
 
 
-def remote_proxy_handshake_passes(timeout: float = 5) -> bool:
+def encode_websocket_text(payload: dict) -> bytes:
+    data = json.dumps(payload, separators=(",", ":"), allow_nan=False).encode()
+    if len(data) > 65536:
+        raise ContractError("websocket_frame_oversize")
+    mask = secrets.token_bytes(4)
+    if len(data) < 126:
+        length = bytes([0x80 | len(data)])
+    elif len(data) <= 65535:
+        length = b"\xfe" + struct.pack("!H", len(data))
+    else:
+        length = b"\xff" + struct.pack("!Q", len(data))
+    return b"\x81" + length + mask + bytes(v ^ mask[i % 4] for i, v in enumerate(data))
+
+
+def decode_websocket_frame(data: bytes) -> tuple[bytes, bytes] | None:
+    if len(data) < 2:
+        return None
+    if data[0] != 0x81 or data[1] & 0x80:
+        # This one-roundtrip probe supports only a complete unmasked text frame;
+        # ping/close/fragmentation are inconclusive, never readiness evidence.
+        raise ContractError("websocket_frame_unsupported")
+    length, offset = data[1] & 127, 2
+    if length == 126:
+        if len(data) < 4:
+            return None
+        length, offset = struct.unpack("!H", data[2:4])[0], 4
+        if length < 126:
+            raise ContractError("websocket_length_noncanonical")
+    elif length == 127:
+        if len(data) < 10:
+            return None
+        length, offset = struct.unpack("!Q", data[2:10])[0], 10
+        if length < 65536:
+            raise ContractError("websocket_length_noncanonical")
+    if length > 65536:
+        raise ContractError("websocket_frame_oversize")
+    if len(data) < offset + length:
+        return None
+    return data[offset:offset + length], data[offset + length:]
+
+
+def validate_initialize_response(data: bytes, request_id: str | int) -> bool:
+    def unique(pairs):
+        result = {}
+        for key, value in pairs:
+            if key in result:
+                raise ValueError("duplicate_initialize_member")
+            result[key] = value
+        return result
+    def nonfinite(_):
+        raise ValueError("nonfinite_initialize_value")
+    try:
+        payload = json.loads(data.decode("utf-8"), object_pairs_hook=unique,
+                             parse_constant=nonfinite)
+    except (ValueError, UnicodeError):
+        return False
+    if (type(payload) is not dict or type(request_id) not in {str, int}
+            or type(payload.get("id")) is not type(request_id)
+            or payload.get("id") != request_id or "error" in payload
+            or payload.get("jsonrpc", "2.0") != "2.0"
+            or type(payload.get("result")) is not dict):
+        return False
+    result = payload["result"]
+    return (result.get("platformFamily") == "windows"
+            and result.get("platformOs") == "windows"
+            and type(result.get("userAgent")) is str
+            and 0 < len(result["userAgent"]) <= 1024)
+
+
+def remote_proxy_observation(timeout: float = 5) -> dict:
+    facts = {"state": "UNKNOWN", "transport": False, "application": False}
+    key = base64.b64encode(secrets.token_bytes(16)).decode("ascii")
+    request_id = secrets.token_hex(16)
     handshake = (
         b"GET /rpc HTTP/1.1\r\n"
         b"Host: codex-app-server\r\n"
         b"Upgrade: websocket\r\n"
         b"Connection: Upgrade\r\n"
-        b"Sec-WebSocket-Key: AQIDBAUGBwgJCgsMDQ4PEA==\r\n"
+        b"Sec-WebSocket-Key: " + key.encode() + b"\r\n"
         b"Sec-WebSocket-Version: 13\r\n\r\n"
     )
-    process = subprocess.Popen(
+    try:
+        process = subprocess.Popen(
         [
             "/usr/bin/ssh", "-T", "-o", "BatchMode=yes",
             "-o", "PasswordAuthentication=no",
             "-o", "KbdInteractiveAuthentication=no",
-            "-o", "ConnectTimeout=8", "windows-host",
+            "-o", "ConnectTimeout=8", "-o", "StrictHostKeyChecking=yes",
+            "-o", "ForwardAgent=no", "windows-host",
             "codex app-server proxy",
         ],
         stdin=subprocess.PIPE,
         stdout=subprocess.PIPE,
         stderr=subprocess.DEVNULL,
-    )
-    selector = selectors.DefaultSelector()
+        )
+    except (OSError, subprocess.SubprocessError):
+        return facts
+    selector = None
     try:
+        selector = selectors.DefaultSelector()
         assert process.stdin is not None and process.stdout is not None
         process.stdin.write(handshake)
         process.stdin.flush()
@@ -252,24 +515,67 @@ def remote_proxy_handshake_passes(timeout: float = 5) -> bool:
             if not chunk:
                 break
             response.extend(chunk)
-            if len(response) > 16384:
-                return False
-        return validate_websocket_upgrade(bytes(response))
+            if len(response.split(b"\r\n\r\n", 1)[0]) > 16384:
+                return facts
+        if not validate_websocket_upgrade(bytes(response), key) or process.poll() is not None:
+            return facts
+        facts["transport"] = True
+        response = bytearray(response.split(b"\r\n\r\n", 1)[1])
+        process.stdin.write(encode_websocket_text({
+            "jsonrpc": "2.0", "id": request_id, "method": "initialize",
+            "params": {"clientInfo": {"name": "aidev_holder_probe", "version": "1.0.0"}}
+        }))
+        process.stdin.flush()
+        while time.monotonic() < deadline:
+            frame = decode_websocket_frame(bytes(response))
+            if frame is not None:
+                body, _ = frame
+                if not validate_initialize_response(body, request_id) or process.poll() is not None:
+                    return facts
+                process.stdin.write(encode_websocket_text({"jsonrpc": "2.0", "method": "initialized"}))
+                process.stdin.flush()
+                if process.poll() is not None:
+                    return facts
+                facts.update(state="PRESENT", application=True)
+                return facts
+            if not selector.select(timeout=max(0, deadline - time.monotonic())):
+                break
+            chunk = os.read(process.stdout.fileno(), 8192)
+            if not chunk:
+                break
+            response.extend(chunk)
+            if len(response) > 65546:
+                break
+        return facts
+    except (ContractError, OSError, subprocess.SubprocessError):
+        return facts
     finally:
-        selector.close()
-        if process.poll() is None:
-            process.terminate()
+        if selector is not None:
+            selector.close()
+        try:
+            if process.poll() is None:
+                process.terminate()
             try:
                 process.wait(timeout=2)
             except subprocess.TimeoutExpired:
                 process.kill()
                 process.wait(timeout=2)
+        except (OSError, subprocess.SubprocessError) as exc:
+            raise ContractError("proxy_child_unsettled") from exc
+        finally:
+            for stream in (process.stdin, process.stdout):
+                if stream is not None:
+                    stream.close()
+
+
+def remote_proxy_handshake_passes(timeout: float = 5) -> bool:
+    return remote_proxy_observation(timeout)["state"] == "PRESENT"
 
 
 def preflight() -> dict[str, object]:
     state, _ = filesystem_state()
-    loaded = launchd_loaded()
-    proxy = remote_proxy_handshake_passes(timeout=3)
+    loaded = observe_launchd()
+    proxy = remote_proxy_observation(timeout=3)
     facts = {
         "profile": PROFILE,
         "native_transport_runtime_doctor_pass":
@@ -278,12 +584,16 @@ def preflight() -> dict[str, object]:
             helper_doctor_passes(ISOLATION, "doctor"),
         "session_flags_exact": session_flags_exact(),
         "filesystem_state": state,
-        "launchd_loaded": loaded,
-        "remote_proxy_websocket_pass": proxy,
+        "launchd_state": loaded,
+        "launchd_loaded": loaded == "PRESENT",
+        "remote_proxy_state": proxy["state"],
+        "remote_proxy_websocket_pass": proxy["transport"],
+        "remote_application_initialize_pass": proxy["application"],
+        "remote_absence_contract_supported": REMOTE_ABSENCE_SUPPORTED,
     }
     ownership_valid = (
-        (state == "absent" and not loaded and not proxy)
-        or (state == "exact" and loaded and proxy)
+        (state == "absent" and loaded == "ABSENT" and proxy["state"] == "ABSENT")
+        or (state == "exact" and loaded == "PRESENT" and proxy["state"] == "PRESENT")
     )
     facts["verdict"] = "PASS" if (
         facts["native_transport_runtime_doctor_pass"]
@@ -301,26 +611,267 @@ def doctor() -> dict[str, object]:
         and facts["filesystem_state"] == "exact"
         and facts["launchd_loaded"]
         and facts["remote_proxy_websocket_pass"]
+        and facts["remote_application_initialize_pass"]
     ) else "BLOCKED"
     return facts
 
 
-def atomic_create(path: Path, data: bytes, mode: int) -> None:
-    if path.exists() or path.is_symlink():
-        raise ContractError("managed_target_collision")
-    validate_parent(path.parent)
-    descriptor, staged = tempfile.mkstemp(prefix=f".{PROFILE}.", dir=path.parent)
-    staged_path = Path(staged)
+ACTIVE_JOURNAL: dict | None = None
+JOURNAL_EXPECTED: tuple[bytes, dict] | None = None
+
+
+def atomic_create(path: Path, data: bytes, mode: int, *, expected_parent=None) -> None:
+    with HeldParent(path.parent) as parent:
+        verify_parent_identity(path.parent, parent, expected_parent)
+        if ACTIVE_JOURNAL is not None and path.parent == layout()["state"]:
+            verify_state_identity(ACTIVE_JOURNAL, parent=parent)
+        staged = f".{PROFILE}-{secrets.token_hex(16)}.stage"
+        descriptor = os.open(staged, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                             mode, dir_fd=parent.fd)
+        published = False
+        try:
+            os.fchmod(descriptor, mode)
+            pending = memoryview(data)
+            while pending:
+                count = os.write(descriptor, pending)
+                if count <= 0:
+                    raise ContractError("managed_write_incomplete")
+                pending = pending[count:]
+            os.fsync(descriptor)
+            os.close(descriptor)
+            descriptor = -1
+            staged_data, identity = read_bound(parent, staged)
+            if staged_data != data:
+                raise ContractError("managed_write_readback")
+            # Durable inode custody precedes publication. A crash before/after
+            # link is distinguishable without claiming ownership from hash alone.
+            if ACTIVE_JOURNAL is not None and path != layout()["journal"]:
+                ACTIVE_JOURNAL["files"][str(path)] = {
+                    "identity": identity, "staged": staged, "phase": "staged"}
+                save_journal(ACTIVE_JOURNAL)
+            parent.verify()
+            os.link(staged, path.name, src_dir_fd=parent.fd, dst_dir_fd=parent.fd,
+                    follow_symlinks=False)
+            published = True
+            os.fsync(parent.fd)
+            parent.verify()
+            os.unlink(staged, dir_fd=parent.fd)
+            os.fsync(parent.fd)
+            actual, observed = read_bound(parent, path.name)
+            if actual != data or observed != identity:
+                raise ContractError("managed_publication_changed")
+            if ACTIVE_JOURNAL is not None and path != layout()["journal"]:
+                ACTIVE_JOURNAL["files"][str(path)]["phase"] = "published"
+                save_journal(ACTIVE_JOURNAL)
+        except FileExistsError as exc:
+            raise ContractError("managed_target_collision") from exc
+        finally:
+            if descriptor >= 0:
+                os.close(descriptor)
+            # Keep interrupted/published staging custody until explicit recovery.
+            if not published and ACTIVE_JOURNAL is None:
+                try:
+                    os.unlink(staged, dir_fd=parent.fd)
+                except FileNotFoundError:
+                    pass
+
+
+def bound_file(path: Path) -> tuple[bytes, dict]:
+    with HeldParent(path.parent) as parent:
+        return read_bound(parent, path.name)
+
+
+def withdraw_exact(path: Path, expected: tuple[bytes, dict], *, expected_parent=None) -> Path:
+    """Withdraw via no-clobber rename, then verify displaced inode and bytes.
+
+    An external edit racing the rename is retained in custody, never unlinked.
+    Custody is evidence, not permission to adopt a displaced foreign file.
+    """
+    with HeldParent(path.parent) as parent:
+        verify_parent_identity(path.parent, parent, expected_parent)
+        if read_bound(parent, path.name) != expected:
+            raise ContractError("exact_preimage_changed")
+        custody = (f".{PROFILE}-operation.previous.json" if path == layout()["journal"]
+                   else f".{PROFILE}-{secrets.token_hex(16)}.custody")
+        if ACTIVE_JOURNAL is not None and path != layout()["journal"]:
+            ACTIVE_JOURNAL.setdefault("withdrawals", {})[str(path)] = {
+                "custody": custody, "identity": expected[1], "phase": "planned"}
+            save_journal(ACTIVE_JOURNAL)
+        rename_exclusive(parent, path.name, custody)
+        if read_bound(parent, custody) != expected:
+            raise ContractError("displaced_foreign_file_preserved")
+        if ACTIVE_JOURNAL is not None and path != layout()["journal"]:
+            ACTIVE_JOURNAL["withdrawals"][str(path)]["phase"] = "withdrawn"
+            save_journal(ACTIVE_JOURNAL)
+        return path.parent / custody
+
+
+def replace_exact_file(path: Path, data: bytes, mode: int,
+                       expected: tuple[bytes, dict], *, expected_parent=None) -> None:
+    old = withdraw_exact(path, expected, expected_parent=expected_parent)
     try:
-        os.fchmod(descriptor, mode)
-        with os.fdopen(descriptor, "wb", closefd=True) as handle:
-            handle.write(data)
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(staged_path, path)
-    finally:
-        if staged_path.exists():
-            staged_path.unlink()
+        atomic_create(path, data, mode, expected_parent=expected_parent)
+    except BaseException:
+        # Restore only into absence. A concurrent arrival always wins its name;
+        # the exact old file remains recoverable, no blind overwrite occurs.
+        with HeldParent(path.parent) as parent:
+            if read_bound(parent, old.name) != expected:
+                raise ContractError("replacement_custody_changed")
+            try:
+                rename_exclusive(parent, old.name, path.name)
+            except ContractError:
+                raise ContractError("replacement_recovery_required")
+        raise
+    # Private random custody is retired only after both images were verified.
+    with HeldParent(path.parent) as parent:
+        if read_bound(parent, old.name) != expected:
+            raise ContractError("replacement_custody_changed")
+        os.unlink(old.name, dir_fd=parent.fd)
+        os.fsync(parent.fd)
+
+
+def save_journal(value: dict) -> None:
+    global JOURNAL_EXPECTED
+    path = layout()["journal"]
+    data = (json.dumps(value, sort_keys=True, separators=(",", ":")) + "\n").encode()
+    parent_identity = value.get("parents", {}).get(str(path.parent))
+    if path.exists() or path.is_symlink():
+        if JOURNAL_EXPECTED is None:
+            raise ContractError("journal_preimage_unbound")
+        replace_exact_file(path, data, 0o600, JOURNAL_EXPECTED, expected_parent=parent_identity)
+    else:
+        if JOURNAL_EXPECTED is not None:
+            raise ContractError("journal_preimage_disappeared")
+        atomic_create(path, data, 0o600, expected_parent=parent_identity)
+    JOURNAL_EXPECTED = bound_file(path)
+
+
+def load_journal() -> dict | None:
+    global JOURNAL_EXPECTED
+    path = layout()["journal"]
+    previous = path.parent / f".{PROFILE}-operation.previous.json"
+    if previous.exists() or previous.is_symlink():
+        # Death during journal publication is never treated as no operation.
+        raise ContractError("interrupted_journal_publication_recovery_required")
+    if not path.exists() and not path.is_symlink():
+        JOURNAL_EXPECTED = None
+        return None
+    raw, identity = bound_file(path)
+    try:
+        value = json.loads(raw)
+    except ValueError as exc:
+        raise ContractError("holder_journal_invalid") from exc
+    if (type(value) is not dict or type(value.get("schema")) is not int or value.get("schema") != 1
+            or value.get("profile") != PROFILE or identity["mode"] != 0o600
+            or type(value.get("commit")) is not str
+            or COMMIT_RE.fullmatch(value["commit"]) is None
+            or type(value.get("operation")) is not str
+            or value.get("operation") not in {"install", "rollback", "rebind"}
+            or type(value.get("phase")) is not str
+            or value.get("phase") not in {"planned", "publishing", "starting", "active",
+                                         "stopping", "retiring", "complete"}
+            or type(value.get("files")) is not dict):
+        raise ContractError("holder_journal_invalid")
+    allowed = {str(layout()[key]) for key in ("runtime", "plist", "receipt")}
+    required_parents = {str(layout()[key].parent) for key in ("runtime", "plist", "state")}
+    parents = value.get("parents")
+    if (type(parents) is not dict or not required_parents.issubset(parents)
+            or not set(parents).issubset(required_parents | {str(layout()["state"])})):
+        raise ContractError("holder_journal_parents_invalid")
+    for signature in parents.values():
+        if (type(signature) is not list or len(signature) != 4
+                or any(type(part) is not int or part < 0 for part in signature)
+                or signature[2] != os.getuid() or not stat.S_ISDIR(signature[3])):
+            raise ContractError("holder_journal_parent_identity_invalid")
+    if (value.get("stateIdentity") is not None
+            and value["stateIdentity"] != parents.get(str(layout()["state"]))):
+        raise ContractError("holder_journal_state_identity_invalid")
+    if not set(value["files"]).issubset(allowed):
+        raise ContractError("holder_journal_targets_invalid")
+    for record in value["files"].values():
+        if (type(record) is not dict or type(record.get("identity")) is not dict
+                or record.get("phase") not in {"staged", "published"}
+                or not re.fullmatch(rf"\.{PROFILE}-[a-f0-9]{{32}}\.stage", str(record.get("staged", "")))):
+            raise ContractError("holder_journal_record_invalid")
+        signature = record["identity"]
+        if (set(signature) != {"device", "inode", "owner", "mode", "hash"}
+                or any(type(signature[key]) is not int or signature[key] < 0
+                       for key in ("device", "inode", "owner", "mode"))
+                or signature["owner"] != os.getuid()
+                or type(signature["hash"]) is not str
+                or re.fullmatch(r"[0-9a-f]{64}", signature["hash"]) is None):
+            raise ContractError("holder_journal_identity_invalid")
+    if (type(value.get("withdrawals", {})) is not dict
+            or not set(value.get("withdrawals", {})).issubset(allowed)):
+        raise ContractError("holder_journal_withdrawals_invalid")
+    for record in value.get("withdrawals", {}).values():
+        if (type(record) is not dict or record.get("phase") not in {"planned", "withdrawn"}
+                or type(record.get("identity")) is not dict
+                or not re.fullmatch(rf"\.{PROFILE}-[a-f0-9]{{32}}\.custody",
+                                    str(record.get("custody", "")))):
+            raise ContractError("holder_journal_withdrawal_invalid")
+    JOURNAL_EXPECTED = raw, identity
+    return value
+
+
+def directory_identity(path: Path) -> list[int]:
+    with HeldParent(path) as parent:
+        parent.verify()
+        value = os.fstat(parent.fd)
+        return [value.st_dev, value.st_ino, value.st_uid, value.st_mode]
+
+
+def state_identity() -> list[int]:
+    return directory_identity(layout()["state"])
+
+
+def verify_parent_identity(path: Path, parent: HeldParent, expected=None):
+    if expected is None and ACTIVE_JOURNAL is not None:
+        expected = ACTIVE_JOURNAL.get("parents", {}).get(str(path))
+    parent.verify()
+    current = os.fstat(parent.fd)
+    actual = [current.st_dev, current.st_ino, current.st_uid, current.st_mode]
+    if expected is not None and actual != expected:
+        raise ContractError("holder_bound_parent_changed")
+
+
+def verify_state_identity(value: dict, *, parent: HeldParent | None = None):
+    expected = value.get("stateIdentity")
+    if parent is None:
+        actual = state_identity()
+    else:
+        parent.verify()
+        current = os.fstat(parent.fd)
+        actual = [current.st_dev, current.st_ino, current.st_uid, current.st_mode]
+    if expected is None or actual != expected:
+        raise ContractError("holder_state_directory_changed")
+
+
+def create_owned_state(value: dict):
+    path = layout()["state"]
+    with HeldParent(path.parent) as parent:
+        verify_parent_identity(path.parent, parent)
+        staged = f".{PROFILE}-{secrets.token_hex(16)}.directory"
+        os.mkdir(staged, mode=0o700, dir_fd=parent.fd)
+        descriptor = os.open(staged, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                             dir_fd=parent.fd)
+        try:
+            current = os.fstat(descriptor)
+            identity = [current.st_dev, current.st_ino, current.st_uid, current.st_mode]
+            value["stateIdentity"] = identity
+            value["parents"][str(path)] = identity
+            value["stateStage"] = staged
+            # Directory inode custody is durable before public-name publication.
+            os.fsync(descriptor)
+            os.fsync(parent.fd)
+            save_journal(value)
+            rename_exclusive(parent, staged, path.name)
+            visible = os.stat(path.name, dir_fd=parent.fd, follow_symlinks=False)
+            if [visible.st_dev, visible.st_ino, visible.st_uid, visible.st_mode] != identity:
+                raise ContractError("holder_state_directory_changed")
+            parent.verify()
+        finally:
+            os.close(descriptor)
 
 
 def write_receipt(path: Path, commit: str, runtime_hash: str,
@@ -341,7 +892,7 @@ def write_receipt(path: Path, commit: str, runtime_hash: str,
 
 
 def replace_receipt(path: Path, commit: str, runtime_hash: str,
-                    plist_hash: str) -> None:
+                    plist_hash: str, expected: tuple[bytes, dict]) -> None:
     if not path.is_file() or path.is_symlink() or file_mode(path) != 0o600:
         raise ContractError("receipt_rebind_target_not_exact")
     payload = {
@@ -352,20 +903,9 @@ def replace_receipt(path: Path, commit: str, runtime_hash: str,
         "runtimeHash": runtime_hash,
         "plistHash": plist_hash,
     }
-    descriptor, staged = tempfile.mkstemp(prefix=f".{PROFILE}.", dir=path.parent)
-    staged_path = Path(staged)
-    try:
-        os.fchmod(descriptor, 0o600)
-        with os.fdopen(descriptor, "wb", closefd=True) as handle:
-            handle.write((
-                json.dumps(payload, sort_keys=True, separators=(",", ":")) + "\n"
-            ).encode())
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(staged_path, path)
-    finally:
-        if staged_path.exists():
-            staged_path.unlink()
+    replace_exact_file(path, (
+        json.dumps(payload, sort_keys=True, separators=(",", ":")) + "\n"
+    ).encode(), 0o600, expected)
 
 
 def bootstrap(plist: Path) -> None:
@@ -383,122 +923,259 @@ def bootout() -> bool:
     return result.returncode == 0
 
 
-def wait_for_proxy(expected: bool, seconds: float = 25) -> bool:
+def wait_for_proxy(expected: str, seconds: float = 25) -> bool:
     deadline = time.monotonic() + seconds
     while time.monotonic() < deadline:
-        if remote_proxy_handshake_passes(timeout=3) is expected:
+        if remote_proxy_observation(timeout=min(3, max(.001, deadline - time.monotonic())))["state"] == expected:
             return True
         time.sleep(1)
     return False
 
 
 def remove_exact(path: Path, expected_hash: str) -> None:
-    if not path.is_file() or path.is_symlink():
-        raise ContractError("rollback_target_not_exact")
-    if sha256(path.read_bytes()) != expected_hash:
+    expected = bound_file(path)
+    if expected[1]["hash"] != expected_hash:
         raise ContractError("rollback_target_hash_mismatch")
-    path.unlink()
+    withdraw_exact(path, expected)
+
+
+def target_binding() -> dict:
+    paths = layout()
+    facts = {"parents": {str(paths[key].parent): directory_identity(paths[key].parent)
+                         for key in ("runtime", "plist", "state")}}
+    for key in ("runtime", "plist", "receipt", "journal"):
+        path = paths[key]
+        facts[key] = bound_file(path) if path.exists() or path.is_symlink() else None
+    if paths["state"].exists() or paths["state"].is_symlink():
+        with HeldParent(paths["state"]) as parent:
+            parent.verify()
+            value = os.fstat(parent.fd)
+            facts["state"] = (value.st_dev, value.st_ino, value.st_uid,
+                              value.st_mode, tuple(sorted(os.listdir(parent.fd))))
+    else:
+        facts["state"] = None
+    return facts
+
+
+def source_binding() -> dict:
+    # Recheck consumed code/manifest bytes and identities, not only Git's stat
+    # cache, after slow preflight/launchd observations and before publication.
+    paths = ("bin/codex-windows-host-ssh-app-server-holder",
+             "bin/codex-windows-host-ssh-stdio-compat",
+             "bin/codex-windows-host-ssh-remote-control-isolation", "bin/windows-host-ssh-client",
+             "payload/macos/codex-windows-host-app-server-holder.sh",
+             "manifests/codex-windows-host-ssh-app-server-holder.json",
+             "manifests/codex-windows-host-ssh-stdio-compat.json",
+             "manifests/codex-windows-host-ssh-remote-control-isolation.json",
+             "manifests/windows-host-ssh-client.json", "lib/operation_readiness.py",
+             "lib/current_doctor_native.py", "lib/current_source_admission.py")
+    return {name: bound_file(ROOT / name) for name in paths}
+
+
+def mutation_gate(commit: str):
+    global SOURCE_EXPECTED
+    SOURCE_EXPECTED = None
+    require_exact_commit(commit)
+    source = source_binding()
+    before = target_binding()
+    sys.path.insert(0, str(ROOT))
+    from lib.operation_readiness import require_scoped_operation_ready
+    require_scoped_operation_ready(ROOT, "ssh-holder", commit,
+        checks={"ssh-transport": session_flags_exact,
+                "native-consent": lambda: (helper_doctor_passes(COMPAT, "runtime-doctor")
+                    and helper_doctor_passes(ISOLATION, "doctor"))},
+        target_guard=lambda: target_binding() == before and source_binding() == source)
+    SOURCE_EXPECTED = source
+    require_exact_commit(commit)
+
+
+def begin_operation(operation: str, commit: str, *, parents=None) -> dict:
+    prior = load_journal()
+    if prior is not None and prior["phase"] != "complete":
+        raise ContractError("holder_incomplete_operation_recover_required")
+    value = {"schema": 1, "profile": PROFILE, "operation": operation,
+             "commit": commit, "phase": "planned", "files": {}, "withdrawals": {},
+             "parents": (dict(parents) if parents is not None else target_binding()["parents"])}
+    save_journal(value)
+    return value
+
+
+def set_phase(value: dict, phase: str):
+    value["phase"] = phase
+    save_journal(value)
 
 
 def apply(commit: str) -> dict[str, object]:
-    require_exact_commit(commit)
-    facts = preflight()
-    if facts["verdict"] != "PASS":
-        raise ContractError("preflight_blocked")
-    state, receipt = filesystem_state()
-    if state == "exact":
-        if receipt is None:
-            raise ContractError("receipt_missing")
-        previous_commit = str(receipt.get("commit", ""))
-        rebound = previous_commit != commit
-        if rebound:
-            replace_receipt(
-                layout()["receipt"], commit,
-                str(receipt["runtimeHash"]), str(receipt["plistHash"]),
-            )
-        result = doctor()
-        if result.get("verdict") != "PASS" and rebound:
-            replace_receipt(
-                layout()["receipt"], previous_commit,
-                str(receipt["runtimeHash"]), str(receipt["plistHash"]),
-            )
-            raise ContractError("receipt_rebind_postcheck_failed_restored")
-        result["apply_noop"] = True
-        result["receipt_rebound"] = rebound
-        return result
-    if state != "absent" or receipt is not None:
-        raise ContractError("ownership_conflict")
-    paths = layout()
-    for parent in (paths["runtime"].parent, paths["plist"].parent,
-                   paths["state"].parent):
-        validate_parent(parent)
-    runtime_bytes = payload_bytes()
-    plist_bytes = render_plist(paths["runtime"])
-    runtime_hash = sha256(runtime_bytes)
-    plist_hash = sha256(plist_bytes)
-    created: list[Path] = []
-    loaded = False
-    try:
-        paths["state"].mkdir(mode=0o700)
-        atomic_create(paths["runtime"], runtime_bytes, 0o755)
-        created.append(paths["runtime"])
-        atomic_create(paths["plist"], plist_bytes, 0o644)
-        created.append(paths["plist"])
-        bootstrap(paths["plist"])
-        loaded = True
-        if not wait_for_proxy(True):
-            raise ContractError("holder_proxy_start_failed")
-        write_receipt(paths["receipt"], commit, runtime_hash, plist_hash)
-        checked = doctor()
-        if checked["verdict"] != "PASS":
-            raise ContractError("postcheck_failed")
-        checked["apply_noop"] = False
-        return checked
-    except Exception as exc:
-        if loaded or launchd_loaded():
+    global ACTIVE_JOURNAL
+    mutation_gate(commit)
+    with lifecycle_lock():
+        require_exact_commit(commit)
+        initial = target_binding()
+        facts = preflight()
+        if facts["verdict"] != "PASS":
+            raise ContractError("preflight_blocked")
+        require_exact_commit(commit)
+        if target_binding() != initial:
+            raise ContractError("holder_preflight_target_drift")
+        state, receipt = filesystem_state()
+        paths = layout()
+        if state == "exact":
+            if receipt is None:
+                raise ContractError("receipt_missing")
+            previous_commit = str(receipt["commit"])
+            rebound = previous_commit != commit
+            if not rebound:
+                result = doctor()
+                if result.get("verdict") != "PASS":
+                    raise ContractError("noop_postcheck_failed")
+                result.update(apply_noop=True, receipt_rebound=False)
+                return result
+            original = bound_file(paths["receipt"])
+            ACTIVE_JOURNAL = begin_operation("rebind", commit, parents=initial["parents"])
+            try:
+                ACTIVE_JOURNAL["stateIdentity"] = state_identity()
+                ACTIVE_JOURNAL["parents"][str(paths["state"])] = ACTIVE_JOURNAL["stateIdentity"]
+                save_journal(ACTIVE_JOURNAL)
+                require_exact_commit(commit)
+                replace_receipt(paths["receipt"], commit, str(receipt["runtimeHash"]),
+                                str(receipt["plistHash"]), original)
+                published = bound_file(paths["receipt"])
+                result = doctor()
+                verify_state_identity(ACTIVE_JOURNAL)
+                require_exact_commit(commit)
+                if result.get("verdict") != "PASS":
+                    replace_exact_file(paths["receipt"], original[0], 0o600, published)
+                    set_phase(ACTIVE_JOURNAL, "complete")
+                    raise ContractError("receipt_rebind_postcheck_failed_restored")
+                set_phase(ACTIVE_JOURNAL, "complete")
+                result.update(apply_noop=True, receipt_rebound=True)
+                return result
+            finally:
+                ACTIVE_JOURNAL = None
+        if state != "absent" or receipt is not None:
+            raise ContractError("ownership_conflict")
+        runtime, plist = payload_bytes(), render_plist(paths["runtime"])
+        ACTIVE_JOURNAL = begin_operation("install", commit, parents=initial["parents"])
+        try:
+            # Intent precedes even directory creation. Crash after mkdir retains
+            # a pending operation; an unknown pre-existing directory is not adopted.
+            create_owned_state(ACTIVE_JOURNAL)
+            set_phase(ACTIVE_JOURNAL, "publishing")
+            atomic_create(paths["runtime"], runtime, 0o755)
+            atomic_create(paths["plist"], plist, 0o644)
+            set_phase(ACTIVE_JOURNAL, "starting")
+            bootstrap(paths["plist"])
+            if not wait_for_proxy("PRESENT"):
+                raise ContractError("holder_proxy_start_failed")
+            verify_state_identity(ACTIVE_JOURNAL)
+            require_exact_commit(commit)
+            write_receipt(paths["receipt"], commit, sha256(runtime), sha256(plist))
+            set_phase(ACTIVE_JOURNAL, "active")
+            checked = doctor()
+            if checked["verdict"] != "PASS":
+                raise ContractError("postcheck_failed")
+            verify_state_identity(ACTIVE_JOURNAL)
+            require_exact_commit(commit)
+            set_phase(ACTIVE_JOURNAL, "complete")
+            checked["apply_noop"] = False
+            return checked
+        except Exception as exc:
+            # A lost bootstrap response can have started a server. Never infer
+            # absence from failure or discard custody to make retry look clean.
+            raise ContractError("apply_failed_recovery_required_state_preserved") from exc
+        finally:
+            ACTIVE_JOURNAL = None
+
+
+def rollback(commit: str) -> dict[str, object]:
+    global ACTIVE_JOURNAL
+    mutation_gate(commit)
+    if not REMOTE_ABSENCE_SUPPORTED:
+        raise ContractError("remote_absence_contract_unavailable_state_preserved")
+    with lifecycle_lock():
+        require_exact_commit(commit)
+        initial = target_binding()
+        state, receipt = filesystem_state()
+        if state != "exact" or receipt is None or observe_launchd() != "PRESENT":
+            raise ContractError("rollback_state_mismatch")
+        paths = layout()
+        with HeldParent(paths["state"]) as parent:
+            if set(os.listdir(parent.fd)) != {"receipt.json"}:
+                raise ContractError("rollback_state_directory_not_empty")
+        snapshots = {key: bound_file(paths[key]) for key in ("runtime", "plist", "receipt")}
+        require_exact_commit(commit)
+        if target_binding() != initial:
+            raise ContractError("rollback_preflight_target_drift")
+        ACTIVE_JOURNAL = begin_operation("rollback", commit, parents=initial["parents"])
+        try:
+            ACTIVE_JOURNAL["stateIdentity"] = state_identity()
+            ACTIVE_JOURNAL["parents"][str(paths["state"])] = ACTIVE_JOURNAL["stateIdentity"]
+            ACTIVE_JOURNAL["files"] = {str(paths[key]): {
+                "identity": value[1], "phase": "published",
+                "staged": f".{PROFILE}-{'0' * 32}.stage"} for key, value in snapshots.items()}
+            set_phase(ACTIVE_JOURNAL, "stopping")
+            # Returncode/timeout is not settlement; both observed states control.
             bootout()
-            stopped = wait_for_proxy(False, seconds=15)
-        else:
-            stopped = True
-        if not stopped:
-            raise ContractError("apply_failed_cleanup_blocked") from exc
-        if paths["receipt"].is_file() and not paths["receipt"].is_symlink():
-            paths["receipt"].unlink()
-        for path, expected in reversed([
-            (paths["runtime"], runtime_hash), (paths["plist"], plist_hash)
-        ]):
-            if path in created and path.exists():
-                remove_exact(path, expected)
-        if paths["state"].is_dir() and not any(paths["state"].iterdir()):
-            paths["state"].rmdir()
-        raise ContractError("apply_failed_rolled_back") from exc
+            if observe_launchd() != "ABSENT" or not wait_for_proxy("ABSENT", seconds=20):
+                raise ContractError("rollback_stop_unknown_state_preserved")
+            verify_state_identity(ACTIVE_JOURNAL)
+            require_exact_commit(commit)
+            set_phase(ACTIVE_JOURNAL, "retiring")
+            for key in ("runtime", "plist", "receipt"):
+                withdraw_exact(paths[key], snapshots[key])
+            require_exact_commit(commit)
+            set_phase(ACTIVE_JOURNAL, "complete")
+            return {"profile": PROFILE, "filesystem_absent": True,
+                    "launchd_absent": True, "remote_proxy_absent": True,
+                    "recovery_custody_retained": True, "verdict": "PASS"}
+        finally:
+            ACTIVE_JOURNAL = None
 
 
-def rollback() -> dict[str, object]:
-    state, receipt = filesystem_state()
-    if state != "exact" or receipt is None or not launchd_loaded():
-        raise ContractError("rollback_state_mismatch")
-    paths = layout()
-    if not bootout() or not wait_for_proxy(False, seconds=20):
-        raise ContractError("rollback_stop_failed_state_preserved")
-    remove_exact(paths["runtime"], str(receipt["runtimeHash"]))
-    remove_exact(paths["plist"], str(receipt["plistHash"]))
-    paths["receipt"].unlink()
-    if any(paths["state"].iterdir()):
-        raise ContractError("rollback_state_directory_not_empty")
-    paths["state"].rmdir()
-    final_state, _ = filesystem_state()
-    facts = {
-        "profile": PROFILE,
-        "filesystem_absent": final_state == "absent",
-        "launchd_absent": not launchd_loaded(),
-        "remote_proxy_absent": not remote_proxy_handshake_passes(timeout=3),
-    }
-    facts["verdict"] = "PASS" if all(
-        value for key, value in facts.items()
-        if key not in {"profile", "verdict"}
-    ) else "BLOCKED"
-    return facts
+def recover(commit: str) -> dict[str, object]:
+    """Explicit narrow withdrawal, never reinstallation or blind continuation."""
+    global ACTIVE_JOURNAL
+    mutation_gate(commit)
+    if not REMOTE_ABSENCE_SUPPORTED:
+        raise ContractError("remote_absence_contract_unavailable_state_preserved")
+    with lifecycle_lock():
+        require_exact_commit(commit)
+        value = load_journal()
+        if value is None:
+            raise ContractError("holder_recovery_intent_missing")
+        if value["phase"] == "complete":
+            return {"profile": PROFILE, "verdict": "PASS", "recovery_noop": True}
+        # A rebind failure has no server stop obligation; its old and new private
+        # receipt compositions need exact owner adjudication, not uninstall.
+        if value["operation"] == "rebind":
+            raise ContractError("receipt_rebind_exact_custody_handoff_required")
+        if observe_launchd() != "ABSENT" or remote_proxy_observation(timeout=3)["state"] != "ABSENT":
+            raise ContractError("holder_recovery_absence_unknown_preserved")
+        require_exact_commit(commit)
+        if value.get("stateIdentity") is not None:
+            verify_state_identity(value)
+        elif layout()["state"].exists() or layout()["state"].is_symlink():
+            raise ContractError("holder_recovery_directory_identity_unknown")
+        ACTIVE_JOURNAL = value
+        try:
+            for name, record in value.get("withdrawals", {}).items():
+                custody = Path(name).parent / record["custody"]
+                if custody.exists() or custody.is_symlink():
+                    if bound_file(custody)[1] != record["identity"]:
+                        raise ContractError("holder_recovery_foreign_custody_preserved")
+            for name, record in list(value["files"].items()):
+                path = Path(name)
+                if path.exists() or path.is_symlink():
+                    current = bound_file(path)
+                    if current[1] != record["identity"]:
+                        raise ContractError("holder_recovery_foreign_target_preserved")
+                    withdraw_exact(path, current)
+            value["operation"] = "rollback"
+            set_phase(value, "complete")
+            return {"profile": PROFILE, "verdict": "PASS", "recovery_noop": False,
+                    "recovery_custody_retained": True}
+        finally:
+            ACTIVE_JOURNAL = None
 
 
 def emit(payload: dict[str, object], as_json: bool) -> None:
@@ -523,7 +1200,11 @@ def main() -> int:
     doctor_parser = subparsers.add_parser("doctor")
     doctor_parser.add_argument("--json", action="store_true")
     rollback_parser = subparsers.add_parser("rollback")
+    rollback_parser.add_argument("--commit", required=True)
     rollback_parser.add_argument("--json", action="store_true")
+    recover_parser = subparsers.add_parser("recover")
+    recover_parser.add_argument("--commit", required=True)
+    recover_parser.add_argument("--json", action="store_true")
     args = parser.parse_args()
     try:
         if args.command == "prepare":
@@ -532,12 +1213,16 @@ def main() -> int:
             payload = apply(args.commit)
         elif args.command == "doctor":
             payload = doctor()
+        elif args.command == "rollback":
+            payload = rollback(args.commit)
         else:
-            payload = rollback()
+            payload = recover(args.commit)
         emit(payload, args.json)
         return 0 if payload.get("verdict") == "PASS" else 1
-    except (ContractError, OSError, subprocess.SubprocessError) as exc:
-        print(f"blocked={exc}", file=sys.stderr)
+    except (RuntimeError, OSError, subprocess.SubprocessError, ValueError, KeyError) as exc:
+        reason = str(exc) if isinstance(exc, RuntimeError) and re.fullmatch(
+            r"[a-z][a-z0-9_-]{0,100}", str(exc)) else "bounded_runtime_failure"
+        print(f"blocked={reason}", file=sys.stderr)
         return 1
 
 

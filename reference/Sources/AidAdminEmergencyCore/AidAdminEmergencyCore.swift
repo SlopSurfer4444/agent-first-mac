@@ -1,6 +1,9 @@
 import CryptoKit
 import Darwin
 import Foundation
+#if canImport(AidAdminRuntime)
+import AidAdminRuntime
+#endif
 
 public enum EmergencyFailure: Error, CustomStringConvertible, Equatable {
     case rejected(String)
@@ -92,7 +95,7 @@ public struct EmergencyContext {
     }
 }
 
-public struct EmergencyArtifactExpectations: Equatable {
+public struct EmergencyArtifactExpectations: Equatable, Sendable {
     public let binarySHA256: String
     public let binarySize: Int
     public let policySHA256: String
@@ -115,8 +118,8 @@ public struct EmergencyArtifactExpectations: Equatable {
     }
 
     public static let production = EmergencyArtifactExpectations(
-        binarySHA256: "bce4427701a0278ea7941710939fc6e0a2b36abe0f3f487564b228b7283acd8e",
-        binarySize: 483_712,
+        binarySHA256: "ccf7c87823476892f35d25ae5b65e614fbd9e2fc1ae6e8c409644e800e291b54",
+        binarySize: 813_680,
         policySHA256: "2555b3f0ed1f75cd26bc41af6512ecc30d444ba1b0113458f72efcfccc304225",
         policySize: 1_617,
         sudoersSHA256: "b51a2c60bae3652decef1df7ffe2fd66931ee317305fbf1bc5c50e491f5c3ee6",
@@ -153,19 +156,13 @@ public final class EmergencyProcessRunner: EmergencyCommandRunning {
 
     public func run(executable: String, arguments: [String],
                     environment: [String: String]) throws -> EmergencyCommandResult {
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: executable)
-        process.arguments = arguments
-        process.environment = environment
-        let pipe = Pipe()
-        process.standardOutput = pipe
-        process.standardError = pipe
-        try process.run()
-        let data = pipe.fileHandleForReading.readDataToEndOfFile()
-        process.waitUntilExit()
-        return EmergencyCommandResult(
-            status: process.terminationStatus,
-            output: String(decoding: data.prefix(4096), as: UTF8.self))
+        let result = try BoundedProcess.run(
+            executable: executable, arguments: arguments, environment: environment,
+            limits: .init(timeout: 30, maximumOutputBytes: 4096))
+        try require(result.outcome == .exited && result.settled,
+                    "emergency_process_" + result.outcome.rawValue)
+        return EmergencyCommandResult(status: result.status,
+                                      output: result.stdout + result.stderr)
     }
 
     public func runInteractive(
@@ -261,6 +258,12 @@ public enum EmergencyOwnerAction: String {
     case recover
 }
 
+public func validateEmergencyRecoveryCommit(_ commit: String) throws {
+    try require(commit.utf8.count == 40 &&
+                commit.utf8.allSatisfy { (48...57).contains($0) || (97...102).contains($0) },
+                "resume_commit_syntax")
+}
+
 public final class EmergencyOwnerOrchestrator {
     private let runner: EmergencyCommandRunning
     private let executablePath: String
@@ -272,7 +275,12 @@ public final class EmergencyOwnerOrchestrator {
 
     public func perform(_ action: EmergencyOwnerAction) throws -> [String] {
         let internalAction = action == .disable ? "__root-disable" : "__root-recover"
-        let rootResult = try interactiveSudo(["-k", "--", executablePath, internalAction])
+        let rootResult: EmergencyCommandResult
+        do { rootResult = try interactiveSudo(["-k", "--", executablePath, internalAction]) }
+        catch {
+            _ = try? clearTimestamp()
+            throw EmergencyFailure.rejected(action.rawValue + "_root_transaction_unknown")
+        }
         if rootResult.status != 0 {
             try clearTimestampOrReject(action.rawValue + "_root_transaction_failed")
             throw EmergencyFailure.rejected(action.rawValue + "_root_transaction_failed")
@@ -281,6 +289,29 @@ public final class EmergencyOwnerOrchestrator {
             return try finishDisable()
         }
         return try finishRecovery()
+    }
+
+    /// Resumes only the recorded exact target under a new standard-sudo boundary.
+    /// It never restores broker admission and never claims payload data recovery.
+    public func performResume(commit: String) throws -> [String] {
+        try validateEmergencyRecoveryCommit(commit)
+        let result: EmergencyCommandResult
+        do {
+            result = try interactiveSudo(["-k", "--", executablePath, "__root-resume", commit])
+        } catch {
+            _ = try? clearTimestamp()
+            throw EmergencyFailure.rejected("resume_root_transaction_unknown")
+        }
+        try clearTimestampOrReject("resume_timestamp_clear_failed")
+        try require(result.status == 0, "resume_root_transaction_failed")
+        return [
+            "EMERGENCY_OPERATION_RESUMED_DISABLED",
+            "recorded_operation_resumed=true",
+            "arbitrary_data_restoration_claimed=false",
+            "broker_admission_disabled=true",
+            "sudo_timestamp_cleared=true",
+            "reenable_requires_separate_fresh_standard_sudo=true",
+        ]
     }
 
     private func finishDisable() throws -> [String] {
@@ -294,11 +325,19 @@ public final class EmergencyOwnerOrchestrator {
             "sudo_n_doctor_denied=true",
             "sudo_timestamp_cleared=true",
             "recovery_requires_fresh_standard_sudo=true",
+            "in_flight_apply_state=UNKNOWN",
+            "in_flight_apply_stopped=false",
         ]
     }
 
     private func finishRecovery() throws -> [String] {
-        let doctor = try doctorResult()
+        let doctor: EmergencyCommandResult
+        do { doctor = try doctorResult() }
+        catch {
+            // The doctor is read-only. Revocation is safe even if its child
+            // settlement is unknown; this does not claim that child stopped.
+            return try rollbackFailedRecovery(original: "recovery_doctor_unknown")
+        }
         guard recoveredDoctorIsReady(doctor) else {
             return try rollbackFailedRecovery()
         }
@@ -317,7 +356,12 @@ public final class EmergencyOwnerOrchestrator {
     private func rollbackFailedRecovery(
         original: String = "recovery_verification_failed"
     ) throws -> [String] {
-        let rollback = try sudo(["-n", "--", executablePath, "__root-disable"])
+        let rollback: EmergencyCommandResult
+        do { rollback = try sudo(["-n", "--", executablePath, "__root-disable"]) }
+        catch {
+            _ = try? clearTimestamp()
+            throw EmergencyFailure.rejected(original + "_rollback_unknown")
+        }
         guard rollback.status == 0 else {
             _ = try? clearTimestamp()
             throw EmergencyFailure.rejected(original + "_rollback_failed")
@@ -372,7 +416,7 @@ public final class EmergencyOwnerOrchestrator {
     }
 }
 
-private struct InstallAttestation: Codable {
+private struct EmergencyInstallAttestation: Codable {
     let agentOwnerIdentity: String
     let agentOwnerUID: UInt32
     let binarySHA256: String
@@ -407,11 +451,27 @@ private struct TrustedEmergencyParents {
     let libexec: TrustedEmergencyDirectory
     let audit: TrustedEmergencyDirectory
     let staging: TrustedEmergencyDirectory
+    let operationRoot: TrustedEmergencyDirectory
 }
 
 private struct EmergencyFileIdentity: Equatable {
     let device: dev_t
     let inode: ino_t
+}
+
+// Write-ahead ownership, not a success receipt. Kept until exact terminal state
+// is verified, so another authenticated process can reconcile an interruption.
+private struct EmergencyJournal: Codable {
+    let schema: Int
+    let action: String
+    let sudoersDevice: Int64
+    let sudoersInode: UInt64
+}
+
+private final class EmergencyLease {
+    let fd: Int32
+    init(_ fd: Int32) { self.fd = fd }
+    deinit { _ = flock(fd, LOCK_UN); Darwin.close(fd) }
 }
 
 public final class EmergencyTransaction {
@@ -424,6 +484,10 @@ public final class EmergencyTransaction {
     public static let markerPath = "/etc/agent-first-mac/aid-admin.disabled"
     public static let auditPath = "/var/log/agent-first-mac/aid-admin"
     public static let stagingPath = "/var/db/agent-first-mac/staging"
+    public static let operationRootPath = "/var/db/agent-first-mac"
+    public static let journalPath = stagingPath + "/emergency-operation.json"
+    public static let journalTemporaryPath = journalPath + ".new"
+    public static let operationPath = stagingPath + "/operation.json"
 
     public static let binarySHA256 = EmergencyArtifactExpectations.production.binarySHA256
     public static let binarySize = EmergencyArtifactExpectations.production.binarySize
@@ -453,9 +517,15 @@ public final class EmergencyTransaction {
     public func disable() throws -> String {
         try validateContext()
         let parents = try openTrustedParents()
+        let lease = try acquireLease(".emergency.lock", parents)
+        defer { withExtendedLifetime(lease) {} }
+        if try reconcileInterrupted(parents) {
+            return "EMERGENCY_DISABLE_TRANSACTION_COMMITTED"
+        }
         try validateEnabledState(parents)
         try validateSudoers(Self.sudoersPath, parents)
         try validateFullSudoers(parents)
+        try beginJournal(action: "disable", sudoers: Self.sudoersPath, parents)
         var mutationStarted = false
         var committedMarker: EmergencyFileIdentity?
         do {
@@ -474,13 +544,16 @@ public final class EmergencyTransaction {
             try hooks.afterMutation(step: "full-visudo-disabled")
             try validateDisabledState(parents)
             try hooks.afterMutation(step: "disabled-final-verification")
+            try clearJournal(parents)
             return "EMERGENCY_DISABLE_TRANSACTION_COMMITTED"
         } catch {
             let original = String(describing: error)
+            if original.hasPrefix("emergency_process_") { throw error }
             if mutationStarted {
                 do {
                     try hooks.beforeRollback()
                     try rollbackDisable(parents, committedMarker: committedMarker)
+                    try clearJournal(parents)
                     throw EmergencyFailure.rejected(original + "_rolled_back")
                 } catch let failure as EmergencyFailure where failure.description.hasSuffix("_rolled_back") {
                     throw failure
@@ -495,9 +568,15 @@ public final class EmergencyTransaction {
     public func recover() throws -> String {
         try validateContext()
         let parents = try openTrustedParents()
+        let lease = try acquireLease(".emergency.lock", parents)
+        _ = try reconcileInterrupted(parents)
+        let applyLease = try acquireLease(".operation.lock", parents)
+        defer { withExtendedLifetime((lease, applyLease)) {} }
+        try requireSettledApply(parents)
         try validateDisabledState(parents)
         try validateSudoers(Self.disabledSudoersPath, parents)
         try validateFullSudoers(parents)
+        try beginJournal(action: "recover", sudoers: Self.disabledSudoersPath, parents)
         var mutationStarted = false
         do {
             try renameNoReplace(Self.disabledSudoersPath, Self.sudoersPath,
@@ -508,6 +587,7 @@ public final class EmergencyTransaction {
             try renameNoReplace(Self.markerPath, Self.markerTemporaryPath,
                                 parents: parents, step: "recovery-marker-stage",
                                 failure: "recovery_marker_stage")
+            try hooks.afterMutation(step: "marker-staged")
             let markerIdentity = try identity(Self.markerTemporaryPath, parents)
             try removeExactFile(Self.markerTemporaryPath, expected: markerIdentity,
                                 parents: parents, failure: "recovery_marker_remove")
@@ -518,13 +598,16 @@ public final class EmergencyTransaction {
             try hooks.afterMutation(step: "full-visudo-enabled")
             try validateEnabledState(parents)
             try hooks.afterMutation(step: "enabled-final-verification")
+            try clearJournal(parents)
             return "EMERGENCY_RECOVERY_TRANSACTION_COMMITTED"
         } catch {
             let original = String(describing: error)
+            if original.hasPrefix("emergency_process_") { throw error }
             if mutationStarted {
                 do {
                     try hooks.beforeRollback()
                     try rollbackRecovery(parents)
+                    try clearJournal(parents)
                     throw EmergencyFailure.rejected(original + "_rolled_back")
                 } catch let failure as EmergencyFailure where failure.description.hasSuffix("_rolled_back") {
                     throw failure
@@ -541,9 +624,219 @@ public final class EmergencyTransaction {
         try validateEnabledState(openTrustedParents())
     }
 
+    /// The executable supplies the fixed broker method, never a user-selected
+    /// command, path or generation. Core owns the operation lease and reviewed
+    /// receipt/boot/state checks; this boundary owns disabled-artifact trust and
+    /// exclusion against authority publication for the entire exact-target resume.
+    public func resume(commit: String, operation: (String) throws -> String) throws -> String {
+        try validateEmergencyRecoveryCommit(commit)
+        try validateContext()
+        let parents = try openTrustedParents()
+        let lease = try acquireLease(".emergency.lock", parents)
+        defer { withExtendedLifetime(lease) {} }
+        _ = try reconcileInterrupted(parents)
+        try validateDisabledState(parents)
+        try validateSudoers(Self.disabledSudoersPath, parents)
+        try validateFullSudoers(parents)
+        do {
+            let result = try operation(commit)
+            try require(result == "OPERATION_RESUMED_DISABLED", "resume_result_contract")
+            try validateDisabledState(parents)
+            return result
+        } catch {
+            // Do not enable, repeat a possibly committed operation, or erase its
+            // journal. The core's exact error/phase remains available for retry.
+            try validateDisabledState(parents)
+            throw error
+        }
+    }
+
     public func validateDisabledState() throws {
         try validateContext()
         try validateDisabledState(openTrustedParents())
+    }
+
+    private func acquireLease(_ name: String, _ parents: TrustedEmergencyParents) throws -> EmergencyLease {
+        let directory = parents.operationRoot
+        try revalidateDirectory(directory)
+        let fd = openat(directory.fd, name,
+                        O_RDWR | O_CREAT | O_NOFOLLOW | O_CLOEXEC | O_NONBLOCK, 0o600)
+        try require(fd >= 0, "emergency_lock_open")
+        do {
+            var descriptor = stat(), named = stat()
+            try require(fstat(fd, &descriptor) == 0 &&
+                        fstatat(directory.fd, name, &named, AT_SYMLINK_NOFOLLOW) == 0 &&
+                        (descriptor.st_mode & S_IFMT) == S_IFREG &&
+                        descriptor.st_nlink == 1 && descriptor.st_uid == context.trustedUID &&
+                        descriptor.st_gid == context.trustedGID &&
+                        (descriptor.st_mode & 0o777) == 0o600 &&
+                        descriptor.st_dev == named.st_dev && descriptor.st_ino == named.st_ino,
+                        "emergency_lock_contract")
+            try require(flock(fd, LOCK_EX | LOCK_NB) == 0,
+                        name == ".operation.lock" ? "emergency_apply_busy" : "emergency_busy")
+            try require(fstatat(directory.fd, name, &named, AT_SYMLINK_NOFOLLOW) == 0 &&
+                        descriptor.st_dev == named.st_dev && descriptor.st_ino == named.st_ino,
+                        "emergency_lock_identity_drift")
+            return EmergencyLease(fd)
+        } catch {
+            Darwin.close(fd)
+            throw error
+        }
+    }
+
+    private func requireSettledApply(_ parents: TrustedEmergencyParents) throws {
+        guard try exists(Self.operationPath, parents) else { return }
+        let bytes = try readTrustedFile(Self.operationPath, mode: 0o600,
+                                        maximum: 64 * 1024, parents: parents)
+        guard let object = try? JSONSerialization.jsonObject(with: bytes) as? [String: Any],
+              let schema = object["schema"] as? NSNumber,
+              CFGetTypeID(schema) != CFBooleanGetTypeID(),
+              [1, 2].contains(schema.intValue), schema.doubleValue == Double(schema.intValue),
+              let phase = object["phase"] as? String,
+              (["complete", "rollback_verified"].contains(phase) ||
+               (schema.intValue == 2 && phase == "resumed")) else {
+            throw EmergencyFailure.rejected("emergency_apply_unresolved")
+        }
+    }
+
+    private func beginJournal(action: String, sudoers: String,
+                              _ parents: TrustedEmergencyParents) throws {
+        let sudoersIdentity = try identity(sudoers, parents)
+        let journal = EmergencyJournal(schema: 1, action: action,
+            sudoersDevice: Int64(sudoersIdentity.device), sudoersInode: UInt64(sudoersIdentity.inode))
+        let data = try journalBytes(journal)
+        let location = try fileLocation(Self.journalTemporaryPath, parents)
+        let fd = openat(location.directory.fd, location.name,
+                        O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0o600)
+        try require(fd >= 0, "emergency_journal_create")
+        defer { Darwin.close(fd) }
+        try hooks.afterMutation(step: "emergency-journal-opened")
+        var offset = 0
+        while offset < data.count {
+            let count = data.withUnsafeBytes {
+                Darwin.write(fd, $0.baseAddress!.advanced(by: offset), data.count - offset)
+            }
+            try require(count > 0, "emergency_journal_write")
+            offset += count
+            try hooks.afterMutation(step: "emergency-journal-written")
+        }
+        try require(fsync(fd) == 0 && fsync(location.directory.fd) == 0,
+                    "emergency_journal_sync")
+        let staged = try readTrustedFile(Self.journalTemporaryPath, mode: 0o600,
+                                         maximum: 4096, parents: parents)
+        try require(staged == data, "emergency_journal_staging_drift")
+        try renameNoReplace(Self.journalTemporaryPath, Self.journalPath, parents: parents,
+                            step: "emergency-journal-publish", failure: "emergency_journal_publish")
+        _ = try readJournal(parents)
+        try hooks.afterMutation(step: "emergency-journal-created")
+    }
+
+    private func journalBytes(_ journal: EmergencyJournal) throws -> Data {
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys]
+        return try encoder.encode(journal)
+    }
+
+    /// A pre-publication crash cannot have mutated sudoers. Retire only the
+    /// fixed temporary file whose bytes are an exact canonical journal prefix
+    /// for the freshly verified terminal prestate and original descriptor.
+    private func reconcileJournalTemporary(_ parents: TrustedEmergencyParents) throws -> Bool {
+        guard try exists(Self.journalTemporaryPath, parents) else { return false }
+        let final = try exists(Self.journalPath, parents)
+        try require(!final, "emergency_journal_collision")
+        let enabled = try exists(Self.sudoersPath, parents)
+        if enabled { try validateEnabledState(parents) }
+        else { try validateDisabledState(parents) }
+        let sudoers = enabled ? Self.sudoersPath : Self.disabledSudoersPath
+        let source = try identity(sudoers, parents)
+        let canonical = try journalBytes(EmergencyJournal(schema: 1,
+            action: enabled ? "disable" : "recover", sudoersDevice: Int64(source.device),
+            sudoersInode: UInt64(source.inode)))
+        let bytes = try readTrustedFile(Self.journalTemporaryPath, mode: 0o600,
+                                        maximum: 4096, parents: parents)
+        try require(canonical.starts(with: bytes), "emergency_journal_temporary_unknown")
+        let expected = try identity(Self.journalTemporaryPath, parents)
+        let location = try fileLocation(Self.journalTemporaryPath, parents)
+        let current = try identity(Self.journalTemporaryPath, parents)
+        try require(current == expected && unlinkat(location.directory.fd, location.name, 0) == 0 &&
+                    fsync(location.directory.fd) == 0, "emergency_journal_temporary_remove")
+        return !enabled
+    }
+
+    private func readJournal(_ parents: TrustedEmergencyParents) throws -> EmergencyJournal {
+        let data = try readTrustedFile(Self.journalPath, mode: 0o600, maximum: 4096, parents: parents)
+        guard let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              Set(object.keys) == ["schema", "action", "sudoersDevice", "sudoersInode"],
+              let journal = try? JSONDecoder().decode(EmergencyJournal.self, from: data),
+              journal.schema == 1, ["disable", "recover"].contains(journal.action) else {
+            throw EmergencyFailure.rejected("emergency_journal_invalid")
+        }
+        return journal
+    }
+
+    private func clearJournal(_ parents: TrustedEmergencyParents) throws {
+        _ = try readJournal(parents)
+        let expected = try identity(Self.journalPath, parents)
+        let location = try fileLocation(Self.journalPath, parents)
+        try revalidateDirectory(location.directory)
+        let current = try identity(Self.journalPath, parents)
+        try require(current == expected && unlinkat(location.directory.fd, location.name, 0) == 0 &&
+                    fsync(location.directory.fd) == 0, "emergency_journal_remove")
+    }
+
+    /// No inferred phase permits overwrite. A retained write-ahead record and
+    /// exact original sudoers inode/bytes must agree with one known partial state.
+    /// Reconciliation first returns authority to disabled; recovery is separate.
+    private func reconcileInterrupted(_ parents: TrustedEmergencyParents) throws -> Bool {
+        let alreadyDisabled = try reconcileJournalTemporary(parents)
+        guard try exists(Self.journalPath, parents) else { return alreadyDisabled }
+        let journal = try readJournal(parents)
+        let enabled = try exists(Self.sudoersPath, parents)
+        let disabled = try exists(Self.disabledSudoersPath, parents)
+        try require(enabled != disabled, "emergency_interrupted_sudoers_state")
+        let sudoers = enabled ? Self.sudoersPath : Self.disabledSudoersPath
+        try validateStaticArtifacts(sudoers: sudoers, parents: parents)
+        let current = try identity(sudoers, parents)
+        try require(Int64(current.device) == journal.sudoersDevice &&
+                    UInt64(current.inode) == journal.sudoersInode,
+                    "emergency_interrupted_sudoers_identity")
+        let marker = try exists(Self.markerPath, parents)
+        let temporary = try exists(Self.markerTemporaryPath, parents)
+        try require(!(marker && temporary), "emergency_interrupted_marker_collision")
+        var partialTemporary = false
+        for path in [Self.markerPath, Self.markerTemporaryPath] where try exists(path, parents) {
+            let bytes = try readTrustedFile(path, mode: 0o400, maximum: 256, parents: parents)
+            if path == Self.markerTemporaryPath && bytes != Self.markerData {
+                try require(Self.markerData.starts(with: bytes), "emergency_interrupted_marker_drift")
+                partialTemporary = true
+            } else {
+                try require(bytes == Self.markerData, "emergency_interrupted_marker_drift")
+            }
+        }
+        if enabled {
+            try renameNoReplace(Self.sudoersPath, Self.disabledSudoersPath, parents: parents,
+                                step: "interrupted-sudoers-disable", failure: "interrupted_sudoers_disable")
+        }
+        if temporary {
+            if partialTemporary {
+                let expected = try identity(Self.markerTemporaryPath, parents)
+                let location = try fileLocation(Self.markerTemporaryPath, parents)
+                let current = try identity(Self.markerTemporaryPath, parents)
+                try require(current == expected && unlinkat(location.directory.fd, location.name, 0) == 0 &&
+                            fsync(location.directory.fd) == 0, "interrupted_marker_partial_remove")
+                _ = try createMarker(parents)
+            } else {
+                try renameNoReplace(Self.markerTemporaryPath, Self.markerPath, parents: parents,
+                                    step: "interrupted-marker-restore", failure: "interrupted_marker_restore")
+            }
+        } else if !marker {
+            _ = try createMarker(parents)
+        }
+        try validateSudoers(Self.disabledSudoersPath, parents)
+        try validateFullSudoers(parents)
+        try validateDisabledState(parents)
+        try clearJournal(parents)
+        return true
     }
 
     private func validateEnabledState(_ parents: TrustedEmergencyParents) throws {
@@ -606,7 +899,7 @@ public final class EmergencyTransaction {
         try require(Set(object.keys) == ["agentOwnerIdentity", "agentOwnerUID", "binarySHA256",
                                         "policySHA256", "schema", "sudoersSHA256"],
                     "attestation_keys")
-        let value = try JSONDecoder().decode(InstallAttestation.self, from: attestationData)
+        let value = try JSONDecoder().decode(EmergencyInstallAttestation.self, from: attestationData)
         try require(value.schema == 1 && value.agentOwnerIdentity == context.invokingOwner.name &&
                     value.agentOwnerUID == context.invokingOwner.uid,
                     "attestation_owner_binding")
@@ -741,6 +1034,7 @@ public final class EmergencyTransaction {
         var temporaryIdentity: EmergencyFileIdentity?
         defer { Darwin.close(fd) }
         do {
+            try hooks.afterMutation(step: "marker-temporary-opened")
             var offset = 0
             while offset < Self.markerData.count {
                 let count = Self.markerData.withUnsafeBytes { raw -> Int in
@@ -749,6 +1043,7 @@ public final class EmergencyTransaction {
                 }
                 try require(count > 0, "disable_marker_write")
                 offset += count
+                try hooks.afterMutation(step: "marker-temporary-written")
             }
             try require(fchown(fd, context.trustedUID, context.trustedGID) == 0 &&
                         fchmod(fd, 0o400) == 0 && fsync(fd) == 0,
@@ -757,6 +1052,7 @@ public final class EmergencyTransaction {
             try require(fstat(fd, &created) == 0, "disable_marker_stat")
             temporaryIdentity = EmergencyFileIdentity(device: created.st_dev,
                                                       inode: created.st_ino)
+            try hooks.afterMutation(step: "marker-temporary-created")
             try renameNoReplace(Self.markerTemporaryPath, Self.markerPath,
                                 parents: parents, step: "disable-marker-commit",
                                 failure: "disable_marker_commit")
@@ -787,13 +1083,13 @@ public final class EmergencyTransaction {
         let location = try fileLocation(logical, parents)
         try revalidateDirectory(location.directory)
         let fd = Darwin.openat(location.directory.fd, location.name,
-                               O_RDONLY | O_NOFOLLOW | O_CLOEXEC)
+                               O_RDONLY | O_NOFOLLOW | O_CLOEXEC | O_NONBLOCK)
         try require(fd >= 0, "trusted_file_missing")
         defer { Darwin.close(fd) }
         var before = stat()
         try require(fstat(fd, &before) == 0 && (before.st_mode & S_IFMT) == S_IFREG,
                     "trusted_file_type")
-        try require(before.st_uid == context.trustedUID && before.st_gid == context.trustedGID,
+        try require(before.st_nlink == 1 && before.st_uid == context.trustedUID && before.st_gid == context.trustedGID,
                     "trusted_file_owner")
         try require((before.st_mode & 0o777) == mode, "trusted_file_mode")
         try require(before.st_size >= 0 && before.st_size <= maximum, "trusted_file_size")
@@ -810,6 +1106,7 @@ public final class EmergencyTransaction {
         var after = stat()
         try require(fstat(fd, &after) == 0 && before.st_dev == after.st_dev &&
                     before.st_ino == after.st_ino && before.st_size == after.st_size &&
+                    before.st_nlink == after.st_nlink &&
                     before.st_uid == after.st_uid && before.st_gid == after.st_gid &&
                     before.st_mode == after.st_mode &&
                     before.st_mtimespec.tv_sec == after.st_mtimespec.tv_sec &&
@@ -818,6 +1115,9 @@ public final class EmergencyTransaction {
                     before.st_ctimespec.tv_nsec == after.st_ctimespec.tv_nsec,
                     "trusted_file_race")
         try revalidateDirectory(location.directory)
+        let namedIdentity = try identity(logical, parents)
+        try require(namedIdentity.device == before.st_dev && namedIdentity.inode == before.st_ino,
+                    "trusted_file_named_identity_drift")
         return data
     }
 
@@ -835,7 +1135,8 @@ public final class EmergencyTransaction {
             agentConfiguration: try openTrustedDirectory("/etc/agent-first-mac", mode: 0o755),
             libexec: try openTrustedDirectory("/usr/local/libexec", mode: 0o755),
             audit: try openTrustedDirectory(Self.auditPath, mode: 0o700),
-            staging: try openTrustedDirectory(Self.stagingPath, mode: 0o700))
+            staging: try openTrustedDirectory(Self.stagingPath, mode: 0o700),
+            operationRoot: try openTrustedDirectory(Self.operationRootPath, mode: 0o755))
     }
 
     private func openTrustedDirectory(
@@ -903,6 +1204,12 @@ public final class EmergencyTransaction {
             return (parents.sudoers, "agent-first-mac-aid-admin")
         case Self.disabledSudoersPath:
             return (parents.sudoers, "agent-first-mac-aid-admin.disabled")
+        case Self.journalPath:
+            return (parents.staging, "emergency-operation.json")
+        case Self.journalTemporaryPath:
+            return (parents.staging, "emergency-operation.json.new")
+        case Self.operationPath:
+            return (parents.staging, "operation.json")
         default:
             throw EmergencyFailure.rejected("fixed_path_not_allowed")
         }
@@ -940,11 +1247,14 @@ public final class EmergencyTransaction {
     ) throws {
         let sourceLocation = try fileLocation(source, parents)
         let destinationLocation = try fileLocation(destination, parents)
+        let sourceIdentity = try identity(source, parents)
         try revalidateDirectory(sourceLocation.directory)
         try revalidateDirectory(destinationLocation.directory)
         try hooks.beforeTransition(step: step)
         try revalidateDirectory(sourceLocation.directory)
         try revalidateDirectory(destinationLocation.directory)
+        let currentSource = try identity(source, parents)
+        try require(currentSource == sourceIdentity, failure + "_source_identity")
         try require(renameatx_np(sourceLocation.directory.fd, sourceLocation.name,
                                  destinationLocation.directory.fd, destinationLocation.name,
                                  UInt32(RENAME_EXCL)) == 0, failure)

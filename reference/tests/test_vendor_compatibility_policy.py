@@ -253,6 +253,36 @@ class PolicyTests(unittest.TestCase):
             with self.subTest(version=version):
                 self.assertEqual(P._version_at_or_above(version), namespace["version_at_or_above"](version))
 
+    def test_full_version_grammar_precedes_all_numeric_ordering(self):
+        for numeric in ("0.144.0", "0.145.0", "0.146.0", "1.0.0"):
+            for suffix in (".", "alpha..18", ".alpha", "alpha.", "", "alpha.é", "alpha/18"):
+                malformed = "codex-cli " + numeric + "-" + suffix
+                with self.subTest(version=malformed):
+                    self.assertFalse(P._version_at_or_above(malformed))
+                    self.assertFalse(P._version_at_or_above("codex-cli 9.0.0", malformed))
+        for malformed in (None, True, "codex-cli 1", "codex-cli 1.0+build",
+                          "codex-cli " + "9" * 257 + ".0", "codex-cli 1.0\n"):
+            self.assertFalse(P._version_at_or_above(malformed))
+        for valid in ("codex-cli 0.145.0-alpha.18", "codex-cli 0.145.0-alpha.19",
+                      "codex-cli 0.145.0", "codex-cli 0.146.0-alpha.1", "codex-cli 1.0"):
+            self.assertTrue(P._version_at_or_above(valid), valid)
+
+    def test_unrelated_method_extension_is_disjoint_not_a_global_schema_pin(self):
+        self.defs["ClientRequest"]["oneOf"].append(obj({
+            "method": {"type": "string", "enum": ["future/read"], "vendorAnnotation": True},
+            "params": {"futureConstraint": True}}, ("method", "params")))
+        self.assertTrue(self.result()["compatible"])
+        self.defs["ClientRequest"]["oneOf"][-1]["properties"]["method"]["enum"] = ["hooks/list"]
+        self.fails()
+
+    def test_foreign_tag_ref_sibling_cannot_hide_consumed_duplicate_method(self):
+        self.defs["FutureAlias"] = copy.deepcopy(self.defs["ClientRequest"]["oneOf"][2])
+        self.defs["ClientRequest"]["oneOf"].append({
+            "$ref": "#/definitions/FutureAlias",
+            "properties": {"method": {"type": "string", "enum": ["future/read"],
+                                        "vendorAnnotation": True}}})
+        self.assertIn("schema_shape_unproven", self.fails()["reasonCodes"])
+
     def test_each_required_exec_flag(self):
         for flag in P.EXEC_FLAGS:
             with self.subTest(flag=flag):

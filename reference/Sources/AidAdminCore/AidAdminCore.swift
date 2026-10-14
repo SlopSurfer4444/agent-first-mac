@@ -1,6 +1,9 @@
 import CryptoKit
 import Darwin
 import Foundation
+#if canImport(AidAdminRuntime)
+import AidAdminRuntime
+#endif
 
 public let compiledPolicySHA256 = "dfa6376b60831d2dea55c9717a64fe37c6afe432f499b7181b2cd1854d919462"
 
@@ -20,6 +23,14 @@ private func require(_ condition: @autoclosure () -> Bool, _ reason: String) thr
 
 public func sha256Hex(_ data: Data) -> String {
     SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
+}
+
+public func nativeBootGeneration() throws -> String {
+    var boot = timeval()
+    var size = MemoryLayout<timeval>.size
+    try require(sysctlbyname("kern.boottime", &boot, &size, nil, 0) == 0 &&
+                size == MemoryLayout<timeval>.size && boot.tv_sec > 0, "boot_generation_unavailable")
+    return sha256Hex(Data("darwin-boot-v1:\(boot.tv_sec):\(boot.tv_usec)".utf8))
 }
 
 private func exactKeys(_ value: [String: Any], _ expected: Set<String>, _ context: String) throws {
@@ -226,18 +237,11 @@ public protocol CommandRunning {
 public final class ProcessCommandRunner: CommandRunning {
     public init() {}
     public func run(executable: String, arguments: [String], environment: [String: String]) throws -> CommandResult {
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: executable)
-        process.arguments = arguments
-        process.environment = environment
-        let pipe = Pipe()
-        process.standardOutput = pipe
-        process.standardError = pipe
-        try process.run()
-        let data = pipe.fileHandleForReading.readDataToEndOfFile()
-        process.waitUntilExit()
-        return CommandResult(status: process.terminationStatus,
-                             output: String(decoding: data.prefix(8192), as: UTF8.self))
+        let result = try BoundedProcess.run(executable: executable, arguments: arguments, environment: environment)
+        try require(result.settled && result.outcome == .exited,
+                    "process_" + result.outcome.rawValue + "_needs_reconcile")
+        return CommandResult(status: result.status,
+                             output: String((result.stdout + result.stderr).prefix(8192)))
     }
 }
 
@@ -285,7 +289,10 @@ public protocol AuditWriting {
 }
 
 public final class AtomicAuditWriter: AuditWriting {
-    public init() {}
+    private let checkpoint: (String, String) throws -> Void
+    public init(checkpoint: @escaping (String, String) throws -> Void = { _, _ in }) {
+        self.checkpoint = checkpoint
+    }
     public func write(_ record: AuditRecord, directory: String, suffix: String, maximumBytes: Int) throws {
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.sortedKeys]
@@ -293,10 +300,28 @@ public final class AtomicAuditWriter: AuditWriting {
         data.append(0x0a)
         try require(data.count <= maximumBytes, "audit_record_too_large")
         let final = directory + "/" + record.actionID + "." + suffix + ".json"
-        let temporary = final + ".tmp"
+        // A killed publisher may leave its private temporary. A fresh publisher
+        // never reuses/removes that ambiguous inode or collides with its name.
+        let temporary = final + "." + UUID().uuidString.lowercased() + ".tmp"
+        var existingInfo = stat()
+        if lstat(final, &existingInfo) == 0 {
+            try require(existingInfo.st_mode & S_IFMT == S_IFREG && existingInfo.st_uid == geteuid() &&
+                        existingInfo.st_mode & 0o7777 == 0o600 && existingInfo.st_nlink == 1 &&
+                        existingInfo.st_size == data.count, "audit_existing_identity_conflict")
+            let existingFD = Darwin.open(final, O_RDONLY | O_NOFOLLOW | O_CLOEXEC)
+            try require(existingFD >= 0, "audit_existing_open")
+            defer { Darwin.close(existingFD) }
+            let handle = FileHandle(fileDescriptor: existingFD, closeOnDealloc: false)
+            let existing = try handle.read(upToCount: maximumBytes + 1) ?? Data()
+            try require(existing == data, "audit_existing_content_conflict")
+        } else {
+            try require(errno == ENOENT, "audit_existing_lookup")
+        }
+        try checkpoint(suffix, "before_open")
         let fd = Darwin.open(temporary, O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW, 0o600)
         try require(fd >= 0, "audit_open_failed")
         defer { Darwin.close(fd) }
+        defer { unlink(temporary) }
         var offset = 0
         while offset < data.count {
             let count = data.withUnsafeBytes { raw -> Int in
@@ -308,17 +333,22 @@ public final class AtomicAuditWriter: AuditWriting {
                 throw BrokerFailure.rejected("audit_write_failed")
             }
             offset += count
+            try checkpoint(suffix, "after_write")
         }
-        if fsync(fd) != 0 || rename(temporary, final) != 0 {
+        if fsync(fd) != 0 {
             unlink(temporary)
             throw BrokerFailure.rejected("audit_commit_failed")
         }
+        try checkpoint(suffix, "after_file_sync")
+        if rename(temporary, final) != 0 { throw BrokerFailure.rejected("audit_commit_failed") }
+        try checkpoint(suffix, "after_rename")
         let directoryFD = Darwin.open(directory, O_RDONLY | O_DIRECTORY)
         if directoryFD < 0 || fsync(directoryFD) != 0 {
             if directoryFD >= 0 { Darwin.close(directoryFD) }
             throw BrokerFailure.rejected("audit_directory_sync_failed")
         }
         Darwin.close(directoryFD)
+        try checkpoint(suffix, "after_directory_sync")
     }
 }
 
@@ -502,16 +532,24 @@ public final class AidAdminBroker {
     private let expectedPolicyHash: String
     private let actionID: () -> String
     private let fixedPolicyPath = "/etc/agent-first-mac/aid-admin-policy.json"
+    private var operationLease: ApplyOperationLease?
+    private var operation: ApplyOperation?
+    private let operationCheckpoint: (String) throws -> Void
+    private let bootGeneration: () throws -> String
 
     public init(context: RuntimeContext, runner: CommandRunning = ProcessCommandRunner(),
                 auditWriter: AuditWriting = AtomicAuditWriter(),
                 expectedPolicyHash: String = compiledPolicySHA256,
-                actionID: @escaping () -> String = { UUID().uuidString.lowercased() }) {
+                actionID: @escaping () -> String = { UUID().uuidString.lowercased() },
+                operationCheckpoint: @escaping (String) throws -> Void = { _ in },
+                bootGeneration: @escaping () throws -> String = nativeBootGeneration) {
         self.context = context
         self.runner = runner
         self.auditWriter = auditWriter
         self.expectedPolicyHash = expectedPolicyHash
         self.actionID = actionID
+        self.operationCheckpoint = operationCheckpoint
+        self.bootGeneration = bootGeneration
     }
 
     public func doctorRoot() -> DoctorReport {
@@ -527,6 +565,13 @@ public final class AidAdminBroker {
             try validateInstalledContract(policy, policyHash: hash, includeCurrentExecutable: true)
             checks["installed_artifact_attestation"] = true
             checks["installed_contract"] = true
+            // Read-only doctor does not create a lock or repair transaction state.
+            let journalPath = policy.installedPaths.staging + "/operation.json"
+            if pathExists(journalPath) {
+                let bytes = try readTrustedFile(journalPath, exactMode: 0o600, maximumBytes: 16384)
+                try validateSettledApplyJournal(bytes)
+            }
+            checks["operation_settled"] = true
         } catch {
             problems.append(String(describing: error))
             checks["installed_artifact_attestation"] = false
@@ -546,6 +591,13 @@ public final class AidAdminBroker {
         try require(!policy.preparationOnly && policy.apply.applyGateAccepted, "phase4_apply_gate_closed")
         try require(!pathExists(policy.installedPaths.emergencyDisable), "emergency_disabled")
         try validateInstalledContract(policy, policyHash: policyHash, includeCurrentExecutable: true)
+
+        let lease = try ApplyOperationLease(directory: physical(policy.installedPaths.staging), uid: context.trustedUID)
+        operationLease = lease
+        defer { operation = nil; operationLease = nil }
+        if let pending = try lease.read(), !["complete", "rollback_verified", "resumed"].contains(pending.phase) {
+            return try reconcileOperation(pending, lease: lease, commit: commit, policy: policy, policyHash: policyHash)
+        }
 
         let activationExecutable = try physicalResolvedExecutable(policy.executables.activation, policy: policy)
         let nixEnvExecutable = try physicalValidatedNixApplet(
@@ -592,22 +644,45 @@ public final class AidAdminBroker {
                                    stagedReceiptPath: stagedReceiptPath, stagedHash: stagedHash,
                                    receipt: stagedReceipt)
 
+        operation = ApplyOperation(schema: 2, identifier: identifier, commit: commit, tree: controlTree,
+            policyHash: policyHash, receiptHash: stagedHash, previousIdentifier: previous.identifier,
+            previousTarget: previous.targetLogical, target: stagedReceipt.targetSystemPath,
+            activationExecutable: activationExecutable, activationHash: try executionHash(activationExecutable),
+            nixEnvExecutable: nixEnvExecutable, nixEnvHash: try executionHash(nixEnvExecutable),
+            caller: callerClass, targetIdentifier: preTarget, phase: "sealed", sourceDrift: false)
+        operation?.bootGeneration = try validatedBootGeneration()
+        operation?.previousNarHash = try observedNarHash(previous.targetLogical, policy: policy)
+        operation?.targetNarHash = stagedReceipt.targetSystemNarHash
+        operation?.previousRevision = try closureRevision(previous.targetLogical, policy: policy)
+        try persistOperation("sealed")
+
         if targetPhysical == previous.targetPhysical {
+            let current = try currentGeneration(policy)
+            try require(current.identifier == previous.identifier && current.targetPhysical == previous.targetPhysical,
+                        "noop_prestate_changed_no_mutation")
+            try validateCurrentSystem(previous)
+            try persistOperation("committed")
             let record = auditRecord(identifier, outcome: "already_current", status: 0,
                                      caller: callerClass, commit: commit, policyHash: policyHash,
                                      previous: previous.identifier, target: previous.identifier, policy: policy)
-            try auditWriter.write(record, directory: physical(policy.installedPaths.audit),
-                                  suffix: "result", maximumBytes: policy.audit.maxRecordBytes)
+            try publishCommittedAudit(record, policy: policy)
             return 0
         }
 
         let setResult: CommandResult
+        try verifySealedExecutors()
+        try require(!pathExists(policy.installedPaths.emergencyDisable), "emergency_disabled_before_profile")
+        try persistOperation("profile_pending")
         do {
             setResult = try runner.run(executable: nixEnvExecutable,
                                        arguments: ["--profile", policy.apply.profilePath,
                                                    "--set", stagedReceipt.targetSystemPath],
                                        environment: policy.environment)
         } catch {
+            if String(describing: error).contains("process_") {
+                try? persistOperation("unknown")
+                throw BrokerFailure.rejected("profile_process_unknown_needs_reconcile")
+            }
             return try failAfterMutation("profile_update_launch_failed", status: 127,
                                          identifier: identifier, caller: callerClass, commit: commit,
                                          policyHash: policyHash, previous: previous, target: "pending",
@@ -628,6 +703,8 @@ public final class AidAdminBroker {
             try require(created.count == 1 && created.contains(after.identifier), "new_generation_not_unique")
             try require(after.targetPhysical == targetPhysical, "new_generation_target_mismatch")
             targetGeneration = after
+            operation?.targetIdentifier = after.identifier
+            try persistOperation("profile_ready")
         } catch {
             return try failAfterMutation("profile_update_verification_failed", status: 70,
                                          identifier: identifier, caller: callerClass, commit: commit,
@@ -636,11 +713,18 @@ public final class AidAdminBroker {
         }
 
         let activation: CommandResult
+        try verifySealedExecutors()
+        try require(!pathExists(policy.installedPaths.emergencyDisable), "emergency_disabled_before_activation")
+        try persistOperation("activation_pending")
         do {
             activation = try runner.run(executable: activationExecutable,
                                         arguments: policy.apply.activationArguments + [targetGeneration.identifier],
                                         environment: activationEnvironment(policy))
         } catch {
+            if String(describing: error).contains("process_") {
+                try? persistOperation("unknown")
+                throw BrokerFailure.rejected("activation_process_unknown_needs_reconcile")
+            }
             return try failAfterMutation("activation_launch_failed", status: 127,
                                          identifier: identifier, caller: callerClass, commit: commit,
                                          policyHash: policyHash, previous: previous,
@@ -659,12 +743,17 @@ public final class AidAdminBroker {
             try recheckImmutableInputs(policy: policy, policyHash: policyHash, repository: repository,
                                        commit: commit, controlTree: controlTree,
                                        stagedReceiptPath: stagedReceiptPath, stagedHash: stagedHash,
-                                       receipt: stagedReceipt)
+                                       receipt: stagedReceipt, checkRepository: false)
+            try verifySealedExecutors()
             let current = try currentGeneration(policy)
             try require(current.identifier == targetGeneration.identifier &&
                         current.targetPhysical == targetPhysical, "post_apply_profile_mismatch")
             try validateCurrentSystem(current)
         } catch {
+            if String(describing: error).contains("process_") {
+                try? persistOperation("unknown")
+                throw BrokerFailure.rejected("verification_process_unknown_no_rollback")
+            }
             return try failAfterMutation("post_apply_verification_failed", status: 70,
                                          identifier: identifier, caller: callerClass, commit: commit,
                                          policyHash: policyHash, previous: previous,
@@ -672,29 +761,397 @@ public final class AidAdminBroker {
                                          rollbackExecutable: activationExecutable, policy: policy)
         }
 
+        // Git is mutable owner state, not an input once the execution seal exists.
+        // It can block the next operation, but is not an inverse trigger here.
+        do {
+            operation?.sourceDrift = try validateRepository(repository, commit: commit, policy: policy) != controlTree
+        } catch {
+            operation?.sourceDrift = true
+            if String(describing: error).contains("process_") {
+                try? persistOperation("unknown")
+                throw BrokerFailure.rejected("applied_source_observation_process_unknown_no_rollback")
+            }
+        }
+        try persistOperation("committed")
+
         let record = auditRecord(identifier, outcome: "applied", status: 0, caller: callerClass,
                                  commit: commit, policyHash: policyHash, previous: previous.identifier,
                                  target: targetGeneration.identifier, policy: policy)
+        try publishCommittedAudit(record, policy: policy)
+        return 0
+    }
+
+    private func persistOperation(_ phase: String) throws {
+        guard var value = operation, let lease = operationLease else {
+            throw BrokerFailure.rejected("operation_missing_unknown")
+        }
+        value.phase = phase
+        try lease.write(value)
+        operation = value
+        try operationCheckpoint(phase)
+    }
+
+    private func validatedBootGeneration() throws -> String {
+        let value = try bootGeneration()
+        try validateHex(value, count: 64, reason: "boot_generation_invalid")
+        return value
+    }
+
+    private func observedNarHash(_ target: String, policy: BrokerPolicy) throws -> String {
+        _ = try validateClosureFilesystem(target, policy: policy)
+        let executable = try physicalValidatedNixApplet(policy.executables.nixStore,
+            expectedBasename: "nix-store", policy: policy)
+        let verify = try runner.run(executable: executable, arguments: ["--verify-path", target],
+                                    environment: policy.environment)
+        try require(verify.status == 0, "recovery_closure_verify_failed")
+        let result = try runner.run(executable: executable, arguments: ["--query", "--hash", target],
+                                    environment: policy.environment)
+        let hash = result.output.trimmingCharacters(in: .whitespacesAndNewlines)
+        try require(result.status == 0, "recovery_closure_hash_failed")
+        try validatePattern(hash, "^sha256:[0-9abcdfghijklmnpqrsvwxyz]{52}$", "recovery_closure_hash")
+        return hash
+    }
+
+    private func closureRevision(_ target: String, policy: BrokerPolicy) throws -> String {
+        let path = try canonicalPhysical(target + "/darwin-version.json", allowSymlink: true)
+        let bytes = try readImmutableStoreFile(logicalFromPhysical(path), policy: policy, maximumBytes: 4096)
+        var parser = try StrictStringObjectParser(data: bytes)
+        let object = try parser.parse(expectedKeys: ["configurationRevision", "darwinLabel", "darwinRevision", "nixpkgsRevision"],
+                                      context: "recovery_revision")
+        let revision = object["configurationRevision"] ?? ""
+        try validateClosureRevision(target, expectedCommit: revision, policy: policy)
+        return revision
+    }
+
+    private func executionHash(_ path: String) throws -> String {
+        let resolved = try canonicalArbitraryPhysical(path)
+        let fd = Darwin.open(resolved, O_RDONLY | O_NOFOLLOW | O_CLOEXEC)
+        try require(fd >= 0, "sealed_executor_open")
+        defer { Darwin.close(fd) }
+        var info = stat()
+        try require(fstat(fd, &info) == 0 && info.st_uid == context.trustedUID &&
+                    info.st_mode & S_IFMT == S_IFREG && info.st_mode & 0o222 == 0 &&
+                    info.st_size >= 0 && info.st_size <= 32 * 1024 * 1024, "sealed_executor_identity")
+        let handle = FileHandle(fileDescriptor: fd, closeOnDealloc: false)
+        let data = try handle.read(upToCount: Int(info.st_size) + 1) ?? Data()
+        try require(data.count == info.st_size, "sealed_executor_size")
+        return sha256Hex(data)
+    }
+
+    private func verifySealedExecutors() throws {
+        guard let value = operation else { throw BrokerFailure.rejected("operation_missing_unknown") }
+        let activationHash = try executionHash(value.activationExecutable)
+        let nixEnvHash = try executionHash(value.nixEnvExecutable)
+        try require(activationHash == value.activationHash, "sealed_activation_drift")
+        try require(nixEnvHash == value.nixEnvHash, "sealed_nix_env_drift")
+    }
+
+    private func publishCommittedAudit(_ record: AuditRecord, policy: BrokerPolicy) throws {
         do {
             try auditWriter.write(record, directory: physical(policy.installedPaths.audit),
                                   suffix: "result", maximumBytes: policy.audit.maxRecordBytes)
+            try persistOperation("complete")
         } catch {
-            let rollback = rollbackAndVerify(previous, executable: activationExecutable, policy: policy)
-            if rollback.commandStatus != 0 {
-                throw BrokerFailure.rejected("final_audit_failed_rollback_command_failed")
-            }
-            if !rollback.verified {
-                throw BrokerFailure.rejected("final_audit_failed_rollback_verification_failed")
-            }
-            throw BrokerFailure.rejected("final_audit_failed_rolled_back")
+            // A renamed applied audit may already be visible. The durable
+            // operational commit is never inverted merely to repair logging.
+            try? persistOperation("audit_incomplete")
+            throw BrokerFailure.rejected("applied_audit_incomplete_needs_reconcile")
         }
+    }
+
+    private func reconcileOperation(_ pending: ApplyOperation, lease: ApplyOperationLease,
+                                    commit: String, policy: BrokerPolicy, policyHash: String) throws -> Int32 {
+        try require(pending.commit == commit && pending.policyHash == policyHash,
+                    "operation_pending_different_identity")
+        operation = pending
+        if pending.phase == "sealed" {
+            let current = try currentGeneration(policy)
+            try require(current.identifier == pending.previousIdentifier && current.targetLogical == pending.previousTarget,
+                        "sealed_prestate_drift_unknown")
+            try validateCurrentSystem(current)
+            try persistOperation("rollback_verified")
+            throw BrokerFailure.rejected("interrupted_before_mutation_reconciled_no_apply")
+        }
+        if pending.phase == "profile_ready" {
+            let current = try currentGeneration(policy)
+            try require(current.identifier == pending.targetIdentifier && current.targetLogical == pending.target,
+                        "interrupted_profile_foreign_unknown")
+            let previousPhysical = try validateClosureFilesystem(pending.previousTarget, policy: policy)
+            let previous = GenerationState(identifier: pending.previousIdentifier,
+                targetLogical: pending.previousTarget, targetPhysical: previousPhysical)
+            // profile_ready is durable only after --set has settled, and before
+            // activation can spawn. Reconcile this owned intermediate state only
+            // while the running system is still the exact previous generation.
+            try validateCurrentSystem(previous)
+            try verifySealedExecutors()
+            return try failAfterMutation("interrupted_profile_reconciled", status: 70,
+                identifier: pending.identifier, caller: pending.caller, commit: pending.commit,
+                policyHash: pending.policyHash, previous: previous, target: pending.targetIdentifier,
+                rollbackExecutable: pending.activationExecutable, policy: policy)
+        }
+        // Only the durable commit attests settled activation. Matching symlinks
+        // alone cannot establish completion or payload recovery after a crash.
+        try require(["committed", "audit_incomplete"].contains(pending.phase),
+                    "operation_unknown_requires_owner_reconciliation_" + pending.phase)
+        let receiptPath = policy.installedPaths.staging + "/" + pending.identifier + "/apply-receipt.json"
+        let bytes = try readTrustedFile(receiptPath, exactMode: 0o400, maximumBytes: 8192)
+        try require(sha256Hex(bytes) == pending.receiptHash, "operation_receipt_drift")
+        let receipt = try ApplyReceipt.decodeStrict(bytes)
+        try require(receipt.controlCommit == pending.commit && receipt.controlTree == pending.tree &&
+                    receipt.policyHash == pending.policyHash && receipt.targetSystemPath == pending.target,
+                    "operation_seal_drift")
+        _ = try validateTargetClosure(receipt, expectedCommit: pending.commit, policy: policy)
+        try verifySealedExecutors()
+        let current = try currentGeneration(policy)
+        try require(current.identifier == pending.targetIdentifier && current.targetLogical == pending.target,
+                    "operation_committed_state_drift_unknown")
+        try validateCurrentSystem(current)
+        let record = auditRecord(pending.identifier,
+            outcome: pending.previousTarget == pending.target ? "already_current" : "applied",
+            status: 0, caller: pending.caller, commit: pending.commit, policyHash: pending.policyHash,
+            previous: pending.previousIdentifier, target: pending.targetIdentifier, policy: policy)
+        try publishCommittedAudit(record, policy: policy)
         return 0
+    }
+
+    public func inspectOperation() throws -> [String: String] {
+        let (policy, hash) = try loadPolicy()
+        try require(hash == expectedPolicyHash, "policy_hash_drift")
+        let path = policy.installedPaths.staging + "/operation.json"
+        guard pathExists(path) else { return ["state": "no_operation", "system_mutations_performed": "false"] }
+        let bytes = try readTrustedFile(path, exactMode: 0o600, maximumBytes: 16384)
+        let value = try ApplyOperation.decodeStrict(bytes)
+        try validateCommit(value.commit)
+        var report = ["state": value.phase, "operation_id": value.identifier,
+                "applied_target_revision": value.commit, "source_drift": String(value.sourceDrift),
+                "generation_recovery_is_payload_recovery": "false",
+                "system_mutations_performed": "false",
+                "next_action": ["committed", "audit_incomplete", "profile_ready", "sealed"].contains(value.phase)
+                    ? "repeat_exact_apply_system_commit_to_reconcile_without_duplicate_apply"
+                    : (["complete", "rollback_verified", "resumed"].contains(value.phase) ? "none"
+                       : (value.phase == "resume_committed" ? "fresh_authenticated_exact_target_resume_audit_only"
+                          : (value.schema == 1 ? "schema1_unknown_requires_separate_reviewed_migration"
+                             : "owner_disable_reboot_then_fresh_authenticated_exact_target_resume")))]
+        if value.schema == 2 {
+            report.merge(["schema": "2", "operation_seal_sha256": try value.sealSHA256(),
+                "staged_receipt_sha256": value.receiptHash, "policy_hash": value.policyHash,
+                "original_boot_generation": value.bootGeneration ?? "",
+                "last_attempt_boot_generation": value.lastAttemptBoot ?? value.bootGeneration ?? "",
+                "resume_attempt_count": String(value.resumeAttemptCount ?? 0),
+                "current_boot_generation": try validatedBootGeneration(),
+                "previous_target_path": value.previousTarget, "previous_nar_hash": value.previousNarHash ?? "",
+                "target_path": value.target, "target_nar_hash": value.targetNarHash ?? "",
+                "previous_generation_identifier": value.previousIdentifier, "target_generation_identifier": value.targetIdentifier,
+                "target_revision": value.commit, "previous_revision": value.previousRevision ?? ""]) { _, new in new }
+        }
+        return report
+    }
+
+    /// Called only by the compiled fresh-standard-sudo emergency action while
+    /// its emergency lock is held. This authorizes a NEW exact-target attempt;
+    /// it does not assert that old effects or arbitrary payload data were restored.
+    public func resumeInterruptedOperation(commit: String) throws -> String {
+        try validateCommit(commit)
+        try require(context.effectiveUID == 0 && context.realUID != 0, "resume_owner_root_required")
+        let (policy, policyHash) = try loadPolicy()
+        try require(policyHash == expectedPolicyHash && !policy.preparationOnly && policy.apply.applyGateAccepted,
+                    "resume_policy_binding")
+        try validateInstalledContract(policy, policyHash: policyHash, includeCurrentExecutable: false, disabled: true)
+        let lease = try ApplyOperationLease(directory: physical(policy.installedPaths.staging), uid: context.trustedUID)
+        operationLease = lease
+        defer { operation = nil; operationLease = nil }
+        guard let pending = try lease.read() else { throw BrokerFailure.rejected("resume_operation_missing") }
+        try require(pending.schema == 2, "schema1_unknown_requires_separate_reviewed_migration")
+        try require(pending.commit == commit && pending.policyHash == policyHash, "resume_operation_binding")
+        try require(!["complete", "rollback_verified"].contains(pending.phase), "resume_operation_already_settled")
+        operation = pending
+        let boot = try validatedBootGeneration()
+        let auditOnly = ["resume_committed", "resumed"].contains(pending.phase)
+        if !auditOnly {
+            try require((pending.lastAttemptBoot ?? pending.bootGeneration) != boot, "resume_requires_changed_last_attempt_boot")
+            try require((pending.resumeAttemptCount ?? 0) < 16, "resume_attempt_limit_owner_handoff")
+        }
+        let receiptPath = policy.installedPaths.staging + "/" + pending.identifier + "/apply-receipt.json"
+        let original = try readTrustedFile(receiptPath, exactMode: 0o400, maximumBytes: 8192)
+        try require(sha256Hex(original) == pending.receiptHash, "resume_original_receipt_drift")
+        let receipt = try ApplyReceipt.decodeStrict(original)
+        try require(receipt.controlCommit == commit && receipt.controlTree == pending.tree &&
+                    receipt.policyHash == policyHash && receipt.targetSystemPath == pending.target &&
+                    receipt.targetSystemNarHash == pending.targetNarHash, "resume_original_binding")
+        let targetPhysical = try validateTargetClosure(receipt, expectedCommit: commit, policy: policy)
+        let previousPhysical = try validateClosureFilesystem(pending.previousTarget, policy: policy)
+        try validateClosureRevision(pending.previousTarget, expectedCommit: pending.previousRevision!, policy: policy)
+        let previousNar = try observedNarHash(pending.previousTarget, policy: policy)
+        try require(previousNar == pending.previousNarHash, "resume_previous_closure_drift")
+        try verifySealedExecutors()
+
+        // These reviewed generated guards were not present in historical targets.
+        // Fresh authentication cannot upgrade an immutable old activation script.
+        let activation = String(decoding: try readImmutableStoreFile(pending.target + "/activate",
+            policy: policy, maximumBytes: 1024 * 1024), as: UTF8.self)
+        for marker in ["aid-admin-resume-windows-marker-guards-v1", "aid-admin-resume-rustdesk-marker-guards-v1"] {
+            try require(activation.contains(marker), "resume_target_entry_guards_unavailable")
+        }
+        try validateResumeStaging()
+        let jobs = ResumeLaunchdVerifier(context: context, runner: runner, environment: policy.environment)
+        try jobs.validateInventory(target: pending.target, previous: pending.previousTarget)
+        let home = ResumeHomeManagerVerifier(context: context, runner: runner, environment: policy.environment)
+        try home.validateInventory(target: pending.target)
+        // The original hook itself contains rsync --delete. Refuse divergent
+        // owner additions BEFORE replay, not merely after its destructive hook.
+        try home.converge(target: pending.target, beforeRepair: {
+            throw BrokerFailure.rejected("resume_home_prestate_no_repair")
+        })
+
+        func checkCapturedPrestate() throws -> [String: String] {
+            let targets = try generationTargets(policy)
+            try require(targets[pending.previousIdentifier] == previousPhysical, "resume_previous_generation_drift")
+            let current = try currentGeneration(policy)
+            try require((current.identifier == pending.previousIdentifier && current.targetPhysical == previousPhysical) ||
+                        (current.targetPhysical == targetPhysical &&
+                         (pending.targetIdentifier == "pending" || current.identifier == pending.targetIdentifier)),
+                        "resume_foreign_profile")
+            let running = try canonicalPhysical("/run/current-system", allowSymlink: true)
+            try require(running == previousPhysical || running == targetPhysical, "resume_foreign_running_system")
+            return targets
+        }
+        func verifyAppliedState() throws {
+            try recheckImmutableInputs(policy: policy, policyHash: policyHash, repository: "", commit: commit,
+                controlTree: pending.tree, stagedReceiptPath: receiptPath, stagedHash: pending.receiptHash,
+                receipt: receipt, checkRepository: false)
+            try verifySealedExecutors()
+            try validateInstalledContract(policy, policyHash: policyHash, includeCurrentExecutable: false, disabled: true)
+            let current = try currentGeneration(policy)
+            try require(current.identifier == operation?.targetIdentifier && current.targetPhysical == targetPhysical,
+                        "resume_post_apply_profile_mismatch")
+            try validateCurrentSystem(current)
+            let finalBoot = try validatedBootGeneration()
+            try require(finalBoot == boot, "resume_boot_drift")
+            try validateResumeStaging()
+        }
+        func publishResumeAudit() throws {
+            let record = auditRecord(pending.identifier, outcome: "resumed_applied", status: 0,
+                caller: pending.caller, commit: commit, policyHash: policyHash,
+                previous: pending.previousIdentifier, target: operation!.targetIdentifier, policy: policy)
+            do {
+                try auditWriter.write(record, directory: physical(policy.installedPaths.audit),
+                    suffix: "resume-" + String(operation!.resumeAttemptCount!) + "-result", maximumBytes: policy.audit.maxRecordBytes)
+                try persistOperation("resumed")
+            } catch {
+                throw BrokerFailure.rejected("resumed_applied_audit_incomplete_disabled")
+            }
+        }
+        if auditOnly {
+            try verifyAppliedState()
+            try jobs.converge(target: pending.target, previous: pending.previousTarget, beforeBootstrap: {
+                throw BrokerFailure.rejected("resumed_committed_job_drift_no_mutation")
+            })
+            try home.converge(target: pending.target, beforeRepair: {
+                throw BrokerFailure.rejected("resumed_committed_home_drift_no_mutation")
+            })
+            try verifyAppliedState()
+            if pending.phase == "resume_committed" { try publishResumeAudit() }
+            return "OPERATION_RESUMED_DISABLED"
+        }
+
+        let beforeTargets = try checkCapturedPrestate()
+        let matching = beforeTargets.filter { $0.value == targetPhysical }.map { $0.key }
+        try require(matching.count <= 1, "resume_ambiguous_target_generation")
+        if pending.targetIdentifier != "pending" {
+            try require(matching == [pending.targetIdentifier], "resume_recorded_target_generation_drift")
+        }
+        let latestBoot = try validatedBootGeneration()
+        try require(latestBoot == boot, "resume_boot_drift")
+        try validateInstalledContract(policy, policyHash: policyHash, includeCurrentExecutable: false, disabled: true)
+        operation?.lastAttemptBoot = boot
+        operation?.resumeAttemptCount = (pending.resumeAttemptCount ?? 0) + 1
+        if let existing = matching.first { operation?.targetIdentifier = existing }
+        let pre = auditRecord(pending.identifier, outcome: "resume_authorized", status: 0,
+            caller: pending.caller, commit: commit, policyHash: policyHash,
+            previous: pending.previousIdentifier, target: operation!.targetIdentifier, policy: policy)
+        try auditWriter.write(pre, directory: physical(policy.installedPaths.audit),
+            suffix: "resume-" + String(operation!.resumeAttemptCount!) + "-pre", maximumBytes: policy.audit.maxRecordBytes)
+        // Durable latest-attempt boot BEFORE any profile/activation/corrective job mutation.
+        try persistOperation("resume_pending")
+        do {
+            _ = try checkCapturedPrestate()
+            try verifySealedExecutors()
+            if matching.isEmpty {
+                let set = try runner.run(executable: pending.nixEnvExecutable,
+                    arguments: ["--profile", policy.apply.profilePath, "--set", pending.target],
+                    environment: policy.environment)
+                try require(set.status == 0, "resume_profile_update_failed")
+                let current = try currentGeneration(policy)
+                let after = try generationTargets(policy)
+                let created = Set(after.keys).subtracting(beforeTargets.keys)
+                try require(current.targetPhysical == targetPhysical && created == [current.identifier],
+                            "resume_profile_allocation_mismatch")
+                operation?.targetIdentifier = current.identifier
+                try persistOperation("resume_pending")
+            }
+            try verifySealedExecutors()
+            // Pre-audit/journal/profile I/O must not leave a stale admission for
+            // upstream's copy-if-different job transition or a foreign plist.
+            try jobs.validateInventory(target: pending.target, previous: pending.previousTarget)
+            try home.converge(target: pending.target, beforeRepair: {
+                throw BrokerFailure.rejected("resume_home_prestate_no_repair")
+            })
+            // Deliberately no already-current fast path. Pinned darwin-rebuild
+            // switches the numbered profile and executes its activate script.
+            let result = try runner.run(executable: pending.activationExecutable,
+                arguments: policy.apply.activationArguments + [operation!.targetIdentifier],
+                environment: activationEnvironment(policy))
+            try require(result.status == 0, "resume_activation_failed")
+            try verifyAppliedState()
+            try jobs.converge(target: pending.target, previous: pending.previousTarget, beforeBootstrap: {
+                try self.verifySealedExecutors()
+                try self.persistOperation("resume_pending")
+            })
+            try home.converge(target: pending.target, beforeRepair: {
+                try self.verifySealedExecutors()
+                try self.persistOperation("resume_pending")
+            })
+            try verifyAppliedState()
+        } catch {
+            // New attempt failure is not evidence that either generation's
+            // effects were restored; never invoke the old inverse here.
+            try? persistOperation("unknown")
+            throw BrokerFailure.rejected("resume_failed_or_unknown_disabled:" + String(describing: error))
+        }
+        // If this publication itself is uncertain, retain the visible journal;
+        // never overwrite a possibly committed state with rollback/UNKNOWN.
+        try persistOperation("resume_committed")
+        try publishResumeAudit()
+        return "OPERATION_RESUMED_DISABLED"
+    }
+
+    private func validateResumeStaging() throws {
+        let applications = physical("/Applications")
+        if pathExists("/Applications") {
+            let names = try FileManager.default.contentsOfDirectory(atPath: applications)
+            try require(!names.contains(where: { $0.hasPrefix(".gametomac-stage.") }),
+                        "resume_gametomac_retained_stage_owner_handoff")
+        }
     }
 
     private func failAfterMutation(_ failure: String, status: Int32, identifier: String,
                                    caller: String, commit: String, policyHash: String,
                                    previous: GenerationState, target: String,
                                    rollbackExecutable: String, policy: BrokerPolicy) throws -> Int32 {
+        // Compare before inverse: never roll back a foreign generation or closure.
+        guard let owned = operation else { throw BrokerFailure.rejected("operation_missing_unknown") }
+        let current = try currentGeneration(policy)
+        try require((current.identifier == previous.identifier && current.targetLogical == previous.targetLogical) ||
+                    (current.targetLogical == owned.target && (target == "pending" || target == "unknown" || current.identifier == target)),
+                    "foreign_generation_unknown_no_rollback")
+        let previousLink = try canonicalPhysical(policy.apply.profilePath + "-" + previous.identifier + "-link",
+                                                 allowSymlink: true)
+        try require(previousLink == previous.targetPhysical, "previous_generation_drift_unknown_no_rollback")
+        let running = try canonicalPhysical("/run/current-system", allowSymlink: true)
+        try require(running == previous.targetPhysical || running == physical(owned.target),
+                    "foreign_running_system_unknown_no_rollback")
+        try verifySealedExecutors()
+        try persistOperation("rollback_pending")
         let rollback = rollbackAndVerify(previous, executable: rollbackExecutable, policy: policy)
         let outcome: String
         if rollback.commandStatus != 0 {
@@ -704,6 +1161,8 @@ public final class AidAdminBroker {
         } else {
             outcome = failure + "_rolled_back"
         }
+        // This attests generation links only, never restoration of payload data.
+        try persistOperation(rollback.commandStatus == 0 && rollback.verified ? "rollback_verified" : "unknown")
         let record = auditRecord(identifier, outcome: outcome, status: status, caller: caller,
                                  commit: commit, policyHash: policyHash, previous: previous.identifier,
                                  target: target, policy: policy)
@@ -758,11 +1217,13 @@ public final class AidAdminBroker {
     private func recheckImmutableInputs(policy: BrokerPolicy, policyHash: String,
                                         repository: String, commit: String, controlTree: String,
                                         stagedReceiptPath: String, stagedHash: String,
-                                        receipt: ApplyReceipt) throws {
+                                        receipt: ApplyReceipt, checkRepository: Bool = true) throws {
         let (_, secondPolicyHash) = try loadPolicy()
         try require(secondPolicyHash == policyHash, "policy_hash_drift")
-        let secondTree = try validateRepository(repository, commit: commit, policy: policy)
-        try require(secondTree == controlTree, "control_tree_drift")
+        if checkRepository {
+            let secondTree = try validateRepository(repository, commit: commit, policy: policy)
+            try require(secondTree == controlTree, "control_tree_drift")
+        }
         let secondBytes = try readTrustedFile(stagedReceiptPath, exactMode: 0o400, maximumBytes: 8192)
         let secondReceipt = try ApplyReceipt.decodeStrict(secondBytes)
         try require(sha256Hex(secondBytes) == stagedHash && secondReceipt == receipt,
@@ -771,12 +1232,17 @@ public final class AidAdminBroker {
     }
 
     private func validateInstalledContract(_ policy: BrokerPolicy, policyHash: String,
-                                           includeCurrentExecutable: Bool) throws {
+                                           includeCurrentExecutable: Bool, disabled: Bool = false) throws {
         let binary = try readTrustedFile(policy.installedPaths.binary, exactMode: 0o555,
                                          maximumBytes: 32 * 1024 * 1024)
         let installedPolicy = try readTrustedFile(policy.installedPaths.policy, exactMode: 0o444,
                                                   maximumBytes: 64 * 1024)
-        let sudoers = try readTrustedFile(policy.installedPaths.sudoers, exactMode: 0o440,
+        if disabled {
+            try require(!pathExists(policy.installedPaths.sudoers), "reconciliation_requires_disabled_grant")
+            let marker = try readTrustedFile(policy.installedPaths.emergencyDisable, exactMode: 0o400, maximumBytes: 128)
+            try require(marker == Data("agent-first-mac-aid-admin-disabled-v1\n".utf8), "reconciliation_disable_marker")
+        }
+        let sudoers = try readTrustedFile(policy.installedPaths.sudoers + (disabled ? ".disabled" : ""), exactMode: 0o440,
                                           maximumBytes: 4096)
         let attestationData = try readTrustedFile(policy.installedPaths.attestation, exactMode: 0o400,
                                                   maximumBytes: 4096)
@@ -965,6 +1431,8 @@ public final class AidAdminBroker {
         try validateGenerationIdentifier(identifier)
         let generationLogical = policy.apply.profilePath + "-" + identifier + "-link"
         let targetPhysical = try canonicalPhysical(generationLogical, allowSymlink: true)
+        let actualProfileTarget = try canonicalPhysical(policy.apply.profilePath, allowSymlink: true)
+        try require(actualProfileTarget == targetPhysical, "profile_link_resolution_drift")
         try require(targetPhysical.hasPrefix(physical(policy.apply.storeRoot) + "/"),
                     "generation_target_escape")
         let targetLogical = logicalFromPhysical(targetPhysical)
@@ -1201,6 +1669,10 @@ public final class AidAdminBroker {
         let logical = root + "/" + identifier
         try require(mkdir(physical(logical), 0o700) == 0, "staging_create_failed")
         try validateDirectory(logical, exactMode: 0o700)
+        let parent = Darwin.open(physical(root), O_RDONLY | O_DIRECTORY | O_NOFOLLOW)
+        try require(parent >= 0, "staging_parent_open")
+        defer { Darwin.close(parent) }
+        try require(fsync(parent) == 0, "staging_parent_sync")
         return logical
     }
 
@@ -1218,6 +1690,11 @@ public final class AidAdminBroker {
             offset += count
         }
         try require(fsync(fd) == 0, "staging_write_failed")
+        let parentPath = URL(fileURLWithPath: physical(logicalPath)).deletingLastPathComponent().path
+        let parent = Darwin.open(parentPath, O_RDONLY | O_DIRECTORY | O_NOFOLLOW)
+        try require(parent >= 0, "staging_receipt_parent_open")
+        defer { Darwin.close(parent) }
+        try require(fsync(parent) == 0, "staging_receipt_parent_sync")
     }
 
     private func validateActionID(_ value: String) throws {

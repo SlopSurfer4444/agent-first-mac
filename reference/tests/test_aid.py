@@ -5,6 +5,8 @@ import json
 import os
 from pathlib import Path
 import sys
+import subprocess
+import tempfile
 from types import SimpleNamespace
 import unittest
 from unittest.mock import Mock, patch
@@ -36,6 +38,10 @@ class Adapter:
     def doctor(self, section):
         self.calls.append(("doctor", section))
         raise SystemExit(37)  # deterministic stand-in for process replacement
+
+    def maintenance(self, operation, json_output):
+        self.calls.append(("maintenance", operation, json_output))
+        raise SystemExit(37)
 
 
 class AidTests(unittest.TestCase):
@@ -76,6 +82,45 @@ class AidTests(unittest.TestCase):
             A.main(["doctor"], adapter_factory=lambda: adapter)
         self.assertEqual(adapter.calls, [("doctor", "current")])
 
+    def test_maintenance_views_dispatch_without_catalog_or_output_translation(self):
+        for operation in ("status", "schedule-status"):
+            for options in ([], ["--json"]):
+                adapter, output = Adapter(), []
+                with self.assertRaises(SystemExit) as stopped:
+                    A.main(["maintenance", operation, *options], adapter_factory=lambda: adapter, emit=output.append)
+                self.assertEqual(stopped.exception.code, 37)
+                self.assertEqual(adapter.calls, [("maintenance", operation, bool(options))])
+                self.assertEqual(output, [])
+
+    def test_maintenance_closed_grammar_denies_mutations_and_overrides_before_io(self):
+        arguments = [["maintenance", name] for name in (
+            "cycle", "scheduled", "install", "remove", "repair", "recover", "plan",
+            "schedule-install", "schedule-remove", "schedule-recover", "schedule-plan",
+            "unknown", "status;command", "../status")]
+        arguments += [["maintenance"], ["maintenance", "--json", "status"],
+            ["maintenance", "status", "--json", "--json"],
+            ["maintenance", "status", "--root", "/tmp"],
+            ["maintenance", "schedule-status", "--section", "current"],
+            ["maintenance", "status", "--apply"], ["maintenance", "status", True],
+            ["maintenance", "status", "schedule-status"]]
+        for args in arguments:
+            with self.subTest(args=args):
+                self.assertEqual(A.main(args, adapter_factory=lambda: self.fail("unexpected IO"), emit=lambda _: None), 2)
+
+    def test_maintenance_exec_failure_or_unexpected_return_is_not_success(self):
+        for effect in (OSError("private launch error"), None):
+            output = []
+            with patch.object(Adapter, "maintenance", side_effect=effect, return_value=0):
+                self.assertEqual(A.main(["maintenance", "status"], adapter_factory=Adapter, emit=output.append), 1)
+            self.assertEqual(json.loads(output[0])["status"], "UNKNOWN")
+            self.assertNotIn("private", "".join(output))
+
+    def test_maintenance_help_distinguishes_latest_observation_from_schedule(self):
+        self.assertIn("aid maintenance status [--json]", A.HELP)
+        self.assertIn("aid maintenance schedule-status [--json]", A.HELP)
+        self.assertIn("does not run a new capture", A.HELP)
+        self.assertIn("does not prove a completed cycle", A.HELP)
+
     def test_inventory_is_explicit_declared_only_without_installed_or_acceptance_claim(self):
         adapter = Adapter()
         output = []
@@ -89,18 +134,39 @@ class AidTests(unittest.TestCase):
         self.assertEqual(adapter.calls, ["catalog"])
         self.assertNotIn("workflow", value)
 
-    def test_plan_is_fixed_nonexecutable_workflow_not_actual_diff(self):
+    def test_plan_is_scoped_nonexecutable_routing_not_universal_root_workflow(self):
         value = fixture_catalog()
         value["items"][0]["lifecycle"] = "Metadata; no invocation"
         adapter = Adapter(raw(value))
         output = []
         self.assertEqual(A.main(["plan", "--json"], adapter_factory=lambda: adapter, emit=output.append), 0)
         report = json.loads(output[0])
-        self.assertEqual(report["workflow"], list(A.WORKFLOW))
+        self.assertEqual(report["routingHelp"], {name: list(steps) for name, steps in A.ROUTES.items()})
+        self.assertIsNone(report["selectedScope"])
+        self.assertNotIn("workflow", report)
         self.assertFalse(report["executablePlan"] or report["freshObservation"])
         self.assertEqual(adapter.calls, ["catalog"])
-        for word in ("Review", "Build", "broker", "Verify", "rollback"):
-            self.assertIn(word, " ".join(report["workflow"]))
+        for scope in ("project", "workstation"):
+            adapter = Adapter()
+            output = []
+            self.assertEqual(A.main(["plan", "--json", "--scope", scope],
+                                   adapter_factory=lambda: adapter, emit=output.append), 0)
+            scoped = json.loads(output[0])
+            self.assertEqual(scoped["routingHelp"], {scope: list(A.ROUTES[scope])})
+            self.assertEqual(scoped["selectedScope"], scope)
+            text = " ".join(scoped["routingHelp"][scope])
+            for forbidden in ("aid-admin", "acceptance-child", "independently accept", "Build the exact"):
+                self.assertNotIn(forbidden, text)
+            self.assertEqual(adapter.calls, ["catalog"])
+        self.assertIn("typed aid-admin", " ".join(A.ROUTES["protected"]))
+        self.assertIn("native", " ".join(A.ROUTES["protected"]).lower())
+
+    def test_scope_help_rejects_mutation_and_unknown_scopes_without_io(self):
+        for args in (["plan", "--scope", "root-apply"], ["plan", "--scope"],
+                     ["inventory", "--scope", "project"], ["plan", "--scope", "project", "--json"],
+                     ["plan", "--json", "--scope", "project", "--apply"]):
+            self.assertEqual(A.main(args, adapter_factory=lambda: self.fail("unexpected IO"),
+                                    emit=lambda _: None), 2)
 
     def test_human_inventory_and_plan_remain_explicit(self):
         for command in ("inventory", "plan"):
@@ -168,6 +234,56 @@ class AidTests(unittest.TestCase):
 
 
 class NativeAidTests(unittest.TestCase):
+    def test_maintenance_exact_vectors_preserve_context_and_only_known_operations(self):
+        self.assertEqual(A.MAINTENANCE, {
+            "status": ("bin/workstation-maintenance-cycle", "status"),
+            "schedule-status": ("bin/workstation-maintenance-cycle", "schedule-status"),
+        })
+        native = A.Native.__new__(A.Native)
+        native.root = "/fixture/AIDev/control"
+        for operation in A.MAINTENANCE:
+            for as_json in (False, True):
+                with self.subTest(operation=operation, as_json=as_json):
+                    context = {"TERM": "fixture", "PATH": "/fixture/bin"}
+                    def execute(executable, argv):
+                        self.assertEqual(dict(os.environ), context)
+                        raise SystemExit(3)
+                    with patch.dict(os.environ, context, clear=True), patch.object(A.os, "chdir") as chdir, \
+                            patch.object(A.os, "execve", side_effect=AssertionError("no environment replacement")), \
+                            patch.object(A.os, "execv", side_effect=execute) as call:
+                        with self.assertRaises(SystemExit):
+                            native.maintenance(operation, as_json)
+                    chdir.assert_called_once_with(native.root)
+                    call.assert_called_once_with("/usr/bin/python3", ("/usr/bin/python3",
+                        native.root + "/bin/workstation-maintenance-cycle", operation, *(("--json",) if as_json else ())))
+        for operation, as_json in (("cycle", False), ("schedule-install", True), ("status", 1), (None, False)):
+            with patch.object(A.os, "chdir") as chdir, patch.object(A.os, "execv") as call:
+                with self.assertRaises(A.AidError): native.maintenance(operation, as_json)
+                chdir.assert_not_called(); call.assert_not_called()
+
+    def test_real_process_replacement_preserves_native_text_json_and_nonzero_exit(self):
+        with tempfile.TemporaryDirectory(dir="/private/tmp") as directory:
+            fixture = Path(directory)
+            (fixture / "bin").mkdir()
+            (fixture / "bin/workstation-maintenance-cycle").write_text(
+                'import sys\nprint(\'{"status":"STALE","fixture":true}\' if "--json" in sys.argv else "Native fixture: STALE")\n'
+                'raise SystemExit(3)\n')
+            code = '''import importlib.machinery,sys
+A=importlib.machinery.SourceFileLoader("fixture_aid",sys.argv[1]).load_module()
+native=A.Native.__new__(A.Native); native.root=sys.argv[2]
+raise SystemExit(A.main(sys.argv[3:],adapter_factory=lambda:native))
+'''
+            for operation in ("status", "schedule-status"):
+                for options in ([], ["--json"]):
+                    result = subprocess.run([sys.executable, "-I", "-B", "-c", code, str(ROOT / "bin/aid"),
+                        str(fixture), "maintenance", operation, *options], stdin=subprocess.DEVNULL,
+                        stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=10,
+                        env={"PATH": "/usr/bin:/bin", "TMPDIR": "/private/tmp"})
+                    self.assertEqual(result.returncode, 3, result.stderr)
+                    self.assertEqual(result.stderr, b"")
+                    self.assertEqual(result.stdout, b'{"status":"STALE","fixture":true}\n' if options
+                        else b"Native fixture: STALE\n")
+
     def test_mac_launcher_uses_system_shell_without_metadata_repair(self):
         source = (ROOT / "darwin/aid.nix").read_text()
         self.assertIn('aidLauncher = pkgs.writeTextFile {', source)
@@ -188,6 +304,7 @@ class NativeAidTests(unittest.TestCase):
     def test_each_fixed_exec_vector_preserves_the_callers_environment(self):
         expected = {
             "current": ("bin/current-doctor", "--json"),
+            "root": ("bin/root-runtime-doctor", "--json"),
             "revision": ("bin/system-revision-status", "--json"),
             "productivity": ("bin/productivity-doctor", "--manifest"),
             "tailscale": ("bin/tailscale-windows-host-doctor", "--installed"),

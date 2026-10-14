@@ -3,6 +3,7 @@ import hashlib,importlib.machinery,importlib.util,json,os,shutil,stat,subprocess
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
+from lib import operation_readiness as readiness
 P=Path(__file__).resolve().parents[1];COMMIT='a'*40
 loader=importlib.machinery.SourceFileLoader('launch_update',str(P/'bin/game-launch-reliability-update'));spec=importlib.util.spec_from_loader(loader.name,loader);u=importlib.util.module_from_spec(spec);loader.exec_module(u)
 class Tests(unittest.TestCase):
@@ -33,6 +34,8 @@ class Tests(unittest.TestCase):
             self.put('source/'+rel,new,0o755);self.source_files[rel]=u.digest(new)
             self.put('candidate/'+u.CANDIDATE_FILES[key],new,0o600 if key=='helper' else 0o755 if key in ('hub.launcher','cs2.launcher') else 0o700)
         self.put('source/bin/game-app-launcher.m',b'reviewed native source');self.source_files['bin/game-app-launcher.m']=u.digest(b'reviewed native source')
+        for name in u.LIBRARY_SOURCES:
+            self.put('source/'+name,('reviewed '+name).encode());self.source_files[name]=u.digest(('reviewed '+name).encode())
         self.new_native['sourceSha256']=self.source_files['bin/game-app-launcher.m'];self.new_native['previousPolicySha256']=old_policy;self.native_raw=u.encode(self.new_native);self.put('source/'+u.NATIVE_POLICY,self.native_raw)
         for name,owner,launcher_key in (('hub','control-games-hub','hub.launcher'),('ds3','control-ds3-marshal-fix','ds3.lifecycle'),('cs2','control-cs2-standalone','cs2.launcher')):
             root=self.mapping[name]
@@ -61,8 +64,20 @@ class Tests(unittest.TestCase):
         for key,value in values.items():fixture_patch=patch.object(u,key,value);fixture_patch.start();self.addCleanup(fixture_patch.stop)
         self.doctor={'verdict':'PASS','gitOnly':False,'configurationSourceAccepted':True,'currentSentinelReady':True,'integratedMain':True};self.head=COMMIT;self.branch='main';self.dirty='';self.active=False
         fixture_patch=patch.object(u.subprocess,'run',self.command);fixture_patch.start();self.addCleanup(fixture_patch.stop)
+        fixture_patch=patch.object(u,'operation_ready',self.readiness);fixture_patch.start();self.addCleanup(fixture_patch.stop)
         self.before=self.images();self.pin=u.operate('plan',COMMIT)['planSha256']
-        self.assertEqual(sum(argv[0].endswith('current-doctor') for argv,_ in self.calls),1)
+        self.assertEqual(sum(argv[0]=='operation-readiness' for argv,_ in self.calls),1)
+    def readiness(self,commit,operation,checks,target_guard):
+        self.calls.append((['operation-readiness',operation],{}))
+        import fcntl
+        for rel in ('cs2/.launcher.lock','state/games-hub.lock'):
+            with self.path(rel).open('rb') as other:
+                with self.assertRaises(BlockingIOError):fcntl.flock(other,fcntl.LOCK_EX|fcntl.LOCK_NB)
+        try:return readiness.evaluate(operation,commit,checks=checks,target_guard=target_guard,
+            source_guard=lambda:self.doctor['configurationSourceAccepted'] is True and self.head==commit and self.branch=='main' and not self.dirty)
+        except RuntimeError as error:
+            if type(error) is RuntimeError:raise u.Blocked(str(error)) from None
+            raise
     def path(self,rel):base,inner=rel.split('/',1);return self.mapping[base]/inner
     def put(self,rel,raw,mode=0o600):
         path=self.path(rel);path.parent.mkdir(mode=0o700,parents=True,exist_ok=True);path.write_bytes(raw);path.chmod(mode)
@@ -74,6 +89,7 @@ class Tests(unittest.TestCase):
     def command(self,argv,**kwargs):
         self.calls.append((argv,kwargs))
         if argv[0]=='/usr/bin/git':
+            if 'merge-base' in argv:return SimpleNamespace(returncode=0,stdout=b'')
             tail=argv[-2:]
             value=self.head if tail==['rev-parse','HEAD'] else self.branch if tail==['branch','--show-current'] else self.dirty if tail==['status','--porcelain'] else None
             assert value is not None;return SimpleNamespace(returncode=0,stdout=(value+'\n').encode())
@@ -88,7 +104,7 @@ class Tests(unittest.TestCase):
     def recover(self,event=lambda _:None):return u.operate('recover',COMMIT,self.pin,event)
     def once(self,operation,event=lambda _:None):
         start=len(self.calls);result=u.operate(operation,COMMIT,self.pin,event)
-        self.assertEqual(sum(argv[0].endswith('current-doctor') for argv,_ in self.calls[start:]),1)
+        self.assertEqual(sum(argv[0]=='operation-readiness' for argv,_ in self.calls[start:]),1)
         return result
     def test_read_only_plan_then_apply_noop_rollback_noop_return_and_receipt_preservation(self):
         self.assertFalse((self.mapping['state']/u.NAMESPACE).exists());self.assertEqual(self.images(),self.before)
@@ -119,6 +135,36 @@ class Tests(unittest.TestCase):
                 with self.assertRaises(KeyboardInterrupt):self.rollback(interrupt)
                 with self.assertRaisesRegex(u.Blocked,'explicit_recovery_required'):self.rollback()
                 self.once('recover');self.assertEqual(self.images(),self.before)
+    def test_second_reviewed_deployment_upgrades_present_helper_and_retains_first_recovery(self):
+        self.apply();first=self.images();old_plan=self.pin
+        self.definition.update(schema=2,receiptPreimages='observed-owned',previousFiles=first,
+                               previousNativePolicySha256=self.definition['nativePolicySha256'])
+        newer=b'reviewed second helper incarnation'
+        self.put('candidate/game-launch-admission',newer,0o600);self.put('source/bin/game-launch-admission',newer,0o755)
+        self.definition['sourceFiles']['bin/game-launch-admission']=u.digest(newer)
+        self.definition['desiredFiles']['helper']=self.image('candidate/game-launch-admission')
+        self.put('source/'+u.POLICY,u.encode(self.definition));self.head='b'*40
+        with self.assertRaisesRegex(u.Blocked,'previous_settled_transaction_archive_required'):u.operate('plan',self.head)
+        self.assertEqual(self.images(),first)
+        result=u.operate('archive-settled',self.head,old_plan,old_commit=COMMIT)
+        self.assertFalse(result['installedTargetsChanged']);self.assertEqual(self.images(),first)
+        archive=self.mapping['state']/u.ARCHIVES/(COMMIT+'-'+old_plan)
+        self.assertTrue((archive/'transaction/journal.json').is_file())
+        second=u.operate('plan',self.head)['planSha256']
+        self.assertTrue(u.operate('apply',self.head,second)['changed']);self.assertFalse(u.operate('apply',self.head,second)['changed'])
+        self.assertEqual(self.path(u.TARGETS['helper']).read_bytes(),newer)
+        u.operate('rollback',self.head,second);self.assertEqual(self.images(),first)
+        u.operate('return',self.head,second);self.assertEqual(self.path(u.TARGETS['helper']).read_bytes(),newer)
+    def test_pending_or_drifted_transaction_cannot_be_archived_for_successor(self):
+        self.apply();before=self.images();self.head='b'*40
+        journal=self.mapping['state']/u.NAMESPACE/'transaction/journal.json';saved=journal.read_bytes();value=u.decode(saved)
+        value['phase']='applying';journal.write_bytes(u.encode(value))
+        with self.assertRaisesRegex(u.Blocked,'archive_requires_settlement'):u.operate('archive-settled',self.head,self.pin,old_commit=COMMIT)
+        self.assertEqual(self.images(),before);self.assertTrue(journal.exists());journal.write_bytes(saved)
+        def changed(event):
+            if event=='before-archive':self.path(u.TARGETS['hub.launcher']).write_bytes(b'foreign owned drift')
+        with self.assertRaisesRegex(u.Blocked,'archive_endpoint_drift'):u.operate('archive-settled',self.head,self.pin,changed,old_commit=COMMIT)
+        self.assertTrue(journal.exists());self.assertEqual(self.path(u.TARGETS['hub.launcher']).read_bytes(),b'foreign owned drift')
     def test_foreign_target_candidate_guard_and_rehashed_backup_are_never_overwritten(self):
         self.apply();target=self.path(u.TARGETS['hub.launcher']);target.write_bytes(b'foreign');before=self.images()
         with self.assertRaisesRegex(u.Blocked,'target_unknown_drift'):self.rollback()
@@ -127,9 +173,9 @@ class Tests(unittest.TestCase):
         backup=self.mapping['state']/u.NAMESPACE/'transaction/native-0.after';backup.write_bytes(b'foreign')
         with self.assertRaisesRegex(u.Blocked,'backup_drift'):self.rollback()
     def test_gates_reject_nonbool_source_drift_active_and_pending_before_writes(self):
-        for key,value in (('configurationSourceAccepted',1),('currentSentinelReady',False),('integratedMain',False),('gitOnly',True)):
+        for key,value in (('configurationSourceAccepted',1),('configurationSourceAccepted',False)):
             saved=self.doctor[key];self.doctor[key]=value
-            with self.assertRaisesRegex(u.Blocked,'fresh_accepted_doctor_required'):self.apply()
+            with self.assertRaisesRegex(u.Blocked,'operation_source_drift'):self.apply()
             self.doctor[key]=saved;self.assertEqual(self.images(),self.before)
         for key,value in (('head','f'*40),('branch','review'),('dirty',' M file')):
             saved=getattr(self,key);setattr(self,key,value)
@@ -155,7 +201,7 @@ class Tests(unittest.TestCase):
                 with self.assertRaisesRegex(u.Blocked,'launcher_busy'):self.apply()
             self.assertEqual(self.images(),self.before)
         self.apply();self.doctor['configurationSourceAccepted']=False
-        with self.assertRaisesRegex(u.Blocked,'fresh_accepted_doctor_required'):self.apply()
+        with self.assertRaisesRegex(u.Blocked,'operation_source_drift'):self.apply()
     def test_helper_changed_at_delete_boundary_is_retained_and_recovery_blocks(self):
         self.apply();helper=self.path(u.TARGETS['helper'])
         def change(event):
@@ -255,6 +301,13 @@ class Tests(unittest.TestCase):
         bindings={'HOME':self.home,'CONTROL':self.source,'SOURCE_PATH':self.source/'bin/games-runtime-update','HUB':self.mapping['hub'],'DS3':self.mapping['ds3'],'STATE':self.mapping['state'],'CANDIDATE':candidate,'ADMISSION':self.path(u.TARGETS['helper'])}
         patches=[patch.object(adapter,key,value) for key,value in bindings.items()]
         for active_patch in patches:active_patch.start();self.addCleanup(active_patch.stop)
+        def overlay_ready(commit,operation,checks,target_guard):
+            import fcntl
+            with self.path('state/games-hub.lock').open('rb') as other:
+                with self.assertRaises(BlockingIOError):fcntl.flock(other,fcntl.LOCK_EX|fcntl.LOCK_NB)
+            return readiness.evaluate(operation,commit,checks=checks,target_guard=target_guard,
+                                      source_guard=lambda:self.head==commit and not self.dirty)
+        scoped_patch=patch.object(adapter,'operation_ready',side_effect=overlay_ready);scoped_patch.start();self.addCleanup(scoped_patch.stop)
         with self.assertRaises(FileNotFoundError):adapter.operate('plan',COMMIT)
         self.assertEqual(self.images(),self.before)
         self.apply();launch_after=self.images();overlay_plan=adapter.operate('plan',COMMIT)['planSha256']
@@ -277,7 +330,7 @@ class Tests(unittest.TestCase):
             shutil.copytree(self.mapping['games']/name,native_only/name)
             shutil.copyfile(self.path('candidate/'+name+'/Contents/MacOS/launcher'),native_only/name/'Contents/MacOS/launcher')
         (native_only/'build.json').write_bytes(u.encode({'schema':1,'sourceSha256':self.source_files['bin/game-app-launcher.m'],'apps':self.new_native['builtApps']}))
-        with patch.object(h,'HOME',self.home),patch.object(h,'HUB',self.mapping['hub']),patch.object(h,'DS3',self.mapping['ds3']),patch.object(h,'HERE',self.source),patch.object(h,'source_gate',side_effect=u.source_gate),patch.object(h,'status'):
+        with patch.object(h,'HOME',self.home),patch.object(h,'HUB',self.mapping['hub']),patch.object(h,'DS3',self.mapping['ds3']),patch.object(h,'HERE',self.source),patch.object(h,'source_gate',side_effect=lambda commit,*_:u.source_check(commit)),patch.object(h,'status'):
             old.update(COMMIT,native_only)
             before=self.images()
             with self.assertRaisesRegex(u.Blocked,'predecessor_drift'):self.apply()
@@ -300,23 +353,18 @@ class Tests(unittest.TestCase):
             with self.assertRaisesRegex(u.Blocked,'canonical_source_required'):self.apply()
         source=(P/'bin/game-launch-reliability-update').read_text();self.assertNotIn('--root',source);self.assertNotIn('--offline-fixture-gates',source)
 
-    def test_entry_doctor_under_both_locks_and_vendor_change_observed_on_next_invocation(self):
-        import fcntl
-        real=self.command
-        def locked(argv,**kwargs):
-            if argv[0].endswith('current-doctor'):
-                for rel in ('cs2/.launcher.lock','state/games-hub.lock'):
-                    with self.path(rel).open('rb') as other:
-                        with self.assertRaises(BlockingIOError):fcntl.flock(other,fcntl.LOCK_EX|fcntl.LOCK_NB)
-            return real(argv,**kwargs)
+    def test_scoped_readiness_holds_both_locks_and_unrelated_vendor_failure_does_not_veto(self):
         def vendor_change(event):
             if event=='replaced:'+u.TARGETS['helper']:self.doctor['currentSentinelReady']=False
-        with patch.object(u.subprocess,'run',locked):self.assertTrue(self.once('apply',vendor_change)['changed'])
+        self.assertTrue(self.once('apply',vendor_change)['changed'])
+        self.assertFalse(self.once('apply')['changed'])
+        self.assertEqual(sum(argv[0].endswith('current-doctor') for argv,_ in self.calls),0)
         journal=self.mapping['state']/u.NAMESPACE/'transaction/journal.json';old=journal.read_bytes();before=self.images()
+        self.doctor['configurationSourceAccepted']=False
         for operation in ('apply','rollback','return','recover','plan'):
             start=len(self.calls)
-            with self.assertRaisesRegex(u.Blocked,'fresh_accepted_doctor_required'):u.operate(operation,COMMIT,self.pin)
-            self.assertEqual(sum(argv[0].endswith('current-doctor') for argv,_ in self.calls[start:]),1)
+            with self.assertRaisesRegex(u.Blocked,'operation_source_drift'):u.operate(operation,COMMIT,self.pin)
+            self.assertEqual(sum(argv[0]=='operation-readiness' for argv,_ in self.calls[start:]),1)
             self.assertEqual(self.images(),before);self.assertEqual(journal.read_bytes(),old)
 
     def test_local_drift_at_first_publication_blocks_before_helper(self):
@@ -333,7 +381,7 @@ class Tests(unittest.TestCase):
                         else:self.put('state/game-launch-pending.json',b'pending')
                 start=len(self.calls)
                 with self.assertRaisesRegex(u.Blocked,reason):self.apply(drift)
-                self.assertEqual(sum(argv[0].endswith('current-doctor') for argv,_ in self.calls[start:]),1)
+                self.assertEqual(sum(argv[0]=='operation-readiness' for argv,_ in self.calls[start:]),1)
                 self.assertEqual(self.images(),self.before)
                 self.head=COMMIT;self.dirty='';self.active=False;candidate.write_bytes(original)
                 pending=self.path('state/game-launch-pending.json')

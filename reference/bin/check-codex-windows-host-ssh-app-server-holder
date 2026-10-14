@@ -19,12 +19,17 @@ assert manifest["platform"] == "macOS outbound-only user LaunchAgent"
 assert manifest["dataBoundary"]["codexPrivateStateRead"] is False
 assert manifest["dataBoundary"]["rawLogsRead"] is False
 assert "require_exact_commit" in runner
-assert "wrong_task_branch" in runner
+assert "canonical_main_required" in runner
+assert "require_scoped_operation_ready" in runner
 assert "dirty_worktree" in runner
 assert "replace_receipt" in runner
 assert "launchctl\", \"bootstrap" in runner
 assert "launchctl\", \"bootout" in runner
 assert "remote_proxy_handshake_passes" in runner
+assert "validate_initialize_response" in runner
+assert "observe_launchd" in runner
+assert "holder_operation_busy" in runner
+assert "recovery_required_state_preserved" in runner
 assert "receipt_rebind_postcheck_failed_restored" in runner
 assert "CODEX_INTERNAL_APP_SERVER_REMOTE_CONTROL_DISABLED" in payload
 assert "CODEX_SSH_SKIP_APP_SERVER_BOOT" in payload

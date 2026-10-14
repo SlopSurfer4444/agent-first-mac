@@ -1,62 +1,45 @@
 # Agent-First Mac
 
-A source reference for an agent-managed Mac: desired state in Git, bounded
-privileged operations, quarantine for unknown projects, diagnostics, and
-recoverable configuration changes.
+A workstation harness that helps an agent manage a Mac without making the owner
+ask permission to use it. Ordinary development stays ordinary; persistent machine
+changes get scoped checks, explicit ownership and recoverable execution.
 
-**This is a sanitized source release, not a one-command installer.** It contains
-the implementation developed for one workstation, not that workstation's private
-history, credentials, trust decisions, recovery records, or installed binaries.
-It has not been validated as a bootstrap for a fresh Mac.
+**Public source reference, not a fresh-Mac installer.** No credentials, live trust
+configuration, private history, recovery records or installed binaries are included.
 
-## What is here
+## Start here
 
-- `reference/bin/aid`: the command facade and its diagnostic/lifecycle tools.
-- `reference/lib/`: configuration transitions, Git source admission, compatibility
-  checks, runtime discovery, and recovery logic.
-- `reference/Sources/`: Swift source for bounded administrator operations.
-- `reference/darwin/`, `reference/flake.nix`, `reference/flake.lock`: Nix/Darwin
-  configuration source and pinned inputs.
-- `reference/codex/hooks/` and `reference/skills/`: context and workstation/SSH
-  operating guidance. These are source material, not auto-installed instructions.
-- `reference/tests/`: implementation tests, including disposable Git fixtures.
-- `reference/examples/manifests/`: explicitly wrapped, sanitized historical
-  examples; **not live configuration**.
+- [Product guide](docs/product-guide.md): benefits, boundaries and everyday use.
+- [Source map](docs/source-map.md): find implementation by task.
+- [Example workstation skill](examples/skills/manage-workstation/SKILL.md) and
+  [illustrative lifecycle](examples/component-lifecycle.json): reusable guidance,
+  not active configuration.
+- [Validation](VALIDATION.md), [export workflow](docs/export.md) and
+  [release boundary](PUBLIC-RELEASE.md).
 
-## Start safely
+## What the design buys you
 
-Read [ARCHITECTURE.md](ARCHITECTURE.md) and [PUBLIC-RELEASE.md](PUBLIC-RELEASE.md).
-To run the selected portable logic tests, with Python 3.11+ and Git available:
+- A read-only `aid` front door for declared inventory, routing and scoped doctors.
+- Bounded deterministic metadata observation, separate from health and repair.
+- Component-specific changes instead of replaying bootstrap for every edit.
+- Explicit quarantine, native consent and typed administrator boundaries.
+- Optional Windows and game integration separate from ordinary development.
+
+Historical implementation modules remain where current code depends on them.
+Their names are not instructions to rerun old live trials. Optional game source
+is not a game distribution or a supported Wine installation.
+
+## Safe first command
+
+With Python 3.11+ and Git:
 
 ```sh
 python3 tools/test_reference.py
 ```
 
-These tests use mocks and disposable directories. They do not install the
-harness, run privileged operations, configure VPNs, or touch games.
-The full historical test suite is **not** the public acceptance suite: some
-tests intentionally depend on private receipts, omitted manifests, or the
-original Git ancestry.
+This selected suite uses mocks and disposable fixtures. Do not run the entire
+historical suite or installers against your workstation just because it passes.
+Read [ARCHITECTURE.md](ARCHITECTURE.md) before adapting the implementation.
 
-There is no supported installation command for this release. Do not copy its
-sudoers, hook configuration, system policies, or Nix modules into your machine
-without reviewing and adapting them. Removing executable bits reduces accidental
-execution; it is not a security sandbox. Interpreters can still execute scripts.
-
-## Why build this?
-
-The goal is to make an agent useful beyond editing one repository without giving
-every task unrestricted ownership of the workstation: explicit installation
-owners, ordinary development that stays ordinary, narrow system changes, and
-evidence-based recovery when something fails.
-
-This release shares the actual implementation and its trade-offs. Personal
-operating notes and incident history are omitted. Turning it
-into a portable product requires a new host configuration and locally established
-trust and acceptance, not replaying somebody else's successful checks.
-
-## License
-
-Original project code: [MIT](LICENSE). Vendored Tomli retains its own MIT
-copyright and license; see [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md).
-No Apple, Microsoft, game, or Wine binaries are distributed.
+Original code: [MIT](LICENSE). [Third-party notices](THIRD-PARTY-NOTICES.md)
+remain intact. No Apple, Microsoft, game or Wine binaries are distributed.

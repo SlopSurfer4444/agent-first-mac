@@ -107,6 +107,21 @@ private final class Fixture {
                                   actionID: { "11111111-2222-3333-4444-555555555555" })
     }
 
+    func subprocess(_ mode: String, step: String = "") throws -> Int32 {
+        let child = Process()
+        var length: UInt32 = 0
+        _ = _NSGetExecutablePath(nil, &length)
+        var buffer = [CChar](repeating: 0, count: Int(length))
+        try expect(_NSGetExecutablePath(&buffer, &length) == 0, "test_executable_path")
+        child.executableURL = URL(fileURLWithPath: String(cString: buffer))
+        child.arguments = [mode, root.path, step]
+        child.standardOutput = FileHandle.nullDevice
+        child.standardError = FileHandle.nullDevice
+        try child.run()
+        child.waitUntilExit()
+        return child.terminationStatus
+    }
+
     func request(owner: String = "agentowner", ownerUID: UInt32 = 12345,
                  identity: String = "name:agentowner",
                  brokerPath: String? = nil) throws -> BootstrapRequest {
@@ -408,8 +423,10 @@ private struct BootstrapTests {
             }
         }
         let reason = try expectThrows { _ = try fixture.installer().install(fixture.request()) }
-        try expect(reason.hasSuffix("_rolled_back"))
-        try expect(fixture.expectedPathsAbsent())
+        try expect(reason.hasSuffix("_rollback_failed"))
+        try expect(try String(contentsOf: fixture.physical(BootstrapInstaller.attestationPath),
+                              encoding: .utf8) == "attestation-drift")
+        try expect(try expectThrows { _ = try fixture.installer().reconcileInterruptedInstall() }.contains("UNKNOWN"))
     }
 
     func testRenderedSudoersAndDirectBackendRejections() throws {
@@ -436,11 +453,185 @@ private struct BootstrapTests {
         _ = try expectThrows { _ = try fixture.installer().install(fixture.request()) }
         try expect(fixture.expectedPathsAbsent())
     }
+
+    func testCrashRestartMatrix() throws {
+        let targets = ["aid-admin", "aid-admin-policy.json", "aid-admin-install.json",
+                       "agent-first-mac-aid-admin"]
+        let steps = ["journal-prepared", "runtime-directories", "final-verification"] +
+            targets.flatMap { ["before-backup-" + $0, "after-backup-" + $0, "after-publication-" + $0] }
+        for installed in [false, true] {
+            for step in steps {
+                let fixture = try Fixture()
+                if installed { _ = try fixture.installer().install(fixture.request()) }
+                let prior = installed ? try fixture.fileHashes() : [:]
+                try FileManager.default.setAttributes([.posixPermissions: 0o644], ofItemAtPath: fixture.broker.path)
+                try Data("changed-broker-v2".utf8).write(to: fixture.broker)
+                try FileManager.default.setAttributes([.posixPermissions: 0o555], ofItemAtPath: fixture.broker.path)
+                try fixture.refreshInputs()
+                try expect(try fixture.subprocess("--crash", step: step) == 77, "crash_seam_" + step)
+                try expect(try fixture.subprocess("--reconcile") == 0, "restart_reconcile_" + step)
+                if installed {
+                    try expect(try fixture.fileHashes() == prior, "exact_restore_" + step)
+                } else {
+                    try expect(fixture.expectedPathsAbsent(), "absent_restore_" + step)
+                }
+                try expect(try fixture.installer().reconcileInterruptedInstall() == "NO_INTERRUPTED_INSTALL")
+            }
+        }
+        for directory in ["/etc/agent-first-mac", "/var/log/agent-first-mac",
+                          BootstrapInstaller.auditPath, BootstrapInstaller.brokerStagingPath] {
+            for prefix in ["before-directory-publication-", "after-directory-publication-"] {
+                let fixture = try Fixture()
+                try expect(try fixture.subprocess("--crash", step: prefix + directory) == 77)
+                try expect(try fixture.subprocess("--reconcile") == 0, "directory_restart_" + prefix + directory)
+                try expect(fixture.expectedPathsAbsent())
+            }
+        }
+    }
+
+    func testCommittedCrashDoesNotUndoInstall() throws {
+        let fixture = try Fixture()
+        try expect(try fixture.subprocess("--crash", step: "journal-committed") == 77)
+        let committed = try fixture.fileHashes()
+        try expect(try fixture.subprocess("--reconcile") == 0)
+        try expect(try fixture.fileHashes() == committed)
+        try expect(fixture.expectedPathsPresent())
+    }
+
+    func testForeignAndUntrustedRecoveryStayUnknown() throws {
+        for attack in ["target", "journal-mode", "journal-symlink", "backup"] {
+            let fixture = try Fixture()
+            if attack == "backup" { _ = try fixture.installer().install(fixture.request()) }
+            try expect(try fixture.subprocess("--crash", step: "after-publication-aid-admin") == 77)
+            let journal = fixture.physical("/var/db/agent-first-mac/bootstrap/active.json")
+            let target = fixture.physical(BootstrapInstaller.binaryPath)
+            if attack == "target" || attack == "backup" {
+                let path = attack == "target" ? target : fixture.physical(
+                    "/var/db/agent-first-mac/bootstrap/transaction-11111111-2222-3333-4444-555555555555/prior-aid-admin")
+                try FileManager.default.removeItem(at: path)
+                try Data("foreign-do-not-delete".utf8).write(to: path)
+                try FileManager.default.setAttributes([.posixPermissions: 0o555], ofItemAtPath: path.path)
+                try expect(try fixture.subprocess("--reconcile") == 78)
+                try expect(try String(contentsOf: path, encoding: .utf8) == "foreign-do-not-delete")
+            } else if attack == "journal-mode" {
+                try FileManager.default.setAttributes([.posixPermissions: 0o644], ofItemAtPath: journal.path)
+                try expect(try fixture.subprocess("--reconcile") == 78)
+            } else {
+                try FileManager.default.removeItem(at: journal)
+                try FileManager.default.createSymbolicLink(at: journal, withDestinationURL: fixture.inputs)
+                try expect(try fixture.subprocess("--reconcile") == 78)
+            }
+            try expect(target.exists)
+        }
+    }
+
+    func testInstallReconcilesBeforeNewAdmission() throws {
+        let fixture = try Fixture()
+        try expect(try fixture.subprocess("--crash", step: "after-publication-aid-admin") == 77)
+        try expect(try fixture.installer().install(fixture.request()) == "INSTALL_TRANSACTION_COMMITTED")
+    }
+
+    func testRecoveryCanItselfRestartAndLockIsExclusive() throws {
+        let fixture = try Fixture()
+        _ = try fixture.installer().install(fixture.request())
+        let prior = try fixture.fileHashes()
+        try expect(try fixture.subprocess("--crash", step: "after-publication-aid-admin-policy.json") == 77)
+        try expect(try fixture.subprocess("--rollback-crash", step: "rollback-aid-admin-policy.json") == 77)
+        try expect(try fixture.subprocess("--reconcile") == 0)
+        try expect(try fixture.fileHashes() == prior)
+        let lock = fixture.physical("/var/db/agent-first-mac/.operation.lock")
+        let fd = Darwin.open(lock.path, O_RDWR | O_NOFOLLOW)
+        try expect(fd >= 0)
+        defer { Darwin.close(fd) }
+        try expect(flock(fd, LOCK_EX | LOCK_NB) == 0)
+        try expect(try fixture.subprocess("--reconcile") == 78)
+        try expect(try fixture.fileHashes() == prior)
+    }
+
+    func testEmergencyRevocationNeverRepublishesGrant() throws {
+        for installed in [false, true] {
+            let fixture = try Fixture()
+            if installed { _ = try fixture.installer().install(fixture.request()) }
+            fixture.hooks.afterStep = { step in
+                if step == "after-backup-agent-first-mac-aid-admin" {
+                    try Data("emergency-disabled".utf8).write(to: fixture.physical(BootstrapInstaller.emergencyDisablePath))
+                }
+            }
+            let reason = try expectThrows { _ = try fixture.installer().install(fixture.request()) }
+            try expect(reason == "bootstrap_emergency_revocation_UNKNOWN")
+            try expect(!fixture.physical(BootstrapInstaller.sudoersPath).exists)
+            try expect(try fixture.subprocess("--reconcile") == 78)
+            try expect(!fixture.physical(BootstrapInstaller.sudoersPath).exists)
+        }
+    }
+
+    func testApplyJournalAdmissionAndParentIdentity() throws {
+        for phase in ["complete", "rollback_verified", "activation_pending", "unknown"] {
+            let fixture = try Fixture()
+            _ = try fixture.installer().install(fixture.request())
+            let hash = String(repeating: "a", count: 64)
+            let target = "/nix/store/" + String(repeating: "a", count: 32) + "-darwin-system-fixture"
+            let record: [String: Any] = ["schema": 1,
+                "identifier": "11111111-2222-3333-4444-555555555555",
+                "commit": String(repeating: "a", count: 40), "tree": String(repeating: "b", count: 40),
+                "policyHash": hash, "receiptHash": hash, "previousIdentifier": "1",
+                "previousTarget": target, "target": target,
+                "activationExecutable": "/nix/store/activation", "activationHash": hash,
+                "nixEnvExecutable": "/nix/store/nix-env", "nixEnvHash": hash,
+                "caller": "sudo-user", "targetIdentifier": "2", "phase": phase, "sourceDrift": false]
+            let path = fixture.physical(BootstrapInstaller.brokerStagingPath + "/operation.json")
+            try JSONSerialization.data(withJSONObject: record, options: [.sortedKeys]).write(to: path)
+            try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: path.path)
+            let before = try fixture.fileHashes()
+            if ["complete", "rollback_verified"].contains(phase) {
+                try expect(try fixture.installer().install(fixture.request()) == "INSTALL_TRANSACTION_COMMITTED")
+            } else {
+                _ = try expectThrows { _ = try fixture.installer().install(fixture.request()) }
+            }
+            try expect(try fixture.fileHashes() == before)
+        }
+        let fixture = try Fixture()
+        fixture.hooks.afterStep = { step in
+            if step == "binary" {
+                let parent = fixture.physical("/usr/local/libexec")
+                try FileManager.default.moveItem(at: parent, to: fixture.physical("/usr/local/retained-libexec"))
+                try FileManager.default.createDirectory(at: parent, withIntermediateDirectories: false)
+                try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: parent.path)
+            }
+        }
+        let reason = try expectThrows { _ = try fixture.installer().install(fixture.request()) }
+        try expect(reason.contains("bound_directory_drift_UNKNOWN"))
+        try expect(fixture.physical("/usr/local/retained-libexec/aid-admin").exists)
+        try expect(!fixture.physical(BootstrapInstaller.binaryPath).exists)
+    }
 }
 
 @main
 private struct TestMain {
     static func main() throws {
+        if CommandLine.arguments.count == 4 {
+            let mode = CommandLine.arguments[1], root = CommandLine.arguments[2]
+            let context = BootstrapContext(rootPrefix: root, trustedUID: getuid(), trustedGID: getgid(),
+                effectiveUID: getuid(), currentExecutablePath: root + "/reviewed/aid-admin-bootstrap",
+                invokingOwner: .init(name: "agentowner", uid: 12345), fixtureMode: true)
+            let hooks = TestHooks()
+            hooks.afterStep = { step in if step == CommandLine.arguments[3] { _exit(77) } }
+            let installer = BootstrapInstaller(context: context, runner: FakeRunner(), hooks: hooks,
+                actionID: { "11111111-2222-3333-4444-555555555555" })
+            do {
+                if mode == "--reconcile" || mode == "--rollback-crash" { _ = try installer.reconcileInterruptedInstall() }
+                else {
+                    let inputs = root + "/reviewed/install-inputs.json"
+                    let bytes = try Data(contentsOf: URL(fileURLWithPath: inputs))
+                    _ = try installer.install(.init(brokerPath: root + "/reviewed/aid-admin",
+                        policyPath: root + "/reviewed/aid-admin-policy.json",
+                        sudoersTemplatePath: root + "/reviewed/sudoers-template", inputsPath: inputs,
+                        inputsSHA256: bootstrapSHA256(bytes), inputsSize: bytes.count,
+                        ownerName: "agentowner", ownerUID: 12345, sudoersIdentity: "name:agentowner"))
+                }
+                exit(0)
+            } catch { FileHandle.standardError.write(Data("\(error)\n".utf8)); exit(78) }
+        }
         let suite = BootstrapTests()
         let tests: [(String, () throws -> Void)] = [
             ("sudo_invoker_provenance_matrix", suite.testStandardSudoInvokerProvenanceMatrix),
@@ -457,6 +648,13 @@ private struct TestMain {
             ("attestation_mismatch", suite.testAttestationMismatchTriggersRollback),
             ("sudoers_drift_direct_backend", suite.testRenderedSudoersAndDirectBackendRejections),
             ("bootstrap_self_attestation", suite.testBootstrapSelfAttestationFailsClosed),
+            ("crash_restart_matrix", suite.testCrashRestartMatrix),
+            ("committed_crash", suite.testCommittedCrashDoesNotUndoInstall),
+            ("foreign_recovery", suite.testForeignAndUntrustedRecoveryStayUnknown),
+            ("restart_before_admission", suite.testInstallReconcilesBeforeNewAdmission),
+            ("recovery_restart_lock", suite.testRecoveryCanItselfRestartAndLockIsExclusive),
+            ("emergency_revocation", suite.testEmergencyRevocationNeverRepublishesGrant),
+            ("apply_journal_parent_identity", suite.testApplyJournalAdmissionAndParentIdentity),
         ]
         for (name, test) in tests {
             do { try test() }

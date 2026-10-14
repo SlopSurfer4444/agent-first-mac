@@ -23,6 +23,8 @@ from lib import phase5_current_probe as P
 from lib import phase5_current_quarantine as Q
 
 SOURCE = (ROOT / "evidence/phase-5/current-quarantine-launcher-root-adapter.txt").read_text()
+# The frozen adapter admits this exact historical root. It is mocked, never read.
+HISTORICAL_ROOT = Path("/Users/example-user/AIDev/worktrees/control/phase5-current-runtime-successor")
 TREE = ast.parse(SOURCE)
 BINDINGS = next(ast.literal_eval(node.value) for node in TREE.body
                 if isinstance(node, ast.Assign) and isinstance(node.targets[0], ast.Name)
@@ -32,8 +34,9 @@ CLOSURE = next(tuple(ast.literal_eval(node.value.args[0])) for node in TREE.body
                and node.targets[0].id == "source_closure")
 HOME = "/Users/synthetic-owner"
 WORKSPACE = HOME + "/AIDev/quarantine/phase5-quarantine-task." + "a" * 12
-PROFILE = (ROOT / "codex/quarantine.config.toml").read_bytes()
-LAUNCHER = (ROOT / "bin/codex-quarantine").read_bytes()
+# Frozen root-adapter receipt is not rewritten to name the source successor.
+PROFILE = (ROOT / "tests/fixtures/phase5-quarantine-before-temp-deny.config.toml").read_bytes()
+LAUNCHER = (ROOT / "tests/fixtures/phase5-quarantine-before-current-cli.zsh").read_bytes()
 GOOD = json.dumps({"schema": 1, "userMcpToolsVisible": False,
                    "userPluginToolsVisible": False,
                    "userAppToolsVisible": False}).encode()
@@ -65,7 +68,7 @@ class OuterTests(unittest.TestCase):
                 require((home, uid, keep) == (HOME, 501, False))
                 if case == "acquisition":
                     raise ValueError("private acquisition")
-                self.digest = BINDINGS[str(path.relative_to(ROOT))]
+                self.digest = BINDINGS[str(path.relative_to(HISTORICAL_ROOT))]
                 self.closed = False
                 pins.append(self)
             def verify(self):
@@ -207,7 +210,7 @@ class OuterTests(unittest.TestCase):
         def digest(data):
             try:
                 path = Path(data.decode())
-                relative = str(path.relative_to(ROOT))
+                relative = str(path.relative_to(HISTORICAL_ROOT))
             except (ValueError, UnicodeError):
                 return real_digest(data)
             if relative not in BINDINGS:
@@ -222,7 +225,7 @@ class OuterTests(unittest.TestCase):
             raise ExitBoundary()
 
         with ExitStack() as stack:
-            stack.enter_context(patch.object(Path, "cwd", return_value=ROOT))
+            stack.enter_context(patch.object(Path, "cwd", return_value=HISTORICAL_ROOT))
             stack.enter_context(patch.object(Path, "read_bytes", lambda path: str(path).encode()))
             stack.enter_context(patch.object(hashlib, "sha256", side_effect=digest))
             stack.enter_context(patch.object(importlib.machinery.SourceFileLoader, "load_module", bootstrap))

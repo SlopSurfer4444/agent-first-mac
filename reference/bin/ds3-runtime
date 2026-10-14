@@ -2,7 +2,7 @@
 """Reviewed DS3-only adoption; preparation and installation never start a game."""
 import sys
 sys.dont_write_bytecode = True
-import fcntl, hashlib, json, os, pwd, re, shutil, stat, subprocess, tempfile
+import ctypes, fcntl, hashlib, importlib.machinery, importlib.util, json, os, pwd, re, shutil, stat, subprocess, tempfile
 import xml.etree.ElementTree as ET
 from pathlib import Path
 HOME = Path(pwd.getpwuid(os.getuid()).pw_dir)
@@ -35,7 +35,7 @@ def admission(home,route,goal=None):
         with os.fdopen(os.dup(fd),'rb') as stream:raw=stream.read()
         after=os.fstat(fd)
         keys=('st_dev','st_ino','st_mode','st_uid','st_nlink','st_size','st_mtime_ns','st_ctime_ns')
-        if any(getattr(facts,k)!=getattr(after,k) for k in keys) or hashlib.sha256(raw).hexdigest()!='f0227b4f9e38671a58d6bbbb8ad86a58354c706d55a99521ee9ce973d4ed5750':
+        if any(getattr(facts,k)!=getattr(after,k) for k in keys) or hashlib.sha256(raw).hexdigest()!='e445e867abad4816b4b4960f78116ae993a97941c19e8881c380787c40cb7146':
             raise RuntimeError('admission_helper_changed')
     finally:os.close(fd)
     namespace={'__name__':'game_launch_admission','__admission_source':raw}
@@ -44,8 +44,10 @@ def admission(home,route,goal=None):
 
 SOURCE_HUB_MANIFEST = 'manifests/ds3-source-hub-v1.json'
 RUNTIME_OVERLAY_POLICY = 'manifests/wine-runtime-overlay.json'
+INSTALLED_POLICY_FILES = {'overlay-policy.json','source-hub-v1.json'}
 RUNTIME_OVERLAY_POLICY_FIELDS = {'schema','id','owner','previousHubManifestSha256','previousDS3ManifestSha256','previousHubCriticalHashes','sourceHubManifestSha256','sourceCriticalHashes','desiredPEHashes','lifecycleSha256'}
 RUNTIME_OVERRIDE_PATHS = {'engine/lib/wine/i386-windows/winemac.drv', 'engine/lib/wine/x86_64-windows/winemac.drv'}
+RUNTIME_EXTENDED_PATHS = RUNTIME_OVERRIDE_PATHS | {'engine/lib/wine/x86_64-unix/winemac.so','engine/lib/wine/i386-windows/oleacc.dll','engine/lib/wine/x86_64-windows/oleacc.dll'}
 DS3_MANIFEST_FIELDS = ['architecture', 'aspectFit', 'aspectPolicySha256', 'authorization', 'candidateBuildFiles', 'candidateSha256', 'candidateState', 'capabilities', 'dataBoundary', 'destination', 'donorSha256', 'followPolicySha256', 'fontPathCount', 'graphicsPolicy', 'id', 'marshalSources', 'owner', 'primaryOwner', 'processGate', 'provenance', 'provenanceSha256', 'remove', 'resolver', 'rollback', 'schema', 'singleLauncher', 'smokeTest', 'sourceCriticalHashes', 'sourceHubManifestSha256', 'versionPolicy', 'windowEnumEvidence', 'windowMode']
 
 def need(ok, reason):
@@ -75,9 +77,9 @@ def sha(p, allow_source_hardlinks=False):
         for b in iter(lambda: f.read(1048576), b''): h.update(b)
     return h.hexdigest()
 
-def load(p):
+def load(p, limit=65536):
     safe_file(p)
-    need(p.stat().st_size <= 65536, 'metadata_limit')
+    need(p.stat().st_size <= limit, 'metadata_limit')
     def unique(rows):
         out = {}
         for k,v in rows:
@@ -90,20 +92,43 @@ def pinned(digest):
 
 def manifest(p):
     m = load(p)
-    need(type(m) is dict and type(m.get('schema')) is int and m.get('schema') in (1,2) and m.get('id') == 'ds3-marshal-fix' and m.get('owner') == 'control-ds3-marshal-fix', 'manifest_identity')
-    allowed = set(DS3_MANIFEST_FIELDS) | ({'runtimeOverrides','runtimeOverlayPolicySha256'} if m['schema'] == 2 else set())
-    need(set(m) <= allowed and (m['schema'] == 2 or 'runtimeOverrides' not in m and 'runtimeOverlayPolicySha256' not in m), 'manifest_field_schema')
+    need(type(m) is dict and type(m.get('schema')) is int and m.get('schema') in (1,2,3,4) and m.get('id') == 'ds3-marshal-fix' and m.get('owner') == 'control-ds3-marshal-fix', 'manifest_identity')
+    allowed = set(DS3_MANIFEST_FIELDS) | ({'runtimeOverrides','runtimeOverlayPolicySha256'} if m['schema'] >= 2 else set())
+    need(set(m) <= allowed and (m['schema'] >= 2 or 'runtimeOverrides' not in m and 'runtimeOverlayPolicySha256' not in m), 'manifest_field_schema')
     for k in ('candidateSha256', 'provenanceSha256'):
         need(pinned(m.get(k)), 'candidate_pins_pending')
     need(m.get('windowMode') == 'WINDOW', 'unsupported_graphics_policy')
     need(pinned(m.get('sourceHubManifestSha256')), 'hub_manifest_pin')
     expected = None
-    ancestry_source = CONTROL if m['schema'] == 2 else HERE
-    if HERE == CONTROL or m['schema'] == 2:
+    ancestry_source = CONTROL if m['schema'] >= 2 else HERE
+    original_path = ancestry_source/SOURCE_HUB_MANIFEST
+    policy_path = ancestry_source/RUNTIME_OVERLAY_POLICY
+    lifecycle_path = ancestry_source/'bin/ds3-runtime'
+    hub_path = ancestry_source/'manifests/games-hub.json'
+    if m['schema'] == 4:
+        # Installed generation closure: paths are fixed by the schema, never
+        # supplied by metadata. Source preparation still validates source bytes.
+        if p == ROOT/'manifest.json':
+            directory = ROOT/'policy-source'
+            safe_directory(directory)
+            info = directory.lstat()
+            need(info.st_uid == os.getuid() and stat.S_IMODE(info.st_mode) == 0o700
+                 and {x.name for x in directory.iterdir()} == INSTALLED_POLICY_FILES, 'installed_policy_inventory')
+            original_path = directory/'source-hub-v1.json'
+            policy_path = directory/'overlay-policy.json'
+            for path in (original_path,policy_path):
+                safe_file(path)
+                info = path.lstat()
+                need(info.st_uid == os.getuid() and stat.S_IMODE(info.st_mode) == 0o600, 'installed_policy_mode')
+            lifecycle_path = ROOT/'ds3-runtime'
+            hub_path = SOURCE/'manifest.json'
+        else:
+            need(HERE == CONTROL and p == CONTROL/MANIFEST, 'schema4_manifest_scope')
+    if HERE == CONTROL or m['schema'] >= 2:
         # Adoption ancestry remains the exact original reviewed hub blob.
-        original = load(ancestry_source/SOURCE_HUB_MANIFEST)
+        original = load(original_path)
         need(type(original) is dict and original.get('id') == 'games-hub' and original.get('owner') == 'control-games-hub', 'source_hub_identity')
-        need(m['sourceHubManifestSha256'] == sha(ancestry_source/SOURCE_HUB_MANIFEST), 'hub_manifest_pin')
+        need(m['sourceHubManifestSha256'] == sha(original_path), 'hub_manifest_pin')
         expected = original.get('criticalHashes')
     need(type(m.get('sourceCriticalHashes')) is dict and all(pinned(v) for v in m['sourceCriticalHashes'].values()), 'critical_pin_schema')
     if expected is not None: need(m['sourceCriticalHashes'] == expected, 'hub_critical_pins_changed')
@@ -111,25 +136,29 @@ def manifest(p):
     need('engine/lib/wine/x86_64-windows/d3d11.dll' in m['sourceCriticalHashes'], 'd3d11_pin_required')
     for rel in m['sourceCriticalHashes']:
         need(type(rel) is str and not Path(rel).is_absolute() and '..' not in Path(rel).parts and rel.startswith('engine/'), 'unsafe_critical_path')
-    if m['schema'] == 2:
+    if m['schema'] >= 2:
         overrides = m.get('runtimeOverrides')
-        need(type(overrides) is dict and set(overrides) == RUNTIME_OVERRIDE_PATHS and all(pinned(v) for v in overrides.values()), 'runtime_override_schema')
-        policy = load(ancestry_source/RUNTIME_OVERLAY_POLICY)
-        need(type(policy) is dict and set(policy) == RUNTIME_OVERLAY_POLICY_FIELDS and type(policy.get('schema')) is int and policy.get('schema') == 1 and policy.get('id') == 'wine-runtime-overlay' and policy.get('owner') == 'control-games-hub', 'overlay_policy_identity')
-        need(pinned(m.get('runtimeOverlayPolicySha256')) and m['runtimeOverlayPolicySha256'] == sha(ancestry_source/RUNTIME_OVERLAY_POLICY), 'overlay_policy_pin')
-        need(pinned(policy.get('lifecycleSha256')) and policy['lifecycleSha256'] == sha(ancestry_source/'bin/ds3-runtime'), 'overlay_lifecycle_pin')
-        need(policy.get('desiredPEHashes') == overrides and policy.get('sourceHubManifestSha256') == m['sourceHubManifestSha256'] and policy.get('sourceCriticalHashes') == m['sourceCriticalHashes'], 'overlay_source_binding')
-        current_hub = load(ancestry_source/'manifests/games-hub.json')
+        need(type(overrides) is dict and set(overrides) == (RUNTIME_EXTENDED_PATHS if m['schema'] >= 3 else RUNTIME_OVERRIDE_PATHS) and all(pinned(v) for v in overrides.values()), 'runtime_override_schema')
+        policy = load(policy_path)
+        need(type(policy) is dict and set(policy) == (RUNTIME_OVERLAY_POLICY_FIELDS - {'desiredPEHashes'} | {'desiredRuntimeHashes'} if m['schema'] >= 3 else RUNTIME_OVERLAY_POLICY_FIELDS) and type(policy.get('schema')) is int and policy.get('schema') == (2 if m['schema'] >= 3 else 1) and policy.get('id') == 'wine-runtime-overlay' and policy.get('owner') == 'control-games-hub', 'overlay_policy_identity')
+        need(pinned(m.get('runtimeOverlayPolicySha256')) and m['runtimeOverlayPolicySha256'] == sha(policy_path), 'overlay_policy_pin')
+        need(pinned(policy.get('lifecycleSha256')) and policy['lifecycleSha256'] == sha(lifecycle_path), 'overlay_lifecycle_pin')
+        need(policy.get('desiredRuntimeHashes' if m['schema'] >= 3 else 'desiredPEHashes') == overrides and policy.get('sourceHubManifestSha256') == m['sourceHubManifestSha256'] and policy.get('sourceCriticalHashes') == m['sourceCriticalHashes'], 'overlay_source_binding')
+        current_hub = load(hub_path)
         need(type(current_hub) is dict and type(current_hub.get('criticalHashes')) is dict, 'current_hub_schema')
         need(current_hub.get('runtimeOverlayPolicySha256') == m['runtimeOverlayPolicySha256'] and all(current_hub.get('criticalHashes',{}).get(rel) == value for rel,value in overrides.items()), 'overlay_hub_binding')
+        if m['schema'] == 4:
+            need(current_hub.get('id') == 'games-hub' and current_hub.get('owner') == 'control-games-hub'
+                 and type(policy.get('previousHubCriticalHashes')) is dict
+                 and current_hub['criticalHashes'] == dict(policy['previousHubCriticalHashes'],**overrides), 'installed_policy_hub_binding')
     return m
 
 def installed_critical_hashes(m):
-    # Only the two reviewed PE pins override source ancestry. DXMT, donor,
+    # Only the versioned fixed runtime scope overrides source ancestry. DXMT, donor,
     # controller and every other inherited file remain separately pinned.
     pins = dict(m['sourceCriticalHashes'])
     pins[METAL] = m['candidateSha256']; pins[DONOR] = m['donorSha256']
-    if m['schema'] == 2: pins.update(m['runtimeOverrides'])
+    if m['schema'] >= 2: pins.update(m['runtimeOverrides'])
     return pins
 
 def code_tree(p, allow_source_hardlinks=False, allow_installed_loader_hardlinks=False):
@@ -185,15 +214,77 @@ def inactive(runtime, prefix):
     try: run([runtime/'engine/bin/wineserver', '-w'], timeout=3, env=wine_env(runtime,prefix))
     except subprocess.TimeoutExpired: raise RuntimeError('profile_active')
 
-def source_gate(commit):
+def readiness_bridge():
+    loader=importlib.machinery.SourceFileLoader('game_scoped_ready',str(CONTROL/'lib/game_operation_readiness.py'))
+    module=importlib.util.module_from_spec(importlib.util.spec_from_loader(loader.name,loader));loader.exec_module(module);return module
+
+def source_gate(commit,action='apply',candidate=None,apply_commit=None):
     need(HERE == CONTROL and Path(__file__).absolute() == CONTROL/'bin/ds3-runtime', 'canonical_source_required')
     need(type(commit) is str and re.fullmatch('[0-9a-f]{40}',commit), 'invalid_commit')
     def git(*a): return run(['/usr/bin/git','-c','core.hooksPath=/dev/null','-C',CONTROL,*a]).decode().strip()
     def exact():
         need(git('rev-parse','HEAD') == commit and git('branch','--show-current') == 'main' and not git('status','--porcelain'), 'clean_exact_main_required')
     exact()
-    d = json.loads(run([CONTROL/'bin/current-doctor','--json']))
-    need(d.get('verdict') == 'PASS' and all(d.get(k) is True for k in ('configurationSourceAccepted','currentSentinelReady','integratedMain')) and d.get('gitOnly') is False, 'fresh_accepted_doctor_required')
+    bridge=readiness_bridge();namespace=lifecycle_directory();bootstrap=lifecycle_bootstrap_path()
+    nodes=[ROOT,ROOT.parent,HOME/'AIDev/bin',HOME/'Games',HOME/'AIDev/state']
+    if ROOT.exists():nodes.extend((ROOT/'manifest.json',ROOT/'receipt.json',ROOT/'ds3-runtime'))
+    if namespace.exists():
+        nodes.append(namespace)
+        if (namespace/'journal.json').exists():nodes.append(namespace/'journal.json')
+    if bootstrap.exists():nodes.append(bootstrap)
+    if action in ('repair-window','rollback-window'):
+        window_repair_pending_guard();nodes.extend((PREFIX/CONFIG_REL,PREFIX/'user.reg'))
+        if action=='rollback-window':
+            transaction=window_repair_transaction(apply_commit)
+            nodes.extend((transaction,transaction/'record.json',transaction/'before.xml',transaction/'after.xml'))
+    guard=bridge.bound(lambda:bridge.metadata(nodes))
+    def owner():
+        desired=manifest(HERE/MANIFEST);need(desired['owner']=='control-ds3-marshal-fix','operation_payload_owner')
+        if ROOT.exists():need(load(ROOT/'receipt.json').get('owner')=='control-ds3-marshal-fix','operation_payload_owner')
+        if action in ('repair-window','rollback-window'):verify_installed();verify_borderless()
+        return True
+    def recovery():
+        if (namespace/'journal.json').exists() or (namespace/'journal.json').is_symlink():
+            j=lifecycle_load();published=j['operation']=='install' and not (namespace/'stage').exists() and ROOT.exists()
+            # Completed install/retire profile images are history, not a quota
+            # on subsequent owner data changes. Only unsettled steps own those
+            # original pre/postimages; a new operation captures current owner
+            # state through its existing verifier/retire inventory.
+            if j['state']=='pending':
+                need(action not in ('repair-window','rollback-window'),'lifecycle_recovery_required');lifecycle_validate(j,published)
+        elif bootstrap.exists() or bootstrap.is_symlink():
+            safe_file(bootstrap);need(bootstrap.stat().st_size<=32*1024*1024,'lifecycle_journal_limit');raw=bootstrap.read_bytes()
+            if action=='install' and candidate is not None:
+                desired=manifest(HERE/MANIFEST);candidate_check(desired,candidate);tree=source_check(desired)
+                binding={'candidate':str(candidate),'manifestSha256':sha(HERE/MANIFEST),'sourceTree':tree,'sourceProfile':json.loads(json.dumps(snapshot(SOURCE/'profiles/prince'))),'helperHashes':{name:sha(HERE/'bin'/name) for name in ('ds3-runtime','ds3-play')},'copySources':{}}
+                journal={'schema':1,'owner':'control-ds3-marshal-fix','operation':'install','commit':commit,'direction':'forward','state':'pending','binding':binding,'steps':[],'active':None,'directoryIdentity':None}
+                payload={'schema':1,'owner':journal['owner'],'directory':namespace.name,'parentIdentity':lifecycle_facts(ROOT.parent),'journal':journal}
+                expected=(json.dumps(payload,separators=(',',':'))+'\n').encode();need(expected.startswith(raw),'lifecycle_bootstrap_collision')
+            else:
+                value=json.loads(raw);need(type(value) is dict and value.get('owner')=='control-ds3-marshal-fix' and value.get('directory')==namespace.name
+                    and value.get('parentIdentity')==lifecycle_facts(ROOT.parent) and type(value.get('journal')) is dict
+                    and value['journal'].get('commit')==commit and value['journal'].get('state')=='pending','lifecycle_bootstrap_schema')
+        else:
+            for node in (ROOT.parent,HOME/'AIDev/bin',HOME/'Games',HOME/'AIDev/state'):safe_directory(node)
+        if action=='rollback-window':
+            window_repair_record(apply_commit);need(target() is True,'operation_dependency_wine-target')
+        return True
+    def target():
+        if ROOT.exists():
+            base=load(ROOT/'manifest.json');need(sha(ROOT/'runtime/engine/bin/wineserver')==base['sourceCriticalHashes']['engine/bin/wineserver'],'operation_server_drift')
+            inactive(ROOT/'runtime',PREFIX)
+            if action in ('repair-window','rollback-window'):
+                registry=PREFIX/'user.reg';safe_file(registry);need(registry.stat().st_size<=16*1024*1024,'registry_size_limit')
+                raw=registry.read_bytes();need(retina_plan(raw)==raw,'retina_not_enabled')
+                if action=='repair-window':
+                    config=PREFIX/CONFIG_REL;safe_file(config);need(config.stat().st_size<=131072,'graphics_limit');repair_window_plan(config.read_bytes())
+        else:
+            desired=manifest(HERE/MANIFEST);source_check(desired)
+        return True
+    checks={'payload-owner':owner,'recovery':recovery}
+    if action not in ('recover','retire','rollback-window'):checks['wine-target']=target
+    d=bridge.ready(CONTROL,commit,'wine-recovery' if action in ('recover','retire','rollback-window') else 'wine-install',checks=checks,target_guard=guard)
+    need(d.get('scopedCandidateReady') is True,'scoped_operation_readiness_required')
     exact()
 
 def source_check(m):
@@ -361,8 +452,7 @@ def rebase_fonts(prefix, expected):
 
 CONFIG_REL = 'drive_c/users/crossover/AppData/Roaming/DarkSoulsIII/GraphicsConfig.xml'
 
-def window_config():
-    p = PREFIX/CONFIG_REL; safe_file(p); raw = p.read_bytes()
+def initial_window_plan(raw):
     need(len(raw) <= 131072 and not raw.startswith(b'\xff\xfe') and not raw.startswith(b'\xfe\xff'), 'graphics_encoding_drift')
     text = raw.decode('utf-16-le','strict')
     def exact(tag,value):
@@ -373,9 +463,14 @@ def window_config():
     after = text.replace('<ScreenMode>FULLSCREEN</ScreenMode>','<ScreenMode>WINDOW</ScreenMode>')
     after = after.replace('<Resolution-WindowScreenWidth>1680</Resolution-WindowScreenWidth>','<Resolution-WindowScreenWidth>1710</Resolution-WindowScreenWidth>')
     after = after.replace('<Resolution-WindowScreenHeight>945</Resolution-WindowScreenHeight>','<Resolution-WindowScreenHeight>1068</Resolution-WindowScreenHeight>')
+    return after.encode('utf-16-le')
+
+def window_config():
+    p = PREFIX/CONFIG_REL; safe_file(p); raw = p.read_bytes()
+    after = initial_window_plan(raw)
     backup = p.with_name(p.name+'.ds3-pre-window')
     need(not backup.exists() and not backup.is_symlink(), 'graphics_backup_collision')
-    backup.write_bytes(raw); backup.chmod(0o600); p.write_bytes(after.encode('utf-16-le'))
+    backup.write_bytes(raw); backup.chmod(0o600); p.write_bytes(after)
     return {'preimageSha256':hashlib.sha256(raw).hexdigest(),'postimageSha256':sha(p)}
 
 def verify_window_config():
@@ -401,8 +496,333 @@ def verify_window_config():
         number = int(number); need(minimum <= number <= maximum, 'ds3_window_config_drift'); dimensions.append(number)
     return {'windowMode':'WINDOW','windowWidth':dimensions[0],'windowHeight':dimensions[1]}
 
+def lifecycle_directory():
+    # Outside ROOT: retirement must never move away its own recovery route.
+    return ROOT.parent/'.Adapted Games DS3.lifecycle'
+
+def lifecycle_sync(p):
+    fd = os.open(p,os.O_RDONLY|os.O_NOFOLLOW)
+    try: os.fsync(fd)
+    finally: os.close(fd)
+
+def lifecycle_facts(p, digest=False):
+    safe_directory(p.parent)
+    if not p.exists() and not p.is_symlink(): return None
+    s = p.lstat()
+    need(s.st_uid == os.getuid(), 'lifecycle_foreign_owner')
+    result = {'dev':s.st_dev,'ino':s.st_ino,'mode':stat.S_IMODE(s.st_mode)}
+    if stat.S_ISDIR(s.st_mode):
+        need(not s.st_mode & 0o022,'lifecycle_directory_mode'); result['kind']='directory'
+    elif stat.S_ISLNK(s.st_mode): result.update(kind='link',link=os.readlink(p))
+    else:
+        need(stat.S_ISREG(s.st_mode) and s.st_nlink == 1 and not s.st_mode & 0o022,'lifecycle_unsafe_file')
+        result.update(kind='file',size=s.st_size,mtime=s.st_mtime_ns,ctime=s.st_ctime_ns)
+        if digest: result['sha256']=sha(p)
+    return result
+
+def lifecycle_parent_fd(p):
+    """Hold every no-follow parent component through the actual mutation."""
+    need(p.is_absolute() and '..' not in p.parts,'lifecycle_step_binding')
+    flags=os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW
+    fd=os.open('/',flags)
+    try:
+        for name in p.parent.parts[1:]:
+            child=os.open(name,flags,dir_fd=fd);os.close(fd);fd=child
+            s=os.fstat(fd);need(stat.S_ISDIR(s.st_mode) and s.st_uid in (0,os.getuid()) and not s.st_mode & 0o022,'lifecycle_directory_chain')
+        return fd
+    except BaseException:os.close(fd);raise
+
+def lifecycle_clone(source_fd,parent_fd,name):
+    # Darwin's descriptor clone is atomic and retains APFS copy-on-write without
+    # a pathname-based cp that can follow a replaced staging parent.
+    native=ctypes.CDLL('/usr/lib/libSystem.B.dylib',use_errno=True)
+    clone=native.fclonefileat;clone.argtypes=[ctypes.c_int,ctypes.c_int,ctypes.c_char_p,ctypes.c_int];clone.restype=ctypes.c_int
+    if clone(source_fd,parent_fd,os.fsencode(name),0)!=0:raise OSError(ctypes.get_errno(),'lifecycle_clone_failed')
+
+def lifecycle_rename(src,dst,src_dir_fd,dst_dir_fd):
+    native=ctypes.CDLL('/usr/lib/libSystem.B.dylib',use_errno=True)
+    rename=native.renameatx_np;rename.argtypes=[ctypes.c_int,ctypes.c_char_p,ctypes.c_int,ctypes.c_char_p,ctypes.c_uint];rename.restype=ctypes.c_int
+    # Darwin RENAME_EXCL: atomic no-replace, including empty directories.
+    if rename(src_dir_fd,os.fsencode(src),dst_dir_fd,os.fsencode(dst),4)!=0:
+        if ctypes.get_errno()==17:raise RuntimeError('lifecycle_destination_collision')
+        raise OSError(ctypes.get_errno(),'lifecycle_rename_failed')
+
+def lifecycle_save(j):
+    directory = lifecycle_directory()
+    target = directory/'journal.json'; temp = directory/'journal.next'
+    parent=lifecycle_parent_fd(target)
+    try:
+        s=os.fstat(parent);need({'dev':s.st_dev,'ino':s.st_ino,'mode':stat.S_IMODE(s.st_mode),'kind':'directory'}==j['directoryIdentity'],'lifecycle_namespace_drift')
+        try:existing=os.stat(temp.name,dir_fd=parent,follow_symlinks=False)
+        except FileNotFoundError:existing=None
+        if existing is not None:need(stat.S_ISREG(existing.st_mode) and existing.st_uid==os.getuid() and existing.st_nlink==1 and stat.S_IMODE(existing.st_mode)==0o600,'lifecycle_journal_mode')
+        raw=(json.dumps(j,separators=(',',':'))+'\n').encode()
+        need(len(raw) <= 32*1024*1024,'lifecycle_journal_limit')
+        fd=os.open(temp.name,os.O_RDWR|os.O_CREAT|os.O_NOFOLLOW,0o600,dir_fd=parent)
+        try:
+            opened=os.fstat(fd);need(stat.S_ISREG(opened.st_mode) and opened.st_uid==os.getuid() and opened.st_nlink==1 and stat.S_IMODE(opened.st_mode)==0o600,'lifecycle_journal_mode')
+            need(opened.st_size<=len(raw),'lifecycle_journal_drift')
+            prefix=os.read(fd,opened.st_size);need(raw.startswith(prefix),'lifecycle_journal_drift')
+            os.ftruncate(fd,0);os.lseek(fd,0,os.SEEK_SET)
+            with os.fdopen(os.dup(fd),'wb') as stream: stream.write(raw); stream.flush()
+            os.fsync(fd)
+        finally:os.close(fd)
+        os.replace(temp.name,target.name,src_dir_fd=parent,dst_dir_fd=parent);os.fsync(parent)
+    finally:os.close(parent)
+    need(lifecycle_facts(directory)==j['directoryIdentity'],'lifecycle_namespace_drift')
+
+def lifecycle_load():
+    directory=lifecycle_directory(); safe_directory(directory); safe_file(directory/'journal.json')
+    need(directory.stat().st_mode & 0o777 == 0o700,'lifecycle_namespace_mode')
+    p=directory/'journal.json'; need(p.stat().st_size <= 32*1024*1024 and p.stat().st_mode & 0o777 == 0o600,'lifecycle_journal_limit')
+    def unique(rows):
+        out={}
+        for k,v in rows: need(k not in out,'lifecycle_duplicate_key');out[k]=v
+        return out
+    j=json.loads(p.read_text(),object_pairs_hook=unique)
+    fields={'schema','owner','operation','commit','direction','state','binding','steps','active','directoryIdentity'}
+    need(type(j) is dict and set(j)==fields and type(j['schema']) is int and j['schema']==1 and j['owner']=='control-ds3-marshal-fix','lifecycle_journal_schema')
+    need(j['operation'] in ('install','retire') and j['direction']=='forward' and j['state'] in ('pending','complete'),'lifecycle_journal_schema')
+    need(type(j['commit']) is str and re.fullmatch('[0-9a-f]{40}',j['commit']) is not None and type(j['binding']) is dict and type(j['steps']) is list,'lifecycle_journal_schema')
+    need(lifecycle_facts(directory)==j['directoryIdentity'],'lifecycle_namespace_drift')
+    need(j['active'] is None or type(j['active']) is int and 0 <= j['active'] < len(j['steps']),'lifecycle_journal_schema')
+    names=set()
+    for i,row in enumerate(j['steps']):
+        need(type(row) is dict and set(row)=={'name','target','parent','before','after','done','digest'} and type(row['name']) is str and row['name'] not in names and type(row['done']) is bool and type(row['digest']) is bool and type(row['parent']) is dict,'lifecycle_step_schema')
+        need(type(row['target']) is str and type(row['after']) in (dict,type(None)) and type(row['before']) in (dict,type(None)),'lifecycle_step_schema');names.add(row['name'])
+        need(row['done'] or j['active']==i,'lifecycle_step_schema')
+    return j
+
+def lifecycle_bootstrap_path():return ROOT.parent/'.Adapted Games DS3.lifecycle.bootstrap.json'
+
+def lifecycle_bootstrap_recover():
+    p=lifecycle_bootstrap_path()
+    try:raw=load(p,32*1024*1024)
+    except (json.JSONDecodeError,UnicodeError):raise RuntimeError('lifecycle_bootstrap_incomplete_retry_exact_install') from None
+    need(type(raw) is dict and set(raw)=={'schema','owner','directory','parentIdentity','journal'} and type(raw['schema']) is int and raw['schema']==1 and raw['owner']=='control-ds3-marshal-fix' and raw['directory']==lifecycle_directory().name,'lifecycle_bootstrap_schema')
+    j=raw['journal'];fields={'schema','owner','operation','commit','direction','state','binding','steps','active','directoryIdentity'}
+    need(type(j) is dict and set(j)==fields and type(j['schema']) is int and j['schema']==1 and j['owner']=='control-ds3-marshal-fix' and type(j['commit']) is str and re.fullmatch('[0-9a-f]{40}',j['commit']) is not None and type(j['binding']) is dict and set(j['binding'])=={'candidate','manifestSha256','sourceTree','sourceProfile','helperHashes','copySources'} and j['operation']=='install' and j['state']=='pending' and j['steps']==[] and j['active'] is None and j['direction']=='forward' and j['directoryIdentity'] is None,'lifecycle_bootstrap_schema')
+    need(lifecycle_facts(ROOT.parent)==raw['parentIdentity'] and not ROOT.exists() and not ROOT.is_symlink(),'lifecycle_bootstrap_drift')
+    directory=lifecycle_directory()
+    if directory.exists() or directory.is_symlink():
+        safe_directory(directory);need(directory.stat().st_uid==os.getuid() and directory.stat().st_mode&0o777==0o700 and set(x.name for x in directory.iterdir())<={'journal.next'},'lifecycle_bootstrap_collision')
+    else:
+        parent=lifecycle_parent_fd(directory)
+        try:os.mkdir(directory.name,mode=0o700,dir_fd=parent);os.fsync(parent)
+        finally:os.close(parent)
+    j['directoryIdentity']=lifecycle_facts(directory)
+    nextfile=directory/'journal.next'
+    if nextfile.exists() or nextfile.is_symlink():
+        safe_file(nextfile);expected=(json.dumps(j,separators=(',',':'))+'\n').encode();need(expected.startswith(nextfile.read_bytes()),'lifecycle_bootstrap_collision')
+    lifecycle_save(j);return lifecycle_load()
+
+def lifecycle_new(operation,commit,binding):
+    need(type(commit) is str and re.fullmatch('[0-9a-f]{40}',commit) is not None,'invalid_commit')
+    directory=lifecycle_directory()
+    if directory.exists() or directory.is_symlink():
+        previous=lifecycle_load();need(previous['state']=='complete','lifecycle_recovery_required')
+        retained=directory/(previous['operation']+'-'+previous['commit']+'.json')
+        parent=lifecycle_parent_fd(retained)
+        try:
+            s=os.fstat(parent);need({'dev':s.st_dev,'ino':s.st_ino,'mode':stat.S_IMODE(s.st_mode),'kind':'directory'}==previous['directoryIdentity'],'lifecycle_namespace_drift')
+            fd=os.open('journal.json',os.O_RDONLY|os.O_NOFOLLOW|os.O_NONBLOCK,dir_fd=parent)
+            try:
+                opened=os.fstat(fd);need(stat.S_ISREG(opened.st_mode) and opened.st_uid==os.getuid() and opened.st_nlink==1 and opened.st_size<=32*1024*1024,'lifecycle_journal_mode')
+                with os.fdopen(os.dup(fd),'rb') as stream:raw=stream.read()
+                need(json.loads(raw)==previous,'lifecycle_history_drift')
+            finally:os.close(fd)
+            try:fd=os.open(retained.name,os.O_RDWR|os.O_NOFOLLOW|os.O_NONBLOCK,dir_fd=parent)
+            except FileNotFoundError:fd=os.open(retained.name,os.O_RDWR|os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW,0o600,dir_fd=parent)
+            try:
+                opened=os.fstat(fd);need(stat.S_ISREG(opened.st_mode) and opened.st_uid==os.getuid() and opened.st_nlink==1 and stat.S_IMODE(opened.st_mode)==0o600 and opened.st_size<=len(raw),'lifecycle_history_collision')
+                with os.fdopen(os.dup(fd),'r+b') as stream:
+                    prefix=stream.read();need(raw.startswith(prefix),'lifecycle_history_collision');stream.write(raw[len(prefix):]);stream.flush();os.fsync(stream.fileno())
+            finally:os.close(fd)
+            os.fsync(parent)
+        finally:os.close(parent)
+        # Keep the old current journal until the new intent is durable. A
+        # crash while retaining history cannot make recovery disappear.
+    j={'schema':1,'owner':'control-ds3-marshal-fix','operation':operation,'commit':commit,'direction':'forward','state':'pending','binding':binding,'steps':[],'active':None,'directoryIdentity':lifecycle_facts(directory)}
+    if j['directoryIdentity'] is None:
+        marker=lifecycle_bootstrap_path()
+        parent=lifecycle_parent_fd(marker)
+        try:
+            payload={'schema':1,'owner':j['owner'],'directory':directory.name,'parentIdentity':lifecycle_facts(directory.parent),'journal':j}
+            raw=(json.dumps(payload,separators=(',',':'))+'\n').encode()
+            try:fd=os.open(marker.name,os.O_RDWR|os.O_NOFOLLOW|os.O_NONBLOCK,dir_fd=parent)
+            except FileNotFoundError:fd=os.open(marker.name,os.O_RDWR|os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW,0o600,dir_fd=parent)
+            try:
+                s=os.fstat(fd);need(stat.S_ISREG(s.st_mode) and s.st_uid==os.getuid() and s.st_nlink==1 and stat.S_IMODE(s.st_mode)==0o600 and s.st_size<=len(raw),'lifecycle_bootstrap_collision')
+                # A partial *initial metadata intent* has changed no payload.
+                # Only repeating this exact install can provide its missing
+                # candidate binding; append its proven prefix, never discard it.
+                with os.fdopen(os.dup(fd),'r+b') as stream:
+                    prefix=stream.read();need(raw.startswith(prefix),'lifecycle_bootstrap_collision');stream.write(raw[len(prefix):]);stream.flush()
+                os.fsync(fd);os.fsync(parent)
+            finally:os.close(fd)
+            lifecycle_checkpoint('namespace:intent');os.mkdir(directory.name,mode=0o700,dir_fd=parent);os.fsync(parent);lifecycle_checkpoint('namespace:applied')
+        finally:os.close(parent)
+        j['directoryIdentity']=lifecycle_facts(directory)
+    lifecycle_save(j); return j
+
+def lifecycle_checkpoint(name):
+    """Interruption seam; production has no injection environment or test flag."""
+
+def lifecycle_step(j,name,target,mutate,accept,digest=False):
+    rows=[r for r in j['steps'] if r['name']==name]
+    if rows:
+        row=rows[0]; need(row['target']==str(target) and row['digest']==digest,'lifecycle_step_binding')
+        if row['done']: return
+    else:
+        need(j['active'] is None,'lifecycle_step_order')
+        row={'name':name,'target':str(target),'parent':lifecycle_facts(target.parent),'before':lifecycle_facts(target,digest),'after':None,'done':False,'digest':digest}
+        j['steps'].append(row);j['active']=len(j['steps'])-1;lifecycle_save(j)
+        lifecycle_checkpoint(name+':intent')
+    parent_fd=lifecycle_parent_fd(target)
+    try:
+        s=os.fstat(parent_fd);need({'dev':s.st_dev,'ino':s.st_ino,'mode':stat.S_IMODE(s.st_mode),'kind':'directory'}==row['parent'],'lifecycle_parent_drift')
+        mutate(row,parent_fd)
+        os.fsync(parent_fd)
+    finally:os.close(parent_fd)
+    need(accept(),'lifecycle_postimage_drift')
+    if target.exists() and not target.is_symlink(): lifecycle_sync(target)
+    lifecycle_sync(target.parent); lifecycle_checkpoint(name+':applied')
+    row['after']=lifecycle_facts(target,digest);row['done']=True;j['active']=None;lifecycle_save(j)
+    lifecycle_checkpoint(name+':durable')
+
+def lifecycle_validate(j, published=False):
+    # Check only the latest action for a path (earlier copies can intentionally
+    # be superseded by font/config/candidate writes). Never rebaseline drift.
+    latest={r['target']:r for r in j['steps']}
+    stage=lifecycle_directory()/'stage'
+    if j['operation']=='install':
+        tree=ROOT if published else stage
+        if tree.exists() and not tree.is_symlink():
+            admitted={str(Path(path).relative_to(stage)) for path in latest if Path(path).is_relative_to(stage)}
+            need(all(str(p.relative_to(tree)) in admitted for p in tree.rglob('*')),'lifecycle_tree_collision')
+    for path,row in latest.items():
+        p=Path(path)
+        need(p.is_absolute() and '..' not in p.parts,'lifecycle_step_binding')
+        allowed=(p==stage or p.is_relative_to(stage) or p==ROOT or p==HOME/'AIDev/bin/ds3-play' or p.parent==HOME/'Games' and p.name in shortcuts())
+        if j['operation']=='retire': allowed=p==ROOT or p==HOME/'AIDev/bin/ds3-play' or p.parent==HOME/'Games' and p.name in j['binding']['shortcuts'] or p.parent==lifecycle_directory() and p.name in ('entrypoint-1','entrypoint-2','entrypoint-3')
+        need(allowed,'lifecycle_step_binding')
+        if published and (p==stage or p.is_relative_to(stage)): p=ROOT/p.relative_to(stage)
+        if row['done']: need(lifecycle_facts(p,row['digest'])==row['after'],'lifecycle_target_drift')
+
+def lifecycle_mkdir(j,name,p):
+    def mutate(row,parent_fd):
+        need(row['before'] is None,'lifecycle_destination_collision')
+        if not p.exists() and not p.is_symlink(): os.mkdir(p.name,mode=0o700,dir_fd=parent_fd)
+        else: need(lifecycle_facts(p)['kind']=='directory' and p.stat().st_mode & 0o777==0o700,'lifecycle_destination_collision')
+    lifecycle_step(j,name,p,mutate,lambda:p.is_dir() and not p.is_symlink())
+
+def lifecycle_bytes(j,name,p,data,mode=0o600):
+    digest=hashlib.sha256(data).hexdigest()
+    def accept(): return p.exists() and not p.is_symlink() and sha(p)==digest and p.stat().st_mode & 0o777==mode
+    def mutate(row,parent_fd):
+        now=lifecycle_facts(p,True)
+        if accept(): return
+        need(now==row['before'],'lifecycle_target_drift')
+        # Persist complete postimage before the atomic replace. An interruption
+        # retains it; it is never confused with a partial private-profile copy.
+        temp=lifecycle_directory()/('write-'+str(j['steps'].index(row)))
+        temp_parent=lifecycle_parent_fd(temp)
+        try:
+            namespace=os.fstat(temp_parent);need({'dev':namespace.st_dev,'ino':namespace.st_ino,'mode':stat.S_IMODE(namespace.st_mode),'kind':'directory'}==j['directoryIdentity'],'lifecycle_namespace_drift')
+            try:facts=os.stat(temp.name,dir_fd=temp_parent,follow_symlinks=False)
+            except FileNotFoundError:facts=None
+            if facts is not None:
+                need(stat.S_ISREG(facts.st_mode) and facts.st_uid==os.getuid() and facts.st_nlink==1 and facts.st_size<=len(data) and stat.S_IMODE(facts.st_mode)==mode,'lifecycle_staging_drift')
+                fd=os.open(temp.name,os.O_RDWR|os.O_NOFOLLOW|os.O_NONBLOCK,dir_fd=temp_parent)
+            else:fd=os.open(temp.name,os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW,mode,dir_fd=temp_parent)
+            try:
+                opened=os.fstat(fd);need(stat.S_ISREG(opened.st_mode) and opened.st_nlink==1 and (facts is None or opened.st_ino==facts.st_ino and opened.st_dev==facts.st_dev),'lifecycle_staging_drift')
+                with os.fdopen(os.dup(fd),'r+b' if facts is not None else 'wb') as stream:
+                    prefix=stream.read() if facts is not None else b'';need(prefix==data[:len(prefix)],'lifecycle_staging_drift')
+                    stream.write(data[len(prefix):]);stream.flush()
+                os.fchmod(fd,mode);os.fsync(fd)
+            finally:os.close(fd)
+            os.fsync(temp_parent);need(lifecycle_facts(p,True)==row['before'],'lifecycle_target_drift')
+            if row['before'] is None:lifecycle_rename(temp.name,p.name,src_dir_fd=temp_parent,dst_dir_fd=parent_fd)
+            else:os.replace(temp.name,p.name,src_dir_fd=temp_parent,dst_dir_fd=parent_fd)
+        finally:os.close(temp_parent)
+    lifecycle_step(j,name,p,mutate,accept,True)
+
+def lifecycle_copy_file(j,name,src,dst,opaque=False):
+    safe_file(src,allow_source_hardlinks=not opaque);source=src.stat()
+    source_binding=[source.st_dev,source.st_ino,source.st_size,source.st_mtime_ns,source.st_ctime_ns,stat.S_IMODE(source.st_mode)]
+    source_key='copy:'+name
+    bindings=j['binding']['copySources']
+    if source_key in bindings: need(bindings[source_key]==source_binding,'lifecycle_copy_source_drift')
+    else: bindings[source_key]=source_binding;lifecycle_save(j)
+    mode=stat.S_IMODE(source.st_mode) & ~0o022
+    def accept():
+        f=lifecycle_facts(dst,not opaque)
+        return f is not None and f['kind']=='file' and f['size']==source.st_size and f['mtime']==source.st_mtime_ns and f['mode']==mode and (opaque or f['sha256']==sha(src,True))
+    def mutate(row,parent_fd):
+        need(row['before'] is None,'lifecycle_destination_collision')
+        if not dst.exists() and not dst.is_symlink():
+            source_parent=lifecycle_parent_fd(src)
+            try:
+                source_fd=os.open(src.name,os.O_RDONLY|os.O_NOFOLLOW|os.O_NONBLOCK,dir_fd=source_parent)
+                try:
+                    opened=os.fstat(source_fd);need(opened.st_dev==source.st_dev and opened.st_ino==source.st_ino and stat.S_ISREG(opened.st_mode),'lifecycle_copy_source_drift')
+                    lifecycle_clone(source_fd,parent_fd,dst.name)
+                finally:os.close(source_fd)
+            finally:os.close(source_parent)
+        else:
+            f=lifecycle_facts(dst);need(f['kind']=='file' and f['size']<=source.st_size,'lifecycle_partial_copy_drift')
+            # Reconcile an interrupted clone/copy in place, preserving its
+            # inode and opaque bytes. Compare the copied prefix before append;
+            # do not delete a partial private profile and start over.
+            source_fd=os.open(src,os.O_RDONLY|os.O_NOFOLLOW|os.O_NONBLOCK)
+            try:
+                source_open=os.fstat(source_fd);need(source_open.st_dev==source.st_dev and source_open.st_ino==source.st_ino and stat.S_ISREG(source_open.st_mode),'lifecycle_copy_source_drift')
+                target_fd=os.open(dst.name,os.O_RDWR|os.O_NOFOLLOW|os.O_NONBLOCK,dir_fd=parent_fd)
+                try:
+                    opened=os.fstat(target_fd);need(opened.st_dev==f['dev'] and opened.st_ino==f['ino'] and stat.S_ISREG(opened.st_mode) and opened.st_nlink==1,'lifecycle_partial_copy_drift')
+                    with os.fdopen(os.dup(source_fd),'rb') as original,os.fdopen(os.dup(target_fd),'r+b') as partial:
+                        remaining=f['size']
+                        while remaining:
+                            n=min(1048576,remaining);need(original.read(n)==partial.read(n),'lifecycle_partial_copy_drift');remaining-=n
+                        for chunk in iter(lambda:original.read(1048576),b''):partial.write(chunk)
+                        partial.flush();os.fsync(partial.fileno())
+                    os.fchmod(target_fd,mode);os.utime(target_fd,ns=(source.st_atime_ns,source.st_mtime_ns))
+                finally:os.close(target_fd)
+            finally:os.close(source_fd)
+        f=lifecycle_facts(dst);need(f['kind']=='file','lifecycle_partial_copy_drift')
+        fd=os.open(dst.name,os.O_RDONLY|os.O_NOFOLLOW|os.O_NONBLOCK,dir_fd=parent_fd)
+        try:
+            opened=os.fstat(fd);need(opened.st_dev==f['dev'] and opened.st_ino==f['ino'] and stat.S_ISREG(opened.st_mode) and opened.st_nlink==1,'lifecycle_partial_copy_drift')
+            os.fchmod(fd,mode);os.utime(fd,ns=(source.st_atime_ns,source.st_mtime_ns))
+        finally:os.close(fd)
+        after=src.stat();need(source_binding==[after.st_dev,after.st_ino,after.st_size,after.st_mtime_ns,after.st_ctime_ns,stat.S_IMODE(after.st_mode)],'lifecycle_copy_source_drift')
+    lifecycle_step(j,name,dst,mutate,accept,not opaque)
+
+def lifecycle_copy_tree(j,label,src,dst,opaque=False):
+    lifecycle_mkdir(j,label,dst)
+    entries=sorted(src.rglob('*'),key=lambda p:(len(p.relative_to(src).parts),str(p)))
+    need(len(entries)<MAX_ENTRIES,'lifecycle_tree_limit')
+    expected={str(p.relative_to(src)) for p in entries}
+    expected.update(str(Path(r['target']).relative_to(dst)) for r in j['steps'] if Path(r['target']).is_relative_to(dst) and Path(r['target'])!=dst)
+    need(all(str(p.relative_to(dst)) in expected for p in dst.rglob('*')),'lifecycle_tree_collision')
+    for p in entries:
+        rel=p.relative_to(src);target=dst/rel;name=label+'/'+str(rel);s=p.lstat()
+        if stat.S_ISDIR(s.st_mode): lifecycle_mkdir(j,name,target)
+        elif stat.S_ISLNK(s.st_mode):
+            link=os.readlink(p)
+            def mutate(row,parent_fd,p=target,link=link):
+                need(row['before'] is None,'lifecycle_destination_collision')
+                if not p.exists() and not p.is_symlink():os.symlink(link,p.name,dir_fd=parent_fd)
+                else:need(p.is_symlink() and os.readlink(p)==link,'lifecycle_link_drift')
+            lifecycle_step(j,name,target,mutate,lambda p=target,link=link:p.is_symlink() and os.readlink(p)==link)
+        else:lifecycle_copy_file(j,name,p,target,opaque)
+
 def install(commit, candidate):
-    source_gate(commit); m = manifest(HERE/MANIFEST)
+    source_gate(commit,'install',candidate); m = manifest(HERE/MANIFEST)
+    if lifecycle_directory().exists() or lifecycle_directory().is_symlink():
+        old=lifecycle_load()
+        need(old['state']=='complete','lifecycle_recovery_required')
     if ROOT.exists() or ROOT.is_symlink():
         need((ROOT/'manifest.json').read_bytes() == (HERE/MANIFEST).read_bytes(), 'installed_manifest_drift')
         return dict(status(),changed=False,gameStarted=False)
@@ -413,40 +833,90 @@ def install(commit, candidate):
     for name in shortcuts():
         p = HOME/'Games'/name; need(not p.exists() and not p.is_symlink(), 'shortcut_collision')
     inactive(SOURCE/'runtime',SOURCE/'profiles/prince'); before = snapshot(SOURCE/'profiles/prince')
-    ROOT.mkdir(mode=0o700); (ROOT/'profiles').mkdir(mode=0o700)
-    copy(SOURCE/'runtime',ROOT/'runtime'); copy(SOURCE/'profiles/prince',PREFIX)
-    inactive(SOURCE/'runtime',SOURCE/'profiles/prince')
-    need(before == snapshot(SOURCE/'profiles/prince') == snapshot(PREFIX), 'profile_changed_during_copy')
-    need(code_tree(SOURCE/'runtime',allow_source_hardlinks=True) == source_tree == code_tree(ROOT/'runtime'), 'runtime_changed_during_copy')
-    candidate_check(m,candidate)
-    shutil.copyfile(candidate/'winemetal-airconv-original.so', ROOT/'runtime'/DONOR)
-    shutil.copyfile(candidate/'winemetal.so', ROOT/'runtime'/METAL)
-    provenance = ROOT/'runtime/sources/DS3MarshalFix'; (provenance/'bridge/source').mkdir(mode=0o700,parents=True)
-    shutil.copyfile(candidate/'provenance.json',provenance/'bridge/provenance.json')
-    for rel in load(candidate/'provenance.json')['sourceFiles']:
-        dst = provenance/'bridge/source'/rel; dst.parent.mkdir(mode=0o700,parents=True,exist_ok=True)
-        shutil.copyfile(candidate/'source'/rel,dst)
-    for name in m['candidateBuildFiles']: shutil.copyfile(candidate/name,provenance/'bridge'/name)
-    for name in m['marshalSources']: shutil.copyfile(candidate.parent/name,provenance/name)
-    candidate_check(m,candidate)
-    archived = load(provenance/'bridge/provenance.json')
-    need(sha(provenance/'bridge/provenance.json') == m['provenanceSha256'], 'archived_provenance_drift')
-    for rel,digest in archived['sourceFiles'].items(): need(sha(provenance/'bridge/source'/rel) == digest, 'archived_source_drift')
-    for name,digest in m['candidateBuildFiles'].items(): need(sha(provenance/'bridge'/name) == digest, 'archived_build_drift')
-    for name,digest in m['marshalSources'].items(): need(sha(provenance/name) == digest, 'archived_marshal_drift')
-    PREFIX.chmod(0o700); fonts = rebase_fonts(PREFIX,m['fontPathCount']); graphics = window_config()
-    (ROOT/'logs').mkdir(mode=0o700)
-    for name in ('ds3-runtime','ds3-play'):
-        shutil.copyfile(HERE/'bin'/name,ROOT/name); (ROOT/name).chmod(0o700)
-    shutil.copyfile(HERE/MANIFEST,ROOT/'manifest.json')
-    r = {'schema':1,'owner':m['owner'],'commit':commit,'manifestSha256':sha(ROOT/'manifest.json'),
-         'launcherSha256':sha(ROOT/'ds3-play'),'lifecycleSha256':sha(ROOT/'ds3-runtime'),
-         'runtimeTreeSha256':code_tree(ROOT/'runtime'),'sourceRuntimeTreeSha256':source_tree,'fontPathsRebased':fonts,'graphics':graphics}
-    (ROOT/'receipt.json').write_text(json.dumps(r,indent=2)+'\n')
-    resolver.symlink_to(ROOT/'ds3-play')
-    for name,mode in shortcuts().items():
-        p = HOME/'Games'/name; p.write_bytes(shortcut_bytes(mode)); p.chmod(0o700)
-    return dict(status(),changed=True,gameStarted=False)
+    binding={'candidate':str(candidate),'manifestSha256':sha(HERE/MANIFEST),'sourceTree':source_tree,'sourceProfile':json.loads(json.dumps(before)),'helperHashes':{name:sha(HERE/'bin'/name) for name in ('ds3-runtime','ds3-play')},'copySources':{}}
+    j=lifecycle_new('install',commit,binding)
+    return lifecycle_install(j)
+
+def lifecycle_install(j):
+    binding=j['binding'];need(set(binding)=={'candidate','manifestSha256','sourceTree','sourceProfile','helperHashes','copySources'},'lifecycle_binding_schema')
+    m=manifest(HERE/MANIFEST);candidate=Path(binding['candidate'])
+    need(candidate.is_absolute() and '..' not in candidate.parts and sha(HERE/MANIFEST)==binding['manifestSha256'],'lifecycle_source_drift')
+    need(binding['helperHashes']=={name:sha(HERE/'bin'/name) for name in ('ds3-runtime','ds3-play')},'lifecycle_source_drift')
+    candidate_check(m,candidate);need(source_check(m)==binding['sourceTree'],'lifecycle_source_drift')
+    need(json.loads(json.dumps(snapshot(SOURCE/'profiles/prince')))==binding['sourceProfile'],'lifecycle_profile_source_drift')
+    stage=lifecycle_directory()/'stage'
+    publication=[r for r in j['steps'] if r['name']=='publish-root']
+    published=bool(publication and ROOT.exists() and not stage.exists())
+    if published:
+        row=publication[0];original=[r for r in j['steps'] if r['name']=='stage'][0]['after']
+        need(lifecycle_facts(ROOT)==original,'lifecycle_publication_drift')
+    else: need(not ROOT.exists() and not ROOT.is_symlink(),'lifecycle_destination_collision')
+    lifecycle_validate(j,published)
+    if not published:
+        lifecycle_mkdir(j,'stage',stage);lifecycle_mkdir(j,'profiles',stage/'profiles')
+        lifecycle_copy_tree(j,'runtime',SOURCE/'runtime',stage/'runtime')
+        lifecycle_copy_tree(j,'profile',SOURCE/'profiles/prince',stage/'profiles/ds3',True)
+        inactive(SOURCE/'runtime',SOURCE/'profiles/prince')
+        need(json.loads(json.dumps(snapshot(SOURCE/'profiles/prince')))==binding['sourceProfile'],'profile_changed_during_copy')
+        for name,rel in (('winemetal-airconv-original.so',DONOR),('winemetal.so',METAL)):
+            lifecycle_bytes(j,'candidate/'+name,stage/'runtime'/rel,(candidate/name).read_bytes())
+        provenance=stage/'runtime/sources/DS3MarshalFix'
+        def dirs(p):
+            for directory in reversed([p,*p.parents]):
+                if directory.is_relative_to(stage):
+                    rows=[r for r in j['steps'] if r['target']==str(directory)]
+                    if not rows or rows[-1]['name'].startswith('mkdir/'):lifecycle_mkdir(j,'mkdir/'+str(directory.relative_to(stage)),directory)
+        dirs(provenance/'bridge/source')
+        source_files=load(candidate/'provenance.json')['sourceFiles']
+        files=[(candidate/'provenance.json',provenance/'bridge/provenance.json')]
+        files += [(candidate/'source'/rel,provenance/'bridge/source'/rel) for rel in source_files]
+        files += [(candidate/name,provenance/'bridge'/name) for name in m['candidateBuildFiles']]
+        files += [(candidate.parent/name,provenance/name) for name in m['marshalSources']]
+        for src,dst in files: dirs(dst.parent);lifecycle_bytes(j,'archive/'+str(dst.relative_to(provenance)),dst,src.read_bytes())
+        old=('Z:'+str(SOURCE/'runtime/engine/share/wine/fonts').replace('/','\\')).replace('\\','\\\\').encode()
+        new=('Z:'+str(ROOT/'runtime/engine/share/wine/fonts').replace('/','\\')).replace('\\','\\\\').encode()
+        fonts=0
+        for name in ('system.reg','user.reg','userdef.reg'):
+            source=SOURCE/'profiles/prince'/name;safe_file(source);need(source.stat().st_size<=16*1024*1024,'registry_size_limit');raw=source.read_bytes();fonts+=raw.count(old)
+            lifecycle_bytes(j,'fonts/'+name,stage/'profiles/ds3'/name,raw.replace(old,new))
+        need(fonts==m['fontPathCount'],'font_path_count_drift')
+        config=SOURCE/'profiles/prince'/CONFIG_REL;safe_file(config);raw=config.read_bytes();post=initial_window_plan(raw)
+        target=stage/'profiles/ds3'/CONFIG_REL
+        lifecycle_bytes(j,'graphics-backup',target.with_name(target.name+'.ds3-pre-window'),raw)
+        lifecycle_bytes(j,'graphics',target,post)
+        lifecycle_mkdir(j,'logs',stage/'logs')
+        for name in ('ds3-runtime','ds3-play'): lifecycle_bytes(j,'helper/'+name,stage/name,(HERE/'bin'/name).read_bytes(),0o700)
+        lifecycle_bytes(j,'manifest',stage/'manifest.json',(HERE/MANIFEST).read_bytes())
+        graphics={'preimageSha256':hashlib.sha256(raw).hexdigest(),'postimageSha256':hashlib.sha256(post).hexdigest()}
+        r={'schema':1,'owner':m['owner'],'commit':j['commit'],'manifestSha256':sha(stage/'manifest.json'),'launcherSha256':sha(stage/'ds3-play'),'lifecycleSha256':sha(stage/'ds3-runtime'),'runtimeTreeSha256':code_tree(stage/'runtime'),'sourceRuntimeTreeSha256':binding['sourceTree'],'fontPathsRebased':fonts,'graphics':graphics}
+        lifecycle_bytes(j,'receipt',stage/'receipt.json',(json.dumps(r,indent=2)+'\n').encode())
+    def publish(row,parent_fd):
+        need(row['before'] is None,'lifecycle_destination_collision')
+        if stage.exists():
+            need(not ROOT.exists() and not ROOT.is_symlink(),'lifecycle_destination_collision')
+            stage_parent=lifecycle_parent_fd(stage)
+            try:lifecycle_rename(stage.name,ROOT.name,src_dir_fd=stage_parent,dst_dir_fd=parent_fd);os.fsync(stage_parent)
+            finally:os.close(stage_parent)
+        else:need(lifecycle_facts(ROOT)==[r for r in j['steps'] if r['name']=='stage'][0]['after'],'lifecycle_publication_drift')
+    lifecycle_step(j,'publish-root',ROOT,publish,lambda:ROOT.is_dir() and not ROOT.is_symlink())
+    resolver=HOME/'AIDev/bin/ds3-play'
+    def resolve(row,parent_fd):
+        need(row['before'] is None,'resolver_collision')
+        if not resolver.exists() and not resolver.is_symlink():os.symlink(str(ROOT/'ds3-play'),resolver.name,dir_fd=parent_fd)
+        else:need(resolver.is_symlink() and os.readlink(resolver)==str(ROOT/'ds3-play'),'resolver_drift')
+    lifecycle_step(j,'resolver',resolver,resolve,lambda:resolver.is_symlink() and os.readlink(resolver)==str(ROOT/'ds3-play'))
+    for name,mode in shortcuts().items():lifecycle_bytes(j,'shortcut/'+name,HOME/'Games'/name,shortcut_bytes(mode),0o700)
+    result=dict(status(),changed=True,gameStarted=False)
+    j['state']='complete';lifecycle_save(j);lifecycle_checkpoint('install:complete');return result
+
+def recover(commit):
+    source_gate(commit,'recover')
+    j=lifecycle_load() if (lifecycle_directory()/'journal.json').exists() or (lifecycle_directory()/'journal.json').is_symlink() else lifecycle_bootstrap_recover()
+    if j['state']=='complete':
+        if j['operation']=='install':return dict(status(),changed=False,gameStarted=False,recovered=True)
+        return lifecycle_retire(j,complete=True)
+    result=lifecycle_install(j) if j['operation']=='install' else lifecycle_retire(j)
+    return dict(result,recovered=True)
 
 def refresh(commit):
     """Replace only reviewed helpers/receipt, retaining runtime and private data."""
@@ -942,6 +1412,148 @@ def rollback_follow(commit,apply_commit):
     follow_restore(transaction,follow_targets()); verify_installed(); verify_borderless()
     return {'state':'DS3_FOLLOW_ROLLED_BACK','gameStarted':False,'dataDeleted':False}
 
+def repair_window_plan(raw):
+    need(len(raw) <= 131072 and not raw.startswith((b'\xff\xfe',b'\xfe\xff')), 'resolution_encoding_drift')
+    try:
+        text = raw.decode('utf-16-le','strict')
+        need('<!DOCTYPE' not in text and '<!ENTITY' not in text, 'resolution_graphics_drift')
+        tree = ET.fromstring(text)
+    except (UnicodeError,ET.ParseError): raise RuntimeError('resolution_graphics_drift')
+    modes = list(tree.iter('ScreenMode'))
+    need(tree.tag == 'config' and len(modes) == len(tree.findall('ScreenMode')) == 1
+         and not modes[0].attrib and not len(modes[0]) and modes[0].text in ('FULLSCREEN','WINDOW'), 'resolution_graphics_drift')
+    mode = modes[0].text
+    need(text.count('<ScreenMode>'+mode+'</ScreenMode>') == 1, 'resolution_graphics_drift')
+    if mode == 'FULLSCREEN':
+        raw = text.replace('<ScreenMode>FULLSCREEN</ScreenMode>','<ScreenMode>WINDOW</ScreenMode>',1).encode('utf-16-le')
+    return resolution_plan(raw,'1440')
+
+def window_repair_pending_guard():
+    namespace=lifecycle_directory();journal=namespace/'journal.json'
+    if journal.exists() or journal.is_symlink():
+        j=lifecycle_load();need(j['state']=='complete' and j['active'] is None and all(row['done'] for row in j['steps']),'lifecycle_recovery_required')
+        # Do not validate completed profile images: these are owner history.
+    elif namespace.exists() or namespace.is_symlink() or lifecycle_bootstrap_path().exists() or lifecycle_bootstrap_path().is_symlink():
+        raise RuntimeError('lifecycle_recovery_required')
+
+def window_repair_transaction(apply_commit):
+    need(type(apply_commit) is str and re.fullmatch('[0-9a-f]{40}',apply_commit) is not None,'invalid_apply_commit')
+    return ROOT/('.window-repair-'+apply_commit)
+
+def window_repair_record(apply_commit):
+    transaction=window_repair_transaction(apply_commit);safe_directory(transaction);record=load(transaction/'record.json')
+    need(type(record) is dict and set(record)=={'schema','applyCommit','beforeSha256','afterSha256','mode'} and type(record['schema']) is int and record['schema']==1 and record['applyCommit']==apply_commit and pinned(record['beforeSha256']) and pinned(record['afterSha256']) and type(record['mode']) is int and 0 <= record['mode'] <= 0o777 and not record['mode'] & 0o022,'window_repair_record_drift')
+    for name,key in (('before.xml','beforeSha256'),('after.xml','afterSha256')):
+        path=transaction/name;safe_file(path);need(path.stat().st_size <= 131072 and sha(path)==record[key],'window_repair_backup_drift')
+    before=(transaction/'before.xml').read_bytes();after=(transaction/'after.xml').read_bytes();need(repair_window_plan(before)==after,'window_repair_backup_scope')
+    target=PREFIX/CONFIG_REL;safe_file(target)
+    need(sha(target) in (record['beforeSha256'],record['afterSha256']) and target.stat().st_mode & 0o777 == record['mode'],'window_repair_rollback_drift')
+    return record,before,after
+
+def window_repair_preflight(commit,action='repair-window',apply_commit=None):
+    need(action in ('repair-window','rollback-window'),'window_repair_action')
+    window_repair_pending_guard()
+    source_gate(commit,action,apply_commit=apply_commit); base,_ = verify_installed(); verify_borderless(); inactive(ROOT/'runtime',PREFIX)
+    need(base.get('aspectFit') is True, 'window_repair_requires_aspect')
+    registry=PREFIX/'user.reg';safe_file(registry);need(registry.stat().st_size <= 16*1024*1024,'registry_size_limit')
+    raw=registry.read_bytes();need(retina_plan(raw)==raw,'retina_not_enabled')
+    target=PREFIX/CONFIG_REL;safe_file(target);need(target.stat().st_size <= 131072,'graphics_limit')
+    return target
+
+def window_repair_checkpoint(name):
+    """Synthetic interruption seam; no production injection flag or input."""
+
+def window_repair_fd_facts(fd):
+    s=os.fstat(fd)
+    need(stat.S_ISREG(s.st_mode) and s.st_uid==os.getuid() and s.st_nlink==1 and not s.st_mode & 0o022 and s.st_size <= 131072,'window_repair_target_changed')
+    return tuple(getattr(s,key) for key in ('st_dev','st_ino','st_mode','st_uid','st_nlink','st_size','st_mtime_ns','st_ctime_ns'))
+
+def window_repair_replace(target,data,mode,expected):
+    need(target==PREFIX/CONFIG_REL and type(data) is bytes and len(data)<=131072 and type(mode) is int and 0<=mode<=0o777 and not mode&0o022 and pinned(expected),'window_repair_target_scope')
+    parent_before=lifecycle_facts(target.parent);parent=lifecycle_parent_fd(target);temporary=None;temporary_identity=None;temporary_fd=None;target_fd=None
+    try:
+        s=os.fstat(parent);need({'dev':s.st_dev,'ino':s.st_ino,'mode':stat.S_IMODE(s.st_mode),'kind':'directory'}==parent_before,'window_repair_parent_changed')
+        target_fd=os.open(target.name,os.O_RDONLY|os.O_NOFOLLOW|os.O_NONBLOCK,dir_fd=parent)
+        target_before=window_repair_fd_facts(target_fd)
+        need(stat.S_IMODE(target_before[2])==mode and digest_bytes(os.read(target_fd,131073))==expected,'window_repair_target_changed')
+        window_repair_checkpoint('replace:held')
+        need(lifecycle_facts(target.parent)==parent_before,'window_repair_parent_changed')
+        temporary='.window-repair-'+os.urandom(16).hex()
+        temporary_fd=os.open(temporary,os.O_RDWR|os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW,0o600,dir_fd=parent)
+        with os.fdopen(os.dup(temporary_fd),'wb') as out:out.write(data);out.flush()
+        os.fchmod(temporary_fd,mode);os.fsync(temporary_fd);os.lseek(temporary_fd,0,os.SEEK_SET)
+        temporary_identity=os.fstat(temporary_fd);temporary_before=window_repair_fd_facts(temporary_fd)
+        need(digest_bytes(os.read(temporary_fd,131073))==digest_bytes(data),'window_repair_staging_drift')
+        window_repair_checkpoint('replace:staged')
+        need(lifecycle_facts(target.parent)==parent_before,'window_repair_parent_changed')
+        named=os.stat(target.name,dir_fd=parent,follow_symlinks=False)
+        need(tuple(getattr(named,key) for key in ('st_dev','st_ino','st_mode','st_uid','st_nlink','st_size','st_mtime_ns','st_ctime_ns'))==target_before and window_repair_fd_facts(target_fd)==target_before,'window_repair_target_changed')
+        staged=os.stat(temporary,dir_fd=parent,follow_symlinks=False)
+        need(tuple(getattr(staged,key) for key in ('st_dev','st_ino','st_mode','st_uid','st_nlink','st_size','st_mtime_ns','st_ctime_ns'))==temporary_before and window_repair_fd_facts(temporary_fd)==temporary_before,'window_repair_staging_drift')
+        os.lseek(temporary_fd,0,os.SEEK_SET);need(digest_bytes(os.read(temporary_fd,131073))==digest_bytes(data),'window_repair_staging_drift')
+        os.replace(temporary,target.name,src_dir_fd=parent,dst_dir_fd=parent);os.fsync(parent)
+        window_repair_checkpoint('replace:published')
+        need(lifecycle_facts(target.parent)==parent_before,'window_repair_parent_changed')
+        fd=os.open(target.name,os.O_RDONLY|os.O_NOFOLLOW|os.O_NONBLOCK,dir_fd=parent)
+        try:
+            facts=window_repair_fd_facts(fd);need(stat.S_IMODE(facts[2])==mode and digest_bytes(os.read(fd,131073))==digest_bytes(data),'window_repair_staging_drift')
+        finally:os.close(fd)
+    finally:
+        if target_fd is not None:os.close(target_fd)
+        if temporary_fd is not None:os.close(temporary_fd)
+        try:
+            if temporary is not None:
+                try:remaining=os.stat(temporary,dir_fd=parent,follow_symlinks=False)
+                except FileNotFoundError:remaining=None
+                if remaining is not None:
+                    need(temporary_identity is not None and tuple(getattr(remaining,key) for key in ('st_dev','st_ino','st_mode','st_uid','st_nlink','st_size','st_mtime_ns','st_ctime_ns'))==tuple(getattr(temporary_identity,key) for key in ('st_dev','st_ino','st_mode','st_uid','st_nlink','st_size','st_mtime_ns','st_ctime_ns')) and stat.S_ISREG(remaining.st_mode) and remaining.st_nlink==1,'window_repair_staging_drift')
+                    os.unlink(temporary,dir_fd=parent);os.fsync(parent)
+        finally:os.close(parent)
+
+def repair_window(commit):
+    target=window_repair_preflight(commit);before=target.read_bytes();after=repair_window_plan(before)
+    result={'state':'DS3_WINDOW_REPAIRED','windowMode':'WINDOW','windowWidth':2560,'windowHeight':1440,'gameStarted':False,'borderlessVerified':False}
+    if before==after:return dict(result,changed=False)
+    transaction=window_repair_transaction(commit);need(not transaction.exists() and not transaction.is_symlink(),'window_repair_backup_collision')
+    mode=target.stat().st_mode & 0o777;record={'schema':1,'applyCommit':commit,'beforeSha256':digest_bytes(before),'afterSha256':digest_bytes(after),'mode':mode}
+    root_before=lifecycle_facts(ROOT);parent=lifecycle_parent_fd(transaction);directory=None
+    try:
+        s=os.fstat(parent);need({'dev':s.st_dev,'ino':s.st_ino,'mode':stat.S_IMODE(s.st_mode),'kind':'directory'}==root_before,'window_repair_parent_changed')
+        os.mkdir(transaction.name,mode=0o700,dir_fd=parent)
+        directory=os.open(transaction.name,os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW,dir_fd=parent)
+        s=os.fstat(directory);backup_before={'dev':s.st_dev,'ino':s.st_ino,'mode':stat.S_IMODE(s.st_mode),'kind':'directory'}
+        for name,data in (('before.xml',before),('after.xml',after),('record.json',json_bytes(record))):
+            fd=os.open(name,os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW,0o600,dir_fd=directory)
+            try:
+                with os.fdopen(os.dup(fd),'wb') as out:out.write(data);out.flush()
+                os.fchmod(fd,0o600);os.fsync(fd)
+            finally:os.close(fd)
+            window_repair_checkpoint('backup/'+name+':durable')
+        os.fsync(directory);os.fsync(parent)
+        need(lifecycle_facts(ROOT)==root_before and lifecycle_facts(transaction)==backup_before,'window_repair_parent_changed')
+    finally:
+        if directory is not None:os.close(directory)
+        os.close(parent)
+    inactive(ROOT/'runtime',PREFIX)
+    window_repair_pending_guard();need(lifecycle_facts(transaction)==backup_before,'window_repair_parent_changed');window_repair_record(commit)
+    changed=False
+    try:
+        window_repair_replace(target,after,mode,record['beforeSha256']);changed=True
+        observed=verify_window_config();need(observed['windowWidth']==2560 and observed['windowHeight']==1440 and sha(target)==record['afterSha256'],'window_repair_postimage_drift')
+    except Exception:
+        if changed or sha(target)==record['afterSha256']:window_repair_replace(target,before,mode,record['afterSha256'])
+        raise
+    return dict(result,changed=True)
+
+def rollback_window(commit,apply_commit):
+    window_repair_transaction(apply_commit)
+    target=window_repair_preflight(commit,'rollback-window',apply_commit)
+    record,before,after=window_repair_record(apply_commit);current=sha(target)
+    if current==record['beforeSha256']:return {'state':'DS3_WINDOW_REPAIR_ROLLED_BACK','changed':False,'gameStarted':False}
+    inactive(ROOT/'runtime',PREFIX);window_repair_replace(target,before,record['mode'],record['afterSha256'])
+    need(sha(target)==record['beforeSha256'] and target.stat().st_mode & 0o777==record['mode'],'window_repair_rollback_drift')
+    return {'state':'DS3_WINDOW_REPAIR_ROLLED_BACK','changed':True,'gameStarted':False}
+
 def no_foreign_steam():
     need(not admission(HOME,'ds3').summary()['foreignSteam'], 'foreign_steam_active')
 
@@ -1005,19 +1617,96 @@ def stop():
     return {'state':'DS3_PREFIX_STOPPED'}
 
 def retire(commit):
+    source_gate(commit,'retire')
+    if lifecycle_directory().exists() or lifecycle_directory().is_symlink():
+        prior=lifecycle_load();need(prior['state']=='complete','lifecycle_recovery_required')
+        if prior['operation']=='retire' and not ROOT.exists() and not ROOT.is_symlink():return lifecycle_retire(prior,complete=True)
     need('appLaunchers' not in load(ROOT/'receipt.json'), 'rollback_game_apps_first')
-    source_gate(commit); verify_installed(); inactive(ROOT/'runtime',PREFIX)
+    verify_installed(); inactive(ROOT/'runtime',PREFIX)
     archive = ROOT.with_name(ROOT.name+' retired '+commit[:12])
     need(not archive.exists() and not archive.is_symlink(), 'archive_collision')
-    # Hash-bound removal of visible entrypoints only; retain all profile data.
-    (HOME/'AIDev/bin/ds3-play').unlink()
-    for name in shortcuts(manifest(ROOT/'manifest.json')): (HOME/'Games'/name).unlink()
-    ROOT.rename(archive)
-    return {'state':'RETIRED_DATA_RETAINED','profileDeleted':False}
+    names=shortcuts(manifest(ROOT/'manifest.json'));resolver=HOME/'AIDev/bin/ds3-play'
+    entries={'resolver':{'facts':lifecycle_facts(resolver),'bytes':None}}
+    for name in names:
+        p=HOME/'Games'/name;entries[name]={'facts':lifecycle_facts(p,True),'bytes':p.read_bytes().hex()}
+    binding={'archive':str(archive),'rootIdentity':lifecycle_facts(ROOT),'inventory':lifecycle_retire_inventory(ROOT),'shortcuts':names,'entrypoints':entries}
+    j=lifecycle_new('retire',commit,binding)
+    return lifecycle_retire(j)
+
+def lifecycle_retire_inventory(root):
+    safe_directory(root);rows={}
+    for i,p in enumerate(root.rglob('*')):
+        need(i<MAX_ENTRIES,'lifecycle_tree_limit');s=p.lstat();rel=str(p.relative_to(root))
+        need(s.st_uid==os.getuid(),'lifecycle_foreign_owner')
+        row={'dev':s.st_dev,'ino':s.st_ino,'mode':stat.S_IMODE(s.st_mode)}
+        if stat.S_ISDIR(s.st_mode):safe_directory(p);row['kind']='directory'
+        elif stat.S_ISLNK(s.st_mode):row.update(kind='link',link=os.readlink(p))
+        else:
+            need(stat.S_ISREG(s.st_mode) and (s.st_nlink==1 or rel=='runtime/'+NATIVE_LOADER) and not s.st_mode&0o022,'lifecycle_unsafe_file')
+            row.update(kind='file',size=s.st_size,mtime=s.st_mtime_ns,ctime=s.st_ctime_ns,nlink=s.st_nlink)
+        rows[rel]=row
+    return rows
+
+def lifecycle_retire(j,complete=False):
+    binding=j['binding']
+    need(set(binding)=={'archive','rootIdentity','inventory','shortcuts','entrypoints'},'lifecycle_binding_schema')
+    archive=ROOT.with_name(ROOT.name+' retired '+j['commit'][:12])
+    need(binding['archive']==str(archive) and type(binding['shortcuts']) is dict and binding['shortcuts'] in (shortcuts(),shortcuts({'aspectFit':True})) and set(binding['entrypoints'])=={'resolver',*binding['shortcuts']},'lifecycle_binding_schema')
+    source=ROOT if ROOT.exists() or ROOT.is_symlink() else archive
+    if source==archive:
+        moves=[row for row in j['steps'] if row['name']=='archive-root']
+        need(len(moves)==1 and moves[0]['before']==binding['rootIdentity'],'lifecycle_retire_drift')
+    need(lifecycle_facts(source)==binding['rootIdentity'],'lifecycle_retire_drift')
+    need(not (ROOT.exists() and (archive.exists() or archive.is_symlink())),'archive_collision')
+    if complete:
+        # Once retirement is durable, the retained profile belongs to the
+        # owner. Its historical inventory is evidence of the move, not an
+        # ongoing immutability promise for saves/config/archive contents.
+        need(j['state']=='complete' and j['active'] is None and all(row['done'] for row in j['steps']),'lifecycle_journal_schema')
+        need(not ROOT.exists() and not ROOT.is_symlink() and source==archive and moves[0]['done'],'lifecycle_retire_drift')
+        need(all(not (HOME/'Games'/name).exists() and not (HOME/'Games'/name).is_symlink() for name in binding['shortcuts']) and not (HOME/'AIDev/bin/ds3-play').exists() and not (HOME/'AIDev/bin/ds3-play').is_symlink(),'lifecycle_target_drift')
+        return {'state':'RETIRED_DATA_RETAINED','profileDeleted':False,'changed':False,'recovered':True}
+    need(lifecycle_retire_inventory(source)==binding['inventory'],'lifecycle_retire_drift')
+    lifecycle_validate(j)
+    # Reject unprocessed endpoint drift before even creating a backup. An
+    # already removed endpoint is admitted only by its durable unlink intent.
+    for name,entry in binding['entrypoints'].items():
+        need(type(entry) is dict and set(entry)=={'facts','bytes'},'lifecycle_binding_schema')
+        p=HOME/'AIDev/bin/ds3-play' if name=='resolver' else HOME/'Games'/name
+        now=lifecycle_facts(p,name!='resolver');rows=[r for r in j['steps'] if r['name']=='remove/'+name]
+        if rows:need(now is None or not rows[0]['done'] and now==entry['facts'],'lifecycle_target_drift')
+        else:need(now==entry['facts'],'lifecycle_target_drift')
+    # Before touching any endpoint, prove inactivity with the still-bound server
+    # and exact prefix, including when the archive rename already happened.
+    inactive(source/'runtime',source/'profiles/ds3')
+    entries=binding['entrypoints']
+    for name in ('resolver',*binding['shortcuts']):
+        p=HOME/'AIDev/bin/ds3-play' if name=='resolver' else HOME/'Games'/name
+        expected=entries[name]['facts'];need(type(entries[name]) is dict and set(entries[name])=={'facts','bytes'},'lifecycle_binding_schema')
+        if name!='resolver':
+            raw=bytes.fromhex(entries[name]['bytes']);need(raw==shortcut_bytes(binding['shortcuts'][name]) and hashlib.sha256(raw).hexdigest()==expected.get('sha256'),'lifecycle_entrypoint_preimage')
+            lifecycle_bytes(j,'backup/'+name,lifecycle_directory()/('entrypoint-'+str(list(entries).index(name))),raw,expected['mode'])
+        else:need(entries[name]['bytes'] is None and expected.get('kind')=='link' and expected.get('link')==str(ROOT/'ds3-play'),'lifecycle_entrypoint_preimage')
+        def remove(row,parent_fd,p=p,expected=expected,name=name):
+            need(row['before']==expected,'lifecycle_entrypoint_preimage')
+            now=lifecycle_facts(p,name!='resolver')
+            if now is None:return
+            need(now==expected,'lifecycle_target_drift');os.unlink(p.name,dir_fd=parent_fd)
+        lifecycle_step(j,'remove/'+name,p,remove,lambda p=p:not p.exists() and not p.is_symlink(),name!='resolver')
+    def move(row,parent_fd):
+        need(row['before']==binding['rootIdentity'],'lifecycle_retire_drift')
+        if ROOT.exists():
+            need(not archive.exists() and not archive.is_symlink(),'archive_collision')
+            need(lifecycle_retire_inventory(ROOT)==binding['inventory'],'lifecycle_retire_drift');lifecycle_rename(ROOT.name,archive.name,src_dir_fd=parent_fd,dst_dir_fd=parent_fd)
+        else:need(lifecycle_facts(archive)==binding['rootIdentity'],'lifecycle_retire_drift')
+    lifecycle_step(j,'archive-root',ROOT,move,lambda:not ROOT.exists() and not ROOT.is_symlink() and lifecycle_facts(archive)==binding['rootIdentity'])
+    need(lifecycle_retire_inventory(archive)==binding['inventory'],'lifecycle_retire_drift')
+    j['state']='complete';lifecycle_save(j);lifecycle_checkpoint('retire:complete')
+    return {'state':'RETIRED_DATA_RETAINED','profileDeleted':False,'changed':True}
 
 def main():
     os.umask(0o077); args = sys.argv[1:]
-    need(args, 'usage: ds3-runtime prepare CANDIDATE | install COMMIT CANDIDATE | refresh COMMIT | install-borderless COMMIT CANDIDATE | large-window COMMIT | overlay-off COMMIT | resolution-1080 COMMIT | upgrade-aspect COMMIT CANDIDATE | rollback-aspect COMMIT APPLY_COMMIT | upgrade-follow COMMIT CANDIDATE | rollback-follow COMMIT APPLY_COMMIT | status | play | play-1080 | measure | stop | retire COMMIT')
+    need(args, 'usage: ds3-runtime prepare CANDIDATE | install COMMIT CANDIDATE | recover COMMIT | refresh COMMIT | install-borderless COMMIT CANDIDATE | large-window COMMIT | overlay-off COMMIT | resolution-1080 COMMIT | upgrade-aspect COMMIT CANDIDATE | rollback-aspect COMMIT APPLY_COMMIT | upgrade-follow COMMIT CANDIDATE | rollback-follow COMMIT APPLY_COMMIT | repair-window COMMIT | rollback-window COMMIT APPLY_COMMIT | status | play | play-1080 | measure | stop | retire COMMIT')
     lockdir = HOME/'AIDev/state'; safe_directory(lockdir)
     fd = os.open(lockdir/'games-hub.lock',os.O_CREAT|os.O_RDWR|os.O_NOFOLLOW,0o600)
     s = os.fstat(fd); need(stat.S_ISREG(s.st_mode) and s.st_uid == os.getuid() and s.st_nlink == 1 and not s.st_mode & 0o022,'unsafe_lock')
@@ -1028,11 +1717,14 @@ def main():
         elif args[0] == 'install' and len(args) == 3: result = install(args[1],Path(args[2]))
         elif args[0] == 'install-borderless' and len(args) == 3: result = install_borderless(args[1],Path(args[2]))
         elif args[0] == 'retire' and len(args) == 2: result = retire(args[1])
+        elif args[0] == 'recover' and len(args) == 2: result = recover(args[1])
         elif args[0] == 'upgrade-aspect' and len(args) == 3: result = upgrade_aspect(args[1],Path(args[2]))
         elif args[0] == 'rollback-aspect' and len(args) == 3: result = rollback_aspect(args[1],args[2])
         elif args[0] == 'upgrade-follow' and len(args) == 3: result = upgrade_follow(args[1],Path(args[2]))
         elif args[0] == 'rollback-follow' and len(args) == 3: result = rollback_follow(args[1],args[2])
         elif args[0] == 'play-1080' and len(args) == 1: result = play(preset='1080')
+        elif args[0] == 'repair-window' and len(args) == 2: result = repair_window(args[1])
+        elif args[0] == 'rollback-window' and len(args) == 3: result = rollback_window(args[1],args[2])
         elif args[0] == 'refresh' and len(args) == 2: result = refresh(args[1])
         elif args[0] == 'large-window' and len(args) == 2: result = large_window(args[1])
         elif args[0] == 'overlay-off' and len(args) == 2: result = overlay_off(args[1])

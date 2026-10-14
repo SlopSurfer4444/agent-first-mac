@@ -16,7 +16,7 @@ DEFAULT_OUTPUT = ROOT / "install-bundles/phase-4/aid-admin-emergency"
 MIGRATION_MAIN = "b67c582b4b07fd91fb6d1487ada7aca011a61833"
 CONTROL_MAIN = "217602def502f515f5c0c554f1d4c1d0aaabcb26"
 TASK_PARENT = "55c556f6566a7dcffc302d073e3f78dfc0ebeb73"
-BROKER_SHA256 = "bce4427701a0278ea7941710939fc6e0a2b36abe0f3f487564b228b7283acd8e"
+BROKER_SHA256 = "ccf7c87823476892f35d25ae5b65e614fbd9e2fc1ae6e8c409644e800e291b54"
 POLICY_SHA256 = "2555b3f0ed1f75cd26bc41af6512ecc30d444ba1b0113458f72efcfccc304225"
 SUDOERS_SHA256 = "b51a2c60bae3652decef1df7ffe2fd66931ee317305fbf1bc5c50e491f5c3ee6"
 RECEIPT_SHA256 = "cf5e95fd3bf33fc34794055a80865fde9feaeccac4b271aa30561e42ca30a725"
@@ -24,8 +24,17 @@ MARKER = "CHECKPOINT_PHASE4_FINAL_PROBES_REVIEW"
 SOURCES = (
     "Sources/AidAdminEmergencyAction/main.swift",
     "Sources/AidAdminEmergencyCore/AidAdminEmergencyCore.swift",
+    "Sources/AidAdminRuntime/BoundedProcess.swift",
+    "Sources/AidAdminCore/AidAdminCore.swift",
+    "Sources/AidAdminCore/OperationJournal.swift",
+    "Sources/AidAdminCore/ResumeLaunchd.swift",
+    "Sources/AidAdminCore/ResumeHomeManager.swift",
     "bin/build-phase4-emergency-bundle",
     "tests/AidAdminEmergencyTests/AidAdminEmergencyTests.swift",
+    "tests/AidAdminRuntimeTests/AidAdminRuntimeTests.swift",
+    "tests/AidAdminCoreTests/AidAdminCoreTests.swift",
+    "tests/test_root_bundle_successor.py",
+    "Package.swift",
 )
 
 
@@ -34,11 +43,30 @@ def require(condition, reason):
         raise RuntimeError(reason)
 
 
-def run(argv, cwd=ROOT):
+def cache_environment(cache_root=None):
+    environment = {"HOME": "/var/empty", "LANG": "C", "LC_ALL": "C",
+                   "PATH": "/usr/bin:/bin", "TMPDIR": tempfile.gettempdir()}
+    if cache_root is not None:
+        cache_root = Path(cache_root)
+        directories = {
+            "HOME": cache_root / "home",
+            "TMPDIR": cache_root / "tmp",
+            "CLANG_MODULE_CACHE_PATH": cache_root / "clang-module-cache",
+            "SWIFT_MODULECACHE_PATH": cache_root / "swift-module-cache",
+            "XDG_CACHE_HOME": cache_root / "xdg-cache",
+            "SWIFTPM_MODULECACHE_OVERRIDE": cache_root / "swiftpm-module-cache",
+            "SWIFTPM_CUSTOM_CACHE_PATH": cache_root / "swiftpm-cache",
+        }
+        for key, path in directories.items():
+            path.mkdir(parents=True, exist_ok=True)
+            environment[key] = str(path)
+    return environment
+
+
+def run(argv, cwd=ROOT, cache_root=None):
     result = subprocess.run([str(value) for value in argv], cwd=cwd, text=True,
                             stdout=subprocess.PIPE, stderr=subprocess.STDOUT, check=False,
-                            env={"HOME": "/var/empty", "LANG": "C", "LC_ALL": "C",
-                                 "PATH": "/usr/bin:/bin", "TMPDIR": tempfile.gettempdir()})
+                            env=cache_environment(cache_root))
     require(result.returncode == 0,
             f"command_failed_{Path(str(argv[0])).name}: {result.stdout[-1600:]}")
     return result.stdout
@@ -56,17 +84,85 @@ def pin(path):
     return {"sha256": digest(path), "size": path.stat().st_size}
 
 
-def build(destination):
-    run(["/usr/bin/swiftc", "-O",
+def parse_args(args):
+    successor = len(args) == 3 and args[:2] == ["--successor", "--output"]
+    require(args == [] or (len(args) == 2 and args[0] == "--output") or successor,
+            "usage: [--output NEW] | --successor --output NEW")
+    output_arg = args[2] if successor else (args[1] if args else None)
+    require(output_arg is None or (bool(output_arg) and not output_arg.startswith("--")),
+            "output_path_required")
+    requested_output = Path(output_arg) if output_arg is not None else DEFAULT_OUTPUT
+    require(not os.path.lexists(requested_output), "output_already_exists")
+    output = requested_output.resolve()
+    require(not successor or output != DEFAULT_OUTPUT.resolve(),
+            "successor_historical_output_forbidden")
+    require(not os.path.lexists(output), "output_already_exists")
+    return successor, output
+
+
+def source_snapshot():
+    head = run(["/usr/bin/git", "-c", "core.fsmonitor=false", "rev-parse", "HEAD"]).strip()
+    require(len(head) == 40 and all(character in "0123456789abcdef" for character in head),
+            "invalid_candidate_git_head")
+    return {"gitHEAD": head,
+            "sourceFileSHA256": {path: digest(ROOT / path) for path in SOURCES},
+            "isAcceptance": False}
+
+
+def successor_manifest(manifest, candidate_source):
+    # Historical pins are provenance only, never successor acceptance or live state.
+    manifest = dict(manifest)
+    installed_contract = dict(manifest.pop("installedContract"))
+    manifest["historicalPredecessor"] = {
+        "role": "predecessor-only",
+        "acceptedBases": manifest.pop("acceptedBases"),
+        "receipt": installed_contract.pop("receipt"),
+        "reviewMarker": manifest["reviewMarker"],
+    }
+    manifest["compiledExpectedContract"] = {
+        "role": "compiled-expectations-not-installed-proof",
+        **installed_contract,
+    }
+    manifest["buildProvenance"] = dict(manifest["buildProvenance"])
+    if "sourceBase" in manifest["buildProvenance"]:
+        manifest["historicalPredecessor"]["sourceBase"] = manifest["buildProvenance"].pop("sourceBase")
+    manifest["schema"] = 2
+    manifest["artifactSet"] = "phase4-aid-admin-emergency-successor-candidate-v1"
+    manifest["acceptanceState"] = "not-accepted"
+    manifest["installationState"] = "not-installed"
+    manifest["candidateSource"] = candidate_source
+    manifest["gates"] = {**manifest["gates"],
+                         "preparationOnly": True, "applyGateAccepted": False,
+                         "installed": False, "accepted": False,
+                         "compiledBindingsAccepted": False,
+                         "compiledBindingsRequireRebinding": True,
+                         "independentReviewRequired": True}
+    manifest["reviewMarker"] = "CHECKPOINT_ROOT_SUCCESSOR_SOURCE_REVIEW"
+    manifest["verdict"] = "SOURCE_ONLY_SUCCESSOR_CANDIDATE_NOT_ACCEPTED"
+    return manifest
+
+
+def build(destination, cache_root=None):
+    if cache_root is None:
+        cache_root = Path(destination).parent / (Path(destination).name + "-cache")
+    run(["/usr/bin/swiftc", "-O", "-module-cache-path",
+         Path(cache_root) / "swift-module-cache",
+         ROOT / "Sources/AidAdminRuntime/BoundedProcess.swift",
+         ROOT / "Sources/AidAdminCore/AidAdminCore.swift",
+         ROOT / "Sources/AidAdminCore/OperationJournal.swift",
+         ROOT / "Sources/AidAdminCore/ResumeLaunchd.swift",
+         ROOT / "Sources/AidAdminCore/ResumeHomeManager.swift",
          ROOT / "Sources/AidAdminEmergencyCore/AidAdminEmergencyCore.swift",
          ROOT / "Sources/AidAdminEmergencyAction/main.swift",
-         "-o", destination])
+         "-o", destination], cache_root=cache_root)
     destination.chmod(0o555)
 
 
 def behavior(binary):
     cases = [[], ["unknown"], ["disable", "extra"], ["recover", "extra"],
-             ["__root-disable"], ["__root-recover"], ["disable;id"], ["$(id)"]]
+             ["__root-disable"], ["__root-recover"], ["disable;id"], ["$(id)"],
+             ["resume"], ["resume", "malformed"], ["resume", "a" * 40, "extra"],
+             ["__root-resume", "a" * 40], ["__root-resume", "malformed"]]
     values = []
     environment = {"HOME": "/var/empty", "LANG": "C", "LC_ALL": "C",
                    "PATH": "/usr/bin:/bin", "TMPDIR": "/var/empty",
@@ -93,28 +189,30 @@ def write_json(path, value):
 
 
 def main():
-    args = sys.argv[1:]
-    require(args == [] or (len(args) == 2 and args[0] == "--output"), "usage")
-    output = Path(args[1]).resolve() if args else DEFAULT_OUTPUT
-    require(not output.exists(), "output_already_exists")
+    successor, output = parse_args(sys.argv[1:])
+    candidate_source = source_snapshot() if successor else None
     output.parent.mkdir(parents=True, exist_ok=True)
     scratch = Path(tempfile.mkdtemp(prefix="aid-admin-emergency-build."))
     try:
         candidate_a = scratch / "aid-admin-emergency-action-a"
         candidate_b = scratch / "aid-admin-emergency-action-b"
-        build(candidate_a)
-        build(candidate_b)
-        require(behavior(candidate_a) == behavior(candidate_b), "emergency_behavior_drift")
+        build(candidate_a, scratch / "clean-a")
+        build(candidate_b, scratch / "clean-b")
+        behavior_a = behavior(candidate_a)
+        require(behavior_a == behavior(candidate_b), "emergency_behavior_drift")
         require(architecture(candidate_a) == architecture(candidate_b) == "arm64-darwin",
                 "emergency_architecture_drift")
 
+        swift = run(["/usr/bin/swiftc", "--version"],
+                    cache_root=scratch / "metadata").splitlines()[0]
+        if successor:
+            require(source_snapshot() == candidate_source, "candidate_source_drift")
         output.mkdir(mode=0o755)
         artifact = output / "aid-admin-emergency-action"
         shutil.copyfile(candidate_a, artifact)
         artifact.chmod(0o555)
-        swift = run(["/usr/bin/swiftc", "--version"]).splitlines()[0]
         manifest = output / "review-manifest.json"
-        write_json(manifest, {
+        manifest_value = {
             "acceptedBases": {
                 "controlMain": CONTROL_MAIN,
                 "migrationMain": MIGRATION_MAIN,
@@ -123,6 +221,7 @@ def main():
             "actionSurface": {
                 "disable": "aid-admin-emergency-action disable",
                 "recover": "aid-admin-emergency-action recover",
+                "resume": "aid-admin-emergency-action resume <recorded-40-hex-commit>",
                 "otherInputRejected": True,
             },
             "architecture": "arm64-darwin",
@@ -140,15 +239,17 @@ def main():
                 "recoveryVerificationBeforeTimestampClear": True,
                 "recoveryVerificationFailureSameBoundaryRollback": True,
                 "timestampClearedAfterEachAction": True,
+                "resumeFreshStandardSudo": True,
+                "resumeLeavesBrokerDisabled": True,
             },
             "buildProvenance": {
-                "behaviorCases": 8,
+                "behaviorCases": len(behavior_a),
                 "behaviorIdentical": True,
                 "buildA": pin(candidate_a),
                 "buildB": pin(candidate_b),
                 "commands": [
-                    "/usr/bin/swiftc -O <emergency-core> <emergency-main> -o <clean-a>",
-                    "/usr/bin/swiftc -O <emergency-core> <emergency-main> -o <clean-b>",
+                    "/usr/bin/swiftc -O -module-cache-path <isolated-a-cache> <runtime> <broker-core-and-journals> <emergency-core> <emergency-main> -o <clean-a>",
+                    "/usr/bin/swiftc -O -module-cache-path <isolated-b-cache> <runtime> <broker-core-and-journals> <emergency-core> <emergency-main> -o <clean-b>",
                 ],
                 "sourceFileSHA256": {path: digest(ROOT / path) for path in SOURCES},
                 "swift": swift,
@@ -173,7 +274,7 @@ def main():
             "installedContract": {
                 "attestation": {"mode": "0400", "size": 341,
                                 "ownerAndExactHashBindingsRequired": True},
-                "binary": {"mode": "0555", "sha256": BROKER_SHA256, "size": 483712},
+                "binary": {"mode": "0555", "sha256": BROKER_SHA256, "size": 813680},
                 "policy": {"mode": "0444", "sha256": POLICY_SHA256, "size": 1617},
                 "receipt": {"mode": "0400", "sha256": RECEIPT_SHA256, "size": 431},
                 "sudoers": {"mode": "0440", "sha256": SUDOERS_SHA256, "size": 122},
@@ -222,10 +323,15 @@ def main():
                 },
             },
             "verdict": "FINAL_PHASE4_PROBES_PREPARED_FOR_INDEPENDENT_REVIEW",
-        })
+        }
+        if successor:
+            manifest_value = successor_manifest(manifest_value, candidate_source)
+            require(source_snapshot() == candidate_source, "candidate_source_drift")
+        write_json(manifest, manifest_value)
         print(json.dumps({"artifactSHA256": digest(artifact),
                           "artifactSize": artifact.stat().st_size,
                           "ownerIdentityRetained": False,
+                          "output": str(output),
                           "result": "pass",
                           "reviewManifestSHA256": digest(manifest)}, sort_keys=True))
     finally:

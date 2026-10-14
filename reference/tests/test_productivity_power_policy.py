@@ -71,7 +71,7 @@ class ProductivityPowerPolicyTests(unittest.TestCase):
         self.assertEqual(self.manifest["ownerRuntimePreferences"]["lowPowerMode"], "Only on Battery")
         self.assertEqual(self.manifest["ownerRuntimePreferences"]["chargeLimitPercent"], 90)
         self.assertEqual(self.manifest["ownerAuthorization"]["latestOwnerOverride"]["authorizedOn"],
-                         "EXAMPLE-DATE")
+                         "2026-09-09")
         self.assertIn("batteryLowPowerEnabled = true;", self.module)
         self.assertIn('/usr/bin/pmset -c lowpowermode 0', self.module)
         self.assertIs(self.validate(self.manifest, self.module)["batteryLowPowerMode"], True)
@@ -138,6 +138,26 @@ class ProductivityPowerPolicyTests(unittest.TestCase):
         report = self.validate(manifest, module)
         self.assertIs(report["profileActive"], False)
         self.assertIs(report["batteryLowPowerMode"], True)
+
+    def test_targeted_selector_matches_manifest_without_global_write_scope(self):
+        manifest, module = self.sources()
+        manifest["preferenceOwnership"]["managedKeys"] = ["dockAutohide"]
+        module = module.replace("managedPreferences = [ ];", 'managedPreferences = [ "dockAutohide" ];')
+        self.assertEqual(self.validate(manifest, module)["preferencePlan"]["defaults"], ["dockAutohide"])
+        self.rejects(manifest, self.module, "preference_selector_manifest_drift")
+
+    def test_targeted_declaration_value_or_path_drift_fails_closed(self):
+        manifest, module = self.sources()
+        self.rejects(manifest, module.replace('"dock" "autohide" ]; value = false;',
+                                            '"dock" "autohide" ]; value = true;'), "managed_preference_value_drift")
+        self.rejects(manifest, module.replace('"dock" "autohide" ];',
+                                            '"dock" "show-recents" ];'), "managed_preference_path_drift")
+
+    def test_unconditional_released_writer_cannot_be_reintroduced(self):
+        manifest, module = self.sources()
+        self.rejects(manifest, module.replace("SoftwareUpdate.AutomaticallyInstallMacOSUpdates = true;",
+                     "SoftwareUpdate.AutomaticallyInstallMacOSUpdates = true;\n    dock.autohide = false;"),
+                     "released_preference_write")
 
 
 if __name__ == "__main__":

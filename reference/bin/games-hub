@@ -2,7 +2,7 @@
 """Private, reviewed adoption of the owner's working game environment."""
 import sys
 sys.dont_write_bytecode = True
-import fcntl, hashlib, json, os, pwd, shutil, stat, subprocess
+import fcntl, hashlib, importlib.machinery, importlib.util, json, os, pwd, shutil, stat, subprocess
 from pathlib import Path
 HOME = Path(pwd.getpwuid(os.getuid()).pw_dir)
 CONTROL = HOME/'AIDev/control'
@@ -69,8 +69,23 @@ def source_gate(commit):
     def git(*a): return run(['/usr/bin/git','-c','core.hooksPath=/dev/null','-C',CONTROL,*a]).decode().strip()
     need(len(commit)==40 and all(c in '0123456789abcdef' for c in commit),'invalid_commit')
     need(git('rev-parse','HEAD')==commit and git('branch','--show-current')=='main' and not git('status','--porcelain'),'clean_exact_main_required')
-    d=json.loads(run([CONTROL/'bin/current-doctor','--json']))
-    need(d.get('verdict')=='PASS' and all(d.get(k) is True for k in ('configurationSourceAccepted','currentSentinelReady','integratedMain')) and d.get('gitOnly') is False,'fresh_accepted_doctor_required')
+    loader=importlib.machinery.SourceFileLoader('game_scoped_ready',str(CONTROL/'lib/game_operation_readiness.py'))
+    bridge=importlib.util.module_from_spec(importlib.util.spec_from_loader(loader.name,loader));loader.exec_module(bridge)
+    nodes=[ROOT,ROOT.parent,HOME/'AIDev/bin',HOME/'AIDev/state']
+    if ROOT.exists():nodes.extend((ROOT/'manifest.json',ROOT/'receipt.json',ROOT/'games-play'))
+    def owner():
+        m=json.loads((HERE/MANIFEST).read_text());need(m.get('owner')=='control-games-hub','operation_payload_owner')
+        if ROOT.exists():need(json.loads((ROOT/'receipt.json').read_text()).get('owner')=='control-games-hub','operation_payload_owner')
+        return True
+    def target():
+        if ROOT.exists():status()
+        else:check_source()
+        return True
+    def recovery():
+        for node in nodes[1:]:safe_directory(node)
+        return True
+    d=bridge.ready(CONTROL,commit,'wine-install',checks={'payload-owner':owner,'wine-target':target,'recovery':recovery},target_guard=bridge.bound(lambda:bridge.metadata(nodes)))
+    need(d.get('scopedCandidateReady') is True,'scoped_operation_readiness_required')
     need(git('rev-parse','HEAD')==commit and not git('status','--porcelain'),'source_changed')
 
 def inactive():
@@ -138,11 +153,16 @@ def verify_overlay_manifest(m):
         return result
     policy = json.loads(policy_path.read_text(),object_pairs_hook=unique)
     fields = {'schema','id','owner','previousHubManifestSha256','previousDS3ManifestSha256','previousHubCriticalHashes','sourceHubManifestSha256','sourceCriticalHashes','desiredPEHashes','lifecycleSha256'}
-    need(type(policy) is dict and set(policy) == fields and type(policy['schema']) is int and policy['schema'] == 1 and policy['id'] == 'wine-runtime-overlay' and policy['owner'] == 'control-games-hub', 'overlay_policy_schema')
+    need(type(policy) is dict and type(policy.get('schema')) is int and policy['schema'] in (1,2), 'overlay_policy_schema')
+    extended = policy['schema'] == 2
+    if extended: fields = fields - {'desiredPEHashes'} | {'desiredRuntimeHashes'}
+    desired = policy.get('desiredRuntimeHashes' if extended else 'desiredPEHashes')
+    need(set(policy) == fields and policy['id'] == 'wine-runtime-overlay' and policy['owner'] == 'control-games-hub', 'overlay_policy_schema')
     paths = {'engine/lib/wine/i386-windows/winemac.drv','engine/lib/wine/x86_64-windows/winemac.drv'}
-    need(type(policy['desiredPEHashes']) is dict and set(policy['desiredPEHashes']) == paths and type(policy['previousHubCriticalHashes']) is dict, 'overlay_pe_schema')
-    need(all(type(value) is str and len(value) == 64 and all(c in '0123456789abcdef' for c in value) for value in policy['desiredPEHashes'].values()), 'overlay_pe_pins')
-    expected = dict(policy['previousHubCriticalHashes']); expected.update(policy['desiredPEHashes'])
+    if extended: paths |= {'engine/lib/wine/x86_64-unix/winemac.so','engine/lib/wine/i386-windows/oleacc.dll','engine/lib/wine/x86_64-windows/oleacc.dll'}
+    need(type(desired) is dict and set(desired) == paths and type(policy['previousHubCriticalHashes']) is dict, 'overlay_pe_schema')
+    need(all(type(value) is str and len(value) == 64 and all(c in '0123456789abcdef' for c in value) for value in desired.values()), 'overlay_pe_pins')
+    expected = dict(policy['previousHubCriticalHashes']); expected.update(desired)
     need(m.get('criticalHashes') == expected, 'overlay_critical_binding')
 
 def status():

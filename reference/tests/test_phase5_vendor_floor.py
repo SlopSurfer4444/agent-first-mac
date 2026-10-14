@@ -88,6 +88,20 @@ class NumericVersionTests(unittest.TestCase):
         self.assertTrue(PREFLIGHT.version_at_or_above("opaque-revision", "opaque-revision"))
         self.assertFalse(PREFLIGHT.version_at_or_above("new-opaque", "opaque-revision"))
 
+    def test_malformed_cli_suffix_cannot_win_numeric_comparison(self):
+        for value in ("0.146.0-alpha..18", "1.0.0-.", "1.0.0-alpha.",
+                      "1.0.0-.alpha", "9" * 21 + ".0", ".".join(["1"] * 17)):
+            for prefix in ("", "codex-cli "):
+                with self.subTest(value=value, prefix=prefix):
+                    self.assertFalse(PREFLIGHT.version_at_or_above(prefix + value, "0.1.0"))
+                    self.assertFalse(PREFLIGHT.version_at_or_above(prefix + value, prefix + value))
+
+    def test_valid_prerelease_order_preserved(self):
+        compare = PREFLIGHT.version_at_or_above
+        self.assertTrue(compare("codex-cli 0.146.0-alpha.18", "codex-cli 0.145.0"))
+        self.assertFalse(compare("codex-cli 1.0.0-alpha.18", "codex-cli 1.0.0"))
+        self.assertTrue(compare("codex-cli 1.0.0", "codex-cli 1.0.0-alpha.18"))
+
 
 class AppAttestationTests(unittest.TestCase):
     def setUp(self):

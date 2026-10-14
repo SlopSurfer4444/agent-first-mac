@@ -19,6 +19,7 @@ import sys
 from types import SimpleNamespace
 
 from lib import phase5_runtime_paths as paths
+from lib import vendor_fixture_custody as custody_policy
 
 
 APP = "/Applications/ChatGPT.app"
@@ -41,7 +42,9 @@ FEATURE_KEYS = (
 MAX_SCHEMA = 4 * 1024 * 1024
 REASONS = frozenset(("source_changed", "fixture_invalid", "signature_invalid",
     "cli_identity_invalid", "command_failed", "schema_output_invalid",
-    "capabilities_incompatible", "process_unsettled", "probe_failed"))
+    "capabilities_incompatible", "process_unsettled", "probe_failed",
+    "fixture_capacity_required", "fixture_custody_invalid", "fixture_custody_busy",
+    "fixture_settlement_required"))
 
 
 class ProbeError(Exception):
@@ -209,34 +212,82 @@ def require_fixture_envelope(parent, paths, *, platform=None):
     return paths.require_empty_envelope(parent, platform=FixtureEnvelope(platform))
 
 
+class FixtureDisposition:
+    """One private retained artifact handoff, never a cleanup/quota authority.
+
+    The original failure consumer owns diagnosis and any separately validated
+    retirement. Unknown/failed contents cannot be evicted by age or by parsing
+    a public PASS/error report. Only the exact allocated owner is handed off.
+    """
+    actions = ("inspect-private-owner", "preserve-for-diagnosis")
+
+    def __init__(self, owner, reason, *, child_settled, handles_closed):
+        self.owner = owner
+        self.reason = reason if reason in REASONS else "probe_failed"
+        self.consumer = "current-doctor/root-recovery"
+        self.child_settled = child_settled
+        self.handles_closed = handles_closed
+        self.diagnosis_consumed = False
+
+    def inspect_private_owner(self):
+        return self.owner
+
+    def preserve_for_diagnosis(self, *, diagnostics_consumed=False):
+        require(type(diagnostics_consumed) is bool, "fixture_invalid")
+        self.diagnosis_consumed = diagnostics_consumed
+        # Completion of diagnosis is not proof that deletion is safe. The same
+        # exact owner and failed/unknown contents remain retained.
+        return self.owner
+
+
 class Fixture:
-    """Fresh 0700 root and owned child boundaries; retained, never adopted.
+    """Fresh 0700 root and owned child boundaries; never adopted.
 
 Only schema/cache contents may change. No credential material is seeded.
 Retaining a failed fixture avoids recursive cleanup over vendor-written paths.
 """
-    def __init__(self, scratch, home, uid, paths):
+    def __init__(self, scratch, home, uid, paths, *, custody_factory=custody_policy.Custody):
         self.handles = []
         self.path = None
+        self.allocated = False
+        self.schema_identities = {}
+        self.child_identities = {}
+        self.custody, self.slot = None, None
         self.uid, self.paths = uid, paths
         try:
             parent = paths.OwnedParent.open(scratch, home, uid)
             self.handles.append(parent)
+            install_closer(parent, "_fds")
             require(parent.verify() is not False, "fixture_invalid")
-            leaf = "vendor-sentinel-" + secrets.token_hex(16)
+            self.custody = custody_factory(scratch, home, uid, envelope=require_fixture_envelope)
+            if self.custody is not None:
+                self.slot = self.custody.reserve()
+                leaf = self.custody.leaf(self.custody.records()[self.slot])
+            else:
+                leaf = "vendor-sentinel-" + secrets.token_hex(16)
             self.path = scratch + "/" + leaf
             os.mkdir(leaf, 0o700, dir_fd=parent.descriptor)
+            self.allocated = True
+            if self.custody is not None:
+                self.custody.update(self.slot, root=custody_policy.identity(os.stat(leaf,
+                    dir_fd=parent.descriptor, follow_symlinks=False)), state="allocated")
             parent.verify()
             self.root = paths.OwnedParent.open(self.path, home, uid)
             self.handles.append(self.root)
+            install_closer(self.root, "_fds")
             require_fixture_envelope(self.root, paths)
-            require(os.listdir(self.root.descriptor) == [], "fixture_invalid")
+            require(custody_policy.names(self.root.descriptor, 0) == [], "fixture_invalid")
             for leaf in ("home", "codex", "cwd", "tmp", "schema"):
                 os.mkdir(leaf, 0o700, dir_fd=self.root.descriptor)
+                self.child_identities[leaf] = custody_policy.identity(os.stat(leaf,
+                    dir_fd=self.root.descriptor, follow_symlinks=False))
+                if self.custody is not None:
+                    self.custody.update(self.slot, children=dict(self.child_identities))
                 child = paths.OwnedParent.open(self.path + "/" + leaf, home, uid)
                 self.handles.append(child)
+                install_closer(child, "_fds")
                 require_fixture_envelope(child, paths)
-                require(os.listdir(child.descriptor) == [], "fixture_invalid")
+                require(custody_policy.names(child.descriptor, 0) == [], "fixture_invalid")
             self.verify()
         except BaseException as original:
             selected = original
@@ -244,9 +295,12 @@ Retaining a failed fixture avoids recursive cleanup over vendor-written paths.
                 self.close()
             except BaseException as error:
                 selected = prefer(selected, error)
-                selected.retained_sources = (self,)
                 selected.source_handles_closed = False
                 selected.constructor_errors = (original, error)
+            # Directory custody survives even a successful descriptor close.
+            # A retained artifact is not the same claim as an open descriptor.
+            selected.private_fixture = self
+            selected.retained_sources = getattr(selected, "retained_sources", ()) + (self,)
             raise selected from None
 
     def verify(self):
@@ -288,6 +342,7 @@ Retaining a failed fixture avoids recursive cleanup over vendor-written paths.
                     "schema_output_invalid")
             self.verify()
             result = b"".join(chunks)
+            self.schema_identities[leaf] = stamp(after)
         except BaseException as error:
             primary = error
         finally:
@@ -301,9 +356,103 @@ Retaining a failed fixture avoids recursive cleanup over vendor-written paths.
             raise primary from None
         return result
 
+    def retire(self):
+        """Retire only the exact successful consumed fixture, never sweep scratch.
+
+        Caller invokes this after command settlement, final attestation and
+        other source closure. Unknown output, changed identity or metadata is a
+        retained diagnostic, not authority to recursively remove vendor data.
+        No age/prefix cleanup, symlink following or adoption occurs here.
+        """
+        self.verify()
+        if self.custody is not None:
+            # The two consumed schemas are capability evidence, not the whole
+            # generated bundle. Seal the bounded output of this fresh, settled
+            # fixture before asking the restart-capable owner to retire it.
+            # Legacy retained fixtures cannot enter seal_output's allocated
+            # state; their unrecorded descendants are never adopted here.
+            try:
+                self.custody.seal_output(self.slot, dict(self.schema_identities))
+            except custody_policy.CustodyError:
+                return False
+            self.custody.retire(self.slot)
+            self.slot = None
+            return True
+        parent, root = self.handles[:2]
+        leaves = ("home", "codex", "cwd", "tmp", "schema")
+        schema = self.handles[-1]
+        try:
+            if set(custody_policy.names(root.descriptor, len(leaves))) != set(leaves):
+                return False
+            if any(custody_policy.names(handle.descriptor, 0) for handle in self.handles[2:-1]):
+                return False
+            if (set(self.schema_identities) != {SCHEMA_LEAF, ENVELOPE_LEAF}
+                    or set(custody_policy.names(schema.descriptor, 2)) != set(self.schema_identities)):
+                return False
+        except custody_policy.CustodyError:
+            return False
+        keys = ("st_dev", "st_ino", "st_mode", "st_uid", "st_nlink", "st_size", "st_mtime_ns", "st_ctime_ns")
+        def exact(leaf):
+            facts = os.stat(leaf, dir_fd=schema.descriptor, follow_symlinks=False)
+            return tuple(getattr(facts, key) for key in keys) == self.schema_identities[leaf]
+        if not all(exact(leaf) for leaf in self.schema_identities):
+            return False
+        if self.custody is not None:
+            self.custody.update(self.slot, state="retiring", schemas=dict(self.schema_identities))
+        # Validate the entire known set before the first removal. Each deletion
+        # is descriptor-relative and rechecks the held chain/identity. This is
+        # not filesystem CAS against an uncooperative same-user writer.
+        for leaf in self.schema_identities:
+            self.verify()
+            require(exact(leaf), "fixture_invalid")
+            os.unlink(leaf, dir_fd=schema.descriptor)
+            os.fsync(schema.descriptor)
+        remaining = list(self.handles[2:])
+        for leaf, handle in zip(leaves, self.handles[2:]):
+            parent.verify()
+            root.verify()
+            for pending in remaining:
+                pending.verify()
+                require_fixture_envelope(pending, self.paths)
+            require(custody_policy.names(handle.descriptor, 0) == [], "fixture_invalid")
+            os.rmdir(leaf, dir_fd=root.descriptor)
+            os.fsync(root.descriptor)
+            # Removed child chains cannot be checked again. Release each owned
+            # handle immediately and exclude it from remaining chain checks.
+            handle.close()
+            remaining.remove(handle)
+        root.verify()
+        require(custody_policy.names(root.descriptor, 0) == [], "fixture_invalid")
+        parent.verify()
+        os.rmdir(Path(self.path).name, dir_fd=parent.descriptor)
+        os.fsync(parent.descriptor)
+        if self.custody is not None:
+            self.custody.release_absent(self.slot)
+            self.slot = None
+        return True
+
     def close(self):
-        close_handles(self.handles)
-        self.handles = []
+        primary = None
+        try:
+            close_handles(self.handles)
+            self.handles = []
+        except BaseException as error:
+            primary = error
+        if self.custody is not None:
+            try:
+                if self.slot is not None:
+                    if self.custody.records()[self.slot]["state"] != "retiring":
+                        self.custody.update(self.slot, state="retained", reason="retained_for_diagnosis",
+                                            schemas=dict(self.schema_identities))
+            except BaseException as error:
+                primary = prefer(primary, error)
+            try:
+                self.custody.close()
+                self.custody = None
+            except BaseException as error:
+                primary = prefer(primary, error)
+        if primary is not None:
+            raise primary from None
 
 
 def vendor_source_type(readiness):
@@ -353,7 +502,8 @@ No other source or kept-data read receives the expanded bound.
     return VendorSourceFile
 
 
-def observe(*, root, home, uid, budget, source_guard, readiness, process, policy):
+def observe(*, root, home, uid, budget, source_guard, readiness, process, policy,
+            fixture_consumer=None):
     """One scoped observation. Caller must bind this source and dependencies.
 
 Deadline/output/child ownership reuses phase5_probe_process/catalog. Successful
@@ -361,6 +511,7 @@ return proves source/fixture descriptors closed and direct children settled,
 not descendant supervision, a hard kernel deadline, or entire machine health.
 """
     require(callable(source_guard), "source_changed")
+    require(fixture_consumer is None or callable(fixture_consumer), "fixture_invalid")
     sources, fixture, app = [], None, None
     primary = None
     operation_error = None
@@ -394,7 +545,6 @@ not descendant supervision, a hard kernel deadline, or entire machine health.
 
     def command(argv, *, isolated):
         nonlocal last_command
-        guard()
         if isolated:
             args = ("/usr/bin/sandbox-exec", "-p", isolation_profile(fixture.path)) + tuple(argv)
             env, cwd = environment(fixture.path), fixture.path + "/cwd"
@@ -405,8 +555,26 @@ not descendant supervision, a hard kernel deadline, or entire machine health.
         def admit(value):
             require((value.argv, value.environment, value.cwd) == expected, "command_failed")
             return guard()
-        value = process.command(launch, budget, 25.0, admit_launch=admit,
-            catalog=readiness.catalog, process_factory=readiness.catalog.subprocess.Popen)
+        if fixture is not None and getattr(fixture, "custody", None) is not None:
+            fixture.custody.update(fixture.slot, state="inflight", settled=False)
+        try:
+            value = process.command(launch, budget, 25.0, admit_launch=admit,
+                catalog=readiness.catalog, process_factory=readiness.catalog.subprocess.Popen)
+        except BaseException as error:
+            # Only the process owner's explicit settled observation can finish
+            # the durable command obligation; ordinary exceptions infer nothing.
+            if (fixture is not None and getattr(fixture, "custody", None) is not None
+                    and getattr(error, "child_settled", None) is True
+                    and getattr(error, "private_owner", None) is None):
+                try:
+                    fixture.custody.update(fixture.slot, state="allocated", settled=True)
+                except BaseException as later:
+                    error.custody_settlement_error = later
+                    if getattr(later, "source_handles_closed", True) is not True:
+                        error.source_handles_closed = False
+            raise
+        if fixture is not None and getattr(fixture, "custody", None) is not None:
+            fixture.custody.update(fixture.slot, state="allocated", settled=True)
         last_command = (tuple(argv), value)
         guard()
         return value
@@ -452,14 +620,18 @@ not descendant supervision, a hard kernel deadline, or entire machine health.
         stage = "signature_invalid"
         app_version = attestation()
         stage = "fixture_invalid"
-        fixture = Fixture(home + "/AIDev/scratch", home, uid, paths)
+        # Publish the allocated owner before initialization can create a root
+        # and fail. Constructor exceptions must not turn it into lost scratch.
+        fixture = Fixture.__new__(Fixture)
+        Fixture.__init__(fixture, home + "/AIDev/scratch", home, uid, paths)
         outputs = {}
         stage = "command_failed"
         for name, argv in commands(fixture.path):
             value = command(argv, isolated=True)
             require(value.returncode == 0, "command_failed")
-            # stderr is held privately by caller on failure, never public evidence.
-            require(value.stderr == b"", "command_failed")
+            # Bounded stderr is diagnostic, not the consumed success contract.
+            # Command status and parsed stdout/schema still decide compatibility;
+            # no diagnostic bytes become public evidence.
             outputs[name] = value.stdout
         stage = "schema_output_invalid"
         schema_raw = fixture.schema()
@@ -492,19 +664,33 @@ not descendant supervision, a hard kernel deadline, or entire machine health.
         pending_owner = getattr(primary, "private_owner", None)
         # Unresolved child custody owns these live guards until root reconciles it.
         if pending_owner is None:
-            for item in tuple(reversed(sources)) + (fixture, app):
+            for item in tuple(reversed(sources)) + (app,):
                 if item is not None:
                     try:
                         item.close()
                     except BaseException as error:
                         close_errors.append(error)
                         primary = prefer(primary, error)
+            if fixture is not None:
+                if primary is None:
+                    try:
+                        stage = "fixture_invalid"
+                        result["fixtureRetired"] = fixture.retire()
+                    except BaseException as error:
+                        operation_error = error
+                        primary = prefer(primary, error)
+                try:
+                    fixture.close()
+                except BaseException as error:
+                    close_errors.append(error)
+                    primary = prefer(primary, error)
     if primary is not None:
         # Preserve the actual process owner and original interruption. Do not
         # turn missing/ambiguous settlement into a retry or a successful result.
         failure = primary if (isinstance(primary, (KeyboardInterrupt, SystemExit))
             or getattr(primary, "private_owner", None) is not None) else ProbeError(getattr(primary, "reason_class", stage))
         failure.private_diagnostics = (stage, last_command, assessment, primary, tuple(close_errors))
+        failure.private_fixture = fixture
         all_errors = (operation_error,) + tuple(signing_errors) + tuple(close_errors)
         inherited = tuple(owner for error in all_errors if error is not None
                           for owner in getattr(error, "retained_sources", ()))
@@ -513,5 +699,22 @@ not descendant supervision, a hard kernel deadline, or entire machine health.
             and all(getattr(error, "source_handles_closed", True) is True for error in all_errors if error is not None))
         failure.private_errors = all_errors
         failure.child_settled = True if pending_owner is None else None
+        failure.private_fixture_disposition = (FixtureDisposition(fixture,
+            getattr(failure, "reason_class", stage), child_settled=failure.child_settled,
+            handles_closed=failure.source_handles_closed) if fixture is not None else None)
+        # The original exception always owns its private handoff. An optional
+        # consumer must never replace or suppress that failure.
         raise failure from None
+    if not result.get("fixtureRetired", False) and fixture_consumer is not None:
+        disposition = FixtureDisposition(fixture, "fixture_invalid",
+            child_settled=True, handles_closed=True)
+        try:
+            fixture_consumer(disposition)
+        except BaseException as error:
+            error.private_fixture = fixture
+            error.private_fixture_disposition = disposition
+            error.retained_sources = getattr(error, "retained_sources", ()) + (fixture,)
+            error.source_handles_closed = True
+            error.child_settled = True
+            raise
     return result

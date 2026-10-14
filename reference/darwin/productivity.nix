@@ -9,9 +9,42 @@ let
   # changes only this flag and its matching manifest value.
   fullColorWidgetsEnabled = true;
 
-  # Example policy: Low Power Mode on battery; AC remains unchanged at zero.
-  # Battery charge limits are a separate setting.
+  # Owner override (2026-09-09): preserve Low Power Mode on battery while AC
+  # remains unchanged at zero. Tahoe's 90 percent charge limit is independent.
   batteryLowPowerEnabled = true;
+
+  # Released owner preferences are retained as historical/adopted values, not
+  # replayed by every unrelated activation. Explicit reviewed keys alone write.
+  managedPreferences = [ ];
+  owns = key: builtins.elem key managedPreferences;
+  preferenceDeclarations = {
+    iconAppearance = { path = [ "NSGlobalDomain" "AppleIconAppearanceTheme" ]; value = "RegularAutomatic"; };
+    automaticAppearance = { path = [ "NSGlobalDomain" "AppleInterfaceStyleSwitchesAutomatically" ]; value = true; };
+    showFileExtensions = { path = [ "NSGlobalDomain" "AppleShowAllExtensions" ]; value = true; };
+    initialKeyRepeat = { path = [ "NSGlobalDomain" "InitialKeyRepeat" ]; value = 15; };
+    keyRepeat = { path = [ "NSGlobalDomain" "KeyRepeat" ]; value = 2; };
+    trackpadScaling = { path = [ "NSGlobalDomain" "com.apple.trackpad.scaling" ]; value = 2.0; };
+    widgetAppearance = { path = [ "CustomUserPreferences" "com.apple.widgets" "widgetAppearance" ]; value = 1; };
+    dockAutohide = { path = [ "dock" "autohide" ]; value = false; };
+    minimizeIntoApplicationIcon = { path = [ "dock" "minimize-to-application" ]; value = true; };
+    reorderSpacesByRecentUse = { path = [ "dock" "mru-spaces" ]; value = false; };
+    dockRecents = { path = [ "dock" "show-recents" ]; value = false; };
+    bottomRightHotCornerRaw = { path = [ "dock" "wvous-br-corner" ]; value = 14; };
+    finderPathBar = { path = [ "finder" "ShowPathbar" ]; value = true; };
+    finderStatusBar = { path = [ "finder" "ShowStatusBar" ]; value = true; };
+    tapToClick = { path = [ "trackpad" "Clicking" ]; value = true; };
+    trackpadRightClick = { path = [ "trackpad" "TrackpadRightClick" ]; value = true; };
+    threeFingerDrag = { path = [ "trackpad" "TrackpadThreeFingerDrag" ]; value = true; };
+    stageManager = { path = [ "WindowManager" "GloballyEnabled" ]; value = false; };
+    clickWallpaperToShowDesktop = { path = [ "WindowManager" "EnableStandardClickToShowDesktop" ]; value = true; };
+    nativeWindowTiling = { path = [ "WindowManager" "EnableTilingByEdgeDrag" ]; value = true; };
+    tiledWindowMargins = { path = [ "WindowManager" "EnableTiledWindowMargins" ]; value = false; };
+    screenshotLocationClass = { path = [ "screencapture" "location" ]; value = screenshotsDirectory; };
+  };
+  selectedDefaults = lib.foldl' lib.recursiveUpdate { }
+    (map (key: let item = preferenceDeclarations.${key};
+              in lib.setAttrByPath item.path item.value)
+         (builtins.filter (key: builtins.hasAttr key preferenceDeclarations) managedPreferences));
 
   screenshotsDirectory =
     "${bootstrapIdentity.homeDirectory}/Pictures/Screenshots";
@@ -57,73 +90,23 @@ in
     enableStealthMode = productivityProfileEnabled;
   };
 
-  system.defaults = {
+  system.defaults = selectedDefaults // {
     SoftwareUpdate.AutomaticallyInstallMacOSUpdates = true;
-
-    NSGlobalDomain = {
-      # Owner override: preserve each app's native icon colors.
-      AppleIconAppearanceTheme = "RegularAutomatic";
-      AppleInterfaceStyleSwitchesAutomatically = productivityProfileEnabled;
-      AppleShowAllExtensions = productivityProfileEnabled;
-      InitialKeyRepeat = if productivityProfileEnabled then 15 else 25;
-      KeyRepeat = if productivityProfileEnabled then 2 else 6;
-      "com.apple.trackpad.scaling" =
-        if productivityProfileEnabled then 2.0 else 0.875;
-    };
-
-    CustomUserPreferences."com.apple.widgets".widgetAppearance =
-      if fullColorWidgetsEnabled then 1 else 0;
-
-    dock = {
-      # With autohide off, Dock stays visible normally and macOS still hides it
-      # in full-screen application spaces.
-      autohide = false;
-      minimize-to-application = productivityProfileEnabled;
-      mru-spaces = !productivityProfileEnabled;
-      show-recents = !productivityProfileEnabled;
-      # Restore the pre-change lower-right corner affordance.
-      wvous-br-corner = 14;
-    };
-
-    finder = {
-      AppleShowAllExtensions = productivityProfileEnabled;
-      ShowPathbar = productivityProfileEnabled;
-      ShowStatusBar = productivityProfileEnabled;
-    };
-
-    trackpad = {
-      Clicking = true;
-      TrackpadRightClick = true;
-      TrackpadThreeFingerDrag = productivityProfileEnabled;
-    };
-
-    WindowManager = {
-      GloballyEnabled = false;
-      # Restore the original click-on-wallpaper desktop reveal behavior.
-      EnableStandardClickToShowDesktop = true;
-      EnableTilingByEdgeDrag = true;
-      EnableTopTilingByEdgeDrag = true;
-      EnableTilingOptionAccelerator = true;
-      EnableTiledWindowMargins = false;
-    };
-
-    screencapture.location =
-      if productivityProfileEnabled
-      then screenshotsDirectory
-      else "${bootstrapIdentity.homeDirectory}/Desktop";
   };
 
   system.activationScripts.power.text = lib.mkAfter ''
-    echo "configuring the owner-authorized productivity baseline..." >&2
-
-    ${lib.optionalString productivityProfileEnabled ''
+    ${lib.optionalString (owns "screenshotLocationClass") ''
       /usr/bin/install -d -m 0700 \
         -o "${bootstrapIdentity.userName}" -g staff \
         "${screenshotsDirectory}"
     ''}
 
-    /usr/bin/pmset -b lowpowermode \
-      ${if batteryLowPowerEnabled then "1" else "0"}
-    /usr/bin/pmset -c lowpowermode 0
+    ${lib.optionalString (owns "batteryLowPowerMode") ''
+      /usr/bin/pmset -b lowpowermode \
+        ${if batteryLowPowerEnabled then "1" else "0"}
+    ''}
+    ${lib.optionalString (owns "acLowPowerMode") ''
+      /usr/bin/pmset -c lowpowermode 0
+    ''}
   '';
 }

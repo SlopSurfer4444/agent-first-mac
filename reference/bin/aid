@@ -1,5 +1,5 @@
 #!/usr/bin/python3
-"""Small read-only facade: declared catalog, workflow guidance, native doctors.
+"""Small read-only facade: declared catalog, scoped routing help, native doctors.
 
 No source admission, mutation executor, subprocess owner, or doctor-result
 translation lives here. execv preserves the caller context and replaces this
@@ -17,6 +17,7 @@ import stat
 
 DOCTORS = {
     "current": ("bin/current-doctor", "--json"),
+    "root": ("bin/root-runtime-doctor", "--json"),
     "revision": ("bin/system-revision-status", "--json"),
     "productivity": ("bin/productivity-doctor", "--manifest"),
     "tailscale": ("bin/tailscale-windows-host-doctor", "--installed"),
@@ -24,24 +25,42 @@ DOCTORS = {
     "windows-app": ("bin/windows-app-rdp-client-doctor",),
     "rustdesk": ("bin/rustdesk-mac-controller-doctor",),
 }
+MAINTENANCE = {
+    "status": ("bin/workstation-maintenance-cycle", "status"),
+    "schedule-status": ("bin/workstation-maintenance-cycle", "schedule-status"),
+}
 MAX_CATALOG = 128 * 1024
-WORKFLOW = (
-    "Review and independently accept the exact desired source configuration.",
-    "Build the exact integrated acceptance-child before any system apply.",
-    "Use only the existing typed broker under separately granted apply authority.",
-    "Verify the affected payload with its existing checks and acceptance gate.",
-    "If verification fails, follow the existing reviewed rollback and recovery contract.",
-)
-HELP = """aid - read-only workstation facade
+ROUTES = {
+    "project": (
+        "Use the closest repository contract and lockfile for edits, local dependencies, tests and commits.",
+        "No control registration, workstation doctor, control acceptance or machine lifecycle is implied.",
+    ),
+    "workstation": (
+        "The owner may manage their software; inspect the actual owner and affected target before changing it.",
+        "Durable control-managed intent uses its manifest, source admission and existing scoped lifecycle adapter.",
+        "External or disposable state does not automatically require a permanent control manifest or adoption.",
+        "Check the affected behavior and bounded recovery; consult docs/harness-operations.md for the active gate.",
+    ),
+    "protected": (
+        "Root, policy, native trust, security and credentials retain explicit scope and applicable independent review.",
+        "Only root system activation requires the exact reviewed built target and existing typed aid-admin operation.",
+        "Native permission and consent boundaries remain separate; a routing guide grants no authority.",
+    ),
+}
+HELP = """aid - workstation observations and routing (read-only)
 Usage:
   aid help | --help
   aid inventory [--json]
-  aid plan [--json]
+  aid plan [--json] [--scope project|workstation|protected]
   aid doctor [--json] [--section NAME]
-Sections: current, revision, productivity, tailscale, amnezia, windows-app, rustdesk
+  aid maintenance status [--json]
+  aid maintenance schedule-status [--json]
+Maintenance status: latest metadata observation and freshness; does not run a new capture.
+Schedule status: installed schedule ownership/state; does not prove a completed cycle.
+Sections: current, root, revision, productivity, tailscale, amnezia, windows-app, rustdesk
 Doctor defaults to current and always preserves that doctor's native JSON and exit status.
-Inventory and plan are declared-only guidance, not fresh state or acceptance evidence.
-Install, adopt, upgrade, remove and rollback execution are unsupported.
+Inventory is declared-only; plan is scoped routing help, not an executable machine plan.
+Install, adopt, upgrade, remove, rollback and maintenance triggers are unsupported.
 """
 
 
@@ -59,8 +78,20 @@ def parse(arguments):
     require(type(arguments) is list and all(type(v) is str for v in arguments), "unsupported_arguments")
     if arguments in ([], ["help"], ["--help"]):
         return "help", False, None
-    if arguments[:1] in (["inventory"], ["plan"]) and arguments[1:] in ([], ["--json"]):
+    if arguments[:1] == ["inventory"] and arguments[1:] in ([], ["--json"]):
         return arguments[0], len(arguments) == 2, None
+    if arguments[:1] == ["maintenance"] and len(arguments) in (2, 3) \
+            and arguments[1] in MAINTENANCE and arguments[2:] in ([], ["--json"]):
+        return "maintenance", len(arguments) == 3, arguments[1]
+    if arguments[:1] == ["plan"]:
+        remaining = arguments[1:]
+        json_output = remaining[:1] == ["--json"]
+        if json_output:
+            remaining = remaining[1:]
+        if not remaining:
+            return "plan", json_output, None
+        if len(remaining) == 2 and remaining[0] == "--scope" and remaining[1] in ROUTES:
+            return "plan", json_output, remaining[1]
     if arguments[:1] == ["doctor"]:
         remaining = arguments[1:]
         json_output = remaining[:1] == ["--json"]
@@ -104,12 +135,14 @@ def catalog(raw):
     return value
 
 
-def declared(command, value):
+def declared(command, value, scope=None):
     result = {"schema": 1, "command": command, "scope": "DECLARED_ONLY",
         "freshObservation": False, "installedStateChecked": False, "sourceAcceptanceChecked": False,
         "readOnly": True, "systemMutationsPerformed": False, "catalog": value}
     if command == "plan":
-        result.update(workflow=list(WORKFLOW), executablePlan=False)
+        result.update(routingHelp={name: list(steps) for name, steps in ROUTES.items()
+                                   if scope is None or name == scope},
+                      selectedScope=scope, executablePlan=False)
     return result
 
 
@@ -158,6 +191,16 @@ class Native:
         os.execv("/usr/bin/python3", argv)
         raise AidError("doctor_exec_failed")  # A successful execv never returns.
 
+    def maintenance(self, operation, json_output):
+        require(type(operation) is str and operation in MAINTENANCE
+                and type(json_output) is bool, "unsupported_arguments")
+        target, action = MAINTENANCE[operation]
+        argv = ("/usr/bin/python3", self.root + "/" + target, action,
+                *(("--json",) if json_output else ()))
+        os.chdir(self.root)
+        os.execv("/usr/bin/python3", argv)
+        raise AidError("maintenance_exec_failed")
+
 
 def main(arguments=None, *, adapter_factory=Native, emit=print):
     try:
@@ -173,7 +216,10 @@ def main(arguments=None, *, adapter_factory=Native, emit=print):
         if command == "doctor":
             adapter.doctor(section)
             raise AidError("doctor_exec_failed")
-        result = declared(command, catalog(adapter.read_catalog()))
+        if command == "maintenance":
+            adapter.maintenance(section, json_output)
+            raise AidError("maintenance_exec_failed")
+        result = declared(command, catalog(adapter.read_catalog()), scope=section)
     except (AidError, OSError, KeyError):
         emit(json.dumps({"schema": 1, "status": "UNKNOWN", "reason": "aid_observation_unavailable",
             "readOnly": True, "systemMutationsPerformed": False}, sort_keys=True))
@@ -185,9 +231,11 @@ def main(arguments=None, *, adapter_factory=Native, emit=print):
         for item in result["catalog"]["items"]:
             emit(item["id"] + ": owner=" + item["owner"] + "; policy=" + item["versionPolicy"])
         if command == "plan":
-            emit("Workflow guidance only; not an actual diff or executable plan.")
-            for step in result["workflow"]:
-                emit(step)
+            emit("Scoped routing help only; not an actual diff or executable plan.")
+            for route, steps in result["routingHelp"].items():
+                emit(route + ":")
+                for step in steps:
+                    emit("  " + step)
     return 0
 
 

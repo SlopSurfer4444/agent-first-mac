@@ -130,7 +130,142 @@ class ConfigTransitionSourceTests(unittest.TestCase):
                 "previous_commit": S.CURRENT_DOCTOR_DIAGNOSTICS_PREVIOUS,
                 "paths": S.CURRENT_DOCTOR_DIAGNOSTICS_PATHS, "after": v2},
             S.GLOBAL_HARNESS_PATH: {"previous_commit": S.GLOBAL_HARNESS_PREVIOUS,
-                "paths": S.GLOBAL_HARNESS_PATHS, "after": S.global_harness_policy(anchor)}})
+                "paths": S.GLOBAL_HARNESS_PATHS, "after": S.global_harness_policy(anchor)},
+            S.OWNER_FIRST_WAVE_PATH: {"previous_commit": S.OWNER_FIRST_WAVE_PREVIOUS,
+                "paths": S.OWNER_FIRST_WAVE_PATHS, "after": S.owner_first_wave_policy(anchor)},
+            S.VENDOR_FIXTURE_CUSTODY_REPAIR_PATH: {
+                "previous_commit": S.VENDOR_FIXTURE_CUSTODY_REPAIR_PREVIOUS,
+                "paths": S.VENDOR_FIXTURE_CUSTODY_REPAIR_PATHS, "after": S.owner_first_wave_policy(anchor)},
+            S.SCHEDULER_DESCRIPTOR_REPAIR_PATH: {
+                "previous_commit": S.SCHEDULER_DESCRIPTOR_REPAIR_PREVIOUS,
+                "paths": S.SCHEDULER_DESCRIPTOR_REPAIR_PATHS, "after": S.owner_first_wave_policy(anchor)},
+            S.PRODUCT_SURFACE_PATH: {
+                "previous_commit": S.PRODUCT_SURFACE_PREVIOUS,
+                "paths": S.PRODUCT_SURFACE_PATHS, "after": S.owner_first_wave_policy(anchor)}})
+
+    def test_product_surface_scope_preserves_runtime_and_previous_acceptance(self):
+        self.assertEqual(S.PRODUCT_SURFACE_PREVIOUS, "fac9dd5d7925695c7d0a8b5a3f8af536ef71c3dd")
+        self.assertEqual(S.PRODUCT_SURFACE_PATH, "evidence/config-transitions/product-surface/acceptance.json")
+        expected = {"README.md", "docs/index.md", "docs/usage.md", "docs/installation.md",
+                    "docs/recovery.md", "docs/history/index.md", "bin/aid", "tests/test_aid.py", "docs/aid.md",
+                    "lib/config_transition_source.py", "tests/test_config_transition_source.py",
+                    "tests/test_current_source_checkpoint.py", "tests/test_product_surface.py",
+                    "docs/product-surface-admission.md"}
+        self.assertEqual(S.PRODUCT_SURFACE_PATHS, expected)
+        rules = S.owner_first_wave_policy({})
+        self.assertEqual(S.policy_updates({})[S.PRODUCT_SURFACE_PATH]['after'], rules)
+        before = {p: blob(p) for p in rules['protected_paths']}
+        before[S.SCHEDULER_DESCRIPTOR_REPAIR_PATH] = blob('immutable scheduler receipt')
+        candidate = dict(before, **{p: blob('product ' + p) for p in expected})
+        scope = dict(rules, bootstrap_paths=expected)
+        F.validate_candidate(before, candidate, 'policy', **scope)
+        for path in ('lib/current_source_checkpoint.py', 'lib/workstation_maintenance_delivery.py',
+                     'manifests/workstation-maintenance.json', 'bin/current-doctor', 'bin/game-launch-reliability-update'):
+            with self.subTest(path=path), self.assertRaisesRegex(F.TransitionError, 'unsupported_bootstrap_surface'):
+                F.validate_candidate(before, dict(candidate, **{path: blob('extra')}), 'policy', **scope)
+        with self.assertRaisesRegex(F.TransitionError, 'historical_evidence_changed'):
+            F.validate_candidate(before, dict(candidate, **{S.SCHEDULER_DESCRIPTOR_REPAIR_PATH: blob('changed')}),
+                                 'policy', **scope)
+
+    def test_scheduler_descriptor_scope_is_exact_and_keeps_prior_policy(self):
+        self.assertEqual(S.SCHEDULER_DESCRIPTOR_REPAIR_PREVIOUS,
+                         "6e8d675db89af967e4375e75ef0ab5563e4b9208")
+        self.assertEqual(S.SCHEDULER_DESCRIPTOR_REPAIR_PATH,
+                         "evidence/config-transitions/scheduler-descriptor-repair/acceptance.json")
+        expected = {"lib/workstation_maintenance_delivery.py",
+                    "tests/test_workstation_maintenance_delivery.py", "lib/config_transition_source.py",
+                    "tests/test_config_transition_source.py", "tests/test_current_source_checkpoint.py",
+                    "docs/scheduler-descriptor-repair.md"}
+        self.assertEqual(S.SCHEDULER_DESCRIPTOR_REPAIR_PATHS, expected)
+        rules = S.owner_first_wave_policy({})
+        self.assertEqual(S.policy_updates({})[S.SCHEDULER_DESCRIPTOR_REPAIR_PATH]['after'], rules)
+        before = {p: blob(p) for p in rules['protected_paths']}
+        before[S.VENDOR_FIXTURE_CUSTODY_REPAIR_PATH] = blob('immutable prior receipt')
+        candidate = dict(before, **{p: blob('repair ' + p) for p in expected})
+        scope = dict(rules, bootstrap_paths=expected)
+        F.validate_candidate(before, candidate, 'policy', **scope)
+        for path in ('lib/current_source_checkpoint.py', 'lib/vendor_fixture_custody.py',
+                     'manifests/workstation-maintenance.json', 'bin/current-doctor',
+                     'bin/game-launch-reliability-update', 'tests/test_game_delivery_order.py'):
+            with self.subTest(path=path), self.assertRaisesRegex(F.TransitionError, 'unsupported_bootstrap_surface'):
+                F.validate_candidate(before, dict(candidate, **{path: blob('extra')}), 'policy', **scope)
+        with self.assertRaisesRegex(F.TransitionError, 'historical_evidence_changed'):
+            F.validate_candidate(before, dict(candidate, **{S.VENDOR_FIXTURE_CUSTODY_REPAIR_PATH: blob('changed')}),
+                                 'policy', **scope)
+
+    def test_fixture_custody_correction_is_exact_without_reopening_wave(self):
+        self.assertEqual(S.VENDOR_FIXTURE_CUSTODY_REPAIR_PREVIOUS,
+                         "207e8f3fa2acfc70a588337ef129fb9a91699b1e")
+        self.assertEqual(S.VENDOR_FIXTURE_CUSTODY_REPAIR_PATH,
+                         "evidence/config-transitions/vendor-fixture-custody-repair/acceptance.json")
+        expected = {"lib/vendor_fixture_custody.py", "lib/vendor_compatibility_probe.py",
+                    "tests/test_vendor_fixture_custody.py", "tests/test_vendor_compatibility_probe.py",
+                    "lib/config_transition_source.py", "tests/test_config_transition_source.py",
+                    "tests/test_current_source_checkpoint.py", "docs/vendor-fixture-custody-repair.md"}
+        self.assertEqual(S.VENDOR_FIXTURE_CUSTODY_REPAIR_PATHS, expected)
+        rules = S.owner_first_wave_policy({})
+        self.assertEqual(S.policy_updates({})[S.VENDOR_FIXTURE_CUSTODY_REPAIR_PATH]['after'], rules)
+        self.assertEqual(len(S.OWNER_FIRST_WAVE_PATHS), 180)
+        before = {p: blob(p) for p in rules['protected_paths']}
+        before[S.OWNER_FIRST_WAVE_PATH] = blob('immutable accepted wave')
+        candidate = dict(before, **{p: blob('repair ' + p) for p in expected})
+        preview = dict(rules, bootstrap_paths=expected)
+        F.validate_candidate(before, candidate, 'policy', **preview)
+        for path in ('lib/current_source_checkpoint.py', 'bin/current-doctor',
+                     'policy/aid-admin-policy.json', 'lib/vendor_fixture_custody_extra.py'):
+            with self.subTest(path=path), self.assertRaisesRegex(F.TransitionError, 'unsupported_bootstrap_surface'):
+                F.validate_candidate(before, dict(candidate, **{path: blob('extra')}), 'policy', **preview)
+        with self.assertRaisesRegex(F.TransitionError, 'historical_evidence_changed'):
+            F.validate_candidate(before, dict(candidate, **{S.OWNER_FIRST_WAVE_PATH: blob('replayed')}), 'policy', **preview)
+
+    def test_fresh_combined_wave_has_no_sibling_checkpoint_dependency(self):
+        self.assertEqual(S.OWNER_FIRST_WAVE_PREVIOUS,
+                         "94e0e1999c208aaf4112b611bbfa5c8b65111419")
+        updates = S.policy_updates({})
+        self.assertNotIn("evidence/config-transitions/owner-first-delivery/acceptance.json", updates)
+        self.assertFalse(any(u["previous_commit"] == "849a241f9592e1faf3b9a2a9dc2107d6b93ac46a"
+                             for u in updates.values()))
+        self.assertLessEqual(S.OWNER_FIRST_WAVE_DELIVERY_PATHS, S.OWNER_FIRST_WAVE_PATHS)
+        self.assertLessEqual(S.OWNER_FIRST_WAVE_DELIVERY_PROTECTED,
+                             S.owner_first_wave_policy({})["protected_paths"])
+        self.assertIn("manifests/windows-host-ssh-client.json", S.OWNER_FIRST_WAVE_PATHS)
+        self.assertNotIn(S.OWNER_FIRST_WAVE_PATH, S.OWNER_FIRST_WAVE_PATHS)
+        self.assertNotIn("lib/current_source_checkpoint.py", S.OWNER_FIRST_WAVE_DELIVERY_PATHS)
+        for ordinary in ("bin/ds3-runtime", "bin/games-runtime-update", "bin/wine-runtime-overlay",
+                         "docs/wine-runtime-overlay.md", "manifests/wine-runtime-update.schema.json"):
+            self.assertIn(ordinary, S.OWNER_FIRST_WAVE_PATHS)
+            self.assertNotIn(ordinary, S.OWNER_FIRST_WAVE_DELIVERY_PROTECTED)
+
+    def test_combined_scope_rejects_unregistered_source_and_historical_evidence_edits(self):
+        old = S.global_harness_policy({})
+        before = {p: blob(p) for p in old["protected_paths"]}
+        before["evidence/previous.json"] = blob("immutable")
+        rules = dict(old, bootstrap_paths=S.OWNER_FIRST_WAVE_PATHS)
+        candidate = dict(before, **{p: blob("combined " + p) for p in S.OWNER_FIRST_WAVE_PATHS})
+        F.validate_candidate(before, candidate, "policy", **rules)
+        with self.assertRaisesRegex(F.TransitionError, "unsupported_bootstrap_surface"):
+            F.validate_candidate(before, dict(candidate, **{"lib/unregistered.py": blob("extra")}), "policy", **rules)
+        with self.assertRaisesRegex(F.TransitionError, "historical_evidence_changed"):
+            F.validate_candidate(before, dict(candidate, **{"evidence/previous.json": blob("changed")}), "policy", **rules)
+
+    def test_guidance_delivery_scope_and_authority_boundary_are_exact(self):
+        expected = {"bin/workstation-guidance-delivery", "lib/workstation_guidance_delivery.py",
+                    "tests/test_workstation_guidance_delivery.py",
+                    "manifests/workstation-guidance-delivery.json", "docs/workstation-guidance-delivery.md"}
+        observed = {p for p in S.OWNER_FIRST_WAVE_PATHS
+                    if "workstation-guidance-delivery" in p or "workstation_guidance_delivery" in p}
+        self.assertEqual(observed, expected)
+        old, after = S.global_harness_policy({}), S.owner_first_wave_policy({})
+        for path in expected:
+            self.assertTrue(path in after["protected_paths"] or path.startswith(after["protected_prefixes"]))
+        before = {p: blob(p) for p in old["protected_paths"]}
+        candidate = dict(before, **{p: blob("guidance " + p) for p in expected})
+        rules = dict(old, bootstrap_paths=S.OWNER_FIRST_WAVE_PATHS)
+        F.validate_candidate(before, candidate, "policy", **rules)
+        for outside in ("bin/workstation-guidance-delivery-extra", "lib/workstation_guidance_delivery_extra.py",
+                        "manifests/workstation-guidance-delivery-extra.json", "skills/unrelated/SKILL.md"):
+            with self.subTest(path=outside), self.assertRaisesRegex(F.TransitionError, "unsupported_bootstrap_surface"):
+                F.validate_candidate(before, dict(candidate, **{outside: blob("outside")}), "policy", **rules)
 
     def test_current_doctor_diagnostics_registry_is_exact_and_keeps_v2(self):
         self.assertEqual(S.CURRENT_DOCTOR_DIAGNOSTICS_PREVIOUS,
@@ -815,6 +950,147 @@ class GlobalHarnessSourceTests(unittest.TestCase):
         self.assertIn("tests/test_project_context_boundary.py",
                       update["after"]["protected_paths"])
         self.assertNotIn("manifests/trusted-repos.json", update["paths"])
+
+
+class OwnerFirstWaveSourceTests(unittest.TestCase):
+    RETIRED = frozenset((
+        "Sources/AidAdminCore/RecoveryReceipt.swift", "bin/root-operation-recovery-observe",
+        "lib/root_operation_recovery.py", "tests/test_root_operation_recovery.py",
+    ))
+
+    def fixture(self):
+        chain = fixture(False)
+        before = S.global_harness_policy(chain.anchor_tree)
+        for path in before["protected_paths"]:
+            chain.anchor_tree.setdefault(path, blob("historical " + path))
+        chain.tree = dict(chain.anchor_tree)
+        chain.add()
+        # Keep the synthetic bootstrap contract while using the real production
+        # before/after protection, exact delta list, and policy selector.
+        before = dict(before, bootstrap_paths=RULES["bootstrap_paths"], coordinator=COORDINATOR)
+        after = dict(S.owner_first_wave_policy(chain.anchor_tree),
+                     bootstrap_paths=RULES["bootstrap_paths"], coordinator=COORDINATOR)
+        updates = {S.OWNER_FIRST_WAVE_PATH: {"previous_commit": chain.commit,
+                   "paths": S.OWNER_FIRST_WAVE_PATHS, "after": after}}
+        return chain, before, updates
+
+    def accept(self, chain):
+        return append_policy(chain, S.OWNER_FIRST_WAVE_PATH,
+            {path: blob("reviewed wave " + path) for path in S.OWNER_FIRST_WAVE_PATHS - self.RETIRED})
+
+    def test_fixed_registration_and_monotonic_successor_protection(self):
+        self.assertEqual(S.OWNER_FIRST_WAVE_PREVIOUS,
+                         "94e0e1999c208aaf4112b611bbfa5c8b65111419")
+        self.assertEqual(S.OWNER_FIRST_WAVE_PATH,
+                         "evidence/config-transitions/owner-first-harness-wave/acceptance.json")
+        before, after = S.global_harness_policy({}), S.owner_first_wave_policy({})
+        self.assertLessEqual(before["protected_paths"], after["protected_paths"])
+        self.assertEqual(before["protected_prefixes"], after["protected_prefixes"])
+        self.assertEqual(before["allowed_paths"], after["allowed_paths"])
+        self.assertEqual(before["allowed_prefixes"], after["allowed_prefixes"])
+        for path in ("bin/aid-harness-offramp", "manifests/harness-hook-retirement.json",
+                     "tests/test_current_source_checkpoint.py", "tests/test_operation_readiness.py",
+                     "tests/test_harness_offramp.py", "tests/test_project_context_boundary.py",
+                     "tests/test_aid.py", "tests/test_sessionstart_exposure.py",
+                     "tests/test_prepared_receipt.py", "tests/test_root_resume_module_guards.py",
+                     "tests/test_root_bundle_successor.py",
+                     "tests/AidAdminResumeHomeManagerTests/AidAdminResumeHomeManagerTests.swift",
+                     "tests/AidAdminResumeLaunchdTests/AidAdminResumeLaunchdTests.swift",
+                     "manifests/workstation-maintenance.json",
+                     "bin/workstation-maintenance-cycle", "tests/test_workstation_maintenance_cycle.py",
+                     "tests/test_workstation_maintenance_delivery.py",
+                     "tests/test_vendor_fixture_custody.py",
+                     "manifests/quarantine-boundary-successor.json",
+                     "tests/test_quarantine_boundary_successor.py",
+                     "tests/fixtures/phase5-quarantine-before-current-cli.zsh",
+                     "tests/fixtures/phase5-quarantine-before-temp-deny.config.toml",
+                     "docs/post-phase5-sentinel.md",
+                     "docs/current-source-admission.md", "docs/operation-readiness.md",
+                     "docs/harness-operations.md", "docs/wave-offramp.md"):
+            with self.subTest(path=path):
+                self.assertIn(path, S.OWNER_FIRST_WAVE_PATHS)
+                self.assertIn(path, after["protected_paths"])
+        for path in ("darwin/productivity.nix", "manifests/productivity-baseline.json",
+                     "bin/productivity-doctor", "bin/check-productivity-baseline",
+                     "bin/games-play", "bin/cs2-play", "bin/game-app-launchers",
+                     "docs/wave-games.md", "docs/wave-owner-freedom.md",
+                     "docs/wave-recovery-coverage.md", "bin/workstation-drift-snapshot",
+                     "docs/maintenance.md"):
+            self.assertNotIn(path, after["protected_paths"])
+        self.assertIn("lib/", after["protected_prefixes"])
+        for path in ("Sources/AidAdminCore/ResumeLaunchd.swift",
+                     "Sources/AidAdminCore/ResumeHomeManager.swift",
+                     "lib/workstation_maintenance_delivery.py", "lib/vendor_fixture_custody.py"):
+            self.assertIn(path, S.OWNER_FIRST_WAVE_PATHS)
+            self.assertTrue(path.startswith(after["protected_prefixes"]))
+        for path in ("manifests/game-launch-reliability.json", "manifests/games-hub.json",
+                     "manifests/wine-runtime-overlay.json", "manifests/wine-runtime-update.json",
+                     "bin/wine-runtime-overlay", "docs/wine-runtime-overlay.md",
+                     "manifests/wine-runtime-overlay.schema.json",
+                     "manifests/wine-runtime-update.schema.json",
+                     "tests/test_ds3_window_repair.py", "tests/test_wine_runtime_extended.py",
+                     "darwin/windows-app.nix", "darwin/rustdesk-controller.nix"):
+            self.assertIn(path, S.OWNER_FIRST_WAVE_PATHS)
+            self.assertNotIn(path, after["protected_paths"])
+            self.assertFalse(path.startswith(after["protected_prefixes"]))
+        self.assertLessEqual(self.RETIRED, S.OWNER_FIRST_WAVE_PATHS)
+        self.assertFalse(self.RETIRED & after["protected_paths"])
+        for path in ("policy/aid-admin-policy.json", "manifests/trusted-repos.json",
+                     S.OWNER_FIRST_WAVE_PATH, "evidence/history/acceptance.json"):
+            self.assertNotIn(path, S.OWNER_FIRST_WAVE_PATHS)
+
+    def test_preview_remains_unaccepted_and_independent_receipt_required(self):
+        chain, before, updates = self.fixture()
+        chain.append_tail({path: blob("candidate " + path) for path in S.OWNER_FIRST_WAVE_PATHS})
+        self.assertFalse(route(chain, True, updates, before)["accepted"])
+        with self.assertRaisesRegex(F.TransitionError, "unreviewed_main_source"):
+            route(chain, False, updates, before)
+
+    def test_wave_acceptance_preserves_history_and_payload_freedom(self):
+        chain, before, updates = self.fixture()
+        history = chain.tree["evidence/history/acceptance.json"]
+        self.accept(chain)
+        self.assertTrue(route(chain, updates=updates, rules=before)["accepted"])
+        self.assertEqual(chain.tree["evidence/history/acceptance.json"], history)
+        chain.add({"manifests/productivity-baseline.json": blob("next reviewed preferences"),
+                   "bin/games-play": blob("ordinary payload wrapper update"),
+                   "docs/wave-games.md": blob("descriptive evidence update")})
+        self.assertTrue(route(chain, updates=updates, rules=before)["accepted"])
+
+    def test_new_protected_temporary_edit_restore_cannot_evade_after_rules(self):
+        chain, before, updates = self.fixture()
+        self.accept(chain)
+        for path in sorted(S.OWNER_FIRST_WAVE_PROTECTED - before["protected_paths"]):
+            bad = copy.deepcopy(chain)
+            original = bad.tree[path]
+            bad.append_tail({path: blob("temporary unreviewed authority")})
+            bad.append_tail({path: original})
+            self.assertEqual(bad.tree, chain.tree)
+            with self.subTest(path=path), self.assertRaisesRegex(
+                    F.TransitionError, "protected_policy_changed"):
+                route(bad, True, updates, before)
+
+    def test_retired_scaffold_history_requires_scope_but_not_final_presence(self):
+        chain, before, updates = self.fixture()
+        item = self.accept(chain)
+        first = item["candidate_commits"][0]["tree"]
+        first.update({path: blob("intermediate scaffold " + path) for path in self.RETIRED})
+        self.assertFalse(self.RETIRED & chain.tree.keys())
+        self.assertTrue(route(chain, updates=updates, rules=before)["accepted"])
+        endpoint_only = copy.deepcopy(updates)
+        endpoint_only[S.OWNER_FIRST_WAVE_PATH]["paths"] -= self.RETIRED
+        with self.assertRaisesRegex(F.TransitionError, "unsupported_bootstrap_surface"):
+            route(chain, updates=endpoint_only, rules=before)
+
+    def test_wrong_predecessor_and_unregistered_wave_reject(self):
+        chain, before, updates = self.fixture()
+        self.accept(chain)
+        wrong = copy.deepcopy(updates)
+        wrong[S.OWNER_FIRST_WAVE_PATH]["previous_commit"] = oid("wrong predecessor")
+        with self.assertRaisesRegex(F.TransitionError, "policy_predecessor_mismatch"):
+            route(chain, updates=wrong, rules=before)
+        with self.assertRaisesRegex(F.TransitionError, "unregistered_policy_transition"):
+            route(chain, rules=before)
 
 
 if __name__ == "__main__":

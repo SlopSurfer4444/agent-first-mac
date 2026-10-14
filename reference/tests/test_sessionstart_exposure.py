@@ -1,6 +1,7 @@
 """Pure source-fixture tests: no shell, installed target or trust-state I/O."""
 
 import copy
+import hashlib
 import importlib.util
 import io
 import json
@@ -18,7 +19,10 @@ spec = importlib.util.spec_from_loader("sessionstart_planner",
 S = importlib.util.module_from_spec(spec)
 sys.modules[spec.name] = S
 spec.loader.exec_module(S)
-ORIGINAL = (ROOT / "codex/hooks.json").read_bytes()
+# Retained insertion protocol consumes its actual historical preimage, never
+# the mutable successor hook definition. Exact bytes came from accepted source
+# before the owner-first retirement; no historical manifest/receipt is rewritten.
+ORIGINAL = (ROOT / "tests/fixtures/harness-hooks-pre-retirement.json").read_bytes()
 MANIFEST = S.parse_json((ROOT / "manifests/sessionstart-exposure.json").read_bytes())
 
 
@@ -31,6 +35,11 @@ def command(output):
 
 
 class SessionStartTests(unittest.TestCase):
+    def test_historical_hook_fixture_is_bound_not_current_successor(self):
+        self.assertEqual(hashlib.sha256(ORIGINAL).hexdigest(),
+                         "68bc170c88d0c48f4f80da7f974630ad1084115e2945186829f55881abc60f32")
+        self.assertNotEqual(ORIGINAL, (ROOT / "codex/hooks.json").read_bytes())
+
     def setUp(self):
         self.manifest = copy.deepcopy(MANIFEST)
 

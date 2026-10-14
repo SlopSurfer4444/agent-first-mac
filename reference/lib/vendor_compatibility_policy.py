@@ -121,29 +121,30 @@ def _text(raw):
 
 
 def _version_at_or_above(observed, floor=MINIMUM_VERSION):
-    # Same floor ordering as the accepted phase5-trusted-probe pure comparator.
-    pattern = r"codex-cli ([0-9]+(?:\.[0-9]+)+(?:-[0-9A-Za-z.]+)?)"
-    a, b = re.fullmatch(pattern, observed), re.fullmatch(pattern, floor)
+    # Parse BOTH complete, bounded versions before taking any ordering branch.
+    # A greater numeric release must not hide malformed prerelease components.
+    def parts(value):
+        if type(value) is not str or len(value) > 256:
+            return None
+        match = re.fullmatch(r"codex-cli ([0-9]{1,20}(?:\.[0-9]{1,20}){1,15})(?:-([0-9A-Za-z]{1,64}(?:\.[0-9A-Za-z]{1,64}){0,15}))?", value)
+        if match is None:
+            return None
+        number, suffix = match.groups()
+        return (tuple(int(item) for item in number.split(".")),
+                tuple((0, int(item)) if item.isascii() and item.isdecimal() else (1, item)
+                      for item in suffix.split(".")) if suffix else ())
+    a, b = parts(observed), parts(floor)
     if a is None or b is None:
         return False
-    def parts(value):
-        number, _, suffix = value.partition("-")
-        return tuple(int(item) for item in number.split(".")), suffix
-    an, ap = parts(a.group(1))
-    bn, bp = parts(b.group(1))
+    an, ap = a
+    bn, bp = b
     width = max(len(an), len(bn))
     an, bn = an + (0,) * (width - len(an)), bn + (0,) * (width - len(bn))
     if an != bn:
         return an > bn
     if not ap or not bp:
         return not ap
-    def pre(value):
-        if any(not item for item in value.split(".")):
-            return None
-        return tuple((0, int(item)) if item.isdecimal() else (1, item)
-                     for item in value.split("."))
-    av, bv = pre(ap), pre(bp)
-    return av is not None and bv is not None and av >= bv
+    return ap >= bp
 
 
 def _flags(raw, required):
@@ -354,7 +355,20 @@ class _Schema:
         for row in rows:
             _need(type(row) is dict and type(row.get("properties")) is dict,
                   "schema_shape_unproven")
-            method = self.node(row["properties"].get("method"))
+            # Draft-07 ignores siblings of $ref: a superficial foreign tag
+            # cannot prove the referenced request's discriminator is disjoint.
+            _need("$ref" not in row, "schema_shape_unproven")
+            raw = row["properties"].get("method")
+            # Unconsumed method contracts may evolve independently. A literal
+            # discriminator proves disjointness without interpreting their
+            # unrelated parameter/annotation schema. Ambiguous tags still deny.
+            _need(type(raw) is dict, "schema_shape_unproven")
+            literal = raw.get("enum")
+            if (type(literal) is list and len(literal) == 1
+                    and type(literal[0]) is str and literal[0] != name
+                    and raw.get("type") == "string" and "$ref" not in raw):
+                continue
+            method = self.node(raw)
             values = method.get("enum")
             _need(type(values) is list and len(values) == 1
                   and self.types(method) == {"string"}, "schema_shape_unproven")

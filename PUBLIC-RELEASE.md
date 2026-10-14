@@ -3,8 +3,9 @@
 This publication is a separate repository with clean history. The original
 workstation repository and installed configuration were not modified to create it.
 
-Included: implementation source, tests, generic schemas, sanitized example
-contracts, pinned dependency metadata, and a public architecture overview.
+Included: explicitly allowlisted implementation source, tests, pinned dependency
+metadata, public architecture/navigation and separately authored illustrative
+lifecycle and workstation-skill examples.
 
 Excluded: original Git history; all saved acceptance/observation evidence;
 installation bundles and compiled binaries; private trust registry; workstation
@@ -13,12 +14,12 @@ recovery/closure snapshots; original operating/incident and coordination notes; 
 patch/build packets and their logs. The Wine/launcher integration source remains,
 but neither games nor an operational Wine installation is included.
 
-Personal user and host aliases were replaced in paths and contents. Example
-manifests are wrapped and relocated, not silently represented as ready-to-install
-state. Owner authorization/decision and recovery/observation fields are removed
-from example manifests; they are illustrative data shapes, not complete runtime
-inputs. Original checksum/commit anchors are not recomputed into fabricated trust.
-References to omitted files are expected in historical source and documentation.
+Personal user and host aliases are replaced in paths and contents. This refresh
+does not re-export operational manifests or historical example manifests. Its
+small authored examples are explicitly illustrative, not complete runtime inputs.
+The public skill example is not auto-installed or active. Original checksum/commit
+anchors are not recomputed into fabricated trust. References to omitted runtime
+files remain in implementation source and do not confer local authority.
 
 The portable test runner checks selected logic only. It does not certify the
 whole historical suite, root broker installation, a new Mac, compatibility with
@@ -33,3 +34,7 @@ Before publishing, the exported files are inspected for recognizable credential
 patterns and personal identifiers, with an independent review of the actual
 candidate. Pattern scanning is not a mathematical guarantee against all secrets.
 Do not put sensitive data into an issue when reporting a suspected leak.
+
+The current snapshot and transformation provenance are recorded in
+`export-provenance.json`. That snapshot is not an installed-state certificate.
+See [the export workflow](docs/export.md) for reproducibility and limitations.

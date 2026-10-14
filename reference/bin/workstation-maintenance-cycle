@@ -1,0 +1,132 @@
+#!/usr/bin/python3
+"""Deterministic metadata cycle and exact schedule adapter; no model or repair."""
+import sys
+sys.dont_write_bytecode = True
+
+import importlib.machinery
+import json
+from pathlib import Path
+import time
+
+D = importlib.machinery.SourceFileLoader("workstation_maintenance_observation",
+    str(Path(__file__).absolute().with_name("workstation-drift-snapshot"))).load_module()
+CADENCE_SECONDS = 86400
+MAX_REPORT = 16384
+SCHEDULE_OPERATIONS = {"schedule-plan", "schedule-install", "schedule-remove", "schedule-recover", "schedule-status"}
+COVERAGE = {"kind": "fixed_bounded_metadata", "scopes": list(D.SCOPES),
+    "cadenceSeconds": CADENCE_SECONDS, "cadenceCondition": "when_awake_and_sole_scheduler_available",
+    "capabilityChecks": "not_performed_operation_bound_scoped_doctors_required",
+    "contentsRead": False, "signaturesChecked": False, "networkChecked": False,
+    "payloadContentsRead": False, "sourceDeclarationReadLimit": 8,
+    "sourceDeclarationCoverage": "fixed-reviewed-app-contract-catalog",
+    "fullInventory": False, "hashesAnonymous": False}
+
+
+def run(operation, *, observe, now):
+    """Connected observation is the only execution seam; no model seam exists."""
+    D.require(operation in {"cycle", "status"}, "state_unavailable")
+    try:
+        value = D.valid_report(observe("capture" if operation == "cycle" else "status"))
+    except (OSError, ValueError, TypeError, KeyError):
+        value = D.report("STATE_UNAVAILABLE", "state_unavailable")
+    stamp = now()
+    D.require(D.integer(stamp, 2**53 - 1), "state_unavailable")
+    complete = value["completeObservation"]
+    classification_unavailable = value["status"] in {"BASELINE_OBSERVED", "UNCHANGED"} and value["changeSummary"]["requiredReview"]
+    age = stamp - value["lastCompleteAt"] if 0 < value["lastCompleteAt"] <= stamp else None
+    fresh = complete and age is not None and age <= CADENCE_SECONDS
+    if not complete:
+        status = "SKIPPED_BUSY" if value["status"] == "SKIPPED_BUSY" else "UNAVAILABLE"
+    elif not fresh:
+        status = "STALE"
+    elif value["currentConflict"] is not None:
+        status = "CONFLICT"
+    elif classification_unavailable:
+        status = "UNKNOWN"
+    elif value["currentIncident"] is not None:
+        status = "CONFLICT" if value["currentIncident"]["classification"] == "confirmed_conflict" else "OBSERVED_CHANGE"
+    elif value["status"] == "DRIFT" and value["changeSummary"]["externalObserved"] > 0:
+        status = "EXTERNAL_OBSERVED"
+    else:
+        status = "UNCHANGED" if value["status"] == "UNCHANGED" else "OBSERVED"
+    # One bounded event, not a model invocation or automatic delivery. Stable IDs
+    # let a separately authorized consumer deduplicate repeated unavailable state.
+    event = None
+    actionable = not complete or classification_unavailable or value["currentIncident"] is not None or value["currentConflict"] is not None
+    if operation == "cycle" and (value["status"] == "DRIFT" or not complete or classification_unavailable) and actionable:
+        event = {"id": D.digest(D.encoded([value["snapshotDigest"], value["reason"],
+            value["currentIncident"] if value["status"] == "DRIFT" else None])),
+            "kind": "ownership_observation_unavailable" if classification_unavailable else
+                    "metadata_change" if complete else "observation_unavailable",
+            "requiresScopedReview": actionable}
+    result = {"schema": 1, "operation": operation, "status": status,
+        "observedAt": value["observedAt"], "evaluatedAt": stamp,
+        "lastCompleteAt": value["lastCompleteAt"], "ageSeconds": age,
+        "freshObservation": fresh, "missedCadence": age is None or age > CADENCE_SECONDS,
+        "sleepingOrUnavailableCause": "not_observed", "coverage": COVERAGE,
+        "observation": value, "event": event, "modelInvocations": 0,
+        "changeClassification": value["changeSummary"],
+        "actionable": actionable,
+        "requiresOwnershipAdmission": False,
+        "automaticRepair": False, "sourceAdmission": False, "installedHealthChecked": False,
+        "scheduleInstalledByHelper": False, "scheduledOriginClaimed": False,
+        "writerSerialization": "observation_store_nonblocking_flock",
+        "migrationState": "old_heartbeat_settlement_and_supported_pause_required_before_replacement"}
+    D.require(len(D.encoded(result)) <= MAX_REPORT, "state_unavailable")
+    return result
+
+
+def delivery_api():
+    """Load reviewed source lazily; importing is not a lifecycle action."""
+    root = Path(__file__).absolute().parent.parent
+    sys.path.insert(0, str(root / "lib"))
+    import workstation_maintenance_delivery
+    return workstation_maintenance_delivery
+
+
+def native_schedule(operation):
+    D.require(operation in {"schedule-plan", "schedule-install", "schedule-remove", "schedule-recover", "schedule-status"}, "state_unavailable")
+    return delivery_api().native_schedule(operation.removeprefix("schedule-"))
+
+
+def scheduled_native(*, now):
+    return delivery_api().scheduled_native(D,
+        build_report=lambda report: run("cycle", observe=lambda _: report, now=now), now=now)
+
+
+def main(arguments=None, *, observe=D.native, now=lambda: int(time.time()), emit=print,
+         schedule_operation=None, scheduled_operation=None):
+    args = sys.argv[1:] if arguments is None else arguments
+    allowed = SCHEDULE_OPERATIONS | {"cycle", "status", "scheduled"}
+    if type(args) is not list or len(args) not in {1, 2} or type(args[0]) is not str \
+            or args[0] not in allowed or len(args) == 2 and args[1] != "--json":
+        emit("workstation-maintenance-cycle: use cycle/status/scheduled or schedule-plan/install/remove/recover/status [--json]")
+        return 2
+    lifecycle = args[0] in SCHEDULE_OPERATIONS
+    try:
+        if lifecycle:
+            result = (schedule_operation or native_schedule)(args[0])
+        elif args[0] == "scheduled":
+            result = (scheduled_operation or scheduled_native)(now=now)
+        else:
+            result = run(args[0], observe=observe, now=now)
+        D.require(type(result) is dict and type(result.get("schema")) is int and result["schema"] == 1
+            and type(result.get("status")) is str
+            and len(D.encoded(result)) <= MAX_REPORT, "state_unavailable")
+        if lifecycle or args[0] == "scheduled":
+            code = result.get("exitCode", 1)
+            D.require(type(code) is int and code in {0, 1, 3}, "state_unavailable")
+        else:
+            code = 3 if result["status"] == "SKIPPED_BUSY" else 0 if result["status"] in {"UNCHANGED", "OBSERVED", "EXTERNAL_OBSERVED"} else 1
+    except Exception:
+        result = {"schema": 1, "operation": args[0], "status": "UNAVAILABLE", "exitCode": 1,
+            "scheduledOriginClaimed": False, "modelInvocations": 0, "automaticRepair": False}
+        code = 1
+    emit(json.dumps(result, sort_keys=True, separators=(",", ":")) if "--json" in args else
+        "Metadata maintenance: " + result["status"] + "; model calls=0; cadence=86400s while awake; "
+        "capabilities/signatures/network unchecked; no automatic repair.")
+    return code
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

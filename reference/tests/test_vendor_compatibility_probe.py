@@ -2,6 +2,8 @@
 
 import json
 import hashlib
+import ast
+import inspect
 import os
 import stat
 import errno
@@ -23,7 +25,7 @@ WRAPPER_CLI = "/Applications/ChatGPT.app/Contents/Resources/codex-cli/bin/codex"
 class FixtureEnvelopeTests(unittest.TestCase):
     def check_envelope(self, names=(), acl=0, mode=0o700, generic=False):
         from lib import phase5_runtime_paths as P
-        with tempfile.TemporaryDirectory() as directory:
+        with tempfile.TemporaryDirectory(dir="/private/tmp") as directory:
             directory = os.path.realpath(directory)
             os.chmod(directory, mode)
             parent = P.OwnedParent.open(directory, directory, os.getuid())
@@ -63,11 +65,11 @@ class FixtureEnvelopeTests(unittest.TestCase):
     def test_connected_fixture_constructor_and_later_unknown_attribute(self):
         names = [("com.apple.provenance",)]
         platform = NS(acl_count=lambda fd: 0, xattr_names=lambda fd: names[0])
-        with tempfile.TemporaryDirectory() as directory:
+        with tempfile.TemporaryDirectory(dir="/private/tmp") as directory:
             directory = os.path.realpath(directory)
             os.chmod(directory, 0o700)
             with patch.object(V.paths, "DarwinEnvelope", return_value=platform):
-                fixture = V.Fixture(directory, directory, os.getuid(), V.paths)
+                fixture = V.Fixture(directory, directory, os.getuid(), V.paths, custody_factory=lambda *a, **k: None)
                 try:
                     self.assertTrue(fixture.verify())
                     self.assertEqual(len(fixture.handles), 7)
@@ -81,7 +83,7 @@ class FixtureEnvelopeTests(unittest.TestCase):
         observations = iter(((), ("com.apple.quarantine",)))
         platform = NS(acl_count=lambda fd: 0,
                       xattr_names=lambda fd: next(observations))
-        with tempfile.TemporaryDirectory() as directory:
+        with tempfile.TemporaryDirectory(dir="/private/tmp") as directory:
             directory = os.path.realpath(directory)
             parent = V.paths.OwnedParent.open(directory, directory, os.getuid())
             try:
@@ -144,6 +146,118 @@ class PlanTests(unittest.TestCase):
             self.assertIn("features." + key + "=false", rows[-2][1])
 
 
+class FixtureRetirementTests(unittest.TestCase):
+    def fixture(self, directory):
+        os.chmod(directory, 0o700)
+        fixture = V.Fixture(directory, directory, os.getuid(), V.paths, custody_factory=lambda *a, **k: None)
+        for leaf in (V.SCHEMA_LEAF, V.ENVELOPE_LEAF):
+            target = Path(fixture.path) / "schema" / leaf
+            target.write_bytes(b'{"public":"fixture"}')
+            target.chmod(0o600)
+            fixture.schema(leaf)
+        return fixture
+
+    def test_constructor_collision_is_retained_without_claiming_allocation(self):
+        with tempfile.TemporaryDirectory(dir="/private/tmp") as directory:
+            os.chmod(directory, 0o700)
+            token = "a" * 32
+            foreign = Path(directory) / ("vendor-sentinel-" + token)
+            foreign.mkdir(mode=0o700)
+            (foreign / "foreign").write_bytes(b"preserve")
+            owner = V.Fixture.__new__(V.Fixture)
+            with patch.object(V.secrets, "token_hex", return_value=token):
+                with self.assertRaises(FileExistsError) as caught:
+                    V.Fixture.__init__(owner, directory, directory, os.getuid(), V.paths, custody_factory=lambda *a, **k: None)
+            self.assertFalse(owner.allocated)
+            self.assertIs(caught.exception.private_fixture, owner)
+            self.assertIn(owner, caught.exception.retained_sources)
+            self.assertEqual((foreign / "foreign").read_bytes(), b"preserve")
+
+    def test_success_retires_only_exact_owned_consumed_fixture_and_repeat_is_bounded(self):
+        platform = NS(acl_count=lambda fd: 0, xattr_names=lambda fd: ())
+        with tempfile.TemporaryDirectory(dir="/private/tmp") as directory, patch.object(V.paths, "DarwinEnvelope", return_value=platform):
+            for _ in range(3):
+                fixture = self.fixture(directory)
+                try:
+                    self.assertTrue(fixture.retire())
+                    self.assertFalse(Path(fixture.path).exists())
+                finally:
+                    fixture.close()
+                self.assertEqual(os.listdir(directory), [])
+
+    def test_unknown_entries_and_symlinks_remain_wholly_untouched(self):
+        platform = NS(acl_count=lambda fd: 0, xattr_names=lambda fd: ())
+        for mutation in ("root-file", "schema-file", "cache-file", "symlink", "replaced-schema"):
+            with self.subTest(mutation=mutation), tempfile.TemporaryDirectory(dir="/private/tmp") as directory, patch.object(V.paths, "DarwinEnvelope", return_value=platform):
+                fixture = self.fixture(directory)
+                root = Path(fixture.path)
+                target = root / "schema" / V.SCHEMA_LEAF
+                if mutation == "root-file":
+                    (root / "foreign").write_bytes(b"foreign")
+                elif mutation == "schema-file":
+                    (root / "schema" / "foreign.json").write_bytes(b"foreign")
+                elif mutation == "cache-file":
+                    (root / "codex" / "foreign").write_bytes(b"foreign")
+                elif mutation == "symlink":
+                    target.unlink()
+                    target.symlink_to(root / "schema" / V.ENVELOPE_LEAF)
+                else:
+                    target.write_bytes(b"changed")
+                try:
+                    before = sorted(str(path.relative_to(root)) for path in root.rglob("*"))
+                    self.assertFalse(fixture.retire())
+                    self.assertEqual(before, sorted(str(path.relative_to(root)) for path in root.rglob("*")))
+                    self.assertTrue((root / "schema" / V.ENVELOPE_LEAF).exists())
+                finally:
+                    fixture.close()
+
+    def test_directory_swap_denies_without_removing_outside_data(self):
+        platform = NS(acl_count=lambda fd: 0, xattr_names=lambda fd: ())
+        with tempfile.TemporaryDirectory(dir="/private/tmp") as directory, patch.object(V.paths, "DarwinEnvelope", return_value=platform):
+            fixture = self.fixture(directory)
+            root = Path(fixture.path)
+            original = root / "codex"
+            original.rename(root / "saved-codex")
+            original.mkdir(mode=0o700)
+            (original / "foreign").write_bytes(b"foreign")
+            try:
+                with self.assertRaises(Exception):
+                    fixture.retire()
+                self.assertEqual((original / "foreign").read_bytes(), b"foreign")
+                self.assertTrue((root / "schema" / V.SCHEMA_LEAF).exists())
+            finally:
+                fixture.close()
+
+    def test_retirement_close_uncertainty_keeps_actual_descriptor_owner(self):
+        platform = NS(acl_count=lambda fd: 0, xattr_names=lambda fd: ())
+        with tempfile.TemporaryDirectory(dir="/private/tmp") as directory, patch.object(V.paths, "DarwinEnvelope", return_value=platform):
+            fixture = self.fixture(directory)
+            handle = fixture.handles[2]
+            descriptor = handle.descriptor
+            actual_close = os.close
+            attempted = []
+            def close(fd):
+                attempted.append(fd)
+                if fd == descriptor:
+                    raise OSError("synthetic uncertain close")
+                actual_close(fd)
+            try:
+                with patch.object(os, "close", side_effect=close):
+                    with self.assertRaises(OSError) as caught:
+                        fixture.retire()
+                    self.assertFalse(caught.exception.source_handles_closed)
+                    self.assertIn(handle, caught.exception.retained_sources)
+                    self.assertIn(descriptor, handle._fds)
+                    with self.assertRaises(OSError):
+                        fixture.close()
+                    self.assertEqual(attempted.count(descriptor), 1)
+                    self.assertTrue(os.fstat(descriptor))
+            finally:
+                # Explicit test-owner reconciliation, never adapter retry.
+                actual_close(descriptor)
+                handle._fds.remove(descriptor)
+
+
 class Harness:
     def __init__(self):
         self.calls, self.sources, self.apps = [], [], []
@@ -152,6 +266,8 @@ class Harness:
         self.fail_command = None
         self.close_failure = False
         self.command_exception = None
+        self.stderr = b""
+        self.source_reads = 0
         self.missing_sources = set()
         self.changed_source = None
         self.assessment = {"compatible": True, "checks": {"schema": True}, "reasonCodes": []}
@@ -181,6 +297,7 @@ class Harness:
                 if self.path in harness.missing_sources:
                     raise FileNotFoundError(self.path)
             def verify(self):
+                harness.source_reads += 1
                 return self.path != harness.changed_source
             def close(self):
                 if harness.close_failure:
@@ -196,6 +313,9 @@ class Harness:
                 return True
             def schema(self, leaf=V.SCHEMA_LEAF):
                 return b'{"definitions":{}}'
+            def retire(self):
+                self.retired = True
+                return True
             def close(self):
                 self.closed = True
                 if harness.close_failure:
@@ -226,18 +346,212 @@ class Harness:
             raise self.command_exception
         is_fail = self.fail_command is not None and self.fail_command in launch.argv
         return NS(returncode=1 if is_fail else 0,
-                  stdout=b"private command output" if is_fail else b"codex-cli 0.200.0\n", stderr=b"")
+                  stdout=b"private command output" if is_fail else b"codex-cli 0.200.0\n", stderr=self.stderr)
 
-    def observe(self):
+    def observe(self, **options):
         with patch.object(V.importlib.machinery, "SourceFileLoader") as loader, \
                 patch.object(V, "Fixture", self.fixture_class):
             loader.return_value.load_module.return_value = self.preflight
             return V.observe(root="/Users/fixture/AIDev/control", home="/Users/fixture", uid=501,
                 budget=self.budget, source_guard=self.guard, readiness=self.readiness,
-                process=self.process, policy=self.policy)
+                process=self.process, policy=self.policy, **options)
 
 
 class ConnectedTests(unittest.TestCase):
+    def test_complete_generated_bundle_retires_and_next_probe_can_run(self):
+        """Exercise the real filesystem owner, with inert injected CLI output.
+
+        The two consumed schemas are a subset of the 317-file vendor bundle;
+        successful repeated observations must not accumulate slot reservations.
+        """
+        from lib import vendor_fixture_custody as C
+        actual_fixture = V.Fixture
+        platform = NS(acl_count=lambda fd: 0, xattr_names=lambda fd: ())
+        with tempfile.TemporaryDirectory(dir="/private/tmp") as directory, \
+                patch.object(V.paths, "DarwinEnvelope", return_value=platform):
+            for _ in range(3):
+                h = Harness()
+                class LocalFixture(actual_fixture):
+                    def __init__(self, *args):
+                        h.fixture = self
+                        super().__init__(directory, directory, os.getuid(), V.paths)
+                h.fixture_class = LocalFixture
+                original = h.process.command
+                def command(launch, *args, **kwargs):
+                    if 'generate-json-schema' in launch.argv:
+                        root = Path(h.fixture.path)
+                        (root / 'codex' / 'tmp').mkdir(mode=0o755)
+                        (root / 'codex' / 'tmp' / 'arg0').mkdir(mode=0o755)
+                        for version in ('v1', 'v2'):
+                            (root / 'schema' / version).mkdir(mode=0o755)
+                        leaves = list(C.SCHEMAS)
+                        leaves += ['Extra%d.json' % i for i in range(35)]
+                        leaves += ['v1/Type%d.json' % i for i in range(140)]
+                        leaves += ['v2/Type%d.json' % i for i in range(140)]
+                        self.assertEqual(len(leaves), 317)
+                        for leaf in leaves:
+                            target = root / 'schema' / leaf
+                            target.write_bytes(b'{"definitions":{}}')
+                            target.chmod(0o644)
+                    return original(launch, *args, **kwargs)
+                h.process.command = command
+                result = h.observe()
+                self.assertEqual(result['status'], 'PASS')
+                self.assertTrue(result['fixtureRetired'])
+                self.assertFalse(Path(h.fixture.path).exists())
+                with C.Custody(directory, directory, os.getuid(), envelope=lambda *a: None) as custody:
+                    self.assertEqual(custody.status()['outstanding'], 0)
+
+    def test_constructor_envelope_failure_after_allocation_retains_exact_owner(self):
+        actual_fixture = V.Fixture
+        with tempfile.TemporaryDirectory(dir="/private/tmp") as directory:
+            os.chmod(directory, 0o700)
+            h = Harness()
+            class ConstructorFixture(actual_fixture):
+                def __init__(self, *args):
+                    h.fixture = self
+                    super().__init__(directory, directory, os.getuid(), V.paths, custody_factory=lambda *a, **k: None)
+            h.fixture_class = ConstructorFixture
+            with patch.object(V, "require_fixture_envelope", side_effect=V.ProbeError("fixture_invalid")):
+                with self.assertRaises(V.ProbeError) as caught:
+                    h.observe()
+            error = caught.exception
+            self.assertEqual(error.reason_class, "fixture_invalid")
+            self.assertIs(error.private_fixture, h.fixture)
+            self.assertIn(h.fixture, error.retained_sources)
+            self.assertTrue(error.source_handles_closed)
+            self.assertEqual(h.fixture.handles, [])
+            self.assertTrue(Path(h.fixture.path).is_dir())
+            self.assertEqual(len(os.listdir(directory)), 1)
+            self.assertEqual(len(h.calls), 1)  # signing only; no capability launch
+            disposition = error.private_fixture_disposition
+            self.assertIs(disposition.inspect_private_owner(), h.fixture)
+            self.assertEqual(disposition.consumer, "current-doctor/root-recovery")
+            self.assertEqual(disposition.actions, ("inspect-private-owner", "preserve-for-diagnosis"))
+            self.assertIs(disposition.preserve_for_diagnosis(diagnostics_consumed=True), h.fixture)
+            self.assertTrue(disposition.diagnosis_consumed)
+            self.assertTrue(Path(h.fixture.path).is_dir())
+            self.assertNotIn(h.fixture.path, str(error))
+
+    def test_unknown_success_handoff_is_private_not_in_public_parser_result(self):
+        h = Harness()
+        h.fixture_class.retire = lambda fixture: False
+        captures = []
+        result = h.observe(fixture_consumer=captures.append)
+        self.assertFalse(result["fixtureRetired"])
+        self.assertEqual(len(captures), 1)
+        self.assertIs(captures[0].inspect_private_owner(), h.fixture)
+        self.assertTrue(captures[0].child_settled and captures[0].handles_closed)
+        self.assertNotIn(FIXTURE, repr(result))
+        self.assertTrue(h.fixture.closed)
+
+    def test_private_handoff_consumer_failure_keeps_exact_artifact(self):
+        h = Harness()
+        h.fixture_class.retire = lambda fixture: False
+        original = KeyboardInterrupt()
+        def consumer(disposition):
+            raise original
+        with self.assertRaises(KeyboardInterrupt) as caught:
+            h.observe(fixture_consumer=consumer)
+        self.assertIs(caught.exception, original)
+        self.assertIs(original.private_fixture, h.fixture)
+        self.assertIs(original.private_fixture_disposition.owner, h.fixture)
+        self.assertIn(h.fixture, original.retained_sources)
+        self.assertTrue(original.source_handles_closed)
+
+    def test_unsettled_failure_private_disposition_retains_live_fixture(self):
+        h = Harness()
+        child = object()
+        original = V.ProbeError("process_unsettled", private_owner=child)
+        command = h.process.command
+        def fail_capability(launch, *args, **kwargs):
+            if launch.argv[0] == "/usr/bin/sandbox-exec":
+                h.command_exception = original
+            return command(launch, *args, **kwargs)
+        h.process.command = fail_capability
+        with self.assertRaises(V.ProbeError) as caught:
+            h.observe()
+        self.assertIs(caught.exception, original)
+        self.assertIs(original.private_owner, child)
+        self.assertIs(original.private_fixture_disposition.owner, h.fixture)
+        self.assertIsNone(original.private_fixture_disposition.child_settled)
+        self.assertFalse(original.private_fixture_disposition.handles_closed)
+        self.assertFalse(h.fixture.closed)
+
+    def test_success_stderr_is_private_and_does_not_override_consumed_semantics(self):
+        h = Harness()
+        h.stderr = b"benign future vendor diagnostic\n"
+        result = h.observe()
+        self.assertEqual(result["status"], "PASS")
+        self.assertTrue(result["fixtureRetired"])
+        self.assertNotIn("diagnostic", repr(result))
+        h = Harness()
+        h.stderr = b"benign diagnostic\n"
+        h.assessment = {"compatible": False}
+        with self.assertRaises(V.ProbeError):
+            h.observe()
+        self.assertFalse(getattr(h.fixture, "retired", False))
+
+    def test_every_launch_admission_and_postcommand_boundary_detects_drift(self):
+        # Both signing commands and all six capability commands use admission.
+        for boundary in ("admission", "postcommand"):
+            for command_index in range(8):
+                with self.subTest(boundary=boundary, command=command_index):
+                    h = Harness()
+                    original = h.process.command
+                    def drift(launch, *args, **kwargs):
+                        selected = len(h.calls) == command_index
+                        if selected and boundary == "admission":
+                            h.guard_failure = True
+                        value = original(launch, *args, **kwargs)
+                        if selected and boundary == "postcommand":
+                            h.guard_failure = True
+                        return value
+                    h.process.command = drift
+                    with self.assertRaises(V.ProbeError):
+                        h.observe()
+                    self.assertEqual(len(h.calls), command_index + 1)
+                    self.assertFalse(getattr(getattr(h, "fixture", None), "retired", False))
+
+    def test_connected_owned_disk_read_counts_drop_without_skipping_final_guard(self):
+        from tests.test_phase5_current_readiness import R
+        # Reconstruct just the removed historical preguard in memory, so both
+        # counters measure connected reader calls instead of extrapolating.
+        tree = ast.parse(inspect.getsource(V.observe))
+        command = next(node for node in tree.body[0].body
+                       if isinstance(node, ast.FunctionDef) and node.name == "command")
+        command.body.insert(1, ast.Expr(ast.Call(ast.Name("guard", ast.Load()), [], [])))
+        ast.fix_missing_locations(tree)
+        namespace = {}
+        exec(compile(tree, "historical-preguard-fixture", "exec"), V.__dict__, namespace)
+        baseline = namespace["observe"]
+        with tempfile.TemporaryDirectory(dir="/private/tmp") as directory:
+            os.chmod(directory, 0o700)
+            for leaf in ("cli", "asar", "contract"):
+                target = Path(directory) / leaf
+                target.write_bytes(b'{"cli":{"observedVersion":"codex-cli 0.1.0"}}')
+                target.chmod(0o700)
+            class LocalSource(R.SourceFile):
+                def __init__(self, path, root, uid, budget, *, keep=True):
+                    leaf = "cli" if str(path) == V.CLI else "asar" if str(path) == V.ASAR else "contract"
+                    super().__init__(Path(directory) / leaf, directory, os.getuid(), budget, keep=keep)
+            actual = os.read
+            for observer, guards, count in ((baseline, 27, 78), (V.observe, 19, 54)):
+                h = Harness()
+                h.readiness.SourceFile = LocalSource
+                reads = []
+                def read(descriptor, maximum):
+                    block = actual(descriptor, maximum)
+                    if block:
+                        reads.append(len(block))
+                    return block
+                with patch.object(V, "observe", observer), patch.object(V, "vendor_source_type", return_value=LocalSource), patch.object(os, "read", side_effect=read):
+                    result = h.observe()
+                self.assertEqual(result["status"], "PASS")
+                self.assertEqual(len(h.calls), 8)
+                self.assertEqual(h.guard_count, guards)
+                self.assertEqual(len(reads), count)
+
     def test_missing_old_cli_and_wrapper_do_not_affect_direct_probe(self):
         h = Harness()
         h.missing_sources = {LEGACY_CLI, WRAPPER_CLI}

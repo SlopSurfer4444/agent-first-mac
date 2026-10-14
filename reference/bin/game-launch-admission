@@ -1,5 +1,5 @@
 """Private launch admission only: no stop, auth reads, install or GUI actions."""
-import contextlib,fcntl,hashlib,json,os,pwd,re,secrets,stat,subprocess,tempfile,time
+import contextlib,ctypes,errno,fcntl,hashlib,json,os,pwd,re,secrets,stat,subprocess,tempfile,time
 from pathlib import Path
 
 class Blocked(RuntimeError): pass
@@ -13,6 +13,27 @@ def directory(path):
         require(stat.S_ISDIR(facts.st_mode) and facts.st_uid in (0,os.getuid())
                 and not facts.st_mode&0o022,'unsafe_admission_directory')
     require(path.lstat().st_uid==os.getuid() and not path.lstat().st_mode&0o022,'admission_directory_owner')
+
+@contextlib.contextmanager
+def held_directory(path):
+    path=Path(path);require(path.is_absolute() and '..' not in path.parts,'unsafe_admission_directory')
+    chain=[];fd=os.open('/',os.O_RDONLY|os.O_DIRECTORY)
+    chain.append((None,None,fd,os.fstat(fd)))
+    def identity(facts):return facts.st_dev,facts.st_ino,facts.st_mode,facts.st_uid
+    try:
+        for name in path.parts[1:]:
+            parent=fd;fd=os.open(name,os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW,dir_fd=parent)
+            facts=os.fstat(fd)
+            require(facts.st_uid in (0,os.getuid()) and not facts.st_mode&0o022,'unsafe_admission_directory')
+            chain.append((parent,name,fd,facts))
+        require(os.fstat(fd).st_uid==os.getuid(),'admission_directory_owner')
+        def bound():
+            for parent,name,child,facts in chain:
+                require(identity(os.fstat(child))==identity(facts),'admission_directory_changed')
+                if parent is not None:require(identity(os.stat(name,dir_fd=parent,follow_symlinks=False))==identity(facts),'admission_directory_changed')
+        bound();yield fd,bound
+    finally:
+        for _,_,child,_ in reversed(chain):os.close(child)
 
 def regular(path,limit=65536):
     directory(path.parent)
@@ -38,6 +59,39 @@ def decode(raw):
     except (ValueError,UnicodeError,RecursionError):raise Blocked('invalid_admission_record') from None
     require(type(value) is dict,'invalid_admission_record');return value
 
+def boot_identity():
+    # Kernel boot time, not a hostname, serial or persistent machine identity.
+    class Timeval(ctypes.Structure):
+        _fields_=[('seconds',ctypes.c_long),('micros',ctypes.c_int)]
+    value=Timeval();size=ctypes.c_size_t(ctypes.sizeof(value))
+    libc=ctypes.CDLL('/usr/lib/libSystem.B.dylib',use_errno=True)
+    libc.sysctlbyname.argtypes=(ctypes.c_char_p,ctypes.c_void_p,ctypes.POINTER(ctypes.c_size_t),ctypes.c_void_p,ctypes.c_size_t)
+    libc.sysctlbyname.restype=ctypes.c_int
+    require(libc.sysctlbyname(b'kern.boottime',ctypes.byref(value),ctypes.byref(size),None,0)==0
+            and size.value==ctypes.sizeof(value) and value.seconds>0 and 0<=value.micros<1000000,'boot_identity_unavailable')
+    return hashlib.sha256(('%d:%d'%(value.seconds,value.micros)).encode()).hexdigest()
+
+def process_identity(pid):
+    # PROC_PIDTBSDINFO supplies microsecond creation time and process group.
+    # No argv, environment or private process memory is requested.
+    class BSDInfo(ctypes.Structure):
+        _fields_=[(name,ctypes.c_uint32) for name in ('flags','status','xstatus','pid','ppid','uid','gid','ruid','rgid','svuid','svgid','rfu')]+[
+            ('comm',ctypes.c_char*16),('name',ctypes.c_char*32)]+[(name,ctypes.c_uint32) for name in ('nfiles','pgid','pjobc','tdev','tpgid')]+[
+            ('nice',ctypes.c_int32),('seconds',ctypes.c_uint64),('micros',ctypes.c_uint64)]
+    value=BSDInfo();libproc=ctypes.CDLL('/usr/lib/libproc.dylib',use_errno=True)
+    libproc.proc_pidinfo.argtypes=(ctypes.c_int,ctypes.c_int,ctypes.c_uint64,ctypes.c_void_p,ctypes.c_int)
+    libproc.proc_pidinfo.restype=ctypes.c_int
+    count=libproc.proc_pidinfo(pid,3,0,ctypes.byref(value),ctypes.sizeof(value))
+    if count==0 and ctypes.get_errno()==errno.ESRCH:return None
+    require(count==ctypes.sizeof(value) and value.pid==pid and value.uid==os.getuid()
+            and value.seconds>0 and value.micros<1000000,'process_incarnation_unavailable')
+    return {'pid':pid,'birth':str(value.seconds)+':'+str(value.micros),'group':value.pgid}
+
+def valid_identity(value,optional=False):
+    return (value is None and optional) or (type(value) is dict and set(value)=={'pid','birth','group'}
+        and type(value['pid']) is int and 1<value['pid']<2**31 and type(value['group']) is int and 1<value['group']<2**31
+        and type(value['birth']) is str and re.fullmatch('[1-9][0-9]{0,19}:[0-9]{1,6}',value['birth']) is not None)
+
 class Admission:
     def __init__(self,home,route,goal=None):
         self.home=Path(home);self.route=route
@@ -62,25 +116,43 @@ class Admission:
     def record(self):
         if not self.pending.exists() and not self.pending.is_symlink():return None
         value=decode(regular(self.pending,4096))
-        require(set(value)=={'schema','route','phase','children','request','goal'} and type(value['schema']) is int
-                and value['schema']==1 and value['route'] in ('cs2','ds3','prince','steam')
+        legacy=value.get('schema')==1
+        require(type(value.get('schema')) is int and value['schema'] in (1,2)
+                and set(value)==({'schema','route','phase','children','request','goal'} if legacy else
+                    {'schema','route','phase','children','request','goal','boot','dispatcher'})
+                and value['route'] in ('cs2','ds3','prince','steam')
                 and value['phase'] in ('prepared','dispatched','confirmed') and value['goal'] in ('client','game') and type(value['children']) is list
-                and len(value['children'])<=2 and all(type(pid) is int and pid>1 for pid in value['children'])
-                and len(set(value['children']))==len(value['children'])
+                and len(value['children'])<=2 and (all(type(pid) is int and pid>1 for pid in value['children']) if legacy else
+                    all(valid_identity(child) for child in value['children']))
+                and len(set(value['children'] if legacy else [child['pid'] for child in value['children']]))==len(value['children'])
                 and type(value['request']) is str and re.fullmatch('[0-9a-f]{32}',value['request'])
                 and (value['phase']=='prepared' or len(value['children'])>=1)
                 and (value['phase']!='prepared' or value['children']==[]),'invalid_admission_record')
+        if not legacy:
+            require(type(value['boot']) is str and re.fullmatch('[0-9a-f]{64}',value['boot'])
+                    and valid_identity(value['dispatcher']),'invalid_admission_record')
         return value
 
-    def publish(self,value):
-        if self.pending.exists() or self.pending.is_symlink():self.record()
-        fd,name=tempfile.mkstemp(prefix='.game-launch-pending-',dir=str(self.state))
-        try:
-            with os.fdopen(fd,'wb') as stream:
-                stream.write((json.dumps(value,sort_keys=True)+'\n').encode());stream.flush();os.fsync(stream.fileno())
-            os.replace(name,self.pending)
-        finally:
-            if os.path.exists(name):os.unlink(name)
+    def publish(self,value,expected=None):
+        require(self.record()==expected,'admission_request_changed')
+        with held_directory(self.state) as (parent,bound):
+            name='.game-launch-pending-'+secrets.token_hex(16)
+            fd=os.open(name,os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW,0o600,dir_fd=parent)
+            try:
+                raw=(json.dumps(value,sort_keys=True)+'\n').encode();offset=0
+                while offset<len(raw):
+                    written=os.write(fd,raw[offset:]);require(written>0,'admission_write_failed');offset+=written
+                os.fsync(fd);bound();require(self.record()==expected,'admission_request_changed');bound()
+                os.replace(name,self.pending.name,src_dir_fd=parent,dst_dir_fd=parent);os.fsync(parent);bound()
+            finally:
+                os.close(fd)
+                try:os.unlink(name,dir_fd=parent)
+                except FileNotFoundError:pass
+
+    def withdraw(self,value):
+        with held_directory(self.state) as (parent,bound):
+            require(self.record()==value,'admission_request_changed');bound()
+            os.unlink(self.pending.name,dir_fd=parent);os.fsync(parent);bound()
 
     def paths(self,route=None):
         route=self.route if route is None else route
@@ -100,9 +172,9 @@ class Admission:
             target=client
         return client,target
 
-    def processes(self):
+    def processes(self,timeout=5):
         # macOS comm supplies executable identity; argv is never read or parsed.
-        result=subprocess.run(['/bin/ps','-U',str(os.getuid()),'-o','pid=,comm='],capture_output=True,timeout=5)
+        result=subprocess.run(['/bin/ps','-U',str(os.getuid()),'-o','pid=,comm='],capture_output=True,timeout=timeout)
         require(result.returncode==0 and len(result.stdout)<=4*1024*1024,'process_probe_failed')
         rows=result.stdout.decode('utf-8','strict').splitlines();require(len(rows)<20000,'process_limit')
         seen=set();commands=[]
@@ -112,6 +184,18 @@ class Admission:
             pid=int(match[1]);require(pid>0 and pid not in seen,'process_identity_unavailable')
             seen.add(pid);commands.append((pid,match[2]))
         return commands
+
+    def process_groups(self,timeout=5):
+        result=subprocess.run(['/bin/ps','-U',str(os.getuid()),'-o','pid=,ppid=,pgid=,comm='],capture_output=True,timeout=timeout)
+        require(result.returncode==0 and len(result.stdout)<=4*1024*1024,'process_probe_failed')
+        rows=[];seen=set()
+        for row in result.stdout.decode('utf-8','strict').splitlines():
+            match=re.fullmatch(r'\s*([0-9]+)\s+([0-9]+)\s+([0-9]+)\s+(.+?)\s*',row)
+            require(match is not None and len(rows)<20000,'process_identity_unavailable')
+            pid,parent,group=map(int,match.groups()[:3])
+            require(pid>0 and pid not in seen,'process_identity_unavailable');seen.add(pid)
+            rows.append((pid,parent,group,match[4]))
+        return rows
 
     def summary(self,route=None,processes=None,goal=None):
         client,target=self.paths(route)
@@ -136,29 +220,30 @@ class Admission:
     def reconcile(self):
         previous=self.record()
         if previous is None:return
-        if previous['phase']=='confirmed':self.pending.unlink();return
+        if previous['phase']=='confirmed':self.withdraw(previous);return
         if previous['phase']=='prepared':raise Blocked('pending_launch_unconfirmed')
         if self.summary(previous['route'],goal=previous['goal'])['targetActive']:
-            self.pending.unlink();return
-        for pid in previous['children']:
-            try:os.kill(pid,0)
-            except ProcessLookupError:continue
-            except PermissionError:raise Blocked('pending_launch_unconfirmed') from None
-            raise Blocked('launch_in_progress')
-        require(not self.active(previous['route']),'profile_active')
+            self.withdraw(previous);return
         self.recover()
 
     def begin(self):
         self.reconcile()
-        self.publish({'schema':1,'route':self.route,'phase':'prepared','children':[],
-                      'request':secrets.token_hex(16),'goal':self.goal})
+        dispatcher=process_identity(os.getpid())
+        require(valid_identity(dispatcher),'process_incarnation_unavailable')
+        self.publish({'schema':2,'route':self.route,'phase':'prepared','children':[],
+                      'request':secrets.token_hex(16),'goal':self.goal,'boot':boot_identity(),'dispatcher':dispatcher})
 
     def dispatched(self,children):
         value=self.record()
         require(value and value['route']==self.route and value['phase']=='prepared','admission_request_changed')
         require(1<=len(children)<=2 and all(type(child.pid) is int and child.pid>1 for child in children)
                 and len({child.pid for child in children})==len(children),'invalid_child_identity')
-        value.update(phase='dispatched',children=[child.pid for child in children]);self.publish(value)
+        before=dict(value);identities=[process_identity(child.pid) for child in children]
+        # A child that disappears before publication leaves the prepared request
+        # explicitly recoverable; missing birth identity is never invented.
+        require(all(valid_identity(child) and child['group']==child['pid'] for child in identities),'process_incarnation_unavailable')
+        require(value.get('schema')==2 and value['boot']==boot_identity(),'admission_request_changed')
+        value.update(phase='dispatched',children=identities);self.publish(value,expected=before)
         self.start_watch(value['request'])
 
     def start_watch(self,request):
@@ -172,21 +257,67 @@ class Admission:
                              stdin=subprocess.DEVNULL,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,start_new_session=True)
         except OSError:pass  # Reservation stays unresolved; no duplicate retry.
 
-    def watch(self,request,timeout=190):
+    def watch(self,request,timeout=190,max_samples=100):
+        require(type(timeout) in (int,float) and 0<timeout<=190 and type(max_samples) is int and 2<=max_samples<=100,'invalid_observer_budget')
         deadline=time.monotonic()+timeout
-        while time.monotonic()<deadline:
+        samples=0;delay=0.25
+        while samples<max_samples:
+            remaining=deadline-time.monotonic()
+            if remaining<=0:return
+            samples+=1
             try:
                 with self.locked():
                     value=self.record()
                     if value is None or value['request']!=request or value['phase']!='dispatched':return
-                    if self.summary(value['route'],goal=value['goal'])['targetActive']:
-                        value['phase']='confirmed';self.publish(value);return
+                    # Every OS observation receives only the remaining budget;
+                    # one last sample is reserved near the declared deadline.
+                    remaining=deadline-time.monotonic()
+                    if remaining<=0:return
+                    rows=self.processes(timeout=min(5,remaining))
+                    if time.monotonic()>deadline:return
+                    if self.summary(value['route'],processes=rows,goal=value['goal'])['targetActive']:
+                        before=dict(value);value['phase']='confirmed';self.publish(value,expected=before);return
             except Blocked as error:
                 if str(error)!='launcher_busy':return
             except (OSError,UnicodeError,subprocess.SubprocessError):return
-            time.sleep(0.25)
+            remaining=deadline-time.monotonic()
+            if remaining<=0:return
+            sleep=min(delay,max(0,remaining-0.01))
+            if samples==max_samples-1:sleep=max(0,remaining-0.01)
+            if sleep:time.sleep(sleep)
+            delay=min(4,delay*1.5)
+
+    def route_status(self,route):
+        base=self.home/'Library/Application Support'
+        root=base/('CS2 Standalone' if route=='cs2' else 'Adapted Games DS3' if route=='ds3' else 'Adapted Games')
+        if not root.exists() and not root.is_symlink():
+            resolver=self.home/'AIDev/bin'/('cs2-play' if route=='cs2' else 'ds3-play' if route=='ds3' else 'games-play')
+            require(not resolver.exists() and not resolver.is_symlink(),'absent_route_has_resolver')
+            namespace=base/'.Adapted Games DS3.lifecycle';journal=namespace/'journal.json'
+            bootstrap=base/'.Adapted Games DS3.lifecycle.bootstrap.json'
+            if route=='ds3' and (namespace.exists() or namespace.is_symlink() or bootstrap.exists() or bootstrap.is_symlink()):
+                require(journal.exists() and not journal.is_symlink(),'route_recovery_required')
+                value=decode(regular(journal,32*1024*1024))
+                fields={'schema','owner','operation','commit','direction','state','binding','steps','active','directoryIdentity'}
+                require(set(value)==fields and type(value.get('schema')) is int and value['schema']==1 and value.get('owner')=='control-ds3-marshal-fix'
+                        and value.get('direction')=='forward' and value.get('state')=='complete' and value.get('operation')=='retire'
+                        and type(value.get('steps')) is list and value.get('active') is None
+                        and all(type(row) is dict and row.get('done') is True for row in value['steps']),'route_recovery_required')
+                facts=namespace.lstat()
+                require(value['directoryIdentity']=={'dev':facts.st_dev,'ino':facts.st_ino,'mode':stat.S_IMODE(facts.st_mode),'kind':'directory'}
+                        and stat.S_ISDIR(facts.st_mode) and stat.S_IMODE(facts.st_mode)==0o700,'route_recovery_required')
+                if value['operation']=='retire':
+                    commit=value.get('commit');require(type(commit) is str and re.fullmatch('[0-9a-f]{40}',commit),'route_recovery_required')
+                    archive=root.with_name(root.name+' retired '+commit[:12]);directory(archive)
+                    binding=value.get('binding');require(type(binding) is dict and binding.get('archive')==str(archive),'route_recovery_required')
+                    old=binding.get('rootIdentity');facts=archive.lstat()
+                    require(type(old) is dict and old=={'dev':facts.st_dev,'ino':facts.st_ino,'mode':stat.S_IMODE(facts.st_mode),'kind':'directory'},'retired_route_archive_drift')
+                    return 'RETIRED'
+            return 'ABSENT'
+        return 'PRESENT'
 
     def active(self,route):
+        if self.route_status(route)!='PRESENT':return False
         base=self.home/'Library/Application Support'
         if route=='cs2':
             root=base/'CS2 Standalone';runtime=root/'runtime';prefix=root/'prefix'
@@ -222,21 +353,47 @@ class Admission:
     def recover(self):
         value=self.record()
         if value is None:return {'state':'NO_PENDING_LAUNCH'}
-        for pid in value['children']:
-            try:os.kill(pid,0)
-            except ProcessLookupError:continue
-            except PermissionError:raise Blocked('pending_launch_unconfirmed') from None
-            raise Blocked('launch_in_progress')
-        # No clock expiry or PID absence alone establishes safety.
-        for route in ('cs2','ds3','prince'):
-            require(not self.active(route),'profile_active')
-        processes=self.processes()
-        for _,command in processes:
+        legacy=value['schema']==1
+        same_boot=legacy or value['boot']==boot_identity()
+        groups=set()
+        if same_boot:
+            if not legacy:
+                dispatcher=process_identity(value['dispatcher']['pid'])
+                require(dispatcher!=value['dispatcher'],'launch_dispatcher_active')
+            for child in value['children']:
+                current=process_identity(child if legacy else child['pid'])
+                if current is not None:
+                    require(not legacy,'pending_launch_unconfirmed')
+                    require(current!=child,'launch_in_progress')
+                if not legacy and (current is None or current['group']!=child['group']):
+                    # A reused group leader with a different birth owns a new
+                    # group; surviving old descendants prevent PGID reuse.
+                    groups.add(child['group'])
+        # Inactivity is per reserved Wine prefix. Other absent/retired routes
+        # and fully qualified unrelated Wine applications do not own this lock.
+        require(not self.active(value['route']),'profile_active')
+        if legacy:
+            # Schema1 had no process group or incarnation binding. Preserve
+            # its conservative explicit recovery rather than manufacture v2
+            # ownership retrospectively.
+            for route in ('cs2','ds3','prince'):
+                require(not self.active(route),'profile_active')
+        rows=self.process_groups()
+        owned=self.paths(value['route'])[0]
+        prefix=owned
+        while prefix.name!='drive_c':prefix=prefix.parent
+        prefix=prefix.parent
+        runtime=prefix.parent.parent/'runtime' if value['route']=='ds3' else prefix.parent/'runtime' if value['route']=='cs2' else prefix.parent.parent/'runtime'
+        for _,_,group,command in rows:
+            require(group not in groups,'launch_descendant_active')
             name=Path(command).name.lower().strip('[]()')
-            require(name not in ('wine','wine64','wineserver','wine-preloader','wine64-preloader')
-                    and not name.endswith('.exe'),'pending_launch_unconfirmed')
+            wine=name in ('wine','wine64','wineserver','wine-preloader','wine64-preloader') or name.endswith('.exe')
+            # Bare/bracketed identities cannot prove which target/backend owns
+            # them. Exact paths outside the reserved scope can be independent.
+            require(not (wine and (legacy or not command.startswith('/') or command==str(prefix)
+                    or command.startswith(str(prefix)+'/') or command.startswith(str(runtime)+'/'))),'pending_launch_unconfirmed')
         # Recheck the immutable record after the bounded process observations.
-        require(self.record()==value,'admission_request_changed');self.pending.unlink()
+        require(self.record()==value,'admission_request_changed');self.withdraw(value)
         return {'state':'PENDING_LAUNCH_RECOVERED','gameplayVerified':False}
 
 if __name__=='__main__':

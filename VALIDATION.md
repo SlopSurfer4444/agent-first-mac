@@ -1,19 +1,38 @@
-# Public export validation
+# Public validation
 
-Checks performed on the sanitized source candidate before initial publication:
+Current export validation: 14 exporter tests passed; the selected reference suite
+ran 218 tests with 217 passing and one explicit skip. Structure/provenance checks
+passed for 301 text files, including 282 exported sources. The exact source
+revision is recorded in `export-provenance.json`; these are source-release results,
+not installed-workstation acceptance.
 
-- `python3 tools/test_reference.py`: **199 tests passed**. This selected suite
-  covers configuration transitions, disposable Git admission, project context
-  boundaries and compatibility-policy logic. It does not invoke installation.
-- AST parsing: **190 Python source files** parsed successfully.
-- JSON parsing: **41 JSON files** parsed successfully.
-- `git diff --cached --check`: passed.
-- Six vendored Tomli files compared byte-for-byte with the source snapshot:
-  unchanged, including license and provenance.
-- Actual export independently inspected for credential patterns, original
-  user/host/project identifiers, saved private evidence, binaries, symlinks and
-  licensing boundaries. Identified personal narratives and labels were removed.
+Run in this public checkout:
 
-These are bounded source-release checks, not an audit guarantee or acceptance
-of a fresh-machine installation. See PUBLIC-RELEASE.md for omitted components
-and the distinction between portable tests and historical integration tests.
+```sh
+python3 -B tools/test_export_reference.py
+python3 -B tools/check_release.py
+python3 -B tools/test_reference.py
+git diff --check
+```
+
+Exporter fixtures exercise refusal, fresh destination behavior, private redaction
+rules, exact exceptions, public-path mapping and deterministic output. Structural
+validation checks text/non-executable files, source syntax, guide links, the exact
+exported file set and hashes, and the allowlist digest. Neither proves privacy.
+
+The selected portable suite covers transitions, disposable Git admission,
+advisory project context and compatibility-policy logic. One explicitly named
+project-context test is reported SKIPPED because it reads deliberately omitted
+operational `codex/hooks.json`; no authority-bearing file is fabricated for it.
+The version-floor test compares source constants instead of a private observed
+version manifest. These differences are part of the public test scope.
+
+The entire historical test suite is not a portable acceptance suite. These tests
+do not install the harness, exercise native consent, certify a fresh Mac, prove
+root policy, establish Windows connectivity or verify running games. Tests and
+structural checks must run on the final export, not a preceding candidate.
+
+Publication additionally requires independent review of the actual full tree
+and diff, including authored guides and export tools, for private identifiers,
+credential patterns, personal narratives, source completeness and licensing.
+Pattern scanning alone cannot guarantee absence of sensitive data.

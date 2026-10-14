@@ -15,6 +15,7 @@ let
 in
 {
   system.activationScripts.extraActivation.text = lib.mkAfter ''
+    # aid-admin-resume-rustdesk-marker-guards-v1
     echo "reconciling the owner-authorized RustDesk controller lifecycle..." >&2
 
     app=/Applications/RustDesk.app
@@ -26,7 +27,8 @@ in
 
     fail() {
       echo "RustDesk controller lifecycle failure: $1" >&2
-      return 1
+      # Abort even when called from an if/|| context; do not rely on set -e.
+      exit 1
     }
 
     plist_raw() {
@@ -40,7 +42,7 @@ in
     }
 
     verify_app() {
-      test -d "$1" || return 1
+      test -d "$1" && ! test -L "$1" || return 1
       test "$(plist_raw "$1" CFBundleIdentifier)" = com.carriez.rustdesk \
         || return 1
       test "$(plist_raw "$1" CFBundleShortVersionString)" = 1.4.6 \
@@ -53,14 +55,51 @@ in
       test -x "$1/Contents/MacOS/RustDesk"
     }
 
-    install_marker() {
-      test -f "$marker_source" || return 1
+    no_marker_acl() {
+      # POSIX mode bits alone do not exclude ACL-granted non-root writers.
+      acl_listing=$(/bin/ls -lde "$1" 2>/dev/null) || return 1
+      test -n "$acl_listing" || return 1
+      case "$acl_listing" in
+        ??????????+*|*"
+"*) return 1 ;;
+      esac
+    }
+
+    safe_marker_directory() {
+      test -d "$1" && ! test -L "$1" || return 1
+      case "$(/usr/bin/stat -f '%u:%Lp' "$1" 2>/dev/null)" in
+        0:7[0145][0145]) ;;
+        *) return 1 ;;
+      esac
+      no_marker_acl "$1"
+    }
+
+    marker_prestate() {
+      test -f "$marker_source" && ! test -L "$marker_source" || return 1
+      safe_marker_directory /var/db/agent-first-mac || return 1
       if test -e "$marker_dir" || test -L "$marker_dir"; then
-        test -d "$marker_dir" && ! test -L "$marker_dir" || return 1
-      else
+        safe_marker_directory "$marker_dir" || return 1
+      fi
+      if test -e "$marker" || test -L "$marker"; then
+        test -f "$marker" && ! test -L "$marker" \
+          && test "$(/usr/bin/stat -f '%u:%Lp:%l' "$marker" 2>/dev/null)" = 0:644:1 \
+          && no_marker_acl "$marker" \
+          && /usr/bin/cmp -s "$marker_source" "$marker" || return 1
+      fi
+    }
+
+    install_marker() {
+      marker_prestate || return 1
+      if test -e "$marker"; then return 0; fi
+      if ! test -d "$marker_dir"; then
         /usr/bin/install -d -o root -g wheel -m 0755 "$marker_dir" || return 1
       fi
-      /usr/bin/install -o root -g wheel -m 0644 "$marker_source" "$marker"
+      # The broker serializes root operations; this parent excludes non-root
+      # writers. A competing root is outside this minimal marker contract.
+      marker_prestate || return 1
+      ! test -e "$marker" && ! test -L "$marker" || return 1
+      /usr/bin/install -o root -g wheel -m 0644 "$marker_source" "$marker" || return 1
+      marker_prestate
     }
 
     verify_managed() {
@@ -69,6 +108,7 @@ in
         && test "$(/bin/cat "$marker")" = "$expected_marker"
     }
 
+    marker_prestate || fail conflicting_or_unsafe_managed_marker
     if ${if rustDeskControllerEnabled then "true" else "false"}; then
       if ! verify_managed; then
         if test -e "$app" || test -L "$app"; then

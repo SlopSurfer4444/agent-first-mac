@@ -25,6 +25,119 @@ def observation(entries=None):
 
 
 class PureStateTests(unittest.TestCase):
+    def test_summary_exact_types_privacy_and_review_invariant(self):
+        summary = dict(M.change_summary(), externalObserved=2)
+        M.valid_summary(summary)
+        for update in ({"managed": True}, {"externalObserved": -1}, {"unknown": 1},
+                {"requiredReview": True}, {"actorAttributed": True}, {"completeInventory": True},
+                {"unknown": 40014, "requiredReview": True}, {"rawName": "private"}):
+            with self.assertRaises(M.Fault):
+                M.valid_summary(dict(summary, **update))
+
+    def test_preclassification_schema2_drift_migrates_unknown_without_closing_signal(self):
+        state = M.evolve(M.evolve(None, observation()), observation({"app": "one"}))
+        for report in (state["latest"], state["unresolvedDrift"]):
+            report.pop("changeSummary")
+        upgraded = M.upgrade(state)
+        self.assertTrue(upgraded["latest"]["unresolvedDrift"])
+        self.assertEqual(upgraded["latest"]["changeSummary"], M.change_summary(unknown=1))
+        self.assertEqual(upgraded["unresolvedDrift"]["changeSummary"], M.change_summary(unknown=1))
+
+    def test_exact_disposition_closes_only_signal_preserves_history_and_next_change(self):
+        baseline = M.evolve(None, observation({"app": "v1"}))
+        drift = M.evolve(baseline, observation({"app": "v2"}))
+        signal = drift["latest"]["currentIncident"]
+        for sequence, digest in ((1, signal["snapshotDigest"]), (signal["sequence"], "f" * 64),
+                (True, signal["snapshotDigest"])):
+            with self.assertRaises(M.Fault):
+                M.dispose(drift, sequence, digest, "expected_external")
+        closed = M.dispose(drift, signal["sequence"], signal["snapshotDigest"], "expected_external")
+        self.assertFalse(closed["latest"]["unresolvedDrift"])
+        self.assertEqual(closed["history"]["records"][0], drift["history"]["records"][0])
+        self.assertFalse(closed["latest"]["ownershipAccepted"] or closed["latest"]["sourceAdmission"])
+        self.assertEqual(M.main(["capture"], operation=lambda _: closed["latest"], emit=lambda _: None), 0)
+        unchanged = M.evolve(closed, closed["snapshot"])
+        self.assertFalse(unchanged["latest"]["unresolvedDrift"])
+        next_drift = M.evolve(unchanged, observation({"app": "v3"}))
+        self.assertTrue(next_drift["latest"]["unresolvedDrift"])
+        with self.assertRaises(M.Fault):
+            M.dispose(next_drift, signal["sequence"], signal["snapshotDigest"], "expected_external")
+        self.assertEqual(len(next_drift["history"]["records"]), 3)
+
+    def test_confirmed_conflict_remains_active_until_exact_lifecycle_disposition(self):
+        drift = M.evolve(M.evolve(None, observation()), observation({"app": "one"}))
+        incident = drift["latest"]["currentIncident"]
+        conflict = M.dispose(drift, incident["sequence"], incident["snapshotDigest"], "confirmed_conflict")
+        self.assertTrue(conflict["latest"]["unresolvedDrift"])
+        self.assertEqual(conflict["latest"]["currentIncident"]["classification"], "confirmed_conflict")
+        bad = copy.deepcopy(conflict)
+        bad["latest"]["currentConflict"] = None
+        with self.assertRaises(M.Fault):
+            M.valid_state(bad)
+        unchanged = M.evolve(conflict, conflict["snapshot"])
+        self.assertEqual(unchanged["latest"]["currentIncident"], conflict["latest"]["currentIncident"])
+        self.assertFalse(M.dispose(unchanged, incident["sequence"], incident["snapshotDigest"],
+            "resolved_by_lifecycle")["latest"]["unresolvedDrift"])
+
+    def test_undisposed_latest_drift_cannot_claim_no_current_incident(self):
+        drift = M.evolve(M.evolve(None, observation()), observation({"app": "one"}))
+        drift["unresolvedDrift"] = None
+        drift["latest"].update(unresolvedDrift=False, currentIncident=None)
+        with self.assertRaises(M.Fault):
+            M.valid_state(drift)
+
+    def test_disposition_cli_validates_arguments_before_scan_and_reports_only_assessment(self):
+        drift = M.evolve(M.evolve(None, observation()), observation({"app": "one"}))
+        signal = drift["latest"]["currentIncident"]
+        def operation(op, disposition):
+            self.assertEqual(op, "dispose")
+            return dict(M.dispose(drift, *disposition)["latest"], operation=op)
+        output = []
+        args = ["dispose", str(signal["sequence"]), signal["snapshotDigest"], "expected_external", "--json"]
+        self.assertEqual(M.main(args, operation=operation, emit=output.append), 0)
+        self.assertFalse(json.loads(output[0])["installedHealthChecked"])
+        for bad in (["dispose", "0", signal["snapshotDigest"], "expected_external"],
+                ["dispose", "2", "private", "expected_external"],
+                ["dispose", "2", signal["snapshotDigest"], []]):
+            call = Mock(side_effect=AssertionError("must not access state"))
+            self.assertEqual(M.main(bad, operation=call, emit=lambda _: None), 2)
+            call.assert_not_called()
+
+    def test_latest_distinct_change_is_not_hidden_by_first_drift_and_history_is_bounded(self):
+        state = M.evolve(None, observation())
+        first = M.evolve(state, observation({"app": "0"}))
+        state = first
+        for number in range(M.MAX_HISTORY + 5):
+            state = M.evolve(state, observation({"app": str(number + 1)}))
+        self.assertEqual(state["latest"]["currentIncident"]["sequence"], state["latest"]["sequence"])
+        self.assertNotEqual(state["latest"]["currentIncident"], first["latest"]["currentIncident"])
+        self.assertEqual(len(state["history"]["records"]), M.MAX_HISTORY)
+        self.assertEqual(state["history"]["retiredCount"], 6)
+        self.assertEqual(state["latest"]["historyCount"], M.MAX_HISTORY + 6)
+        self.assertNotEqual(state["history"]["retiredDigest"], M.digest(b"maintenance-history-v2"))
+        M.valid_state(state)
+
+    def test_legacy_retained_failure_migrates_as_history_not_current_unavailability(self):
+        drift = M.evolve(M.evolve(None, observation()), observation({"app": "one"}))
+        failure = M.evolve(drift, failure="scan_unavailable")
+        value = M.evolve(failure, failure["snapshot"])
+        value.pop("history")
+        value["schema"] = 1
+        value["unresolvedFailure"] = copy.deepcopy(failure["unresolvedFailure"])
+        value["latest"]["unresolvedFailure"] = True
+        for report in (value["latest"], value["unresolvedDrift"], value["unresolvedFailure"]):
+            for key in ("observedAt", "lastCompleteAt", "currentIncident", "currentConflict", "pendingConflicts", "historyCount", "historyDigest", "changeSummary"):
+                report.pop(key)
+        legacy = copy.deepcopy(value)
+        upgraded = M.upgrade(value)
+        self.assertTrue(upgraded["latest"]["unresolvedDrift"])
+        self.assertFalse(upgraded["latest"]["unresolvedFailure"])
+        self.assertEqual(upgraded["latest"]["historyCount"], 2)
+        bad = copy.deepcopy(legacy)
+        bad["latest"]["unresolvedDrift"] = False
+        with self.assertRaises(M.Fault):
+            M.upgrade(bad)
+
     def test_baseline_unchanged_and_add_remove_change_have_no_acceptance_claim(self):
         first = M.evolve(None, observation({"private-app": "one", "removed-app": "two"}))
         self.assertEqual(first["latest"]["status"], "BASELINE_OBSERVED")
@@ -38,17 +151,19 @@ class PureStateTests(unittest.TestCase):
             self.assertIs(latest[key], False)
         self.assertNotIn("private-app", M.encoded(next_state).decode())
 
-    def test_unresolved_drift_and_failure_survive_later_unchanged(self):
+    def test_scan_recovers_current_failure_but_keeps_history_and_current_drift(self):
         baseline = M.evolve(None, observation({"app": "v1"}))
         drift = M.evolve(baseline, observation({"app": "v2"}))
         failure = M.evolve(drift, failure="scan_unavailable")
         self.assertEqual(failure["snapshot"], drift["snapshot"])
         last = M.evolve(failure, drift["snapshot"])
         self.assertEqual(last["latest"]["status"], "UNCHANGED")
-        self.assertTrue(last["latest"]["unresolvedDrift"] and last["latest"]["unresolvedFailure"])
+        self.assertTrue(last["latest"]["unresolvedDrift"])
+        self.assertFalse(last["latest"]["unresolvedFailure"])
         self.assertEqual(last["unresolvedDrift"], drift["unresolvedDrift"])
-        self.assertEqual(last["unresolvedFailure"], failure["unresolvedFailure"])
-        self.assertEqual(set(last), {"schema", "snapshot", "latest", "unresolvedDrift", "unresolvedFailure"})
+        self.assertIsNone(last["unresolvedFailure"])
+        self.assertEqual([r["kind"] for r in last["history"]["records"]], ["DRIFT", "SCAN_INCOMPLETE", "SCAN_RECOVERED"])
+        self.assertEqual(set(last), {"schema", "snapshot", "latest", "unresolvedDrift", "unresolvedFailure", "history"})
 
     def test_failed_initial_scan_never_invents_snapshot_or_accepted_baseline(self):
         state = M.evolve(None, failure="scan_limit")
@@ -56,7 +171,8 @@ class PureStateTests(unittest.TestCase):
         self.assertEqual(state["latest"]["status"], "SCAN_INCOMPLETE")
         state = M.evolve(state, observation())
         self.assertEqual(state["latest"]["status"], "BASELINE_OBSERVED")
-        self.assertTrue(state["latest"]["unresolvedFailure"])
+        self.assertFalse(state["latest"]["unresolvedFailure"])
+        self.assertEqual(state["latest"]["historyCount"], 2)
 
     def test_strict_state_schema_digest_bounds_and_types(self):
         valid = M.evolve(None, observation())
@@ -99,7 +215,7 @@ class PureStateTests(unittest.TestCase):
         baseline = M.evolve(None, observation())
         drift = M.evolve(baseline, observation({"added": "one"}))
         failure = M.evolve(drift, failure="scan_unavailable")
-        state = M.evolve(failure, failure["snapshot"])
+        state = failure
         for key in ("unresolvedDrift", "unresolvedFailure"):
             for change in ({"sequence": 0}, {"operation": "status", "observationPublished": False},
                     {"observationPublished": False}):
@@ -187,6 +303,213 @@ class StoreTests(unittest.TestCase):
             owner.close()
         self.assertEqual((self.directory / "observations.json").read_bytes(), before)
 
+    def test_disposition_native_seam_is_atomic_bound_no_scan_and_status_readonly(self):
+        self.execute(observation())
+        report = self.execute(observation({"app": "changed"}))
+        signal = report["currentIncident"]
+        raw = (self.directory / "observations.json").read_bytes()
+        rejected = M.execute("dispose", store_factory=self.store, collector=lambda: self.fail("must not scan"),
+            disposition=(1, signal["snapshotDigest"], "expected_external"))
+        self.assertEqual(rejected["status"], "STATE_UNAVAILABLE")
+        self.assertEqual((self.directory / "observations.json").read_bytes(), raw)
+        result = M.execute("dispose", store_factory=self.store, collector=lambda: self.fail("must not scan"),
+            disposition=(signal["sequence"], signal["snapshotDigest"], "expected_external"))
+        M.valid_report(result)
+        self.assertFalse(result["unresolvedDrift"])
+        readback = self.execute(operation="status")
+        self.assertEqual(readback["historyCount"], 2)
+        self.assertFalse(readback["unresolvedDrift"])
+
+    def test_capture_classifier_uses_actual_previous_and_new_snapshots_and_persists_counts(self):
+        before = observation({"fixture": "one"})
+        after = observation({"fixture": "two", "another": "one"})
+        self.execute(before)
+        calls = []
+        def classifier(previous, current):
+            self.assertEqual(previous, before)
+            self.assertEqual(current, after)
+            calls.append(M.changes(previous, current))
+            return dict(M.change_summary(), externalObserved=calls[-1]["added"] + calls[-1]["changed"])
+        result = M.execute("capture", store_factory=self.store, collector=lambda: after, classifier=classifier)
+        self.assertEqual(calls, [{"added": 1, "removed": 0, "changed": 1, "scopesChanged": 1}])
+        self.assertEqual(result["changeSummary"]["externalObserved"], 2)
+        self.assertFalse(result["unresolvedDrift"])
+        self.assertIsNone(result["currentIncident"])
+        self.assertEqual(result["status"], "DRIFT")
+        saved = self.execute(operation="status")
+        self.assertEqual(saved["changeSummary"], result["changeSummary"])
+        self.assertEqual(saved["historyCount"], 1)
+        self.assertFalse(saved["ownershipAccepted"] or saved["installedHealthChecked"])
+
+    def test_external_change_never_closes_existing_actionable_signal_or_concrete_conflict(self):
+        self.execute(observation())
+        first = self.execute(observation({"fixture": "one"}))
+        signal = first["currentIncident"]
+        M.execute("dispose", store_factory=self.store, collector=lambda: self.fail("no scan"),
+            disposition=(signal["sequence"], signal["snapshotDigest"], "confirmed_conflict"))
+        result = M.execute("capture", store_factory=self.store, collector=lambda: observation({"fixture": "one", "external": "one"}),
+            classifier=lambda old, new: dict(M.change_summary(), externalObserved=1))
+        self.assertTrue(result["unresolvedDrift"])
+        self.assertEqual(result["currentIncident"]["sequence"], signal["sequence"])
+        self.assertEqual(result["currentConflict"]["sequence"], signal["sequence"])
+        self.assertFalse(result["changeSummary"]["requiredReview"])
+
+    def test_classifier_failure_or_invalid_output_is_unknown_not_incomplete_scan(self):
+        self.execute(observation())
+        for index, classify in enumerate((Mock(side_effect=PermissionError("private source catalog")),
+                lambda old, new: dict(M.change_summary(), externalObserved=1, actorAttributed=True),
+                lambda old, new: M.change_summary())):
+            result = M.execute("capture", store_factory=self.store,
+                collector=lambda: observation({"fixture": str(index)}),
+                classifier=classify)
+            self.assertEqual(result["status"], "DRIFT")
+            self.assertTrue(result["completeObservation"])
+            self.assertFalse(result["unresolvedFailure"])
+            self.assertEqual(result["changeSummary"], M.change_summary(unknown=1))
+            self.assertNotIn("private", M.encoded(result).decode())
+
+    def test_connected_managed_and_conflict_summaries_keep_metadata_limits_explicit(self):
+        self.execute(observation())
+        managed = M.execute("capture", store_factory=self.store, collector=lambda: observation({"target": "one"}),
+            classifier=lambda old, new: dict(M.change_summary(), managed=1, requiredReview=True))
+        self.assertTrue(managed["unresolvedDrift"])
+        self.assertIsNone(managed["currentConflict"])
+        conflict = M.execute("capture", store_factory=self.store, collector=lambda: observation(),
+            classifier=lambda old, new: dict(M.change_summary(), conflict=1, requiredReview=True))
+        self.assertEqual(conflict["currentConflict"]["classification"], "confirmed_conflict")
+        self.assertFalse(conflict["changeSummary"]["actorAttributed"] or conflict["installedHealthChecked"])
+
+    def test_reviewed_catalog_classifier_connected_to_capture_for_ten_owner_cases(self):
+        classifier = M.source_classifier(ROOT)
+        def sample(scope, entries):
+            value = observation()
+            value["scopes"][scope] = {"present": True, "root": M.digest(b"fixed fixture root"),
+                "entries": {M.digest(name.encode()): M.digest(payload.encode()) for name, payload in entries.items()}}
+            return M.snapshot(value["scopes"])
+        cases = (
+            ("applications", {}, {"Independent.app": "one"}, "externalObserved"),
+            ("applications", {"Independent.app": "one"}, {}, "externalObserved"),
+            ("applications", {"Independent.app": "one"}, {"Independent.app": "two"}, "externalObserved"),
+            ("applications", {}, {"IINA.app": "one"}, "managed"),
+            ("nix-applications", {"IINA.app": "one"}, {"IINA.app": "two"}, "managed"),
+            ("nix-applications", {"IINA.app": "one"}, {}, "conflict"),
+            ("usr-local-bin", {}, {"new-command": "one"}, "unknown"),
+            ("user-launch-agents", {}, {"new-service": "one"}, "unknown"),
+            ("user-applications", {}, {"Independent.app": "one"}, "externalObserved"),
+            ("nix-applications", {}, {"Undeclared.app": "one"}, "unknown"),
+        )
+        for scope, before, after, kind in cases:
+            with self.subTest(scope=scope, kind=kind):
+                # Separate exact synthetic private homes avoid sharing an active
+                # incident between logically independent owner scenarios.
+                with tempfile.TemporaryDirectory(prefix="aid-catalog-case-") as scratch:
+                    home = Path(scratch).resolve()
+                    (home / "AIDev").mkdir(mode=0o700)
+                    factory = lambda create: M.Store(str(home), self.uid, create)
+                    M.execute("capture", store_factory=factory, collector=lambda: sample(scope, before), classifier=classifier)
+                    result = M.execute("capture", store_factory=factory, collector=lambda: sample(scope, after), classifier=classifier)
+                    self.assertEqual(result["status"], "DRIFT")
+                    expected = dict(M.change_summary(), **{kind: 1}, requiredReview=kind != "externalObserved")
+                    self.assertEqual(result["changeSummary"], expected)
+                    self.assertEqual(result["unresolvedDrift"], kind != "externalObserved")
+                    self.assertEqual(result["currentConflict"] is not None, kind == "conflict")
+                    self.assertFalse(result["ownershipAccepted"] or result["installedHealthChecked"])
+                    self.assertNotIn("Independent.app", M.encoded(result).decode())
+
+    def test_two_and_three_managed_conflicts_cannot_be_closed_as_expected_external(self):
+        classifier = M.source_classifier(ROOT)
+        def sample(names):
+            value = observation()
+            value["scopes"]["nix-applications"] = {"present": True, "root": M.digest(b"fixed fixture root"),
+                "entries": {M.digest(name.encode()): M.digest(b"payload") for name in names}}
+            return M.snapshot(value["scopes"])
+        names = ["IINA.app", "Keka.app", "LocalSend.app"]
+        M.execute("capture", store_factory=self.store, collector=lambda: sample(names), classifier=classifier)
+        signals = []
+        for removed in range(1, 4):
+            result = M.execute("capture", store_factory=self.store,
+                collector=lambda: sample(names[removed:]), classifier=classifier)
+            signals.append(copy.deepcopy(result["currentIncident"]))
+            self.assertEqual(result["currentIncident"]["classification"], "confirmed_conflict")
+            self.assertEqual(result["currentConflict"], signals[0])
+            self.assertEqual(result["pendingConflicts"], signals[1:])
+            for signal in signals:
+                raw = (self.directory / "observations.json").read_bytes()
+                rejected = M.execute("dispose", store_factory=self.store, collector=lambda: self.fail("no scan"),
+                    disposition=(signal["sequence"], signal["snapshotDigest"], "expected_external"))
+                self.assertEqual(rejected["status"], "STATE_UNAVAILABLE")
+                self.assertEqual((self.directory / "observations.json").read_bytes(), raw)
+        unchanged = M.execute("capture", store_factory=self.store, collector=lambda: sample([]), classifier=classifier)
+        self.assertEqual(unchanged["currentConflict"], signals[0])
+        self.assertEqual(unchanged["pendingConflicts"], signals[1:])
+        self.assertFalse(unchanged["installedHealthChecked"])
+        # Resolve the middle binding first. The latest C incident and primary A
+        # must remain active; resolving A promotes C, never fabricates all-green.
+        for index, remaining in ((1, [signals[0], signals[2]]), (0, [signals[2]]), (2, [])):
+            signal = signals[index]
+            result = M.execute("dispose", store_factory=self.store, collector=lambda: self.fail("no scan"),
+                disposition=(signal["sequence"], signal["snapshotDigest"], "resolved_by_lifecycle"))
+            self.assertEqual(([result["currentConflict"]] if result["currentConflict"] else []) + result["pendingConflicts"], remaining)
+            if remaining:
+                self.assertEqual(result["currentIncident"], signals[2])
+                self.assertTrue(result["unresolvedDrift"])
+            self.assertFalse(result["installedHealthChecked"])
+        self.assertFalse(result["unresolvedDrift"])
+        self.assertEqual(self.execute(operation="status")["pendingConflicts"], [])
+
+    def test_conflict_capacity_overflow_preserves_all_exact_state_bytes_and_signals(self):
+        self.execute(observation())
+        for index in range(M.MAX_CONFLICTS):
+            result = M.execute("capture", store_factory=self.store,
+                collector=lambda: observation({"managed": str(index)}),
+                classifier=lambda old, new: dict(M.change_summary(), conflict=1, requiredReview=True))
+            self.assertEqual(result["status"], "DRIFT")
+        self.assertEqual(len(result["pendingConflicts"]), M.MAX_CONFLICTS - 1)
+        raw = (self.directory / "observations.json").read_bytes()
+        overflow = M.execute("capture", store_factory=self.store,
+            collector=lambda: observation({"managed": "overflow"}),
+            classifier=lambda old, new: dict(M.change_summary(), conflict=1, requiredReview=True))
+        self.assertEqual(overflow["status"], "STATE_UNAVAILABLE")
+        self.assertFalse(overflow["observationPublished"] or overflow["completeObservation"])
+        self.assertEqual(overflow["sequence"], result["sequence"])
+        self.assertEqual(overflow["pendingConflicts"], result["pendingConflicts"])
+        self.assertEqual((self.directory / "observations.json").read_bytes(), raw)
+        self.assertNotIn("managed", M.encoded(result["pendingConflicts"]).decode())
+        self.assertLess(len(M.encoded(overflow)), 16384)
+        M.valid_report(overflow)
+
+    def test_pending_conflict_schema_rejects_orphans_duplicates_overflow_and_unproven_latest(self):
+        first = M.evolve(M.evolve(None, observation()), observation({"app": "one"}),
+            summary=dict(M.change_summary(), conflict=1, requiredReview=True))
+        second = M.evolve(first, observation({"app": "two"}),
+            summary=dict(M.change_summary(), conflict=1, requiredReview=True))
+        for mutate in (lambda report: report.update(currentConflict=None),
+                lambda report: report["pendingConflicts"].append(copy.deepcopy(report["pendingConflicts"][0])),
+                lambda report: report["pendingConflicts"][0].update(sequence=True),
+                lambda report: report["pendingConflicts"][0].update(extra="private"),
+                lambda report: report.update(pendingConflicts=report["pendingConflicts"] * M.MAX_CONFLICTS),
+                lambda report: (report.update(pendingConflicts=[]), report["currentIncident"].update(classification="unknown_observation"))):
+            value = copy.deepcopy(second)
+            mutate(value["latest"])
+            with self.assertRaises(M.Fault):
+                M.valid_state(value)
+
+    def test_pre_pending_schema2_migration_preserves_known_current_and_later_bound_conflict(self):
+        first = M.evolve(M.evolve(None, observation()), observation({"app": "one"}),
+            summary=dict(M.change_summary(), conflict=1, requiredReview=True))
+        second = M.evolve(first, observation({"app": "two"}),
+            summary=dict(M.change_summary(), conflict=1, requiredReview=True))
+        latest = M.evolve(second, second["snapshot"])
+        # Reproduce the earlier source-only candidate: A was primary, B was
+        # recorded as an unknown latest incident despite its conflict summary.
+        for report in (latest["latest"], latest["unresolvedDrift"]):
+            report.pop("pendingConflicts")
+            report["currentIncident"]["classification"] = "unknown_observation"
+        upgraded = M.upgrade(latest)
+        self.assertEqual(upgraded["latest"]["currentConflict"], first["latest"]["currentConflict"])
+        self.assertEqual(upgraded["latest"]["pendingConflicts"], second["latest"]["pendingConflicts"])
+        self.assertEqual(upgraded["latest"]["currentIncident"]["classification"], "confirmed_conflict")
+
     def test_status_does_not_recreate_missing_lock_or_modify_existing_snapshot(self):
         self.execute()
         before = (self.directory / "observations.json").read_bytes()
@@ -202,7 +525,7 @@ class StoreTests(unittest.TestCase):
         self.assertEqual(len(lock_calls), 1)
         self.assertFalse(lock_calls[0].args[1] & os.O_CREAT)
 
-    def test_incomplete_scan_preserves_snapshot_and_failure_survives_unchanged(self):
+    def test_incomplete_scan_preserves_snapshot_then_success_closes_only_current_failure(self):
         previous = self.execute(observation({"fixture": "one"}))
         def fail():
             raise PermissionError("private scope/name must not escape")
@@ -213,7 +536,8 @@ class StoreTests(unittest.TestCase):
         self.assertNotIn("private", M.encoded(state).decode())
         next_result = self.execute(observation({"fixture": "one"}))
         self.assertEqual(next_result["status"], "UNCHANGED")
-        self.assertTrue(next_result["unresolvedFailure"])
+        self.assertFalse(next_result["unresolvedFailure"])
+        self.assertEqual(next_result["historyCount"], 2)
 
     def test_malformed_existing_state_is_not_replaced_or_scanned(self):
         self.execute()

@@ -45,6 +45,13 @@ let broker = AidAdminBroker(context: context)
 
 switch command {
 case "doctor-root":
+    if arguments == ["doctor-root", "--operation"] {
+        do {
+            let report = try broker.inspectOperation()
+            let data = try JSONSerialization.data(withJSONObject: report, options: [.sortedKeys])
+            print(String(decoding: data, as: UTF8.self)); exit(0)
+        } catch { fail(String(describing: error), code: 65) }
+    }
     guard arguments.count == 1 || arguments == ["doctor-root", "--json"] else {
         fail("doctor_root_arguments")
     }

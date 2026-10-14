@@ -77,15 +77,19 @@ class CodexWindowsHostSshStdioCompatTests(unittest.TestCase):
     def test_websocket_upgrade_validator_is_fail_closed(self):
         valid = (
             b"HTTP/1.1 101 Switching Protocols\r\n"
-            b"Upgrade: websocket\r\nConnection: Upgrade\r\n\r\n"
+            b"Upgrade: websocket\r\nConnection: Upgrade\r\n"
+            b"Sec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\n\r\n"
         )
-        self.assertTrue(module.validate_websocket_upgrade(valid))
+        key = "dGhlIHNhbXBsZSBub25jZQ=="
+        self.assertTrue(module.validate_websocket_upgrade(valid, key))
         self.assertFalse(module.validate_websocket_upgrade(
-            valid.replace(b"101", b"200", 1)
+            valid.replace(b"101", b"200", 1), key
         ))
         self.assertFalse(module.validate_websocket_upgrade(
-            b"HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\n\r\n"
+            b"HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\n\r\n", key
         ))
+        self.assertFalse(module.validate_websocket_upgrade(valid.replace(b"s3pPL", b"wrong"), key))
+        self.assertFalse(module.validate_websocket_upgrade(valid[:-4], key))
 
     def test_apply_migrates_exact_legacy_receipt_to_native(self):
         old_commit = "a" * 40
@@ -172,8 +176,8 @@ class CodexWindowsHostSshStdioCompatTests(unittest.TestCase):
         self.assertIn("mktemp -d", source)
         self.assertIn('rm -rf -- "$probe_home"', source)
         self.assertIn("app-server proxy", source)
-        self.assertIn("HTTP/1.1 101", source)
-        self.assertIn("upgrade: websocket", source)
+        self.assertIn("parser.validate_websocket_upgrade", source)
+        self.assertIn("parser.validate_initialize_response", source)
         self.assertIn("REMOTE_CONTROL_FLAG", source)
 
     def test_runtime_doctor_checks_duplicate_local_server_absent(self):

@@ -4,6 +4,8 @@ import sys
 sys.dont_write_bytecode = True
 import hashlib
 import fcntl
+import importlib.machinery
+import importlib.util
 import json
 import os
 from pathlib import Path
@@ -94,9 +96,24 @@ def source_gate(commit):
         return run(['/usr/bin/git', '-c', 'core.hooksPath=/dev/null', '-c', 'core.fsmonitor=false', '-C', CONTROL, *args]).decode().strip()
     need(re.fullmatch('[0-9a-f]{40}', commit) and git('rev-parse', 'HEAD') == commit
          and git('branch', '--show-current') == 'main' and not git('status', '--porcelain'), 'clean_exact_main_required')
-    report = json.loads(run([CONTROL/'bin/current-doctor', '--json'], timeout=600))
-    need(report.get('verdict') == 'PASS' and report.get('configurationSourceAccepted') is True
-         and report.get('currentSentinelReady') is True and report.get('integratedMain') is True, 'fresh_accepted_doctor_required')
+    loader=importlib.machinery.SourceFileLoader('game_scoped_ready',str(CONTROL/'lib/game_operation_readiness.py'))
+    bridge=importlib.util.module_from_spec(importlib.util.spec_from_loader(loader.name,loader));loader.exec_module(bridge)
+    nodes=[ROOT,ROOT.parent,HOME/'AIDev/bin',HOME/'AIDev/state']
+    if ROOT.exists():nodes.extend((ROOT/'runtime/.manifest.json',ROOT/'runtime/.owner.json',ROOT/'cs2-play'))
+    def owner():
+        manifest()
+        base=ROOT if ROOT.exists() else STAGE
+        directory(base);owner_file=base/'runtime/.owner.json';directory(owner_file.parent)
+        need(owner_file.is_file() and not owner_file.is_symlink() and json.loads(owner_file.read_text()).get('owner')==OWNER,'operation_payload_owner')
+        return True
+    def target():
+        if (ROOT/'prefix').exists():controller_inactive()
+        return True
+    def recovery():
+        for node in nodes[1:]:directory(node)
+        return True
+    report=bridge.ready(CONTROL,commit,'wine-install',checks={'payload-owner':owner,'wine-target':target,'recovery':recovery},target_guard=bridge.bound(lambda:bridge.metadata(nodes)))
+    need(report.get('scopedCandidateReady') is True,'scoped_operation_readiness_required')
     need(git('rev-parse', 'HEAD') == commit and not git('status', '--porcelain'), 'source_changed')
 
 def attest(m):

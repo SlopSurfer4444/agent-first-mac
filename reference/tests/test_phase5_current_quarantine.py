@@ -12,8 +12,9 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 from lib import phase5_current_quarantine as q
 
-PROFILE = (ROOT / "codex/quarantine.config.toml").read_bytes()
-LAUNCHER = (ROOT / "bin/codex-quarantine").read_bytes()
+# These are the frozen predecessor protocol's bytes, not current policy proof.
+PROFILE = (ROOT / "tests/fixtures/phase5-quarantine-before-temp-deny.config.toml").read_bytes()
+LAUNCHER = (ROOT / "tests/fixtures/phase5-quarantine-before-current-cli.zsh").read_bytes()
 HOME = "/fixture/owner"
 WORKSPACE = HOME + "/AIDev/quarantine/test with spaces"
 

@@ -31,11 +31,12 @@ DELIVERY = 'manifests/wine-runtime-update.json'
 ADMISSION = HOME/'AIDev/bin/game-launch-admission'
 DELIVERY_FIELDS = {'schema','id','owner','overlayPolicySha256','candidateFiles','requiredLaunchAdmissionSha256'}
 CANDIDATE_FILES = {'winemac-i386.drv','winemac-x86_64.drv','wine-source.tar.gz','source.patch','build-provenance.json','LGPL-NOTICE.txt'}
+EXTENDED_CANDIDATE_FILES = CANDIDATE_FILES | {'winemac-x86_64.so','oleacc-i386.dll','oleacc-x86_64.dll'}
 PE32 = 'engine/lib/wine/i386-windows/winemac.drv'
 PE64 = 'engine/lib/wine/x86_64-windows/winemac.drv'
 ARCHIVE_IMMUTABLE_SOURCE = (POLICY,DELIVERY,'manifests/games-hub.json','manifests/ds3-marshal-fix.json',
                             'manifests/ds3-source-hub-v1.json','bin/ds3-runtime','bin/ds3-play',
-                            'bin/games-play','bin/game-launch-admission')
+                            'bin/games-play','bin/game-launch-admission','lib/game_operation_readiness.py','lib/operation_readiness.py')
 
 
 class Blocked(RuntimeError):
@@ -71,15 +72,60 @@ def source_check(commit):
          and git('status','--porcelain') == '', 'clean_exact_main_required')
 
 
-def source_gate(commit):
-    source_check(commit)
-    try:
-        report=json.loads(run([CONTROL/'bin/current-doctor','--json']))
-    except (ValueError,UnicodeError):
-        raise Blocked('invalid_doctor_response')
-    need(type(report) is dict and report.get('verdict') == 'PASS' and report.get('gitOnly') is False
-         and all(report.get(key) is True for key in ('configurationSourceAccepted','currentSentinelReady','integratedMain')), 'fresh_accepted_doctor_required')
-    source_check(commit)
+def operation_ready(commit,operation,checks,target_guard):
+    loader=importlib.machinery.SourceFileLoader('game_scoped_ready',str(CONTROL/'lib/game_operation_readiness.py'))
+    module=importlib.util.module_from_spec(importlib.util.spec_from_loader(loader.name,loader));loader.exec_module(module)
+    return module.ready(CONTROL,commit,operation,checks=checks,target_guard=target_guard)
+
+def source_gate(commit,engine=None,root=None,action='apply'):
+    source_check(commit);need(engine is not None and root is not None,'operation_targets_required')
+    definition=engine.decode(root.read('payload/update-policy.json')[0])
+    need(type(definition) is dict and type(definition.get('schema')) is int and definition['schema'] in (1,2,3),'delivery_policy_schema')
+    prerequisite=action=='bootstrap-policy-source'
+    archival=action in ('archive-prepared','archive-applied','archive-rolled-back')
+    recovery_action=action in ('recover','rollback','archive-prepared','archive-applied','archive-rolled-back')
+    # The prerequisite alone may start without its two fixed files. Archives
+    # bind the recorded old scope; neither route can mint an 18-target plan.
+    selected=dict(engine.POLICY_SOURCE_TARGETS if definition['schema']==3 and not (prerequisite or archival)
+                  else engine.EXTENDED_TARGETS if definition['schema']>=2 else engine.TARGETS)
+    if definition['schema']==3 and root.exists('ds3/policy-source'):
+        engine.verify_policy_inventory(root)
+        selected.update({key:rel for key,rel in engine.POLICY_SOURCE_TARGETS.items() if key not in engine.EXTENDED_TARGETS})
+    def transaction():
+        root.validate_namespace();raw=root.read('state/transaction/plan.json')[0]
+        tx=engine.Transaction(root,digest(raw),source_only=False)
+        need(tx.targets in (engine.TARGETS,engine.EXTENDED_TARGETS,engine.POLICY_SOURCE_TARGETS),'operation_target_scope')
+        need(archival or tx.plan['acceptedCommit']==commit,'transaction_source_commit_drift')
+        tx.journal()
+        return tx
+    if root.anchors['state'].exists(NAMESPACE) and root.exists('state/transaction/journal.json'):
+        # The old recorded kind and the current desired kind are both fixed
+        # engine scopes. No plan-selected arbitrary path enters this guard.
+        selected.update(transaction().targets)
+    before={rel:root.read(rel) for rel in selected.values()}
+    def held():
+        root.bound();root._operation_lock_check()
+        return all(root.read(rel)==image for rel,image in before.items())
+    def owner():
+        delivery(engine,root)
+        for name,expected in (('hub','control-games-hub'),('ds3','control-ds3-marshal-fix')):
+            need(engine.decode(root.read(name+'/receipt.json')[0]).get('owner')==expected,'operation_payload_owner')
+        return True
+    def recovery():
+        state=root.anchors['state']
+        if state.exists(NAMESPACE):
+            root.validate_namespace()
+            if root.exists('state/transaction/journal.json'):
+                tx=transaction()
+                for key,rel in tx.targets.items():need(root.read(rel) in tuple(tx.images[key].values()),'target_unknown_drift')
+        return True
+    checks={'payload-owner':owner,'recovery':recovery}
+    if not recovery_action:
+        def target():
+            _,policy=delivery(engine,root);inactive(root,policy);return True
+        checks['wine-target']=target
+    result=operation_ready(commit,'wine-recovery' if recovery_action else 'wine-install',checks,held)
+    need(result.get('scopedCandidateReady') is True,'scoped_operation_readiness_required');source_check(commit)
 
 
 def load_engine():
@@ -88,6 +134,49 @@ def load_engine():
     module=importlib.util.module_from_spec(spec)
     loader.exec_module(module)
     return module
+
+
+def launch_bridge(root,commit,phase):
+    loader=importlib.machinery.SourceFileLoader('game_delivery_bridge',str(CONTROL/'lib/game_delivery_bridge.py'))
+    module=importlib.util.module_from_spec(importlib.util.spec_from_loader(loader.name,loader));loader.exec_module(module)
+    return module.launch_bridge(CONTROL,root,commit,phase=phase)
+
+
+@contextlib.contextmanager
+def prerequisite_bridge(engine,root,commit,action):
+    definition=engine.decode(root.read('payload/update-policy.json')[0])
+    if action not in ('archive-applied','bootstrap-policy-source') or definition.get('schema')!=3 \
+       or digest(root.read('admission/helper')[0])==definition.get('requiredLaunchAdmissionSha256'):
+        yield
+        return
+    # Only the first prerequisite and terminal archival may use the exact
+    # reviewed launch predecessor. Ordinary apply still requires the new helper.
+    with launch_bridge(root,commit,'predecessor') as proof:
+        root._launch_predecessor=proof
+        try:yield
+        finally:del root._launch_predecessor
+
+
+def build_delivery(engine,root,commit,definition,policy,publish=False):
+    desired=policy['desiredRuntimeHashes' if definition['schema']>=2 else 'desiredPEHashes']
+    kwargs=dict(publish=publish,source_only=False,runtime_sha256=desired if definition['schema']>=2 else None,
+                installed_policy_source=definition['schema']==3)
+    def build():
+        return engine.build(root,commit,desired[PE32],desired[PE64],definition['overlayPolicySha256'],**kwargs)
+    if definition['schema']==3:
+        dm=engine.decode(root.read('ds3/manifest.json')[0])
+        old=engine.decode(root.read('ds3/policy-source/overlay-policy.json')[0])
+        if dm.get('schema')==3 and old.get('lifecycleSha256')!=digest(root.read('ds3/ds3-runtime')[0]):
+            # Launch deployment changes the helper before the overlay. Bind
+            # its complete settled transition instead of erasing old ancestry.
+            with launch_bridge(root,commit,'settled') as proof:
+                proof.revalidate()
+                need(proof.installed_lifecycle==root.read('ds3/ds3-runtime')[0],'launch_bridge_lifecycle_drift')
+                kwargs['predecessor_lifecycle']=proof.before_lifecycle
+                result=build()
+                proof.revalidate()
+                return result
+    return build()
 
 
 def anchor(engine,path):
@@ -164,7 +253,7 @@ def make_root(engine):
                 base,inner='admission',ADMISSION.name
             elif rel.startswith('payload/candidate/'):
                 base,inner='candidate',rel.removeprefix('payload/candidate/')
-                need(inner in CANDIDATE_FILES,'candidate_path_not_declared')
+                need(inner in EXTENDED_CANDIDATE_FILES,'candidate_path_not_declared')
             elif rel == 'payload/policy.json':
                 base,inner='control',POLICY
             elif rel == 'payload/update-policy.json':
@@ -175,7 +264,7 @@ def make_root(engine):
                 base,inner='control','manifests/ds3-source-hub-v1.json'
             elif rel == 'payload/ds3-runtime':
                 base,inner='control','bin/ds3-runtime'
-            elif rel in ('payload/winemac-i386.drv','payload/winemac-x86_64.drv'):
+            elif rel.startswith('payload/') and rel.removeprefix('payload/') in EXTENDED_CANDIDATE_FILES:
                 base,inner='candidate',rel.removeprefix('payload/')
             else:
                 raise Blocked('unsupported_fixed_path')
@@ -208,36 +297,94 @@ def make_root(engine):
 
 def delivery(engine,root):
     definition=engine.decode(root.read('payload/update-policy.json')[0])
-    need(type(definition) is dict and set(definition) == DELIVERY_FIELDS and type(definition['schema']) is int and definition['schema'] == 1
+    need(type(definition) is dict and set(definition) == DELIVERY_FIELDS and type(definition['schema']) is int and definition['schema'] in (1,2,3)
          and definition['id'] == 'wine-runtime-update' and definition['owner'] == 'control-games-hub','delivery_policy_schema')
     need(pin(definition['overlayPolicySha256']) and pin(definition['requiredLaunchAdmissionSha256'])
-         and type(definition['candidateFiles']) is dict and set(definition['candidateFiles']) == CANDIDATE_FILES
+         and type(definition['candidateFiles']) is dict and set(definition['candidateFiles']) == (EXTENDED_CANDIDATE_FILES if definition['schema'] >= 2 else CANDIDATE_FILES)
          and all(pin(value) for value in definition['candidateFiles'].values()),'delivery_pin_schema')
     raw=root.read('payload/policy.json')[0]
     need(digest(raw) == definition['overlayPolicySha256'],'overlay_policy_pin_mismatch')
     policy=engine.decode(raw)
-    need(type(policy) is dict and set(policy) == engine.POLICY_FIELDS and type(policy.get('schema')) is int and policy['schema'] == 1
+    need(type(policy) is dict and set(policy) == (engine.EXTENDED_POLICY_FIELDS if definition['schema'] >= 2 else engine.POLICY_FIELDS) and type(policy.get('schema')) is int and policy['schema'] == (2 if definition['schema'] >= 2 else 1)
          and policy['id'] == 'wine-runtime-overlay' and policy['owner'] == 'control-games-hub','overlay_policy_schema')
-    need(type(policy['desiredPEHashes']) is dict and set(policy['desiredPEHashes']) == {PE32,PE64}
-         and all(pin(value) for value in policy['desiredPEHashes'].values())
-         and policy['desiredPEHashes'][PE32] == definition['candidateFiles']['winemac-i386.drv']
-         and policy['desiredPEHashes'][PE64] == definition['candidateFiles']['winemac-x86_64.drv'],'overlay_delivery_disagreement')
+    extended = definition['schema'] >= 2
+    desired = policy['desiredRuntimeHashes' if extended else 'desiredPEHashes']
+    need(type(desired) is dict and set(desired) == (set(engine.RUNTIME_PAYLOADS) if extended else {PE32,PE64})
+         and all(pin(value) for value in desired.values())
+         and desired[PE32] == definition['candidateFiles']['winemac-i386.drv']
+         and all(desired[rel] == definition['candidateFiles'][name] for rel,name in engine.RUNTIME_PAYLOADS.items() if extended or rel in (PE32,PE64)),'overlay_delivery_disagreement')
     # Hub status keeps its exact source/installed byte equality. The accepted
     # source must declare the precise successor this planner will publish.
     installed_hub=engine.decode(root.read('hub/manifest.json')[0])
     need(type(installed_hub) is dict and type(policy.get('previousHubCriticalHashes')) is dict,'hub_manifest_schema')
-    desired_hub=dict(installed_hub,criticalHashes=dict(policy['previousHubCriticalHashes'],**policy['desiredPEHashes']),runtimeOverlayPolicySha256=definition['overlayPolicySha256'])
+    desired_hub=dict(installed_hub,criticalHashes=dict(policy['previousHubCriticalHashes'],**desired),runtimeOverlayPolicySha256=definition['overlayPolicySha256'])
     need(root.read('payload/current-hub-manifest.json')[0] == engine.encode(desired_hub),'declared_hub_source_successor_drift')
     for name,expected in definition['candidateFiles'].items():
         need(digest(root.read('payload/candidate/'+name)[0]) == expected,'candidate_source_drift')
     provenance=engine.decode(root.read('payload/candidate/build-provenance.json')[0])
-    fields={'schema','peHashes','sourceArchiveSha256','patchSha256','upstreamCommit','installed'}
-    need(type(provenance) is dict and set(provenance) == fields and type(provenance['schema']) is int and provenance['schema'] == 1
-         and provenance['peHashes'] == policy['desiredPEHashes'] and provenance['sourceArchiveSha256'] == definition['candidateFiles']['wine-source.tar.gz']
+    fields={'schema','runtimeHashes' if extended else 'peHashes','sourceArchiveSha256','patchSha256','upstreamCommit','installed'}
+    need(type(provenance) is dict and set(provenance) == fields and type(provenance['schema']) is int and provenance['schema'] == (2 if extended else 1)
+         and provenance['runtimeHashes' if extended else 'peHashes'] == desired and provenance['sourceArchiveSha256'] == definition['candidateFiles']['wine-source.tar.gz']
          and provenance['patchSha256'] == definition['candidateFiles']['source.patch'] and (provenance['upstreamCommit'] is None or pin(provenance['upstreamCommit'],40))
          and provenance['installed'] is False,'candidate_provenance_binding')
-    need(digest(root.read('admission/helper')[0]) == definition['requiredLaunchAdmissionSha256'],'launch_admission_prerequisite')
+    admission_raw=root.read('admission/helper')[0]
+    if digest(admission_raw)!=definition['requiredLaunchAdmissionSha256']:
+        proof=getattr(root,'_launch_predecessor',None)
+        need(definition['schema']==3 and proof is not None,'launch_admission_prerequisite')
+        proof.revalidate()
+        need(proof.admission==admission_raw,'launch_admission_predecessor_drift')
+        need(digest(proof.desired_admission)==definition['requiredLaunchAdmissionSha256'],
+             'launch_admission_successor_disagreement')
     return definition,policy
+
+
+def bootstrap_policy_source(engine,root,commit,fresh):
+    """First schema3 migration only, with historical source read as data."""
+    need(not root.exists('state/transaction'),'bootstrap_requires_archived_transaction')
+    definition,policy=delivery(engine,root)
+    need(definition['schema'] == 3,'bootstrap_delivery_schema')
+    desired=policy['desiredRuntimeHashes']
+    def exact_before():
+        return engine.build(root,commit,desired[PE32],desired[PE64],definition['overlayPolicySha256'],publish=False,source_only=False,runtime_sha256=desired)['planSha256']
+    before_plan=exact_before()
+    dm=engine.decode(root.read('ds3/manifest.json')[0]);dr=engine.decode(root.read('ds3/receipt.json')[0]);hm=engine.decode(root.read('hub/manifest.json')[0])
+    need(dm.get('schema') == 3 and pin(dr.get('commit'),40),'bootstrap_installed_generation')
+    old_commit=dr['commit']
+    git=['/usr/bin/git','-c','core.hooksPath=/dev/null','-C',CONTROL]
+    need(run(git+['cat-file','-t',old_commit]).decode().strip() == 'commit','bootstrap_source_commit_missing')
+    try:run(git+['merge-base','--is-ancestor',old_commit,commit])
+    except Blocked:raise Blocked('bootstrap_source_not_ancestor')
+    old_policy=run(git+['show',old_commit+':'+POLICY])
+    old_source=run(git+['show',old_commit+':manifests/ds3-source-hub-v1.json'])
+    old_lifecycle=run(git+['show',old_commit+':bin/ds3-runtime'])
+    need(digest(old_policy) == dm.get('runtimeOverlayPolicySha256')
+         and digest(old_source) == dm.get('sourceHubManifestSha256')
+         and old_lifecycle == root.read('ds3/ds3-runtime')[0]
+         and digest(old_lifecycle) == dr.get('lifecycleSha256'),'bootstrap_historical_binding')
+    # Validate the same exact fixed closure as schema4 before creating files.
+    # Content checks do not grant authority; the descriptor-bound bootstrap
+    # publishes only after a repeat full installed-state plan and local gate.
+    original=engine.decode(old_source);previous=engine.decode(old_policy)
+    need(type(previous) is dict and set(previous) == engine.EXTENDED_POLICY_FIELDS
+         and type(previous.get('schema')) is int and previous['schema'] == 2
+         and previous.get('id') == 'wine-runtime-overlay' and previous.get('owner') == 'control-games-hub'
+         and previous.get('lifecycleSha256') == digest(old_lifecycle)
+         and previous.get('desiredRuntimeHashes') == dm.get('runtimeOverrides')
+         and previous.get('sourceHubManifestSha256') == dm['sourceHubManifestSha256']
+         and previous.get('sourceCriticalHashes') == dm['sourceCriticalHashes']
+         and type(previous.get('previousHubCriticalHashes')) is dict
+         and hm.get('criticalHashes') == dict(previous['previousHubCriticalHashes'],**dm['runtimeOverrides'])
+         and hm.get('runtimeOverlayPolicySha256') == dm['runtimeOverlayPolicySha256']
+         and type(original) is dict and original.get('id') == 'games-hub' and original.get('owner') == 'control-games-hub'
+         and original.get('criticalHashes') == dm['sourceCriticalHashes'],'bootstrap_historical_closure')
+    loader=importlib.machinery.SourceFileLoader('reviewed_ds3_policy_source_bootstrap',str(CONTROL/'bin/ds3-policy-source-bootstrap'))
+    spec=importlib.util.spec_from_loader(loader.name,loader);module=importlib.util.module_from_spec(spec);loader.exec_module(module)
+    def gate():
+        fresh(commit)
+        need(exact_before() == before_plan,'bootstrap_installed_state_changed')
+    result=module.bootstrap(root.anchors['ds3'],old_policy,old_source,policy_sha256=digest(old_policy),source_hub_sha256=digest(old_source),gate=gate)
+    result.update(liveStateChanged=result['changed'],installedAcceptanceClaimed=False,installedGenerationUnchanged=True)
+    return result
 
 
 def inactive(root,policy):
@@ -261,7 +408,7 @@ def inactive(root,policy):
 
 
 def gate(engine,root,commit):
-    source_gate(commit)
+    source_gate(commit,engine,root)
     return local_gate(engine,root,commit)
 
 
@@ -270,8 +417,12 @@ def local_gate(engine,root,commit):
     if held is not None:held()
     source_check(commit)
     if root.exists('state/transaction'):root.validate_namespace()
-    _,policy=delivery(engine,root)
+    definition,policy=delivery(engine,root)
     inactive(root,policy)
+    if definition['schema'] == 3 and root.exists('ds3/policy-source'):
+        # Also bind the schema4 directory after the potentially slow prefix
+        # probes, including the immediate callback before each replacement.
+        engine.verify_policy_inventory(root)
     return {'sourceAccepted':True,'doctorReady':True,'prefixesInactive':True}
 
 
@@ -335,14 +486,38 @@ def archive_source_ancestry(engine,root,old_commit,current_commit):
              'archive_source_scope_changed')
 
 
-def archive_prepared(engine,root,current_commit,old_commit,expected_plan):
-    """Retain only this exact old prepared namespace; never rebind its source."""
+def archive_prepared(engine,root,current_commit,old_commit,expected_plan,terminal_applied=False,terminal_rolled_back=False):
+    """Retain a proved exact terminal/prepared namespace; never rebind it."""
+    need(type(terminal_applied) is bool and type(terminal_rolled_back) is bool
+         and not (terminal_applied and terminal_rolled_back),'archive_terminal_selection')
+    terminal = terminal_applied or terminal_rolled_back
+    exact_side = 'after' if terminal_applied else 'before'
+    exact_phase = 'applied' if terminal_applied else 'rolled-back' if terminal_rolled_back else 'prepared'
     need(pin(expected_plan) and pin(old_commit,40),'archive_old_binding_required')
-    with read_only_lock(root):
-        source_gate(current_commit)
+    with read_only_lock(root), prerequisite_bridge(engine,root,current_commit,'archive-applied' if terminal_applied else 'archive-rolled-back' if terminal_rolled_back else 'archive-prepared'):
+        source_gate(current_commit,engine,root,'archive-applied' if terminal_applied else 'archive-rolled-back' if terminal_rolled_back else 'archive-prepared')
         fresh=lambda _: local_gate(engine,root,current_commit)
         fresh(current_commit)
-        archive_source_ancestry(engine,root,old_commit,current_commit)
+        if terminal:
+            need(pin(old_commit,40) and old_commit != current_commit,'distinct_old_source_commit_required')
+            git=['/usr/bin/git','-c','core.hooksPath=/dev/null','-C',CONTROL]
+            need(run(git+['cat-file','-t',old_commit]).decode().strip() == 'commit','old_source_commit_missing')
+            try: run(git+['merge-base','--is-ancestor',old_commit,current_commit])
+            except Blocked: raise Blocked('old_source_not_ancestor')
+            historical_policy=run(git+['show',old_commit+':'+POLICY])
+            historical_source=run(git+['show',old_commit+':manifests/ds3-source-hub-v1.json'])
+            class HistoricalRoot:
+                # Only immutable source guards are read from the pinned old
+                # commit. Live gates continue using root/current intent.
+                def read(self,rel,**kwargs):
+                    if rel == 'payload/policy.json':return historical_policy,root.read(rel)[1]
+                    if rel == 'payload/source-hub-v1.json':return historical_source,root.read(rel)[1]
+                    return root.read(rel,**kwargs)
+                def __getattr__(self,name):return getattr(root,name)
+            transaction_root=HistoricalRoot()
+        else:
+            archive_source_ancestry(engine,root,old_commit,current_commit)
+            transaction_root=root
         state=root.anchors['state']
         def prepared_records(tx):
             root.validate_namespace()
@@ -352,9 +527,9 @@ def archive_prepared(engine,root,current_commit,old_commit,expected_plan):
                 check()
             need(state.read(NAMESPACE+'/owner.json')[1] == 0o600,'archive_owner_mode')
             journal=tx.journal()
-            need(journal['phase'] == 'prepared' and journal['intent'] is None,'archive_requires_prepared_null_intent')
+            need(journal['phase'] == exact_phase and journal['intent'] is None,'archive_requires_terminal_null_intent' if terminal else 'archive_requires_prepared_null_intent')
             need(root.read('state/transaction/journal.json')[1] == 0o600,'archive_journal_mode')
-            expected={'plan.json','journal.json'}|{key+'.'+side for key in engine.ORDER for side in ('before','after')}
+            expected={'plan.json','journal.json'}|{key+'.'+side for key in tx.order for side in ('before','after')}
             with root.parent('state/transaction/.unused') as (fd,_,check):
                 need(stat.S_IMODE(os.fstat(fd).st_mode) == 0o700,'transaction_not_private')
                 need(set(os.listdir(fd)) == expected,'archive_requires_no_stages')
@@ -362,14 +537,14 @@ def archive_prepared(engine,root,current_commit,old_commit,expected_plan):
         def exact_prepared():
             root.validate_namespace()
             raw,mode=root.read('state/transaction/plan.json')
-            need(engine.MAX_METADATA_BYTES < len(raw) <= engine.MAX_PLAN_BYTES and mode == 0o600,'archive_not_large_plan_repair')
-            tx=engine.Transaction(root,expected_plan,gate=fresh,source_only=False)
+            need((0 if terminal else engine.MAX_METADATA_BYTES) < len(raw) <= engine.MAX_PLAN_BYTES and mode == 0o600,'archive_not_large_plan_repair')
+            tx=engine.Transaction(transaction_root,expected_plan,gate=fresh,source_only=False)
             need(tx.plan['acceptedCommit'] == old_commit,'archive_old_source_binding')
             prepared_records(tx)
             tx.preflight(mixed=False)
-            need(tx.side('before'),'archive_requires_complete_before')
+            need(tx.side(exact_side),'archive_requires_complete_after' if terminal_applied else 'archive_requires_complete_before')
             for name in ('hub','ds3'):
-                need(engine.tree_rows(root,name+'/runtime') == tx.plan['runtimeRows'][name]['before'],
+                need(engine.tree_rows(root,name+'/runtime') == tx.plan['runtimeRows'][name][exact_side],
                      'archive_runtime_not_before')
             # Fresh gates are observations, not a lease on journal/inventory.
             # Re-read the exact records after the gate, before claiming prepared.
@@ -393,40 +568,57 @@ def archive_prepared(engine,root,current_commit,old_commit,expected_plan):
                     need(stat.S_ISDIR(info.st_mode) and info.st_uid == os.getuid() and stat.S_IMODE(info.st_mode) == 0o700,'archive_parent_entry')
                 destination_name=old_commit+'-'+expected_plan
                 tx=exact_prepared()
-                archive_source_ancestry(engine,root,old_commit,current_commit)
+                if not terminal: archive_source_ancestry(engine,root,old_commit,current_commit)
                 source_check();destination_check()
                 need(engine.identity(os.stat(source_name,dir_fd=source_parent,follow_symlinks=False)) == source_identity,
                      'archive_source_directory_drift')
                 need(os.fstat(source_parent).st_dev == os.fstat(destination_parent).st_dev,'cross_device_archive')
                 fresh(current_commit)
                 prepared_records(tx)
+                if terminal:
+                    # The final local gate can expose drift. Recheck the entire
+                    # old installed closure after it, not just the journal.
+                    tx.preflight(mixed=False)
+                    need(tx.side(exact_side),'archive_requires_complete_after' if terminal_applied else 'archive_requires_complete_before')
+                    for name in ('hub','ds3'):
+                        need(engine.tree_rows(root,name+'/runtime') == tx.plan['runtimeRows'][name][exact_side],
+                             'archive_runtime_not_after' if terminal_applied else 'archive_runtime_not_before')
+                    prepared_records(tx)
+                    source_check();destination_check()
+                    need(engine.identity(os.stat(source_name,dir_fd=source_parent,follow_symlinks=False)) == source_identity,
+                         'archive_source_directory_drift')
                 exclusive_rename(source_parent,source_name,destination_parent,destination_name)
                 os.fsync(source_parent);os.fsync(destination_parent)
                 need(engine.identity(os.stat(destination_name,dir_fd=destination_parent,follow_symlinks=False)) == source_identity,
                      'archive_published_identity_drift')
                 source_check();destination_check()
-        return {'state':'PREPARED_TRANSACTION_ARCHIVED','changed':True,'liveStateChanged':True,'installedTargetsChanged':False,
+        return {'state':'APPLIED_TRANSACTION_ARCHIVED' if terminal_applied else 'ROLLED_BACK_TRANSACTION_ARCHIVED' if terminal_rolled_back else 'PREPARED_TRANSACTION_ARCHIVED','changed':True,'liveStateChanged':True,'installedTargetsChanged':False,
                 'oldSourceCommit':old_commit,'currentSourceCommit':current_commit,'planSha256':expected_plan,
                 'oldTransactionRebound':False,'installedAcceptanceClaimed':False}
 
 
 def operate(operation,commit,expected_plan=None,old_commit=None):
-    need(operation in ('plan','apply','rollback','return','recover','archive-prepared'),'unsupported_operation')
-    need(operation == 'archive-prepared' or old_commit is None,'old_binding_archive_only')
+    need(operation in ('plan','apply','rollback','return','recover','archive-prepared','archive-applied','archive-rolled-back','bootstrap-policy-source'),'unsupported_operation')
+    need(operation in ('archive-prepared','archive-applied','archive-rolled-back') or old_commit is None,'old_binding_archive_only')
     source_check(commit)
     engine=load_engine()
     root=make_root(engine)
     try:
-        if operation == 'archive-prepared':return archive_prepared(engine,root,commit,old_commit,expected_plan)
-        with read_only_lock(root):
-            source_gate(commit)
-            # Made only after this invocation's full doctor PASS under lock.
+        if operation in ('archive-prepared','archive-applied','archive-rolled-back'):return archive_prepared(engine,root,commit,old_commit,expected_plan,terminal_applied=operation == 'archive-applied',terminal_rolled_back=operation == 'archive-rolled-back')
+        with read_only_lock(root), prerequisite_bridge(engine,root,commit,operation):
+            source_gate(commit,engine,root,operation)
+            # Made only after scoped operation readiness under the lock.
             # No persisted or caller-supplied PASS exists.
             fresh=lambda exact: local_gate(engine,root,exact)
             root._publication_check=lambda: fresh(commit)
+            if operation == 'bootstrap-policy-source':
+                need(expected_plan is None,'bootstrap_has_no_runtime_plan')
+                fresh(commit)
+                return bootstrap_policy_source(engine,root,commit,fresh)
             if operation == 'plan':
                 fresh(commit)
                 definition,policy=delivery(engine,root)
+                desired=policy['desiredRuntimeHashes' if definition['schema'] >= 2 else 'desiredPEHashes']
                 if root.exists('state/transaction'):
                     root.validate_namespace()
                     need(pin(expected_plan),'existing_transaction_plan_pin_required')
@@ -434,15 +626,16 @@ def operate(operation,commit,expected_plan=None,old_commit=None):
                     need(tx.plan['acceptedCommit'] == commit,'transaction_source_commit_drift')
                     tx.preflight(mixed=True)
                     return {'state':'PLANNED_EXISTING_TRANSACTION','changed':False,'liveStateChanged':False,'journalPhase':tx.journal()['phase'],'planSha256':expected_plan}
-                return engine.build(root,commit,policy['desiredPEHashes'][PE32],policy['desiredPEHashes'][PE64],definition['overlayPolicySha256'],publish=False,source_only=False)
+                return build_delivery(engine,root,commit,definition,policy)
             need(pin(expected_plan),'reviewed_plan_pin_required')
             if operation == 'apply' and not root.exists('state/transaction'):
                 fresh(commit)
                 definition,policy=delivery(engine,root)
-                planned=engine.build(root,commit,policy['desiredPEHashes'][PE32],policy['desiredPEHashes'][PE64],definition['overlayPolicySha256'],publish=False,source_only=False)
+                desired=policy['desiredRuntimeHashes' if definition['schema'] >= 2 else 'desiredPEHashes']
+                planned=build_delivery(engine,root,commit,definition,policy)
                 need(planned['planSha256'] == expected_plan,'prestate_changed_since_plan')
                 root.ensure_namespace()
-                prepared=engine.build(root,commit,policy['desiredPEHashes'][PE32],policy['desiredPEHashes'][PE64],definition['overlayPolicySha256'],source_only=False)
+                prepared=build_delivery(engine,root,commit,definition,policy,publish=True)
                 need(prepared['planSha256'] == expected_plan,'prepared_plan_drift')
             tx=engine.Transaction(root,expected_plan,gate=fresh,source_only=False)
             root.validate_namespace()
@@ -454,7 +647,10 @@ def operate(operation,commit,expected_plan=None,old_commit=None):
             result['sourceCommitUnchanged']=True
             result['installedAcceptanceClaimed']=False
             if result['state'] == 'ROLLED-BACK':
+                # DS3's generation is independently runnable from schema4,
+                # while the hub still retains its canonical source equality.
                 result['sourceRollbackSuccessorRequired']=True
+                result['ds3RuntimePolicySourceIndependent']=engine.decode(tx.images['ds3.manifest']['before'][0]).get('schema') == 4
             return result
     finally:
         root.close()
@@ -462,7 +658,7 @@ def operate(operation,commit,expected_plan=None,old_commit=None):
 
 def main():
     parser=argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('operation',choices=('plan','apply','rollback','return','recover','archive-prepared'))
+    parser.add_argument('operation',choices=('plan','apply','rollback','return','recover','archive-prepared','archive-applied','archive-rolled-back','bootstrap-policy-source'))
     parser.add_argument('accepted_commit')
     parser.add_argument('--plan-sha256')
     parser.add_argument('--old-commit')
@@ -475,6 +671,7 @@ if __name__ == '__main__':
     try:
         main()
     except Exception as error:
-        print(json.dumps({'state':'BLOCKED','reason':str(error) if isinstance(error,Blocked) or type(error).__name__ == 'Blocked' else type(error).__name__,
-                          'installedAcceptanceClaimed':False}))
+        unknown=getattr(error,'settlement_failed',False) is not False or getattr(error,'private_owner',None) is not None
+        print(json.dumps({'state':'UNKNOWN' if unknown else 'BLOCKED','reason':'operation_settlement_unconfirmed' if unknown else str(error) if isinstance(error,Blocked) or type(error).__name__ == 'Blocked' else type(error).__name__,
+                          'installedAcceptanceClaimed':False,'automaticRetryAllowed':False,'custodyUnknown':unknown}))
         sys.exit(1)

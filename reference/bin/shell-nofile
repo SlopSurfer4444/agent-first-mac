@@ -2,7 +2,7 @@
 """Exact-source user-shell soft open-file limit lifecycle; no root changes."""
 import sys
 sys.dont_write_bytecode = True
-import argparse, fcntl, hashlib, json, os, pwd, re, stat, subprocess
+import argparse, fcntl, hashlib, json, os, pwd, re, stat
 from pathlib import Path
 HERE = Path(__file__).resolve().parent.parent
 HOME = Path(pwd.getpwuid(os.getuid()).pw_dir)
@@ -21,51 +21,207 @@ PAYLOAD = b'''# Managed by AIDev/control: shell-nofile. Remove through its rollb
 def need(value, reason):
     if not value: raise RuntimeError(reason)
 
-def run(args):
-    p = subprocess.run([str(a) for a in args], capture_output=True, timeout=600)
-    need(p.returncode == 0, 'command_failed')
-    return p.stdout.decode().strip()
-
-def gate(commit):
+def gate(commit, fd, operation):
     need(HERE == CONTROL and Path(__file__).absolute() == CONTROL/'bin/shell-nofile', 'canonical_source_required')
     need(re.fullmatch('[0-9a-f]{40}', commit), 'invalid_commit')
-    def git(*args): return run(['/usr/bin/git', '-c', 'core.hooksPath=/dev/null', '-C', CONTROL, *args])
-    def exact():
-        need(git('rev-parse', 'HEAD') == commit and git('branch', '--show-current') == 'main' and not git('status', '--porcelain'), 'clean_exact_main_required')
-    exact()
-    d = json.loads(run([CONTROL/'bin/current-doctor', '--json']))
-    need(d.get('verdict') == 'PASS' and d.get('gitOnly') is False and all(d.get(k) is True for k in ('configurationSourceAccepted', 'currentSentinelReady', 'integratedMain')), 'fresh_accepted_doctor_required')
-    exact()
+    if str(HERE) not in sys.path: sys.path.insert(0, str(HERE))
+    from lib.operation_readiness import require_scoped_operation_ready
+    def capture():
+        home = os.stat(HOME, follow_symlinks=False); held = os.fstat(fd)
+        need((home.st_dev, home.st_ino) == (held.st_dev, held.st_ino), 'home_drift')
+        owned = tuple(snapshot_at(fd, name, links=2) for name in (TARGET, RECEIPT, JOURNAL, PENDING_TARGET, PENDING_RECEIPT, PENDING_LEGACY))
+        startup = []
+        for name in ('.zshenv', '.zprofile'):
+            try: s = os.stat(name, dir_fd=fd, follow_symlinks=False)
+            except FileNotFoundError: startup.append(None)
+            else: startup.append((s.st_dev, s.st_ino, s.st_mode, s.st_size, s.st_mtime_ns, s.st_ctime_ns))
+        return owned, tuple(startup)
+    before = capture()
+    def owner_check():
+        state = transaction(fd, 'status', None)
+        if state == 'ABSENT' and operation == 'apply':
+            need(all(value is None for value in before[1]), 'user_startup_owner_collision')
+        if state == 'RECOVERY_REQUIRED': need(operation == 'recover', 'explicit_recovery_required')
+        return True
+    def recovery_check():
+        transaction(fd, 'status', None)
+        return True
+    return require_scoped_operation_ready(CONTROL, 'shell-apply' if operation == 'apply' else 'shell-recovery', commit, checks={'payload-owner': owner_check, 'recovery': recovery_check}, target_guard=lambda: capture() == before)
 
-def read_at(fd, name):
-    try: leaf = os.open(name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=fd)
+TARGET = '.zshrc'
+RECEIPT = '.aid-shell-nofile-receipt.json'
+JOURNAL = '.aid-shell-nofile-operation.json'
+PENDING_TARGET = '.aid-shell-nofile-target.pending'
+PENDING_RECEIPT = '.aid-shell-nofile-receipt.pending'
+PENDING_LEGACY = '.aid-shell-nofile-legacy-receipt.pending'
+
+def snapshot_at(fd, name, links=1):
+    try: leaf = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=fd)
     except FileNotFoundError: return None
     try:
         s = os.fstat(leaf)
-        need(stat.S_ISREG(s.st_mode) and s.st_uid == os.getuid() and s.st_nlink == 1 and not s.st_mode & 0o022 and s.st_size < 8192, 'unsafe_file')
-        return os.read(leaf, 8192)
+        need(stat.S_ISREG(s.st_mode) and s.st_uid == os.getuid() and 1 <= s.st_nlink <= links and not s.st_mode & 0o022 and s.st_size < 8192, 'unsafe_file')
+        data = os.read(leaf, 8192)
+        need(len(data) == s.st_size and os.read(leaf, 1) == b'', 'file_drift')
+        return data, {'device': s.st_dev, 'inode': s.st_ino, 'uid': s.st_uid, 'mode': stat.S_IMODE(s.st_mode), 'size': s.st_size}
     finally: os.close(leaf)
 
+def read_at(fd, name):
+    value = snapshot_at(fd, name)
+    return None if value is None else value[0]
+
 def create_at(fd, name, data):
-    leaf = os.open(name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=fd)
+    leaf = os.open(name, os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=fd)
     try:
-        with os.fdopen(leaf, 'wb', closefd=False) as f:
-            f.write(data); f.flush(); os.fsync(leaf)
+        remaining = memoryview(data)
+        while remaining:
+            count = os.write(leaf, remaining)
+            need(count > 0, 'write_incomplete')
+            remaining = remaining[count:]
+        os.lseek(leaf, 0, os.SEEK_SET)
+        need(os.read(leaf, len(data)+1) == data, 'write_readback_failed')
+        os.fsync(leaf)
     finally: os.close(leaf)
+    os.fsync(fd)
+
+def parse_json(data):
+    def unique(pairs):
+        result = {}
+        for key, value in pairs:
+            need(key not in result, 'duplicate_key')
+            result[key] = value
+        return result
+    return json.loads(data, object_pairs_hook=unique)
+
+def receipt_valid(data):
+    r = parse_json(data)
+    need(type(r) is dict and type(r.get('schema')) is int and r['schema'] in (1, 2), 'receipt_drift')
+    keys = {'schema', 'commit', 'sha256'} | ({'targetIdentity'} if r['schema'] == 2 else set())
+    need(set(r) == keys and type(r['commit']) is str and re.fullmatch('[0-9a-f]{40}', r['commit']) and r['sha256'] == hashlib.sha256(PAYLOAD).hexdigest(), 'receipt_drift')
+    if r['schema'] == 2: identity_valid(r['targetIdentity'])
+    return r
+
+def identity_valid(ident):
+    need(type(ident) is dict and set(ident) == {'device', 'inode', 'uid', 'mode', 'size'} and all(type(v) is int and v >= 0 for v in ident.values()) and ident['uid'] == os.getuid() and not ident['mode'] & 0o022, 'journal_identity_drift')
+
+def unlink_owned(fd, name, expected, digest):
+    value = snapshot_at(fd, name, links=2)
+    need(value is not None and value[1] == expected and hashlib.sha256(value[0]).hexdigest() == digest, 'owned_file_drift')
+    os.unlink(name, dir_fd=fd)
+    os.fsync(fd)
+
+def journal_state(fd, recorded):
+    j = parse_json(recorded)
+    need(type(j) is dict and j.get('operation') in ('apply', 'rollback', 'migrate-receipt'), 'journal_drift')
+    keys = {'schema', 'operation', 'commit', 'targetIdentity', 'receiptIdentity', 'receiptSha256'}
+    if j['operation'] == 'migrate-receipt': keys |= {'legacyReceiptIdentity', 'legacyReceiptSha256'}
+    need(set(j) == keys and type(j['schema']) is int and j['schema'] == 1 and type(j['commit']) is str and re.fullmatch('[0-9a-f]{40}', j['commit']), 'journal_drift')
+    for key in ('targetIdentity', 'receiptIdentity'):
+        ident = j[key]
+        identity_valid(ident)
+    need(type(j['receiptSha256']) is str and re.fullmatch('[0-9a-f]{64}', j['receiptSha256']), 'journal_drift')
+    if j['operation'] == 'migrate-receipt':
+        identity_valid(j['legacyReceiptIdentity'])
+        need(type(j['legacyReceiptSha256']) is str and re.fullmatch('[0-9a-f]{64}', j['legacyReceiptSha256']), 'journal_drift')
+        need(snapshot_at(fd, TARGET) is not None, 'owned_target_missing')
+    for name, key, digest in ((TARGET, 'targetIdentity', hashlib.sha256(PAYLOAD).hexdigest()), (RECEIPT, 'receiptIdentity', j['receiptSha256'])):
+        observed = snapshot_at(fd, name, links=2)
+        if observed is not None:
+            if name == RECEIPT and j['operation'] == 'migrate-receipt' and observed[1] == j['legacyReceiptIdentity']:
+                need(hashlib.sha256(observed[0]).hexdigest() == j['legacyReceiptSha256'] and receipt_valid(observed[0])['schema'] == 1, 'legacy_receipt_drift')
+                continue
+            need(observed[1] == j[key] and hashlib.sha256(observed[0]).hexdigest() == digest, 'target_drift' if name == TARGET else 'receipt_drift')
+            if name == RECEIPT:
+                r = receipt_valid(observed[0])
+                if r['schema'] == 2: need(r['targetIdentity'] == j['targetIdentity'], 'receipt_target_drift')
+    for name, key, digest in ((PENDING_TARGET, 'targetIdentity', hashlib.sha256(PAYLOAD).hexdigest()), (PENDING_RECEIPT, 'receiptIdentity', j['receiptSha256'])):
+        observed = snapshot_at(fd, name, links=2)
+        if j['operation'] == 'rollback' or name == PENDING_TARGET and j['operation'] == 'migrate-receipt': need(observed is None, 'unexpected_pending_file')
+        elif observed is not None:
+            need(observed[1] == j[key] and hashlib.sha256(observed[0]).hexdigest() == digest, 'pending_drift')
+            if name == PENDING_RECEIPT:
+                r = receipt_valid(observed[0])
+                if r['schema'] == 2: need(r['targetIdentity'] == j['targetIdentity'], 'receipt_target_drift')
+    legacy = snapshot_at(fd, PENDING_LEGACY, links=2)
+    if j['operation'] == 'migrate-receipt':
+        if legacy is not None:
+            need(legacy[1] == j['legacyReceiptIdentity'] and hashlib.sha256(legacy[0]).hexdigest() == j['legacyReceiptSha256'] and receipt_valid(legacy[0])['schema'] == 1, 'legacy_receipt_drift')
+        observed = snapshot_at(fd, RECEIPT, links=2)
+        need(observed is not None and observed[1] == j['receiptIdentity'] or snapshot_at(fd, PENDING_RECEIPT, 2) is not None, 'owned_receipt_missing')
+    else: need(legacy is None, 'unexpected_pending_file')
+    if j['operation'] == 'apply':
+        need(snapshot_at(fd, TARGET, 2) is not None or snapshot_at(fd, PENDING_TARGET, 2) is not None, 'owned_target_missing')
+        need(snapshot_at(fd, RECEIPT, 2) is not None or snapshot_at(fd, PENDING_RECEIPT, 2) is not None, 'owned_receipt_missing')
+    elif j['operation'] == 'rollback':
+        need(snapshot_at(fd, TARGET) is None or snapshot_at(fd, RECEIPT) is not None, 'rollback_state_drift')
+    return j
+
+def recover(fd, j, journal_snapshot):
+    if j['operation'] in ('apply', 'migrate-receipt'):
+        if j['operation'] == 'migrate-receipt':
+            observed = snapshot_at(fd, RECEIPT, links=2)
+            if observed is not None and observed[1] == j['legacyReceiptIdentity']:
+                unlink_owned(fd, RECEIPT, j['legacyReceiptIdentity'], j['legacyReceiptSha256'])
+        publications = ((PENDING_TARGET, TARGET), (PENDING_RECEIPT, RECEIPT)) if j['operation'] == 'apply' else ((PENDING_RECEIPT, RECEIPT),)
+        for pending, final in publications:
+            if snapshot_at(fd, final, 2) is None:
+                # Exclusive publication; the journal binds the staged inode,
+                # not merely bytes which another owner could have created.
+                os.link(pending, final, src_dir_fd=fd, dst_dir_fd=fd, follow_symlinks=False)
+                os.fsync(fd)
+        journal_state(fd, journal_snapshot[0])
+        for name, key, digest in ((PENDING_TARGET, 'targetIdentity', hashlib.sha256(PAYLOAD).hexdigest()), (PENDING_RECEIPT, 'receiptIdentity', j['receiptSha256'])):
+            if snapshot_at(fd, name, 2) is not None: unlink_owned(fd, name, j[key], digest)
+        if j['operation'] == 'migrate-receipt' and snapshot_at(fd, PENDING_LEGACY, 2) is not None:
+            unlink_owned(fd, PENDING_LEGACY, j['legacyReceiptIdentity'], j['legacyReceiptSha256'])
+        result = 'RECEIPT_MIGRATED' if j['operation'] == 'migrate-receipt' else 'INSTALLED'
+    else:
+        for name, key, digest in ((TARGET, 'targetIdentity', hashlib.sha256(PAYLOAD).hexdigest()), (RECEIPT, 'receiptIdentity', j['receiptSha256'])):
+            if snapshot_at(fd, name) is not None: unlink_owned(fd, name, j[key], digest)
+        result = 'REMOVED'
+    journal_state(fd, journal_snapshot[0])
+    unlink_owned(fd, JOURNAL, journal_snapshot[1], hashlib.sha256(journal_snapshot[0]).hexdigest())
+    return result
 
 def transaction(fd, operation, commit):
     # One locked HOME directory descriptor prevents path redirection. No parent
     # directories or receipt directories are created or adopted.
-    target = '.zshrc'; receipt = '.aid-shell-nofile-receipt.json'
-    current = read_at(fd, target); recorded = read_at(fd, receipt)
+    need(operation in ('status', 'apply', 'rollback', 'recover', 'migrate-receipt'), 'invalid_operation')
+    if operation != 'status': need(type(commit) is str and re.fullmatch('[0-9a-f]{40}', commit), 'invalid_commit')
+    journal = snapshot_at(fd, JOURNAL)
+    if journal is not None:
+        j = journal_state(fd, journal[0])
+        if operation == 'status': return 'RECOVERY_REQUIRED'
+        need(operation == 'recover', 'explicit_recovery_required')
+        return recover(fd, j, journal)
+    need(all(snapshot_at(fd, name) is None for name in (PENDING_TARGET, PENDING_RECEIPT, PENDING_LEGACY)), 'unowned_pending_collision')
+    current_snapshot = snapshot_at(fd, TARGET); receipt_snapshot = snapshot_at(fd, RECEIPT)
+    current = None if current_snapshot is None else current_snapshot[0]
+    recorded = None if receipt_snapshot is None else receipt_snapshot[0]
     digest = hashlib.sha256(PAYLOAD).hexdigest()
     if recorded is not None:
-        r = json.loads(recorded)
-        need(type(r) is dict and set(r) == {'schema', 'commit', 'sha256'} and type(r['schema']) is int and r['schema'] == 1 and isinstance(r['commit'], str) and re.fullmatch('[0-9a-f]{40}', r['commit']) and r['sha256'] == digest, 'receipt_drift')
+        r = receipt_valid(recorded)
         need(current == PAYLOAD, 'target_drift')
+        if r['schema'] == 2: need(r['targetIdentity'] == current_snapshot[1], 'target_identity_drift')
+        if operation == 'migrate-receipt':
+            if r['schema'] == 2: return 'INSTALLED'
+            # Explicitly adopt this observed legacy pair, not a fictitious old
+            # inode. Target bytes never change; its exact identity is preserved.
+            body = json.dumps({'schema': 2, 'commit': commit, 'sha256': digest, 'targetIdentity': current_snapshot[1]}, sort_keys=True).encode()+b'\n'
+            create_at(fd, PENDING_RECEIPT, body)
+            os.link(RECEIPT, PENDING_LEGACY, src_dir_fd=fd, dst_dir_fd=fd, follow_symlinks=False)
+            os.fsync(fd)
+            legacy = snapshot_at(fd, PENDING_LEGACY, 2)
+            need(legacy[1] == receipt_snapshot[1] and legacy[0] == recorded, 'legacy_receipt_drift')
+            j = {'schema': 1, 'operation': 'migrate-receipt', 'commit': commit, 'targetIdentity': current_snapshot[1], 'receiptIdentity': snapshot_at(fd, PENDING_RECEIPT)[1], 'receiptSha256': hashlib.sha256(body).hexdigest(), 'legacyReceiptIdentity': receipt_snapshot[1], 'legacyReceiptSha256': hashlib.sha256(recorded).hexdigest()}
+            create_at(fd, JOURNAL, json.dumps(j, sort_keys=True).encode()+b'\n')
+            journal_state(fd, snapshot_at(fd, JOURNAL)[0])
+            return recover(fd, j, snapshot_at(fd, JOURNAL))
         if operation == 'rollback':
-            os.unlink(target, dir_fd=fd); os.unlink(receipt, dir_fd=fd)
-            return 'REMOVED'
+            need(r['schema'] == 2, 'legacy_receipt_requires_explicit_migration')
+            j = {'schema': 1, 'operation': 'rollback', 'commit': commit, 'targetIdentity': current_snapshot[1], 'receiptIdentity': receipt_snapshot[1], 'receiptSha256': hashlib.sha256(recorded).hexdigest()}
+            create_at(fd, JOURNAL, json.dumps(j, sort_keys=True).encode()+b'\n')
+            return recover(fd, j, snapshot_at(fd, JOURNAL))
         return 'INSTALLED'
     need(current is None, 'unowned_zshrc_collision')
     if operation != 'apply': return 'ABSENT'
@@ -74,21 +230,19 @@ def transaction(fd, operation, commit):
         try: os.stat(name, dir_fd=fd, follow_symlinks=False)
         except FileNotFoundError: continue
         raise RuntimeError('user_startup_owner_collision')
-    body = json.dumps({'schema': 1, 'commit': commit, 'sha256': digest}, sort_keys=True).encode() + b'\n'
-    create_at(fd, target, PAYLOAD)
-    try: create_at(fd, receipt, body)
-    except Exception:
-        if read_at(fd, target) == PAYLOAD: os.unlink(target, dir_fd=fd)
-        raise
-    need(read_at(fd, target) == PAYLOAD and read_at(fd, receipt) == body, 'postcheck_failed')
-    return 'INSTALLED'
+    create_at(fd, PENDING_TARGET, PAYLOAD)
+    target_identity = snapshot_at(fd, PENDING_TARGET)[1]
+    body = json.dumps({'schema': 2, 'commit': commit, 'sha256': digest, 'targetIdentity': target_identity}, sort_keys=True).encode() + b'\n'
+    create_at(fd, PENDING_RECEIPT, body)
+    j = {'schema': 1, 'operation': 'apply', 'commit': commit, 'targetIdentity': target_identity, 'receiptIdentity': snapshot_at(fd, PENDING_RECEIPT)[1], 'receiptSha256': hashlib.sha256(body).hexdigest()}
+    create_at(fd, JOURNAL, json.dumps(j, sort_keys=True).encode()+b'\n')
+    return recover(fd, j, snapshot_at(fd, JOURNAL))
 
 def main():
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument('operation', choices=('apply', 'status', 'rollback'))
+    p.add_argument('operation', choices=('apply', 'status', 'rollback', 'recover', 'migrate-receipt'))
     p.add_argument('--commit')
     a = p.parse_args()
-    if a.operation != 'status': gate(a.commit or '')
     need(not os.environ.get('ZDOTDIR') or Path(os.environ['ZDOTDIR']) == HOME, 'alternate_zdotdir')
     m = json.loads((HERE/MANIFEST).read_text())
     need(m['payloadSha256'] == hashlib.sha256(PAYLOAD).hexdigest(), 'manifest_drift')
@@ -97,8 +251,15 @@ def main():
         s = os.fstat(fd)
         need(s.st_uid == os.getuid() and not s.st_mode & 0o022, 'unsafe_home')
         fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        if a.operation != 'status': gate(a.commit or '', fd, a.operation)
         verdict = transaction(fd, a.operation, a.commit)
-        print(json.dumps({'schema': 1, 'verdict': verdict, 'softLimitFloor': 4096, 'existingSessionsChanged': False}))
+        report = {'schema': 1, 'verdict': verdict, 'softLimitFloor': 4096, 'existingSessionsChanged': False}
+        if verdict == 'RECOVERY_REQUIRED':
+            report['recoveryCommand'] = 'bin/shell-nofile recover --commit <accepted-main-commit>'
+        elif verdict == 'INSTALLED' and receipt_valid(read_at(fd, RECEIPT))['schema'] == 1:
+            report['receiptMigrationRequiredBeforeRollback'] = True
+            report['recoveryCommand'] = 'bin/shell-nofile migrate-receipt --commit <accepted-main-commit>'
+        print(json.dumps(report))
     finally: os.close(fd)
 
 if __name__ == '__main__':

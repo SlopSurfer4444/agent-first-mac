@@ -128,14 +128,43 @@ def module(name):
     spec=importlib.util.spec_from_loader(loader.name,loader); out=importlib.util.module_from_spec(spec);loader.exec_module(out)
     return out
 
-def source_gate(commit):
+def source_gate(commit,action='apply',recovery_check=None):
     need(HERE == CONTROL and Path(__file__).absolute() == CONTROL/'bin/game-app-launchers','canonical_source_required')
     need(type(commit) is str and re.fullmatch('[0-9a-f]{40}',commit),'invalid_commit')
     def exact():
         git=['/usr/bin/git','-c','core.hooksPath=/dev/null','-C',CONTROL]
         need(run(git+['rev-parse','HEAD']).decode().strip() == commit and run(git+['branch','--show-current']).decode().strip() == 'main' and not run(git+['status','--porcelain']),'clean_exact_main_required')
-    exact(); report=json.loads(run([CONTROL/'bin/current-doctor','--json']))
-    need(report.get('verdict') == 'PASS' and all(report.get(k) is True for k in ('configurationSourceAccepted','currentSentinelReady','integratedMain')) and report.get('gitOnly') is False,'fresh_accepted_doctor_required'); exact()
+    exact()
+    bridge=module_bridge()
+    nodes=[HUB,DS3,HOME/'Games',HOME/'AIDev/state']
+    guard=bridge.bound(lambda:(bridge.metadata(nodes),{str(p):image(p) for p in targets().values()}))
+    def owner():
+        policy()
+        for base,expected in ((HUB,'control-games-hub'),(DS3,'control-ds3-marshal-fix')):
+            need(load(base/'receipt.json').get('owner')==expected,'operation_payload_owner')
+        return True
+    def recovery():
+        safe_dir(HOME/'AIDev/state');safe_dir(HUB);safe_dir(DS3)
+        if recovery_check is not None:
+            need(callable(recovery_check),'operation_recovery_callback');recovery_check()
+        else:
+            transaction=HUB/('.game-app-launchers-'+commit)
+            if transaction.exists() or transaction.is_symlink():journal_check(transaction)
+        return True
+    def target():
+        ds3=module('ds3-runtime')
+        for base,prefix,field in ((HUB,HUB/'profiles/prince','criticalHashes'),(DS3,DS3/'profiles/ds3','sourceCriticalHashes')):
+            manifest=load(base/'manifest.json');need(sha(base/'runtime/engine/bin/wineserver')==manifest[field]['engine/bin/wineserver'],'operation_server_drift')
+            ds3.inactive(base/'runtime',prefix)
+        return True
+    checks={'payload-owner':owner,'recovery':recovery}
+    if action!='rollback':checks['wine-target']=target
+    report=bridge.ready(CONTROL,commit,'wine-recovery' if action=='rollback' else 'wine-install',checks=checks,target_guard=guard)
+    need(report.get('scopedCandidateReady') is True,'scoped_operation_readiness_required');exact()
+
+def module_bridge():
+    loader=importlib.machinery.SourceFileLoader('game_scoped_ready',str(CONTROL/'lib/game_operation_readiness.py'))
+    spec=importlib.util.spec_from_loader(loader.name,loader);out=importlib.util.module_from_spec(spec);loader.exec_module(out);return out
 
 def targets():
     out={'hub-receipt':HUB/'receipt.json','ds3-lifecycle':DS3/'ds3-runtime','ds3-receipt':DS3/'receipt.json','readme':HOME/'Games/README.txt'}
@@ -277,8 +306,9 @@ def install(commit,candidate):
     return {'state':'GAME_APPS_INSTALLED','changed':True,'gameStarted':False,'gameplayVerified':False}
 
 def rollback(commit,apply_commit):
-    source_gate(commit); need(type(apply_commit) is str and re.fullmatch('[0-9a-f]{40}',apply_commit),'invalid_apply_commit')
+    need(type(apply_commit) is str and re.fullmatch('[0-9a-f]{40}',apply_commit),'invalid_apply_commit')
     transaction=HUB/('.game-app-launchers-'+apply_commit)
+    source_gate(commit,'rollback',lambda:journal_check(transaction))
     m=policy_for_digest(load(transaction/'hub-receipt.after').get('appPolicySha256'))
     journal=journal_check(transaction); transaction_binding(transaction,m,apply_commit)
     # Bind retained recovery objects to the reviewed candidate, not arbitrary journal claims.

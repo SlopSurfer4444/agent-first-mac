@@ -11,6 +11,13 @@ import re
 import stat
 import subprocess
 import sys
+sys.dont_write_bytecode = True
+
+ROOT = Path(__file__).resolve().parent.parent
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+from lib.prepared_receipt import publish_receipt
+from lib.productivity_ownership import collect_homebrew_conflicts, targeted_application_collision
 
 
 NIX = "/nix/var/nix/profiles/default/bin/nix"
@@ -61,14 +68,18 @@ def team_identifier(bundle, *, cwd, env):
     return match.group(1)
 
 
-def fresh_doctor(control, commit, git_prefix, *, env):
-    """Require the full fresh sentinel before build and receipt preparation."""
+def fresh_source(control, commit, git_prefix, *, env):
+    """Preparation uses fresh source admission, not unrelated vendor queries.
+
+    This creates no apply authority. Root execution has its separate typed
+    contract and live integration retains its current full readiness gate.
+    """
     doctor = importlib.machinery.SourceFileLoader(
         "productivity_current_doctor", str(control / "bin/current-doctor")).load_module()
-    output = checked([control / "bin/current-doctor", "--json"], cwd=control, env=env)
-    value = doctor.public_report(doctor.D.R.strict_json(output.encode()), git_only=False)
-    require(value["verdict"] == "PASS" and value["integratedMain"] is True
-            and value["currentSentinelReady"] is True, "fresh_sentinel_required")
+    output = checked([control / "bin/current-doctor", "--git-only", "--json"], cwd=control, env=env)
+    value = doctor.public_report(doctor.D.R.strict_json(output.encode()), git_only=True)
+    require(value["verdict"] == "GIT_ONLY_VALID" and value["integratedMain"] is True,
+            "fresh_source_required")
     require(checked([*git_prefix, "rev-parse", "HEAD"], cwd=control, env=env) == commit
             and checked([*git_prefix, "branch", "--show-current"], cwd=control, env=env) == "main"
             and checked([*git_prefix, "status", "--porcelain", "--untracked-files=all"],
@@ -79,11 +90,24 @@ def reviewed_target(control, *, env):
     """The broker's reviewed:true field still promises actual target review."""
     doctor = importlib.machinery.SourceFileLoader(
         "productivity_reviewed_doctor", str(control / "bin/current-doctor")).load_module()
-    output = checked([control / "bin/current-doctor", "--git-only", "--audit-history", "--json"],
+    output = checked([control / "bin/current-doctor", "--git-only", "--reviewed-target", "--json"],
                      cwd=control, env=env)
     value = doctor.public_report(doctor.D.R.strict_json(output.encode()), git_only=True)
-    require(value["verdict"] == "GIT_ONLY_VALID" and value["integratedMain"] is True
-            and value["admissionMode"] == "historical-review", "independently_reviewed_target_required")
+    require(value["verdict"] == "GIT_ONLY_VALID" and value["integratedMain"] is True,
+            "independently_reviewed_target_required")
+
+
+def validate_build_binding(commit, revision, nar_hash, policy_bytes):
+    """Receipt authority is the actual exact build, never a source-only PASS."""
+    require(type(revision) is dict and revision.get("configurationRevision") == commit,
+            "configuration_revision")
+    require(type(nar_hash) is str and re.fullmatch(
+        r"sha256:[0-9abcdfghijklmnpqrsvwxyz]{52}", nar_hash) is not None,
+        "target_nar_hash")
+    require(type(policy_bytes) is bytes, "installed_policy_hash")
+    policy_hash = hashlib.sha256(policy_bytes).hexdigest()
+    require(policy_hash == EXPECTED_POLICY_SHA256, "installed_policy_hash")
+    return policy_hash
 
 
 def main():
@@ -124,14 +148,18 @@ def main():
     }
     checked([control / "bin/check-productivity-baseline"], cwd=control, env=build_env)
     checked([GIT, "diff", "--check", commit + "^", commit], cwd=control, env=git_env)
-    require(not checked(["/opt/homebrew/bin/brew", "list", "--formula"], cwd=control,
-                        env=build_env), "homebrew_formula_drift")
-    require(not checked(["/opt/homebrew/bin/brew", "list", "--cask"], cwd=control,
-                        env=build_env), "homebrew_cask_drift")
+    ownership = collect_homebrew_conflicts(manifest,
+        lambda argv: run(argv, cwd=control, env=build_env))
+    require(ownership["status"] == "clear" and ownership["observed"] is True,
+            "homebrew_owner_conflict_or_unknown")
+    if manifest["profileActive"]:
+        require(all(targeted_application_collision(manifest, app) == "clear"
+                    for app in manifest["applications"]),
+                "application_owner_conflict_or_unknown")
 
     before = generation_snapshot()
     reviewed_target(control, env=build_env)
-    fresh_doctor(control, commit, git_prefix, env=build_env)
+    fresh_source(control, commit, git_prefix, env=build_env)
     output = checked([
         NIX, "build", "--impure", "--no-link", "--print-out-paths",
         "--no-write-lock-file",
@@ -175,14 +203,8 @@ def main():
                     cwd=control, env=build_env).returncode == 0, "bundle_gatekeeper")
 
     policy_bytes = POLICY.read_bytes()
-    policy_hash = hashlib.sha256(policy_bytes).hexdigest()
-    require(policy_hash == EXPECTED_POLICY_SHA256, "installed_policy_hash")
-    fresh_doctor(control, commit, git_prefix, env=build_env)
-    receipt_dir = home / "AIDev/state/phase-4/apply-receipts"
-    receipt_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
-    receipt_dir.chmod(0o700)
-    receipt = receipt_dir / (commit + ".json")
-    require(not receipt.exists() and not receipt.is_symlink(), "receipt_exists")
+    policy_hash = validate_build_binding(commit, revision, nar_hash, policy_bytes)
+    fresh_source(control, commit, git_prefix, env=build_env)
     value = {
         "controlCommit": commit,
         "controlTree": tree,
@@ -192,22 +214,7 @@ def main():
         "targetSystemNarHash": nar_hash,
         "targetSystemPath": str(target),
     }
-    temporary = receipt.with_suffix(".json.new")
-    require(not temporary.exists() and not temporary.is_symlink(), "temporary_exists")
-    descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o400)
-    try:
-        data = (json.dumps(value, indent=2, sort_keys=True) + "\n").encode()
-        os.write(descriptor, data)
-        os.fsync(descriptor)
-    finally:
-        os.close(descriptor)
-    os.replace(temporary, receipt)
-    directory_descriptor = os.open(receipt_dir, os.O_RDONLY | os.O_DIRECTORY)
-    try:
-        os.fsync(directory_descriptor)
-    finally:
-        os.close(directory_descriptor)
-
+    receipt = publish_receipt(home, commit, value)
     receipt_facts = receipt.stat()
     require(stat.S_ISREG(receipt_facts.st_mode) and receipt_facts.st_uid == os.getuid() and
             receipt_facts.st_mode & 0o777 == 0o400, "receipt_metadata")
@@ -226,6 +233,8 @@ def main():
         "generationStateUnchanged": True,
         "narHash": nar_hash,
         "receiptWrittenOutsideRepository": True,
+        "privateStagingLinkRetained": True,
+        "applyPerformed": False,
         "rawStorePathRetainedInRepository": False,
     }, indent=2, sort_keys=True))
 

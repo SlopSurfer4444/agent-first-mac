@@ -1,0 +1,203 @@
+"""Offline prototype: fixed DS3 policy-source prerequisites, no CLI or live route.
+
+The adapter supplies its already descriptor-bound DS3 root and exact bytes/pins
+obtained from verified installed receipt ancestry. It holds the shared games
+lock throughout. A fresh gate asserts that same source, ancestry and inactive
+prefixes before every publication; a successful assertion returns None.
+"""
+import ctypes
+import hashlib
+import json
+import os
+import re
+import secrets
+import stat
+import sys
+
+STATE = '.policy-source-bootstrap'
+DESTINATION = 'policy-source'
+FILES = ('overlay-policy.json', 'source-hub-v1.json')
+OWNER = b'{"schema":1,"owner":"control-ds3-marshal-fix","purpose":"ds3-policy-source-bootstrap"}\n'
+MAX_INPUT = 1024 * 1024
+
+
+class Blocked(RuntimeError):
+    pass
+
+
+def need(ok, reason):
+    if not ok:
+        raise Blocked(reason)
+
+
+def digest(raw):
+    return hashlib.sha256(raw).hexdigest()
+
+
+def encode(value):
+    return (json.dumps(value, sort_keys=True, indent=2) + '\n').encode()
+
+
+def _expected(overlay_policy, source_hub, policy_sha256, source_hub_sha256):
+    data = dict(zip(FILES, (overlay_policy, source_hub)))
+    for raw, pin in zip(data.values(), (policy_sha256, source_hub_sha256)):
+        need(type(raw) is bytes and 0 < len(raw) <= MAX_INPUT, 'bootstrap_input_limit')
+        need(type(pin) is str and re.fullmatch('[0-9a-f]{64}', pin) is not None
+             and digest(raw) == pin, 'bootstrap_input_pin')
+    intent = encode({'schema': 1, 'kind': 'ds3-policy-source-bootstrap',
+                     'policySha256': policy_sha256, 'sourceHubSha256': source_hub_sha256,
+                     'destination': DESTINATION, 'directoryMode': 0o700, 'fileMode': 0o600})
+    return data, intent
+
+
+def _gate(gate):
+    need(callable(gate), 'fresh_bootstrap_gate_required')
+    need(gate() is None, 'bootstrap_gate_must_assert')
+
+
+def _exists(root, rel):
+    with root.parent(rel) as (parent, name, check):
+        try:
+            os.stat(name, dir_fd=parent, follow_symlinks=False)
+        except FileNotFoundError:
+            check()
+            return False
+        check()
+        return True
+
+
+def _inventory(root, directory):
+    with root.parent(directory + '/.unused') as (fd, _, check):
+        info = os.fstat(fd)
+        need(info.st_uid == os.getuid() and stat.S_IMODE(info.st_mode) == 0o700,
+             'bootstrap_directory_mode')
+        names = set(os.listdir(fd))
+        check()
+        return names
+
+
+def _images(root, directory, data):
+    need(_inventory(root, directory) == set(data), 'bootstrap_file_inventory')
+    for name, raw in data.items():
+        need(root.read(directory + '/' + name) == (raw, 0o600), 'bootstrap_image_drift')
+
+
+def _state(root, data, intent):
+    names = _inventory(root, STATE)
+    need(names in ({'owner.json', 'journal.json'}, {'owner.json', 'journal.json', 'publish'}),
+         'bootstrap_state_inventory')
+    need(root.read(STATE + '/owner.json') == (OWNER, 0o600), 'bootstrap_owner_drift')
+    need(root.read(STATE + '/journal.json') == (intent, 0o600), 'bootstrap_journal_drift')
+    staged = 'publish' in names
+    published = _exists(root, DESTINATION)
+    need(staged != published, 'bootstrap_publication_state')
+    _images(root, STATE + '/publish' if staged else DESTINATION, data)
+    return published
+
+
+def _write(root, rel, raw):
+    # Only new private scratch files are written. Partial unknown state is never
+    # overwritten, adopted, or deleted; it remains diagnostic evidence.
+    root.write_new(rel, raw, 0o600)
+
+
+def exclusive_rename(source_parent, source_name, destination_parent, destination_name):
+    """Descriptor-relative, atomic, no-clobber directory publication."""
+    need('/' not in source_name and '/' not in destination_name, 'bootstrap_basename')
+    if sys.platform == 'darwin':
+        library = ctypes.CDLL('/usr/lib/libSystem.B.dylib', use_errno=True)
+        function = library.renameatx_np
+        flags = 0x00000004
+    elif sys.platform.startswith('linux'):
+        library = ctypes.CDLL(None, use_errno=True)
+        need(hasattr(library, 'renameat2'), 'exclusive_directory_publication_unavailable')
+        function = library.renameat2
+        flags = 1
+    else:
+        raise Blocked('exclusive_directory_publication_unavailable')
+    function.argtypes = (ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_uint)
+    function.restype = ctypes.c_int
+    if function(source_parent, os.fsencode(source_name), destination_parent,
+                os.fsencode(destination_name), flags) != 0:
+        number = ctypes.get_errno()
+        raise OSError(number, os.strerror(number))
+
+
+def _prepare(root, data, intent, gate, event):
+    # Publish a complete retained intent and complete directory together. An
+    # interrupted scratch preparation is inert, private and retained; retry
+    # creates a fresh scratch and never repairs unknown partial scratch bytes.
+    scratch = STATE + '.prepare-' + secrets.token_hex(16)
+    root.mkdir(scratch)
+    event('scratch-created')
+    _write(root, scratch + '/owner.json', OWNER)
+    event('owner-written')
+    _write(root, scratch + '/journal.json', intent)
+    event('journal-written')
+    root.mkdir(scratch + '/publish')
+    event('publication-directory-created')
+    for name, raw in data.items():
+        _write(root, scratch + '/publish/' + name, raw)
+        event('image-written:' + name)
+    _images(root, scratch + '/publish', data)
+    need(_inventory(root, scratch) == {'owner.json', 'journal.json', 'publish'}, 'bootstrap_scratch_inventory')
+    need(root.read(scratch + '/owner.json') == (OWNER, 0o600)
+         and root.read(scratch + '/journal.json') == (intent, 0o600), 'bootstrap_scratch_drift')
+    with root.parent(scratch) as (parent, name, check):
+        _gate(gate)
+        check()
+        need(not _exists(root, DESTINATION), 'bootstrap_destination_collision')
+        # Recheck exact scratch closure after the gate, immediately before its
+        # exclusive publication. All file/directory writes already fsync.
+        _images(root, scratch + '/publish', data)
+        need(_inventory(root, scratch) == {'owner.json', 'journal.json', 'publish'}
+             and root.read(scratch + '/owner.json') == (OWNER, 0o600)
+             and root.read(scratch + '/journal.json') == (intent, 0o600), 'bootstrap_scratch_drift')
+        check()
+        exclusive_rename(parent, name, parent, STATE)
+        os.fsync(parent)
+    event('intent-published')
+
+
+def verify_ready(ds3_root, overlay_policy, source_hub, *, policy_sha256, source_hub_sha256):
+    """Launch prerequisite: exact complete publication or a blocking exception.
+
+    The adapter must separately hold its lock and run its normal fresh launch
+    gate. The retained intent is evidence of bytes, never accepted authority.
+    """
+    data, intent = _expected(overlay_policy, source_hub, policy_sha256, source_hub_sha256)
+    need(_exists(ds3_root, STATE), 'bootstrap_not_ready')
+    need(_state(ds3_root, data, intent), 'bootstrap_not_ready')
+    return True
+
+
+def bootstrap(ds3_root, overlay_policy, source_hub, *, policy_sha256,
+              source_hub_sha256, gate, event=lambda _: None):
+    """Create/resume the one fixed prerequisite directory; never launch.
+
+    Caller-supplied bytes must originate in verified installed receipt ancestry;
+    this primitive does not turn arbitrary bytes, pins, or a root into authority.
+    No filesystem paths, generalized target sets or persisted PASS are accepted.
+    """
+    data, intent = _expected(overlay_policy, source_hub, policy_sha256, source_hub_sha256)
+    _gate(gate)
+    if not _exists(ds3_root, STATE):
+        need(not _exists(ds3_root, DESTINATION), 'bootstrap_unowned_destination')
+        _prepare(ds3_root, data, intent, gate, event)
+    if _state(ds3_root, data, intent):
+        _gate(gate)
+        verify_ready(ds3_root, overlay_policy, source_hub, policy_sha256=policy_sha256,
+                     source_hub_sha256=source_hub_sha256)
+        return {'state': 'POLICY_SOURCE_READY', 'changed': False, 'gameStarted': False}
+    with ds3_root.parent(STATE + '/publish') as (source_parent, source_name, source_check), \
+         ds3_root.parent(DESTINATION) as (destination_parent, destination_name, destination_check):
+        _gate(gate)
+        need(not _state(ds3_root, data, intent), 'bootstrap_publication_state')
+        source_check(); destination_check()
+        exclusive_rename(source_parent, source_name, destination_parent, destination_name)
+        os.fsync(source_parent)
+        os.fsync(destination_parent)
+    event('directory-published')
+    verify_ready(ds3_root, overlay_policy, source_hub, policy_sha256=policy_sha256,
+                 source_hub_sha256=source_hub_sha256)
+    return {'state': 'POLICY_SOURCE_READY', 'changed': True, 'gameStarted': False}

@@ -4,7 +4,8 @@
 This is not a full inventory, integrity check, desired state, source admission,
 or ownership acceptance. No payload contents, profiles or launch plists are read.
 Only private maintenance evidence changes. Previous observations are comparison
-bases, never accepted baselines; unresolved drift/failure has no automatic clear.
+bases, never accepted baselines. Current signals and bounded history are separate.
+Opaque hashes are correlatable, not anonymized inventory or proof of intent.
 """
 import sys
 sys.dont_write_bytecode = True
@@ -17,17 +18,21 @@ from pathlib import Path
 import pwd
 import re
 import stat
+import time
 
 MAX_ENTRIES = 20000
 MAX_SCOPE = 4096
 MAX_STATE = 4 * 1024 * 1024
+MAX_HISTORY = 32
+MAX_CONFLICTS = 32
+DISPOSITIONS = {"expected_external", "resolved_by_lifecycle", "confirmed_conflict"}
 SCOPES = ("applications", "nix-applications", "user-applications", "home-manager-applications",
     "homebrew-cellar", "homebrew-caskroom", "homebrew-bin", "usr-local-bin", "local-bin", "aid-bin",
     "system-launch-agents", "system-launch-daemons", "user-launch-agents")
 STATUSES = {"BASELINE_OBSERVED", "UNCHANGED", "DRIFT", "SCAN_INCOMPLETE", "STATE_MISSING",
     "STATE_MALFORMED", "STATE_UNAVAILABLE", "SKIPPED_BUSY"}
 REASONS = {"observed_only", "metadata_difference", "scan_unavailable", "scan_limit", "scan_changed",
-    "state_missing", "state_malformed", "state_unavailable", "busy", "noncanonical_source"}
+    "state_missing", "state_malformed", "state_unavailable", "busy", "noncanonical_source", "conflict_limit"}
 GUIDANCE = "Review scoped doctors and the existing owner-approved lifecycle; do not auto-repair or treat this observation as acceptance."
 DIR_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
 FILE_FLAGS = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC
@@ -113,6 +118,22 @@ def changes(previous, current):
     return result
 
 
+def change_summary(*, unknown=0):
+    return {"managed": 0, "externalObserved": 0, "conflict": 0, "unknown": unknown,
+        "requiredReview": unknown > 0, "actorAttributed": False, "completeInventory": False}
+
+
+def valid_summary(value):
+    require(type(value) is dict and set(value) == set(change_summary()))
+    counts = ("managed", "externalObserved", "conflict", "unknown")
+    require(all(integer(value[key], MAX_ENTRIES * 2 + len(SCOPES)) for key in counts)
+        and sum(value[key] for key in counts) <= MAX_ENTRIES * 2 + len(SCOPES)
+        and type(value["requiredReview"]) is bool
+        and value["requiredReview"] is bool(value["managed"] + value["conflict"] + value["unknown"])
+        and value["actorAttributed"] is False and value["completeInventory"] is False)
+    return value
+
+
 def report(status, reason, *, sequence=0, observation=None, delta=None, drift=False, failure=False, published=False):
     return {"schema": 1, "operation": "capture", "status": status, "reason": reason, "sequence": sequence,
         "snapshotDigest": observation["digest"] if observation else None,
@@ -122,13 +143,16 @@ def report(status, reason, *, sequence=0, observation=None, delta=None, drift=Fa
         "unresolvedDrift": drift, "unresolvedFailure": failure, "limitedMetadataFootprint": True,
         "fullInventory": False, "sourceAdmission": False, "ownershipAccepted": False,
         "installedHealthChecked": False, "configurationMutationsPerformed": False,
-        "observationPublished": published, "repairGuidance": GUIDANCE}
+        "observationPublished": published, "repairGuidance": GUIDANCE,
+        "observedAt": 0, "lastCompleteAt": 0, "currentIncident": None, "currentConflict": None, "pendingConflicts": [],
+        "historyCount": 0, "historyDigest": digest(b"maintenance-history-v2"),
+        "changeSummary": change_summary(unknown=1 if status not in {"BASELINE_OBSERVED", "UNCHANGED"} else 0)}
 
 
 def valid_report(value):
     require(type(value) is dict and set(value) == set(report("STATE_MISSING", "state_missing")))
     require(type(value["schema"]) is int and value["schema"] == 1
-        and type(value["operation"]) is str and value["operation"] in ("capture", "status")
+        and type(value["operation"]) is str and value["operation"] in ("capture", "status", "dispose")
         and type(value["status"]) is str and value["status"] in STATUSES
         and type(value["reason"]) is str and value["reason"] in REASONS and integer(value["sequence"], 2**53 - 1)
         and (value["snapshotDigest"] is None or hex64(value["snapshotDigest"])))
@@ -151,7 +175,7 @@ def valid_report(value):
         require(reason == "observed_only" and not any(delta.values()) and value["sequence"] > 0)
     elif status == "DRIFT":
         require(reason == "metadata_difference" and delta["scopesChanged"] > 0
-            and value["sequence"] > 0 and value["unresolvedDrift"] is True)
+            and value["sequence"] > 0)
     elif status == "SCAN_INCOMPLETE":
         require(reason in {"scan_unavailable", "scan_limit", "scan_changed"} and not any(delta.values())
             and value["sequence"] > 0 and value["unresolvedFailure"] is True)
@@ -159,13 +183,40 @@ def valid_report(value):
         require(reason in ({"state_unavailable", "noncanonical_source"} if status == "STATE_UNAVAILABLE"
             else {"STATE_MISSING": {"state_missing"}, "STATE_MALFORMED": {"state_malformed"}, "SKIPPED_BUSY": {"busy"}}[status]))
     require(value["operation"] != "status" or value["observationPublished"] is False)
-    require(not value["observationPublished"] or value["operation"] == "capture" and value["sequence"] > 0)
+    require(not value["observationPublished"] or value["operation"] in {"capture", "dispose"} and value["sequence"] > 0)
+    require(integer(value["observedAt"], 2**53 - 1) and integer(value["lastCompleteAt"], 2**53 - 1)
+        and value["lastCompleteAt"] <= value["observedAt"]
+        and integer(value["historyCount"], 2**53 - 1) and hex64(value["historyDigest"]))
+    incident = value["currentIncident"]
+    require((incident is not None) is value["unresolvedDrift"])
+    if incident is not None:
+        require(type(incident) is dict and set(incident) == {"sequence", "snapshotDigest", "classification"}
+            and integer(incident["sequence"], value["sequence"]) and incident["sequence"] > 0
+            and hex64(incident["snapshotDigest"]) and type(incident["classification"]) is str
+            and incident["classification"] in {"unknown_observation", "confirmed_conflict"})
+    conflict = value["currentConflict"]
+    if conflict is not None:
+        require(type(conflict) is dict and set(conflict) == {"sequence", "snapshotDigest", "classification"}
+            and integer(conflict["sequence"], value["sequence"]) and conflict["sequence"] > 0
+            and hex64(conflict["snapshotDigest"]) and conflict["classification"] == "confirmed_conflict")
+    pending = value["pendingConflicts"]
+    require(type(pending) is list and len(pending) < MAX_CONFLICTS and (not pending or conflict is not None))
+    retained = ([conflict] if conflict is not None else []) + pending
+    for signal in pending:
+        require(type(signal) is dict and set(signal) == {"sequence", "snapshotDigest", "classification"}
+            and integer(signal["sequence"], value["sequence"]) and signal["sequence"] > 0
+            and hex64(signal["snapshotDigest"]) and signal["classification"] == "confirmed_conflict")
+    require(all(a["sequence"] < b["sequence"] for a, b in zip(retained, retained[1:])))
+    require(incident is None or incident["classification"] != "confirmed_conflict" or incident in retained)
+    summary = valid_summary(value["changeSummary"])
+    if status == "DRIFT":
+        require(sum(summary[key] for key in ("managed", "externalObserved", "conflict", "unknown")) > 0)
     return value
 
 
 def valid_state(value):
-    require(type(value) is dict and set(value) == {"schema", "snapshot", "latest", "unresolvedDrift", "unresolvedFailure"}
-        and type(value["schema"]) is int and value["schema"] == 1)
+    require(type(value) is dict and set(value) == {"schema", "snapshot", "latest", "unresolvedDrift", "unresolvedFailure", "history"}
+        and type(value["schema"]) is int and value["schema"] == 2)
     if value["snapshot"] is not None:
         valid_snapshot(value["snapshot"])
     latest = valid_report(value["latest"])
@@ -180,17 +231,56 @@ def valid_state(value):
             valid_report(saved)
             require(saved["status"] == expected and 0 < saved["sequence"] <= latest["sequence"]
                 and saved["operation"] == "capture" and saved["observationPublished"] is True)
-            if saved["sequence"] == latest["sequence"]:
-                require(saved == latest)
         require(latest[key] is (saved is not None))
-        if latest["status"] == expected:
-            require(saved is not None)
-            if expected == "SCAN_INCOMPLETE":
+        if expected == "SCAN_INCOMPLETE":
+            require((latest["status"] == expected) is (saved is not None))
+            if saved is not None:
                 require(saved["sequence"] == latest["sequence"])
+    incident = latest["currentIncident"]
+    if incident is not None:
+        saved = value["unresolvedDrift"]
+        require(incident["sequence"] == saved["sequence"] and incident["snapshotDigest"] == saved["snapshotDigest"])
+        if saved["changeSummary"]["conflict"]:
+            require(incident["classification"] == "confirmed_conflict")
+    history = value["history"]
+    require(type(history) is dict and set(history) == {"records", "retiredCount", "retiredDigest"}
+        and type(history["records"]) is list and len(history["records"]) <= MAX_HISTORY
+        and integer(history["retiredCount"], 2**53 - 1) and hex64(history["retiredDigest"]))
+    for row in history["records"]:
+        require(type(row) is dict and set(row) == {"sequence", "snapshotDigest", "kind", "disposition"}
+            and integer(row["sequence"], latest["sequence"]) and row["sequence"] > 0
+            and (row["snapshotDigest"] is None or hex64(row["snapshotDigest"]))
+            and type(row["kind"]) is str and row["kind"] in {"DRIFT", "SCAN_INCOMPLETE", "SCAN_RECOVERED", "DISPOSITION"}
+            and type(row["disposition"]) is str and row["disposition"] in DISPOSITIONS | {"observed", "recovered"})
+        require(row["disposition"] in DISPOSITIONS if row["kind"] == "DISPOSITION" else
+            row["disposition"] == ("recovered" if row["kind"] == "SCAN_RECOVERED" else "observed"))
+    require(latest["historyCount"] == history["retiredCount"] + len(history["records"])
+        and latest["historyDigest"] == digest(encoded(history)))
+    if latest["status"] == "DRIFT" and latest["currentIncident"] is None and latest["changeSummary"]["requiredReview"]:
+        require(any(row["kind"] == "DISPOSITION" and row["sequence"] == latest["sequence"]
+            and row["snapshotDigest"] == latest["snapshotDigest"]
+            and row["disposition"] in {"expected_external", "resolved_by_lifecycle"}
+            for row in history["records"]))
     return value
 
 
-def evolve(previous, observation=None, failure=None):
+def append_history(history, row):
+    history["records"].append(row)
+    if len(history["records"]) > MAX_HISTORY:
+        retired = history["records"].pop(0)
+        history["retiredDigest"] = digest(encoded([history["retiredDigest"], retired]))
+        history["retiredCount"] += 1
+
+
+def summarize(state):
+    latest, history = state["latest"], state["history"]
+    latest.update(unresolvedDrift=state["unresolvedDrift"] is not None,
+        unresolvedFailure=state["unresolvedFailure"] is not None,
+        historyCount=history["retiredCount"] + len(history["records"]), historyDigest=digest(encoded(history)))
+    return state
+
+
+def evolve(previous, observation=None, failure=None, *, observed_at=0, summary=None):
     """Pure deterministic comparison. Failures retain the last complete snapshot."""
     if previous is not None:
         valid_state(previous)
@@ -207,17 +297,142 @@ def evolve(previous, observation=None, failure=None):
         failure=previous is not None and previous["unresolvedFailure"] is not None)
     if latest["status"] == "DRIFT":
         latest["reason"] = "metadata_difference"
-    state = {"schema": 1, "snapshot": old if failure else observation, "latest": latest,
+    if summary is not None:
+        latest["changeSummary"] = dict(valid_summary(summary))
+    latest.update(observedAt=observed_at, lastCompleteAt=(previous["latest"]["lastCompleteAt"] if previous else 0)
+        if failure else observed_at, currentIncident=previous["latest"]["currentIncident"] if previous else None,
+        currentConflict=previous["latest"]["currentConflict"] if previous else None,
+        pendingConflicts=json.loads(encoded(previous["latest"]["pendingConflicts"])) if previous else [])
+    state = {"schema": 2, "snapshot": old if failure else observation, "latest": latest,
         "unresolvedDrift": previous["unresolvedDrift"] if previous else None,
-        "unresolvedFailure": previous["unresolvedFailure"] if previous else None}
-    if latest["status"] == "DRIFT" and state["unresolvedDrift"] is None:
+        "unresolvedFailure": None,
+        "history": json.loads(encoded(previous["history"])) if previous else
+            {"records": [], "retiredCount": 0, "retiredDigest": digest(b"maintenance-history-v2")}}
+    if latest["status"] == "DRIFT" and latest["changeSummary"]["requiredReview"]:
         latest["unresolvedDrift"] = True
+        latest["currentIncident"] = {"sequence": latest["sequence"], "snapshotDigest": latest["snapshotDigest"],
+            "classification": "unknown_observation"}
         state["unresolvedDrift"] = dict(latest)
+        if latest["changeSummary"]["conflict"]:
+            latest["currentIncident"]["classification"] = "confirmed_conflict"
+            retain_conflict(latest, latest["currentIncident"])
+            state["unresolvedDrift"] = dict(latest)
     if failure:
         latest["unresolvedFailure"] = True
         state["unresolvedFailure"] = dict(latest)
-    latest.update(unresolvedDrift=state["unresolvedDrift"] is not None, unresolvedFailure=state["unresolvedFailure"] is not None)
-    return valid_state(state)
+    if latest["status"] in {"DRIFT", "SCAN_INCOMPLETE"}:
+        append_history(state["history"], {"sequence": latest["sequence"], "snapshotDigest": latest["snapshotDigest"],
+            "kind": latest["status"], "disposition": "observed"})
+    elif previous and previous["unresolvedFailure"] is not None:
+        append_history(state["history"], {"sequence": latest["sequence"], "snapshotDigest": latest["snapshotDigest"],
+            "kind": "SCAN_RECOVERED", "disposition": "recovered"})
+    # Saved reports reflect their own observation; current summary belongs to latest.
+    return valid_state(summarize(state))
+
+
+def retain_conflict(latest, signal):
+    retained = ([latest["currentConflict"]] if latest["currentConflict"] is not None else []) + latest["pendingConflicts"]
+    if signal in retained:
+        return
+    require(len(retained) < MAX_CONFLICTS, "conflict_limit")
+    if latest["currentConflict"] is None:
+        latest["currentConflict"] = dict(signal)
+    else:
+        latest["pendingConflicts"].append(dict(signal))
+        latest["pendingConflicts"].sort(key=lambda value: value["sequence"])
+        if latest["pendingConflicts"][0]["sequence"] < latest["currentConflict"]["sequence"]:
+            primary = latest["currentConflict"]
+            latest["currentConflict"] = latest["pendingConflicts"].pop(0)
+            latest["pendingConflicts"].append(primary)
+            latest["pendingConflicts"].sort(key=lambda value: value["sequence"])
+
+
+def dispose(previous, sequence, snapshot_digest, disposition):
+    """An explicit assessment closes only its bound signal, never accepts inventory."""
+    valid_state(previous)
+    require(type(sequence) is int and hex64(snapshot_digest) and type(disposition) is str
+        and disposition in DISPOSITIONS, "state_unavailable")
+    incident = previous["latest"]["currentIncident"]
+    conflict = previous["latest"]["currentConflict"]
+    conflicts = ([conflict] if conflict is not None else []) + previous["latest"]["pendingConflicts"]
+    def matches(signal):
+        return signal is not None and signal["sequence"] == sequence and signal["snapshotDigest"] == snapshot_digest
+    proven = any(matches(signal) for signal in conflicts)
+    require(matches(incident) or disposition == "resolved_by_lifecycle" and proven, "state_unavailable")
+    require(not proven or disposition != "expected_external", "state_unavailable")
+    state = json.loads(encoded(previous))
+    if disposition == "confirmed_conflict":
+        state["latest"]["currentIncident"]["classification"] = disposition
+        retain_conflict(state["latest"], state["latest"]["currentIncident"])
+    else:
+        if matches(incident):
+            state["unresolvedDrift"] = None
+            state["latest"]["currentIncident"] = None
+        if disposition == "resolved_by_lifecycle" and proven:
+            remaining = [signal for signal in conflicts if not matches(signal)]
+            state["latest"]["currentConflict"] = remaining[0] if remaining else None
+            state["latest"]["pendingConflicts"] = remaining[1:]
+    append_history(state["history"], {"sequence": sequence, "snapshotDigest": snapshot_digest,
+        "kind": "DISPOSITION", "disposition": disposition})
+    return valid_state(summarize(state))
+
+
+def upgrade(value):
+    """Migrate legacy private comparison state without dropping retained signals."""
+    if type(value) is dict and type(value.get("schema")) is int and value["schema"] == 2:
+        # Earlier source-only schema2 reports lacked classification. Their
+        # retained drift remains UNKNOWN, never automatic external adoption.
+        for saved in (value.get("latest"), value.get("unresolvedDrift"), value.get("unresolvedFailure")):
+            if type(saved) is dict and "changeSummary" not in saved:
+                saved["changeSummary"] = change_summary(unknown=1 if saved.get("status") not in
+                    {"BASELINE_OBSERVED", "UNCHANGED"} else 0)
+            if type(saved) is dict and "pendingConflicts" not in saved:
+                saved["pendingConflicts"] = []
+                incident = saved.get("currentIncident")
+                if type(incident) is dict and saved["changeSummary"]["conflict"]:
+                    incident["classification"] = "confirmed_conflict"
+                    retain_conflict(saved, incident)
+        latest, active = value.get("latest"), value.get("unresolvedDrift")
+        if type(latest) is dict and type(active) is dict and active.get("changeSummary", {}).get("conflict"):
+            incident = latest.get("currentIncident")
+            if type(incident) is dict and incident.get("sequence") == active.get("sequence"):
+                incident["classification"] = "confirmed_conflict"
+                retain_conflict(latest, incident)
+        return valid_state(value)
+    if type(value) is not dict or type(value.get("schema")) is not int or value["schema"] != 1:
+        return valid_state(value)
+    require(set(value) == {"schema", "snapshot", "latest", "unresolvedDrift", "unresolvedFailure"})
+    require(type(value["latest"]) is dict)
+    for key, expected in (("unresolvedDrift", "DRIFT"), ("unresolvedFailure", "SCAN_INCOMPLETE")):
+        saved = value[key]
+        require(value["latest"].get(key) is (saved is not None))
+        if saved is not None:
+            require(type(saved) is dict and saved.get("status") == expected)
+    old_keys = set(report("STATE_MISSING", "state_missing")) - {
+        "observedAt", "lastCompleteAt", "currentIncident", "currentConflict", "pendingConflicts", "historyCount", "historyDigest", "changeSummary"}
+    for saved in (value["latest"], value["unresolvedDrift"], value["unresolvedFailure"]):
+        if saved is None:
+            continue
+        require(type(saved) is dict and set(saved) == old_keys)
+        require(type(saved["unresolvedDrift"]) is bool and type(saved["unresolvedFailure"]) is bool)
+        saved.update(observedAt=0, lastCompleteAt=0, currentIncident=None, currentConflict=None, pendingConflicts=[], historyCount=0,
+            historyDigest=digest(b"maintenance-history-v2"), changeSummary=change_summary(unknown=1 if
+                saved["status"] not in {"BASELINE_OBSERVED", "UNCHANGED"} else 0))
+        if saved["unresolvedDrift"]:
+            drift = value["unresolvedDrift"]
+            require(type(drift) is dict)
+            saved["currentIncident"] = {"sequence": drift["sequence"], "snapshotDigest": drift["snapshotDigest"],
+                "classification": "unknown_observation"}
+    value["schema"] = 2
+    value["history"] = {"records": [], "retiredCount": 0, "retiredDigest": digest(b"maintenance-history-v2")}
+    for key in ("unresolvedDrift", "unresolvedFailure"):
+        saved = value[key]
+        if saved is not None:
+            append_history(value["history"], {"sequence": saved["sequence"], "snapshotDigest": saved["snapshotDigest"],
+                "kind": saved["status"], "disposition": "observed"})
+    if value["latest"]["status"] != "SCAN_INCOMPLETE":
+        value["unresolvedFailure"] = None
+    return valid_state(summarize(value))
 
 
 def open_directory(path):
@@ -326,6 +541,7 @@ class Store:
         try:
             parts = Path(home).parts[1:] + ("AIDev", "state", "maintenance")
             home_depth = len(Path(home).parts) - 1
+            self.owner_depth, self.private_depth = home_depth - 1, len(parts) - 2
             self.fds.append(os.open("/", DIR_FLAGS))
             for index, part in enumerate(parts):
                 parent = self.fds[-1]
@@ -364,9 +580,14 @@ class Store:
             and stat.S_IMODE(facts.st_mode) == 0o600 and 0 <= facts.st_size <= (0 if empty else MAX_STATE), "state_unavailable")
 
     def verify(self):
-        for parent, name, child, stamp in self.edges:
-            require(identity(os.fstat(child)) == stamp and identity(os.stat(name, dir_fd=parent, follow_symlinks=False)) == stamp,
+        for index, (parent, name, child, stamp) in enumerate(self.edges):
+            facts = os.fstat(child)
+            require(identity(facts) == stamp and identity(os.stat(name, dir_fd=parent, follow_symlinks=False)) == stamp,
                 "state_unavailable")
+            if index >= self.owner_depth:
+                require(facts.st_uid == self.uid and not facts.st_mode & 0o022, "state_unavailable")
+            if index >= self.private_depth:
+                require(stat.S_IMODE(facts.st_mode) == 0o700, "state_unavailable")
         require(identity(os.fstat(self.lock)) == identity(os.stat("persistent.lock", dir_fd=self.directory, follow_symlinks=False)),
             "state_unavailable")
         self.file_valid(os.fstat(self.lock), empty=True)
@@ -395,7 +616,7 @@ class Store:
 
     def load(self):
         self.original = self.read_raw()
-        return valid_state(parse_json(self.original)) if self.original is not None else None
+        return upgrade(parse_json(self.original)) if self.original is not None else None
 
     def save(self, state):
         raw = encoded(valid_state(state))
@@ -437,7 +658,8 @@ class Store:
             os.close(self.fds.pop())
 
 
-def execute(operation, *, store_factory, collector):
+def execute(operation, *, store_factory, collector, now=lambda: 0, disposition=None, classifier=None,
+            preflight=None, consumer=None):
     store, value, previous = None, None, None
     def unavailable(error):
         reason = error.reason if isinstance(error, Fault) else "state_unavailable"
@@ -451,21 +673,52 @@ def execute(operation, *, store_factory, collector):
                 completeObservation=False, observationPublished=published)
         return dict(report(status, reason), operation=operation)
     try:
-        store = store_factory(operation == "capture")
+        store = store_factory(operation in {"capture", "dispose"})
         previous = store.load()
         if operation == "status":
             value = dict(previous["latest"]) if previous else report("STATE_MISSING", "state_missing")
             value.update(operation="status", observationPublished=False)
+        elif operation == "dispose":
+            require(previous is not None and type(disposition) is tuple and len(disposition) == 3, "state_unavailable")
+            state = dispose(previous, *disposition)
+            store.save(state)
+            value = dict(state["latest"], operation="dispose")
         else:
+            if preflight is not None:
+                try:
+                    preflight(store)
+                except Exception:
+                    raise Fault("state_unavailable") from None
+                store.verify()
             try:
                 observation = collector()
                 valid_snapshot(observation)
-                state = evolve(previous, observation)
+                summary = None
+                if classifier is not None:
+                    try:
+                        summary = valid_summary(classifier(previous["snapshot"] if previous else None, observation))
+                        if previous and previous["snapshot"] is not None and previous["snapshot"] != observation:
+                            require(sum(summary[key] for key in ("managed", "externalObserved", "conflict", "unknown")) > 0)
+                    except (OSError, ValueError, TypeError, KeyError):
+                        # Classification failure is unknown ownership context,
+                        # not an unavailable otherwise-complete metadata scan.
+                        summary = change_summary(unknown=1)
+                state = evolve(previous, observation, observed_at=now(), summary=summary)
             except Exception as error:
+                if isinstance(error, Fault) and error.reason == "conflict_limit":
+                    raise
                 reason = error.reason if isinstance(error, Fault) and error.reason in {"scan_limit", "scan_changed"} else "scan_unavailable"
-                state = evolve(previous, failure=reason)
+                state = evolve(previous, failure=reason, observed_at=now())
             store.save(state)
             value = state["latest"]
+            if consumer is not None:
+                store.verify()
+                try:
+                    # Give delivery a detached validated observation; it may
+                    # not mutate the known bytes/receipt of our publication.
+                    consumer(json.loads(encoded(valid_report(value))), store)
+                except Exception:
+                    raise Fault("state_unavailable") from None
     except (OSError, Fault, ValueError, TypeError, KeyError) as error:
         value = unavailable(error)
     finally:
@@ -477,29 +730,49 @@ def execute(operation, *, store_factory, collector):
     return value
 
 
-def native(operation):
+def source_classifier(root):
+    """Use declared source catalog, never names inferred from live inventory."""
+    sys.path.insert(0, str(root / "lib"))
+    try:
+        from productivity_ownership import metadata_change_classifier
+        return metadata_change_classifier(root)
+    except (ImportError, OSError, ValueError, TypeError, KeyError):
+        return lambda previous, observation: change_summary(unknown=1)
+
+
+def native(operation, disposition=None, *, preflight=None, consumer=None, classifier=None):
     uid = os.getuid()
     home = pwd.getpwuid(uid).pw_dir
     script = str(Path(__file__).absolute())
     require(uid > 0 and script == home + "/AIDev/control/bin/workstation-drift-snapshot"
         and os.path.realpath(script) == script, "noncanonical_source")
-    return execute(operation, store_factory=lambda create: Store(home, uid, create), collector=lambda: collect(home))
+    require(classifier is None or callable(classifier), "state_unavailable")
+    if classifier is None and operation == "capture":
+        classifier = source_classifier(Path(__file__).absolute().parent.parent)
+    return execute(operation, store_factory=lambda create: Store(home, uid, create), collector=lambda: collect(home),
+        now=lambda: int(time.time()), disposition=disposition, classifier=classifier,
+        preflight=preflight, consumer=consumer)
 
 
 def main(arguments=None, *, operation=native, emit=print):
     args = sys.argv[1:] if arguments is None else arguments
-    if type(args) is not list or args not in (["capture"], ["capture", "--json"], ["status"], ["status", "--json"]):
-        emit("workstation-drift-snapshot: use capture [--json] or status [--json]")
+    disposition = None
+    if type(args) is list and len(args) in {4, 5} and args[0] == "dispose":
+        if type(args[1]) is str and re.fullmatch(r"[1-9][0-9]{0,15}", args[1]) and hex64(args[2]) \
+                and type(args[3]) is str and args[3] in DISPOSITIONS and (len(args) == 4 or args[4] == "--json"):
+            disposition = (int(args[1]), args[2], args[3])
+    if type(args) is not list or disposition is None and args not in (["capture"], ["capture", "--json"], ["status"], ["status", "--json"]):
+        emit("workstation-drift-snapshot: use capture/status [--json] or dispose <sequence> <digest> <disposition> [--json]")
         return 2
     try:
-        value = valid_report(operation(args[0]))
+        value = valid_report(operation(args[0], disposition) if disposition else operation(args[0]))
     except (OSError, Fault, ValueError, TypeError, KeyError):
         value = dict(report("STATE_UNAVAILABLE", "state_unavailable"), operation=args[0])
     emit(json.dumps(value, sort_keys=True, separators=(",", ":")) if "--json" in args else
         "Limited metadata observation: " + value["status"] + "; unresolved drift=" + str(value["unresolvedDrift"]).lower()
         + "; unresolved failure=" + str(value["unresolvedFailure"]).lower() + "; " + GUIDANCE)
-    return (3 if value["status"] == "SKIPPED_BUSY" else 0 if value["status"] in {"BASELINE_OBSERVED", "UNCHANGED"}
-        and not value["unresolvedDrift"] and not value["unresolvedFailure"] else 1)
+    return (3 if value["status"] == "SKIPPED_BUSY" else 0 if value["status"] in {"BASELINE_OBSERVED", "UNCHANGED", "DRIFT"}
+        and not value["unresolvedDrift"] and not value["unresolvedFailure"] and value["currentConflict"] is None else 1)
 
 
 if __name__ == "__main__":

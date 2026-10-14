@@ -1,2 +1,0 @@
-Cmnd_Alias AGENT_FIRST_MAC_AID_ADMIN = /usr/local/libexec/aid-admin
-@@AGENT_OWNER@@ ALL=(root) NOPASSWD: AGENT_FIRST_MAC_AID_ADMIN

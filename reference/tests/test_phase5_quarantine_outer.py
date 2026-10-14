@@ -30,12 +30,15 @@ from lib import phase5_current_probe as P
 from lib import phase5_current_quarantine as Q
 
 SOURCE = (ROOT / "evidence/phase-5/current-quarantine-capability-root-adapter.txt").read_text()
+# The frozen adapter admits this exact historical root. It is mocked, never read.
+HISTORICAL_ROOT = Path("/Users/example-user/AIDev/worktrees/control/phase5-current-runtime-successor")
 BINDINGS = next(ast.literal_eval(n.value) for n in ast.parse(SOURCE).body
                 if isinstance(n, ast.Assign) and isinstance(n.targets[0], ast.Name)
                 and n.targets[0].id == "bindings")
 HOME = "/Users/synthetic-owner"
 IDS = ("quarantine-profile",)
-PROFILE = (ROOT / "codex/quarantine.config.toml").read_bytes()
+# Frozen root-adapter receipt is exercised only with its predecessor profile.
+PROFILE = (ROOT / "tests/fixtures/phase5-quarantine-before-temp-deny.config.toml").read_bytes()
 WORKSPACE = HOME + "/AIDev/quarantine/phase5-quarantine-task." + "a" * 12
 
 
@@ -65,7 +68,7 @@ class OuterTests(unittest.TestCase):
                 require((home, uid, keep) == (HOME, 501, False))
                 if case == "acquisition":
                     raise ValueError("private acquisition")
-                self.digest = BINDINGS[str(path.relative_to(ROOT))]
+                self.digest = BINDINGS[str(path.relative_to(HISTORICAL_ROOT))]
                 self.closed = False
                 pins.append(self)
             def verify(self):
@@ -238,7 +241,7 @@ class OuterTests(unittest.TestCase):
         def digest(data):
             try:
                 path = Path(data.decode())
-                relative = str(path.relative_to(ROOT))
+                relative = str(path.relative_to(HISTORICAL_ROOT))
             except (ValueError, UnicodeError):
                 return real_digest(data)
             if relative not in BINDINGS:
@@ -253,7 +256,7 @@ class OuterTests(unittest.TestCase):
             raise ExitBoundary()
 
         with ExitStack() as stack:
-            stack.enter_context(patch.object(Path, "cwd", return_value=ROOT))
+            stack.enter_context(patch.object(Path, "cwd", return_value=HISTORICAL_ROOT))
             stack.enter_context(patch.object(Path, "read_bytes", lambda path: str(path).encode()))
             stack.enter_context(patch.object(hashlib, "sha256", side_effect=digest))
             stack.enter_context(patch.object(importlib.machinery.SourceFileLoader, "load_module", bootstrap))

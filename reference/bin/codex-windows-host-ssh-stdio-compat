@@ -2,11 +2,14 @@
 from __future__ import annotations
 
 import argparse
+import base64
+import importlib.machinery
 import json
 import mmap
 import os
 from pathlib import Path
 import re
+import secrets
 import selectors
 import subprocess
 import sys
@@ -139,31 +142,25 @@ def strict_ssh_doctor_passes() -> bool:
     return smoke.returncode == 0 and smoke.stdout == "ssh_smoke=pass"
 
 
+_PROTOCOL = None
+
+
+def protocol():
+    global _PROTOCOL
+    # The same bounded parser is consumed by holder and disposable diagnostic.
+    # Loading this source performs no native probe or lifecycle mutation.
+    if _PROTOCOL is None:
+        _PROTOCOL = importlib.machinery.SourceFileLoader("ssh_holder_protocol",
+            str(ROOT / "bin/codex-windows-host-ssh-app-server-holder")).load_module()
+    return _PROTOCOL
+
+
 def validate_initialize_line(line: str) -> bool:
-    try:
-        payload = json.loads(line)
-    except (TypeError, json.JSONDecodeError):
-        return False
-    if payload.get("id") != 1 or not isinstance(payload.get("result"), dict):
-        return False
-    result = payload["result"]
-    return (
-        result.get("platformFamily") == "windows"
-        and result.get("platformOs") == "windows"
-        and isinstance(result.get("userAgent"), str)
-    )
+    return type(line) is str and protocol().validate_initialize_response(line.encode(), 1)
 
 
-def validate_websocket_upgrade(response: bytes) -> bool:
-    header = response.split(b"\r\n\r\n", 1)[0]
-    lines = header.split(b"\r\n")
-    lowered = {line.lower() for line in lines[1:]}
-    return (
-        bool(lines)
-        and lines[0].startswith(b"HTTP/1.1 101 ")
-        and b"upgrade: websocket" in lowered
-        and b"connection: upgrade" in lowered
-    )
+def validate_websocket_upgrade(response: bytes, key: str) -> bool:
+    return protocol().validate_websocket_upgrade(response, key)
 
 
 def remote_stdio_initialize_passes() -> bool:
@@ -227,12 +224,15 @@ def remote_stdio_initialize_passes() -> bool:
 
 
 def remote_native_websocket_handshake_passes() -> bool:
+    parser = protocol()
+    key = base64.b64encode(secrets.token_bytes(16)).decode("ascii")
+    request_id = secrets.token_hex(16)
     handshake = (
         b"GET /rpc HTTP/1.1\r\n"
         b"Host: codex-app-server\r\n"
         b"Upgrade: websocket\r\n"
         b"Connection: Upgrade\r\n"
-        b"Sec-WebSocket-Key: AQIDBAUGBwgJCgsMDQ4PEA==\r\n"
+        b"Sec-WebSocket-Key: " + key.encode() + b"\r\n"
         b"Sec-WebSocket-Version: 13\r\n\r\n"
     )
     # Exercise the same remote unix-socket plus `app-server proxy` transport
@@ -276,6 +276,7 @@ CODEX_HOME="$probe_home" codex app-server proxy 2>/dev/null
             "/usr/bin/ssh", "-T", "-o", "BatchMode=yes",
             "-o", "PasswordAuthentication=no",
             "-o", "KbdInteractiveAuthentication=no",
+            "-o", "StrictHostKeyChecking=yes", "-o", "ForwardAgent=no",
             "-o", "ConnectTimeout=8", "windows-host", remote_script,
         ],
         stdin=subprocess.PIPE,
@@ -284,8 +285,9 @@ CODEX_HOME="$probe_home" codex app-server proxy 2>/dev/null
         text=False,
         bufsize=0,
     )
-    selector = selectors.DefaultSelector()
+    selector = None
     try:
+        selector = selectors.DefaultSelector()
         assert process.stdin is not None and process.stdout is not None
         process.stdin.write(handshake)
         process.stdin.flush()
@@ -300,18 +302,49 @@ CODEX_HOME="$probe_home" codex app-server proxy 2>/dev/null
             if not chunk:
                 break
             response.extend(chunk)
-            if len(response) > 16384:
+            if len(response.split(b"\r\n\r\n", 1)[0]) > 16384:
                 return False
-        return validate_websocket_upgrade(bytes(response))
+        if not parser.validate_websocket_upgrade(bytes(response), key) or process.poll() is not None:
+            return False
+        response = bytearray(response.split(b"\r\n\r\n", 1)[1])
+        process.stdin.write(parser.encode_websocket_text({
+            "jsonrpc": "2.0", "id": request_id, "method": "initialize",
+            "params": {"clientInfo": {"name": "aidev_native_probe", "version": "1.0.0"}}}))
+        process.stdin.flush()
+        while time.monotonic() < deadline:
+            frame = parser.decode_websocket_frame(bytes(response))
+            if frame is not None:
+                if not parser.validate_initialize_response(frame[0], request_id) or process.poll() is not None:
+                    return False
+                process.stdin.write(parser.encode_websocket_text({"jsonrpc": "2.0", "method": "initialized"}))
+                process.stdin.flush()
+                return process.poll() is None
+            if not selector.select(timeout=max(0, deadline - time.monotonic())):
+                return False
+            chunk = os.read(process.stdout.fileno(), 8192)
+            if not chunk:
+                return False
+            response.extend(chunk)
+            if len(response) > 65546:
+                return False
+        return False
+    except (RuntimeError, OSError, subprocess.SubprocessError):
+        return False
     finally:
-        selector.close()
-        if process.poll() is None:
-            process.terminate()
+        if selector is not None:
+            selector.close()
+        try:
+            if process.poll() is None:
+                process.terminate()
             try:
                 process.wait(timeout=3)
             except subprocess.TimeoutExpired:
                 process.kill()
                 process.wait(timeout=2)
+        finally:
+            for stream in (process.stdin, process.stdout):
+                if stream is not None:
+                    stream.close()
 
 
 def local_desktop_app_server_is_single() -> bool:

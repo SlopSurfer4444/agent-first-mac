@@ -101,9 +101,11 @@ MCP_HTTP_CONTRACT_KEYS = {
 
 def parsed_numeric_version(value):
     """Return a strict comparable numeric vendor version, or None."""
-    if not isinstance(value, str):
+    if type(value) is not str or not 0 < len(value) <= 256:
         return None
-    match = re.fullmatch(r"(?:codex-cli )?([0-9]+(?:\.[0-9]+)+(?:-[0-9A-Za-z.]+)?)", value)
+    match = re.fullmatch(
+        r"(?:codex-cli )?([0-9]{1,20}(?:\.[0-9]{1,20}){1,15}"
+        r"(?:-[0-9A-Za-z]{1,64}(?:\.[0-9A-Za-z]{1,64}){0,15})?)", value)
     if match is None:
         return None
     numeric, suffix = match.group(1).split("-", 1)[0], match.group(1).partition("-")[2]
@@ -115,7 +117,11 @@ def version_at_or_above(observed, floor):
     observed_value = parsed_numeric_version(observed)
     floor_value = parsed_numeric_version(floor)
     if observed_value is None or floor_value is None:
-        return observed == floor
+        # Some plugin revisions are opaque exact identifiers. A malformed
+        # numeric/CLI version must never acquire that fallback, even if equal.
+        return (type(observed) is str and type(floor) is str
+                and 0 < len(observed) <= 256 and observed == floor
+                and re.fullmatch(r"[A-Za-z][A-Za-z0-9._-]*", observed) is not None)
     observed_parts, observed_suffix = observed_value
     floor_parts, floor_suffix = floor_value
     width = max(len(observed_parts), len(floor_parts))

@@ -6,6 +6,9 @@ from pathlib import Path
 import re
 import sys
 
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
+from productivity_ownership import PREFERENCES, declaration, managed_preferences, preference_plan
+
 
 ROOT = Path(__file__).resolve().parent.parent
 MANIFEST = ROOT / "manifests/productivity-baseline.json"
@@ -24,6 +27,41 @@ def main():
     flake = (ROOT / "flake.nix").read_text()
     lock = json.loads((ROOT / "flake.lock").read_text())
     homebrew = (ROOT / "darwin/homebrew.nix").read_text()
+    managed = managed_preferences(manifest)
+    declaration(manifest)
+    selector = re.search(r"managedPreferences = \[([^]]*)\];", module)
+    require(selector is not None, "preference_selector_missing")
+    declared_keys = re.findall(r'"([A-Za-z]+)"', selector.group(1))
+    require(re.sub(r'"[A-Za-z]+"|\s', '', selector.group(1)) == '' and
+            declared_keys == managed, "preference_selector_manifest_drift")
+    entries = re.findall(r'^    ([A-Za-z]+) = \{ path = \[ ([^]]+) \]; value = ([^;]+); \};$',
+                         module, re.MULTILINE)
+    require(len(entries) == len(PREFERENCES) and
+            {key for key, _, _ in entries} == set(PREFERENCES), "preference_declarations")
+    for key, path, value in entries:
+        domain, setting = PREFERENCES[key]
+        domains = {"com.apple.dock": "dock", "com.apple.finder": "finder",
+                   "com.apple.AppleMultitouchTrackpad": "trackpad",
+                   "com.apple.WindowManager": "WindowManager",
+                   "com.apple.screencapture": "screencapture"}
+        expected_path = (["CustomUserPreferences", domain, setting]
+                         if domain == "com.apple.widgets" else
+                         [domains.get(domain, domain), setting])
+        actual_path = re.findall(r'"([^"]+)"', path)
+        require(actual_path == expected_path and
+                re.sub(r'"[^"]+"|\s', '', path) == '', "managed_preference_path_drift")
+        target = manifest["desiredState"].get(key)
+        if key == "widgetAppearance":
+            target = manifest["desiredState"]["widgetAppearanceRaw"]
+        if key == "screenshotLocationClass":
+            require(value == "screenshotsDirectory", "managed_preference_value_drift")
+        else:
+            require(json.loads(value) == target and type(json.loads(value)) is type(target),
+                    "managed_preference_value_drift")
+    require(declaration(manifest) == {"formula": [], "cask": ["iina", "keka", "localsend", "raycast", "shottr"]},
+            "managed_collision_declaration_drift")
+    require(manifest["ownershipObservation"]["targetedExternalApplicationRoot"] == "/Applications",
+            "targeted_collision_root_drift")
 
     require(manifest["schema"] == 1, "manifest_schema")
     require(manifest["profile"] == "m5-air-productivity-baseline", "profile_name")
@@ -84,11 +122,9 @@ def main():
         "/usr/bin/ditto \"LocalSend.app\"",
         "[ \"keka\" \"raycast\" \"shottr\" ]",
         "networking.applicationFirewall", "enableStealthMode",
-        "AppleIconAppearanceTheme = \"RegularAutomatic\";", "autohide = false;",
-        "wvous-br-corner = 14;",
-        "EnableStandardClickToShowDesktop = true;",
-        "CustomUserPreferences.\"com.apple.widgets\".widgetAppearance",
-        "if fullColorWidgetsEnabled then 1 else 0;",
+        "managedPreferences = [", "lib.foldl' lib.recursiveUpdate",
+        "lib.setAttrByPath item.path item.value", "system.defaults = selectedDefaults",
+        'value = "RegularAutomatic";', '"wvous-br-corner" ]; value = 14;',
         "AppleInterfaceStyleSwitchesAutomatically", "InitialKeyRepeat",
         "KeyRepeat", "TrackpadThreeFingerDrag", "EnableTilingByEdgeDrag",
         "EnableTiledWindowMargins", "Pictures/Screenshots",
@@ -104,7 +140,17 @@ def main():
 
     for empty_declaration in ["taps = [ ];", "brews = [ ];", "casks = [ ];",
                               "masApps = { };"]:
-        require(empty_declaration in homebrew, "homebrew_not_empty")
+        require(empty_declaration in homebrew, "homebrew_managed_payload_drift")
+    require('lib.optionalString (owns "batteryLowPowerMode")' in module and
+            'lib.optionalString (owns "acLowPowerMode")' in module and
+            'lib.optionalString (owns "screenshotLocationClass")' in module,
+            "released_preference_write")
+    require(re.search(r'system\.defaults = selectedDefaults // \{\s*'
+                      r'SoftwareUpdate\.AutomaticallyInstallMacOSUpdates = true;\s*\};',
+                      module) is not None and
+            module.count("/usr/bin/pmset -b lowpowermode") == 1 and
+            module.count("/usr/bin/pmset -c lowpowermode 0") == 1,
+            "released_preference_write")
 
     require(manifest["permissions"]["automaticGrantAllowed"] is False,
             "automatic_tcc_grant")
@@ -174,7 +220,9 @@ def main():
         "profileActive": manifest["profileActive"],
         "fullColorWidgetsActive": manifest["fullColorWidgetsActive"],
         "applicationCount": len(expected_apps),
-        "homebrewPayloadCount": 0,
+        "managedHomebrewPayloadCount": 0,
+        "externalHomebrewAllowed": True,
+        "preferencePlan": preference_plan(manifest),
         "floatingInputsAllowed": False,
         "automaticPermissionGrantAllowed": False,
         "batteryLowPowerMode": manifest["desiredState"]["batteryLowPowerMode"],

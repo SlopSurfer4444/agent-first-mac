@@ -13,6 +13,7 @@ sys.dont_write_bytecode = True
 import importlib.machinery
 import json
 from pathlib import Path
+from types import SimpleNamespace
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
@@ -47,7 +48,9 @@ STAGES = frozenset(("arguments", "git", "historical", "acceptance", "source",
                     "exposure", "configuration", "sentinel", "runtime", "final-recheck", "close", "native-unbound"))
 REASONS = frozenset(("source_changed", "fixture_invalid", "signature_invalid",
     "cli_identity_invalid", "command_failed", "schema_output_invalid",
-    "capabilities_incompatible", "process_unsettled", "probe_failed"))
+    "capabilities_incompatible", "process_unsettled", "probe_failed",
+    "fixture_capacity_required", "fixture_custody_invalid", "fixture_custody_busy",
+    "fixture_settlement_required"))
 require, digest, oid = D.require, D.digest, D.oid
 
 
@@ -254,6 +257,12 @@ def consistent_report(value):
     """Observation, acceptance, mode and closure implications are independent."""
     if value["admissionMode"] not in ("historical-review", "current-state"):
         return False
+    if (type(value["retainedFixtureCount"]) is not int
+            or not 0 <= value["retainedFixtureCount"] <= 1
+            or value["fixtureDisposition"] != ("manual-diagnosis-required"
+                if value["retainedFixtureCount"] else "none")
+            or value["gitOnly"] and value["retainedFixtureCount"]):
+        return False
     reasons = value["reasonCodes"]
     if (type(reasons) is not list or len(reasons) > len(REASONS)
             or any(type(reason) is not str or reason not in REASONS for reason in reasons)
@@ -297,7 +306,7 @@ def report(*, historical=False, source=False, accepted=False, integrated=False,
            review=False, sentinel=False, sentinel_checked=False, runtime=False,
            runtime_checked=False, settled=True, closed=True, stage=None, git_only=False,
            exposure=False, exposure_accepted=False, configuration=False, configuration_accepted=False,
-           reasons=None, admission_mode="historical-review"):
+           reasons=None, admission_mode="historical-review", retained_fixtures=0):
     require(stage is None or stage in STAGES)
     require(type(review) is bool)
     require(reasons is None or type(reasons) is list)
@@ -321,6 +330,8 @@ def report(*, historical=False, source=False, accepted=False, integrated=False,
         "gitOnly": git_only, "childSettled": settled, "sourceHandlesClosed": closed,
         "failureStage": stage, "reasonCodes": [] if reasons is None else list(reasons),
         "wholeMachineHealthChecked": False,
+        "retainedFixtureCount": retained_fixtures,
+        "fixtureDisposition": "manual-diagnosis-required" if retained_fixtures else "none",
         **{key: False for key in AUTHORITY}}
     require(consistent_report(value))
     return value
@@ -329,7 +340,8 @@ def report(*, historical=False, source=False, accepted=False, integrated=False,
 def public_report(value, *, git_only=None):
     """Do not serialize arbitrary callback/adapter dictionaries as evidence."""
     require(type(value) is dict and set(value) == set(report()))
-    boolean_keys = set(report()) - {"schema", "probe", "scope", "verdict", "failureStage", "reasonCodes", "admissionMode"}
+    boolean_keys = set(report()) - {"schema", "probe", "scope", "verdict", "failureStage", "reasonCodes", "admissionMode",
+                                   "retainedFixtureCount", "fixtureDisposition"}
     require(all(type(value[k]) is bool for k in boolean_keys)
             and (value["failureStage"] is None
                  or type(value["failureStage"]) is str and value["failureStage"] in STAGES))
@@ -343,7 +355,8 @@ def public_report(value, *, git_only=None):
         closed=value["sourceHandlesClosed"], stage=value["failureStage"], git_only=value["gitOnly"],
         exposure=value["exposureSourceIncluded"], exposure_accepted=value["exposureSourceAccepted"],
         configuration=value["configurationSourceIncluded"], configuration_accepted=value["configurationSourceAccepted"],
-        reasons=value["reasonCodes"], admission_mode=value["admissionMode"])
+        reasons=value["reasonCodes"], admission_mode=value["admissionMode"],
+        retained_fixtures=value["retainedFixtureCount"])
     if value["verdict"] == "NEEDS_REVIEW":
         expected["verdict"] = "NEEDS_REVIEW"
     require(D.R.integrations._equal(value, expected))
@@ -364,7 +377,7 @@ class DoctorError(D.DoctorError):
 
 
 def run(*, git, source_factory, budget, canonical_main, git_only=False,
-        sentinel_check=None, runtime_check=None):
+        sentinel_check=None, runtime_check=None, operation_check=None):
     """Injected source-only or sentinel route; optional readiness stays explicit.
 
 source_factory(path, absent=False) returns an owned accepted SourceFile.
@@ -376,6 +389,10 @@ or serialized here. Runtime results use unchanged R.public's exact schema.
     not a fabricated Git state or a budget-only promise. Full actual Git state
     is checked before/after the callback, never recursively during launch.
     All callbacks share the caller's budget. No native operation is selected here.
+    operation_check(head, source_guard=verify_current) runs only with integrated
+    admitted source held. Literal True means its scoped observations settled;
+    an unknown failure retains provisional unsettled status. It does not alter
+    the report's Git-only/runtime distinction or grant execution authority.
 """
     outcome = Outcome()
     stage, failure_stage = "arguments", None
@@ -388,13 +405,17 @@ or serialized here. Runtime results use unchanged R.public's exact schema.
     pending_callback = False
     state = None
     admission_mode = "historical-review"
+    retained_fixtures = 0
 
     def failure(error):
-        nonlocal failure_stage, settled, callback_closed, pending_callback
+        nonlocal failure_stage, settled, callback_closed, pending_callback, retained_fixtures
         outcome.errors.append(error)
         outcome.primary = D.R.earliest(outcome.primary, error)
         if failure_stage is None:
             failure_stage = stage
+        count = getattr(error, "retained_fixture_count", 0)
+        if stage == "sentinel" and type(count) is int and 0 <= count <= 1:
+            retained_fixtures = count
         # Only the known probe exception's closed reason class may escape.
         # Its message, diagnostics, outputs, paths and owners remain private.
         reason = getattr(error, "reason_class", None) if type(error) is probe.ProbeError else None
@@ -406,11 +427,17 @@ or serialized here. Runtime results use unchanged R.public's exact schema.
             # Only the callback currently entered may close its provisional
             # uncertainty. Exact proof does not promote its failure to PASS.
             retained = getattr(error, "retained_sources", ())
+            # A diagnostic directory can outlive all of its descriptors. Only
+            # exact closed Fixture owners are inert retained artifacts here;
+            # arbitrary owners/unknown handle lists cannot prove settlement.
+            inert_artifacts = (type(retained) is tuple and all(
+                type(item) is probe.Fixture and type(getattr(item, "handles", None)) is list
+                and not item.handles for item in retained))
             if (getattr(error, "child_settled", None) is True
                     and getattr(error, "settlement_failed", None) is False
                     and getattr(error, "source_handles_closed", None) is True
                     and owner is None and outcome.private_owner is None
-                    and type(retained) is tuple and not retained):
+                    and inert_artifacts):
                 settled = callback_closed = True
             pending_callback = False
         if outcome.private_owner is None and owner is not None:
@@ -451,6 +478,7 @@ or serialized here. Runtime results use unchanged R.public's exact schema.
                 and callable(source_factory)
                 and (sentinel_check is None or callable(sentinel_check))
                 and (runtime_check is None or callable(runtime_check))
+                and (operation_check is None or callable(operation_check))
                 and (git_only or callable(sentinel_check)))
         budget.check()
         stage = "git"
@@ -567,6 +595,18 @@ or serialized here. Runtime results use unchanged R.public's exact schema.
             exposure_accepted = exposure and EXPOSURE_ACCEPTANCE in current
             integrated = (accepted and (not exposure or exposure_accepted)
                 and (not configuration or configuration_accepted) and not review and canonical_main)
+        if operation_check is not None:
+            # Scoped diagnostics borrow the actual admitted source custody, not
+            # a cached PASS. They never turn Git-only into runtime readiness.
+            stage = "source"
+            require(integrated and accepted)
+            verify_current()
+            settled = callback_closed = False
+            pending_callback = True
+            require(operation_check(state["head"], source_guard=verify_current) is True)
+            pending_callback = False
+            settled = callback_closed = True
+            verify_current()
         if not git_only:
             budget.check()
             stage, settled, callback_closed = "sentinel", False, False
@@ -574,6 +614,10 @@ or serialized here. Runtime results use unchanged R.public's exact schema.
             value = sentinel_check(budget, source_guard=verify_current)
             pending_callback = False
             outcome.sentinel_report = value
+            if type(value) is dict:
+                count = value.get("retainedFixtureCount", 0)
+                require(type(count) is int and 0 <= count <= 1)
+                retained_fixtures = count
             if (type(value) is dict and type(value.get("status")) is str
                     and value["status"] in ("PASS", "NEEDS_REVIEW")
                     and type(value.get("childSettled")) is bool
@@ -641,7 +685,7 @@ or serialized here. Runtime results use unchanged R.public's exact schema.
         runtime=runtime, runtime_checked=runtime_checked, settled=settled, closed=closed,
         stage=failure_stage, git_only=git_only is True, exposure=exposure, exposure_accepted=exposure_accepted,
         configuration=configuration, configuration_accepted=configuration_accepted and historical and exposure_accepted,
-        reasons=reasons, admission_mode=admission_mode)
+        reasons=reasons, admission_mode=admission_mode, retained_fixtures=retained_fixtures)
     if outcome.primary is not None:
         outcome.public["verdict"] = "NEEDS_REVIEW"
         if isinstance(outcome.primary, (KeyboardInterrupt, SystemExit)):
@@ -656,9 +700,37 @@ or serialized here. Runtime results use unchanged R.public's exact schema.
 class NativeGit(D.NativeGit):
     """Actual predecessor/new-receipt reads over the unchanged command owner.
 
-Reuse only fixed _read/_text/_tree transport mechanics, not D.state/run or
-modified historical constants. No arbitrary command argument entry point.
+Reuse fixed _text/_tree parsing and the same bounded command transport, not
+D.state/run or modified historical constants. The current _read alone allows
+the exact observed Apple temporary-directory warning. No arbitrary command
+argument entry point.
 """
+    TEMP_WARNING = (b"git: warning: confstr() failed with code 5: couldn't get path of "
+                    b"DARWIN_USER_TEMP_DIR; using /tmp instead\n")
+
+    def _read(self, *args, allow_one=False):
+        """Current transport: tolerate only the observed Apple temp-path warning.
+
+        Exit status and typed stdout still determine the actual Git observation.
+        Unknown/additional stderr remains a failure; the historical transport is
+        unchanged. The same deadline, process owner and launch admission apply.
+        """
+        require(type(allow_one) is bool)
+        launch = SimpleNamespace(argv=self.PREFIX + args, cwd=self.root,
+                                 environment=dict(self.environment))
+        expected = (launch.argv, launch.cwd, dict(launch.environment))
+        def admit(value):
+            require((value.argv, value.cwd, value.environment) == expected)
+            self.budget.check()
+            return True
+        result = D.process.command(launch, self.budget, 8.0, admit_launch=admit,
+            catalog=D.R.catalog, process_factory=D.R.catalog.subprocess.Popen)
+        require(type(result.returncode) is int
+                and result.returncode in ((0, 1) if allow_one else (0,))
+                and type(result.stdout) is bytes and type(result.stderr) is bytes
+                and result.stderr in tuple(self.TEMP_WARNING * count for count in range(5)))
+        return result.returncode, result.stdout
+
     def state(self):
         head = self._text("rev-parse", "--verify", "HEAD")
         require(D.hex_value(head, 40))
@@ -706,26 +778,58 @@ modified historical constants. No arbitrary command argument entry point.
                 "tree": self._tree(reviewed)}
 
 
-def native(git_only, *, audit_history=False):
+def native(git_only, *, audit_history=False, reviewed_target=False):
     """Lazy, explicit root-owned adapter; no native operation at import time."""
-    require(type(git_only) is bool)
+    require(type(git_only) is bool and type(audit_history) is bool
+            and type(reviewed_target) is bool and not (audit_history and reviewed_target)
+            and (not reviewed_target or git_only))
     adapter = importlib.import_module("lib.current_doctor_native")
-    return (adapter.native(sys.modules[__name__], git_only, audit_history=True) if audit_history
+    return (adapter.native(sys.modules[__name__], git_only, reviewed_target=True) if reviewed_target
+            else adapter.native(sys.modules[__name__], git_only, audit_history=True) if audit_history
             else adapter.native(sys.modules[__name__], git_only))
 
 
-def main(arguments=None, *, operation=None, emit=print):
+def main(arguments=None, *, operation=None, custody_operation=None, emit=print):
     """Native glue is explicit and separately admitted; tests inject operation."""
     args = sys.argv[1:] if arguments is None else arguments
+    if type(args) is list and ("--fixture-custody-status" in args or "--retire-fixture-slot" in args):
+        status_args = (args == ["--fixture-custody-status"] or args == ["--fixture-custody-status", "--json"])
+        retire_args = (len(args) in (2, 3) and args[0] == "--retire-fixture-slot"
+                       and args[1] in tuple(str(slot) for slot in range(8))
+                       and (len(args) == 2 or args[2] == "--json"))
+        if not (status_args or retire_args):
+            emit(json.dumps({"scope": "disposable-vendor-fixture-custody", "reason": "arguments"}))
+            return 2
+        try:
+            handler = custody_operation
+            if handler is None:
+                adapter = importlib.import_module("lib.current_doctor_native")
+                handler = lambda slot: adapter.custody_cli(sys.modules[__name__], slot)
+            value = handler(None if status_args else int(args[1]))
+            emit(json.dumps(value, sort_keys=True, separators=(",", ":")))
+            return 0
+        except (KeyboardInterrupt, SystemExit):
+            raise
+        except Exception as error:
+            allowed = {"fixture_capacity_required", "fixture_custody_invalid", "fixture_custody_absent",
+                       "fixture_custody_busy", "fixture_settlement_required"}
+            reason = getattr(error, "reason_class", "fixture_custody_invalid")
+            emit(json.dumps({"scope": "disposable-vendor-fixture-custody",
+                             "reason": reason if reason in allowed else "fixture_custody_invalid"}))
+            return 1
     if (type(args) is not list or any(type(arg) is not str for arg in args)
-            or len(set(args)) != len(args) or any(arg not in ("--json", "--git-only", "--audit-history") for arg in args)):
+            or len(set(args)) != len(args)
+            or {"--audit-history", "--reviewed-target"}.issubset(args)
+            or "--reviewed-target" in args and "--git-only" not in args
+            or any(arg not in ("--json", "--git-only", "--audit-history", "--reviewed-target") for arg in args)):
         value, status, args = report(stage="arguments"), 2, ["--json"]
     else:
         returned = None
         requested_git_only = "--git-only" in args
         try:
             operation = native if operation is None else operation
-            returned = (operation(requested_git_only, audit_history=True) if "--audit-history" in args
+            returned = (operation(requested_git_only, reviewed_target=True) if "--reviewed-target" in args
+                        else operation(requested_git_only, audit_history=True) if "--audit-history" in args
                         else operation(requested_git_only))
             value = public_report(returned, git_only=requested_git_only)
             status = 0 if value["verdict"] in ("PASS", "GIT_ONLY_VALID", "PREPARED_SOURCE_ONLY",
@@ -763,6 +867,8 @@ def main(arguments=None, *, operation=None, emit=print):
             human += "; isolated fixture validation failed; inspect probe fixture metadata, not owner configuration"
         else:
             human += "; diagnose the reported boundary before a custom control mutation"
+    if value["retainedFixtureCount"]:
+        human += "; fixture retained for manual diagnosis; no cleanup authorized"
     emit(json.dumps(value, sort_keys=True, separators=(",", ":")) if "--json" in args else human)
     return status
 

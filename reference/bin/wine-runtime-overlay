@@ -29,11 +29,26 @@ TARGETS = {
     'ds3.borderless-receipt': 'ds3/borderless/receipt.json',
 }
 ORDER = tuple(TARGETS)
+OLE32 = 'engine/lib/wine/i386-windows/oleacc.dll'
+OLE64 = 'engine/lib/wine/x86_64-windows/oleacc.dll'
+RUNTIME_PAYLOADS = {PE32:'winemac-i386.drv',PE:'winemac-x86_64.drv',
+                    UNIX:'winemac-x86_64.so',OLE32:'oleacc-i386.dll',OLE64:'oleacc-x86_64.dll'}
+EXTENDED_TARGETS = dict(TARGETS)
+for name in ('hub','ds3'):
+    for suffix,rel in (('unix',UNIX),('ole32',OLE32),('ole64',OLE64)):
+        EXTENDED_TARGETS[name+'.'+suffix] = name+'/runtime/'+rel
+# Publish all runtime files before manifests, helper and receipts.
+EXTENDED_TARGETS = dict(sorted(EXTENDED_TARGETS.items(), key=lambda row: (0 if '/runtime/' in row[1] else 1,list(EXTENDED_TARGETS).index(row[0]))))
+POLICY_SOURCE_TARGETS = dict(EXTENDED_TARGETS, **{
+    'ds3.policy-source':'ds3/policy-source/overlay-policy.json',
+    'ds3.source-hub':'ds3/policy-source/source-hub-v1.json',
+})
 GUARDS = ('hub/games-play', 'ds3/ds3-play', 'ds3/borderless/manifest.json',
           'ds3/borderless/helper.exe','ds3/borderless/helper.c','ds3/borderless/build-provenance.json',
           'ds3/borderless/final-fixture-results.json','payload/policy.json','payload/source-hub-v1.json')
 POLICY_FIELDS = {'schema','id','owner','previousHubManifestSha256','previousDS3ManifestSha256',
                  'previousHubCriticalHashes','sourceHubManifestSha256','sourceCriticalHashes','desiredPEHashes','lifecycleSha256'}
+EXTENDED_POLICY_FIELDS = POLICY_FIELDS - {'desiredPEHashes'} | {'desiredRuntimeHashes'}
 MAX_FILE = 128*1024*1024
 MAX_TREE = 8*1024*1024*1024
 MAX_ENTRIES = 100000
@@ -312,17 +327,71 @@ def verify_images(root, images):
         need(image(*root.read(rel)) == expected, 'guard_drift')
 
 
-def build(root, commit, pe32_sha256, pe64_sha256, policy_sha256, publish=True, source_only=True):
-    """Build one exact paired Winemac transaction; expected payload pins mandatory."""
+def verify_policy_inventory(root):
+    with root.parent('ds3/policy-source/.unused') as (fd,_,check):
+        info=os.fstat(fd)
+        need(info.st_uid == os.getuid() and stat.S_IMODE(info.st_mode) == 0o700
+             and set(os.listdir(fd)) == {'overlay-policy.json','source-hub-v1.json'}, 'installed_policy_inventory')
+        check()
+
+
+def verify_policy_source(root, dm, hm, lifecycle, predecessor_lifecycle=None):
+    """Exact installed metadata closure; no current canonical policy dependency."""
+    verify_policy_inventory(root)
+    policy_raw,mode=root.read('ds3/policy-source/overlay-policy.json')
+    source_raw,source_mode=root.read('ds3/policy-source/source-hub-v1.json')
+    need(mode == source_mode == 0o600, 'installed_policy_mode')
+    policy,source=decode(policy_raw),decode(source_raw)
+    need(dm.get('schema') in (3,4) and type(policy) is dict and set(policy) == EXTENDED_POLICY_FIELDS
+         and type(policy.get('schema')) is int and policy['schema'] == 2
+         and policy.get('id') == 'wine-runtime-overlay' and policy.get('owner') == 'control-games-hub', 'installed_policy_schema')
+    if predecessor_lifecycle is not None:
+        need(dm.get('schema') == 3 and type(predecessor_lifecycle) is bytes,
+             'installed_policy_predecessor_scope')
+    bound_lifecycle = lifecycle if predecessor_lifecycle is None else predecessor_lifecycle
+    need(digest(policy_raw) == dm.get('runtimeOverlayPolicySha256')
+         and digest(source_raw) == dm.get('sourceHubManifestSha256')
+         and policy.get('lifecycleSha256') == digest(bound_lifecycle), 'installed_policy_binding')
+    need(type(source) is dict and source.get('id') == 'games-hub' and source.get('owner') == 'control-games-hub'
+         and source.get('criticalHashes') == dm.get('sourceCriticalHashes')
+         and policy.get('sourceHubManifestSha256') == dm.get('sourceHubManifestSha256')
+         and policy.get('sourceCriticalHashes') == dm.get('sourceCriticalHashes')
+         and type(dm.get('runtimeOverrides')) is dict and set(dm['runtimeOverrides']) == set(RUNTIME_PAYLOADS)
+         and policy.get('desiredRuntimeHashes') == dm['runtimeOverrides'], 'installed_policy_ancestry')
+    need(type(policy.get('previousHubCriticalHashes')) is dict
+         and hm.get('criticalHashes') == dict(policy['previousHubCriticalHashes'],**dm['runtimeOverrides'])
+         and hm.get('runtimeOverlayPolicySha256') == dm.get('runtimeOverlayPolicySha256'), 'installed_policy_hub_binding')
+
+
+def build(root, commit, pe32_sha256, pe64_sha256, policy_sha256, publish=True, source_only=True, runtime_sha256=None, installed_policy_source=False, predecessor_lifecycle=None):
+    """Build one versioned fixed runtime transaction; payload pins mandatory."""
     need(pin(commit, 40) and pin(pe32_sha256) and pin(pe64_sha256) and pin(policy_sha256), 'invalid_pins')
     need(type(source_only) is bool,'invalid_route_metadata')
     if publish: need(not root.exists('state/transaction'), 'transaction_exists')
     payload = {PE32: root.read('payload/winemac-i386.drv')[0], PE: root.read('payload/winemac-x86_64.drv')[0]}
     need(digest(payload[PE32]) == pe32_sha256 and digest(payload[PE]) == pe64_sha256, 'payload_pin_mismatch')
-    old = {key: root.read(rel) for key, rel in TARGETS.items()}
+    extended = runtime_sha256 is not None
+    need(type(installed_policy_source) is bool and (not installed_policy_source or extended), 'installed_policy_scope')
+    need(predecessor_lifecycle is None or installed_policy_source,
+         'installed_policy_predecessor_scope')
+    desired = runtime_sha256 if extended else {PE32:pe32_sha256,PE:pe64_sha256}
+    need(type(desired) is dict and set(desired) == (set(RUNTIME_PAYLOADS) if extended else {PE32,PE})
+         and all(pin(v) for v in desired.values()) and desired[PE32] == pe32_sha256 and desired[PE] == pe64_sha256, 'runtime_payload_scope')
+    if extended:
+        payload = {rel:root.read('payload/'+name)[0] for rel,name in RUNTIME_PAYLOADS.items()}
+        need(all(digest(payload[rel]) == expected for rel,expected in desired.items()), 'payload_pin_mismatch')
+    targets = POLICY_SOURCE_TARGETS if installed_policy_source else EXTENDED_TARGETS if extended else TARGETS
+    order = tuple(targets)
+    old = {key: root.read(rel) for key, rel in targets.items()}
     hm, hr, dm, dr, br = [decode(old[key][0]) for key in ('hub.manifest','hub.receipt','ds3.manifest','ds3.receipt','ds3.borderless-receipt')]
     need(all(type(value) is dict and type(value.get('schema')) is int and value.get('schema') == 1 for value in (hm,hr,dr,br))
-         and type(dm) is dict and type(dm.get('schema')) is int and dm.get('schema') in (1,2), 'installed_metadata_schema')
+         and type(dm) is dict and type(dm.get('schema')) is int and dm.get('schema') in (1,2,3,4), 'installed_metadata_schema')
+    need(installed_policy_source or dm['schema'] != 4, 'installed_policy_scope_downgrade')
+    if installed_policy_source:
+        # Only the fixed adapter supplies this optional first-migration input,
+        # after proving the actual settled launch transaction before/after pair.
+        # It is not a CLI field, authority token, or schema4 downgrade route.
+        verify_policy_source(root,dm,hm,old['ds3.lifecycle'][0],predecessor_lifecycle)
     need(type(hm.get('criticalHashes')) is dict and type(dm.get('sourceCriticalHashes')) is dict
          and all(type(k) is str and pin(v) for pins in (hm['criticalHashes'],dm['sourceCriticalHashes']) for k,v in pins.items())
          and pin(dm.get('candidateSha256')) and pin(dm.get('donorSha256')) and pin(dm.get('sourceHubManifestSha256')), 'installed_pin_schema')
@@ -334,19 +403,20 @@ def build(root, commit, pe32_sha256, pe64_sha256, policy_sha256, publish=True, s
     policy_raw = root.read('payload/policy.json')[0]
     need(digest(policy_raw) == policy_sha256, 'overlay_policy_pin_mismatch')
     policy = decode(policy_raw)
-    need(type(policy) is dict and set(policy) == POLICY_FIELDS and type(policy['schema']) is int and policy['schema'] == 1
+    need(type(policy) is dict and set(policy) == (EXTENDED_POLICY_FIELDS if extended else POLICY_FIELDS) and type(policy['schema']) is int and policy['schema'] == (2 if extended else 1)
          and policy['id'] == 'wine-runtime-overlay' and policy['owner'] == 'control-games-hub', 'overlay_policy_schema')
     lifecycle = root.read('payload/ds3-runtime')[0]
     need(pin(policy['lifecycleSha256']) and digest(lifecycle) == policy['lifecycleSha256'], 'lifecycle_pin_mismatch')
     need(policy['previousHubManifestSha256'] == digest(old['hub.manifest'][0]) and policy['previousDS3ManifestSha256'] == digest(old['ds3.manifest'][0])
          and policy['previousHubCriticalHashes'] == hm['criticalHashes'] and policy['sourceHubManifestSha256'] == dm['sourceHubManifestSha256']
-         and policy['sourceCriticalHashes'] == dm['sourceCriticalHashes'] and policy['desiredPEHashes'] == {PE32:pe32_sha256,PE:pe64_sha256}, 'overlay_policy_binding')
+         and policy['sourceCriticalHashes'] == dm['sourceCriticalHashes'] and policy['desiredRuntimeHashes' if extended else 'desiredPEHashes'] == desired, 'overlay_policy_binding')
     original_raw = root.read('payload/source-hub-v1.json')[0]
     original_hub = decode(original_raw)
     need(type(original_hub) is dict and digest(original_raw) == dm['sourceHubManifestSha256']
          and original_hub.get('criticalHashes') == dm['sourceCriticalHashes'], 'ds3_source_ancestry_drift')
+    need(extended or dm['schema'] < 3, 'runtime_scope_downgrade')
     overrides = dm.get('runtimeOverrides',{})
-    need(type(overrides) is dict and (dm['schema'] == 1 and not overrides or dm['schema'] == 2 and set(overrides) == {PE32,PE} and all(pin(v) for v in overrides.values())), 'ds3_override_schema')
+    need(type(overrides) is dict and (dm['schema'] == 1 and not overrides or dm['schema'] in (2,3,4) and set(overrides) == (set(RUNTIME_PAYLOADS) if dm['schema'] >= 3 else {PE32,PE}) and all(pin(v) for v in overrides.values())), 'ds3_override_schema')
     need(br.get('baseRuntimeTreeSha256') == dr['runtimeTreeSha256'] and br.get('baseManifestSha256') == dr['manifestSha256'], 'borderless_base_drift')
     borderless = decode(root.read('ds3/borderless/manifest.json')[0])
     need(type(borderless) is dict, 'borderless_schema')
@@ -363,33 +433,36 @@ def build(root, commit, pe32_sha256, pe64_sha256, policy_sha256, publish=True, s
     for name, pins in (('hub',hm['criticalHashes']),('ds3',ds3_pins)):
         actual = {row[0]: row[2] for row in rows[name] if row[1] != 'link'}
         need(all(actual.get(rel) == expected for rel, expected in pins.items()), 'critical_hash_drift')
-    # Every before/after row outside the explicitly declared Winemac pair stays exact.
+    # Every before/after row outside the fixed declared runtime scope stays exact.
     after_rows = copy.deepcopy(rows)
     after = dict(old)
+    if installed_policy_source:
+        after['ds3.policy-source'] = policy_raw, old['ds3.policy-source'][1]
+        after['ds3.source-hub'] = original_raw, old['ds3.source-hub'][1]
     after['ds3.lifecycle'] = lifecycle, old['ds3.lifecycle'][1]
     for name in ('hub','ds3'):
-        for suffix, rel in (('pe32',PE32),('pe64',PE)):
+        for suffix, rel in ((('pe32',PE32),('pe64',PE),('unix',UNIX),('ole32',OLE32),('ole64',OLE64)) if extended else (('pe32',PE32),('pe64',PE))):
             key = name+'.'+suffix
             after[key] = (payload[rel], old[key][1])
             matches = [row for row in after_rows[name] if row[0] == rel]
             need(len(matches) == 1 and matches[0][1] != 'link', 'overlay_target_missing')
             matches[0][2] = digest(payload[rel])
     new_hm, new_dm = copy.deepcopy(hm), copy.deepcopy(dm)
-    new_hm['criticalHashes'].update({PE32:pe32_sha256, PE:pe64_sha256})
+    new_hm['criticalHashes'].update(desired)
     new_hm['runtimeOverlayPolicySha256'] = policy_sha256
     after['hub.manifest'] = encode(new_hm), old['hub.manifest'][1]
     # source* remains immutable adoption ancestry; runtimeOverrides names only
-    # the exact PE pair. Existing verification needs the
+    # the versioned fixed scope. Existing verification needs the
     # separately delivered source selector patch before this schema is usable.
-    new_dm.update(schema=2, runtimeOverrides={PE32:pe32_sha256,PE:pe64_sha256}, runtimeOverlayPolicySha256=policy_sha256)
+    new_dm.update(schema=4 if installed_policy_source else 3 if extended else 2, runtimeOverrides=desired, runtimeOverlayPolicySha256=policy_sha256)
     after['ds3.manifest'] = encode(new_dm), old['ds3.manifest'][1]
     for name, receipt in (('hub',hr),('ds3',dr)):
         new_receipt = dict(receipt, commit=commit, manifestSha256=digest(after[name+'.manifest'][0]), runtimeTreeSha256=tree_hash(after_rows[name]))
         if name == 'ds3': new_receipt['lifecycleSha256'] = policy['lifecycleSha256']
         after[name+'.receipt'] = encode(new_receipt), old[name+'.receipt'][1]
     after['ds3.borderless-receipt'] = encode(dict(br, commit=commit, baseManifestSha256=digest(after['ds3.manifest'][0]), baseRuntimeTreeSha256=tree_hash(after_rows['ds3']))), old['ds3.borderless-receipt'][1]
-    plan = {'schema':1,'kind':'wine-winemac-pe-pair-overlay','sourceOnly':source_only,'acceptedCommit':commit,
-            'targets':{key:{'before':image(*old[key]),'after':image(*after[key])} for key in ORDER},
+    plan = {'schema':1,'kind':'wine-runtime-installed-policy-overlay' if installed_policy_source else 'wine-winemac-oleacc-runtime-overlay' if extended else 'wine-winemac-pe-pair-overlay','sourceOnly':source_only,'acceptedCommit':commit,
+            'targets':{key:{'before':image(*old[key]),'after':image(*after[key])} for key in order},
             'runtimeRows':{name:{'before':rows[name],'after':after_rows[name]} for name in rows},'guards':guards}
     raw = encode(plan)
     # The real plan includes complete before/after runtime row inventories.
@@ -400,7 +473,7 @@ def build(root, commit, pe32_sha256, pe64_sha256, policy_sha256, publish=True, s
     # Publish journal/closure before any installed target mutation. Staging failures
     # retain this directory, require explicit inspection, and alter no target bytes.
     root.mkdir('state/transaction')
-    for key in ORDER:
+    for key in order:
         for side, images in (('before',old),('after',after)):
             root.write_new('state/transaction/'+key+'.'+side, *images[key])
     root.write_new('state/transaction/plan.json', raw)
@@ -417,8 +490,11 @@ class Transaction:
         self.plan_sha = expected_plan_sha256
         self.plan = decode(raw,limit=MAX_PLAN_BYTES)
         p = self.plan
-        need(type(source_only) is bool and type(p) is dict and set(p) == {'schema','kind','sourceOnly','acceptedCommit','targets','runtimeRows','guards'} and type(p['schema']) is int and p['schema'] == 1 and p['kind'] == 'wine-winemac-pe-pair-overlay' and type(p['sourceOnly']) is bool and p['sourceOnly'] is source_only and pin(p['acceptedCommit'],40), 'plan_schema')
-        need(type(p['targets']) is dict and set(p['targets']) == set(TARGETS) and type(p['runtimeRows']) is dict and set(p['runtimeRows']) == {'hub','ds3'} and type(p['guards']) is dict and set(p['guards']) == set(GUARDS), 'plan_scope')
+        need(type(source_only) is bool and type(p) is dict and set(p) == {'schema','kind','sourceOnly','acceptedCommit','targets','runtimeRows','guards'} and type(p['schema']) is int and p['schema'] == 1 and p['kind'] in ('wine-winemac-pe-pair-overlay','wine-winemac-oleacc-runtime-overlay','wine-runtime-installed-policy-overlay') and type(p['sourceOnly']) is bool and p['sourceOnly'] is source_only and pin(p['acceptedCommit'],40), 'plan_schema')
+        self.targets = POLICY_SOURCE_TARGETS if p['kind'] == 'wine-runtime-installed-policy-overlay' else EXTENDED_TARGETS if p['kind'] == 'wine-winemac-oleacc-runtime-overlay' else TARGETS
+        self.order = tuple(self.targets)
+        self.runtime_paths = {PE32,PE} if p['kind'] == 'wine-winemac-pe-pair-overlay' else set(RUNTIME_PAYLOADS)
+        need(type(p['targets']) is dict and set(p['targets']) == set(self.targets) and type(p['runtimeRows']) is dict and set(p['runtimeRows']) == {'hub','ds3'} and type(p['guards']) is dict and set(p['guards']) == set(GUARDS), 'plan_scope')
         for value in p['guards'].values():
             need(type(value) is dict and set(value) == {'sha256','mode'} and pin(value['sha256']) and type(value['mode']) is int and 0 <= value['mode'] <= 0o777 and not value['mode'] & 0o022, 'guard_schema')
         for value in p['runtimeRows'].values():
@@ -431,7 +507,7 @@ class Transaction:
                     paths.append(row[0])
                 need(paths == sorted(set(paths)), 'runtime_rows_order')
         self.images = {}
-        for key in ORDER:
+        for key in self.order:
             entry = p['targets'][key]
             need(type(entry) is dict and set(entry) == {'before','after'}, 'target_schema')
             self.images[key] = {}
@@ -447,7 +523,7 @@ class Transaction:
     def journal(self):
         raw, _ = self.root.read('state/transaction/journal.json')
         j = decode(raw)
-        need(type(j) is dict and set(j) == {'schema','planSha256','phase','intent'} and type(j['schema']) is int and j['schema'] == 1 and j['planSha256'] == self.plan_sha and j['intent'] in (None,*ORDER) and type(j['phase']) is str and j['phase'] in ('prepared','applying','applied','rolling-back','rolled-back'), 'journal_binding_drift')
+        need(type(j) is dict and set(j) == {'schema','planSha256','phase','intent'} and type(j['schema']) is int and j['schema'] == 1 and j['planSha256'] == self.plan_sha and j['intent'] in (None,*self.order) and type(j['phase']) is str and j['phase'] in ('prepared','applying','applied','rolling-back','rolled-back'), 'journal_binding_drift')
         return j
 
     def checkpoint(self, phase, intent=None):
@@ -466,7 +542,7 @@ class Transaction:
         data, mode = self.root.read(stage)
         pending = decode(data)
         need(type(pending) is dict and set(pending) == set(current) and type(pending['schema']) is int and pending['schema'] == 1
-             and pending['planSha256'] == self.plan_sha and pending['intent'] in (None,*ORDER), 'journal_stage_drift')
+             and pending['planSha256'] == self.plan_sha and pending['intent'] in (None,*self.order), 'journal_stage_drift')
         transitions = {'prepared':{'applying','applied','rolled-back'},'applying':{'applying','applied'},'applied':{'rolling-back'},
                        'rolling-back':{'rolling-back','rolled-back'},'rolled-back':{'applying'}}
         need(type(pending['phase']) is str and pending['phase'] in transitions[current['phase']], 'journal_stage_transition')
@@ -488,18 +564,20 @@ class Transaction:
         result = self.gate(self.plan['acceptedCommit'])
         need(type(result) is dict and set(result) == {'sourceAccepted','doctorReady','prefixesInactive'}
              and all(type(v) is bool and v for v in result.values()), 'fresh_gate_rejected')
+        if self.plan['kind'] == 'wine-runtime-installed-policy-overlay':
+            verify_policy_inventory(self.root)
         verify_images(self.root, self.plan['guards'])
-        expected_names = {'plan.json','journal.json'} | {key+'.'+side for key in ORDER for side in ('before','after')}
-        allowed_stages = {PurePosixPath(self.root.stage_name(rel)).name for rel in (*TARGETS.values(),'state/transaction/journal.json')}
+        expected_names = {'plan.json','journal.json'} | {key+'.'+side for key in self.order for side in ('before','after')}
+        allowed_stages = {PurePosixPath(self.root.stage_name(rel)).name for rel in (*self.targets.values(),'state/transaction/journal.json')}
         with self.root.parent('state/transaction/.unused') as (fd,_,check):
             observed = set(os.listdir(fd))
             need(expected_names <= observed and observed <= expected_names | allowed_stages, 'transaction_inventory_drift')
             check()
-        for key in ORDER:
-            current = self.root.read(TARGETS[key])
+        for key in self.order:
+            current = self.root.read(self.targets[key])
             choices = tuple(self.images[key].values()) if mixed else (self.images[key]['before'], self.images[key]['after'])
             need(current in choices, 'target_unknown_drift')
-            stage = self.root.stage_name(TARGETS[key])
+            stage = self.root.stage_name(self.targets[key])
             if self.root.exists(stage):
                 need(self.root.read(stage) in tuple(self.images[key].values()), 'replacement_stage_drift')
         for name in ('hub','ds3'):
@@ -509,16 +587,16 @@ class Transaction:
             for observed, old, new in zip(actual, before, after):
                 need(observed == old or observed == new, 'runtime_unknown_drift')
                 if old != new:
-                    need(old[0] in (PE32,PE) and new[:2] == old[:2], 'plan_runtime_scope')
+                    need(old[0] in self.runtime_paths and new[:2] == old[:2], 'plan_runtime_scope')
         # Revalidate immutable staged bytes on every operation, including recovery.
-        for key in ORDER:
+        for key in self.order:
             for side in ('before','after'):
                 need(self.root.read('state/transaction/'+key+'.'+side) == self.images[key][side], 'backup_drift')
         need(allow_journal_stage or not self.root.exists(self.root.stage_name('state/transaction/journal.json')),
              'outstanding_journal_stage_requires_recovery')
 
     def side(self, side):
-        return all(self.root.read(TARGETS[key]) == self.images[key][side] for key in ORDER)
+        return all(self.root.read(self.targets[key]) == self.images[key][side] for key in self.order)
 
     def run(self, side, recover=False):
         need(side in ('before','after'), 'invalid_operation')
@@ -544,14 +622,14 @@ class Transaction:
             if not recover:
                 need(self.side('before' if side == 'after' else 'after'), 'mixed_state_requires_recovery')
             self.checkpoint(start)
-            for key in (ORDER if side == 'after' else tuple(reversed(ORDER))):
-                current = self.root.read(TARGETS[key])
+            for key in (self.order if side == 'after' else tuple(reversed(self.order))):
+                current = self.root.read(self.targets[key])
                 wanted = self.images[key][side]
                 if current == wanted:
                     continue
                 self.preflight(mixed=True)
                 self.checkpoint(start, key)
-                self.root.replace(TARGETS[key], *wanted, current, event=self.event)
+                self.root.replace(self.targets[key], *wanted, current, event=self.event)
             self.preflight(mixed=True)
             need(self.side(side), 'postimage_mismatch')
             self.checkpoint(end)

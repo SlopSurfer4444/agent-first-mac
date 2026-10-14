@@ -1,5 +1,8 @@
 import Darwin
 import Foundation
+#if canImport(AidAdminEmergencyCore)
+import AidAdminEmergencyCore
+#endif
 
 private func expect(_ condition: @autoclosure () -> Bool, _ reason: String = "expectation") throws {
     if !condition() { throw EmergencyFailure.rejected(reason) }
@@ -25,11 +28,13 @@ private final class FakeAccounts: EmergencyAccountLookingUp {
 private final class FakeRunner: EmergencyCommandRunning {
     var calls: [(String, [String], [String: String])] = []
     var failCall: Int?
+    var unknownCall: Int?
     var failureOutput = "bounded-fixture-output"
 
     func run(executable: String, arguments: [String],
              environment: [String: String]) throws -> EmergencyCommandResult {
         calls.append((executable, arguments, environment))
+        if calls.count == unknownCall { throw EmergencyFailure.rejected("emergency_process_unknown") }
         let status: Int32 = calls.count == failCall ? 1 : 0
         return EmergencyCommandResult(status: status,
                                       output: status == 0 ? "bounded-fixture-output" : failureOutput)
@@ -39,6 +44,7 @@ private final class FakeRunner: EmergencyCommandRunning {
 private final class FakeHooks: EmergencyHooks {
     var failStep: String?
     var rollbackFails = false
+    var crashStep: String?
     var beforeTransitionAction: ((String) throws -> Void)?
 
     func beforeTransition(step: String) throws {
@@ -46,6 +52,7 @@ private final class FakeHooks: EmergencyHooks {
     }
 
     func afterMutation(step: String) throws {
+        if step == crashStep { _exit(73) }
         if step == failStep { throw EmergencyFailure.rejected("injected_" + step) }
     }
 
@@ -63,6 +70,7 @@ private final class ScriptedOwnerRunner: EmergencyCommandRunning {
     var expected: [Call]
     var calls: [[String]] = []
     var interactiveCalls: [[String]] = []
+    var throwOnCall: Int?
 
     init(_ expected: [Call]) { self.expected = expected }
 
@@ -75,6 +83,7 @@ private final class ScriptedOwnerRunner: EmergencyCommandRunning {
         let next = expected.removeFirst()
         try expect(arguments == next.arguments, "owner_runner_arguments")
         calls.append(arguments)
+        if calls.count == throwOnCall { throw EmergencyFailure.rejected("emergency_process_unknown") }
         return next.result
     }
 
@@ -181,11 +190,16 @@ private final class Fixture {
         "agentowner ALL=(root) NOPASSWD: AGENT_FIRST_MAC_AID_ADMIN\n").utf8)
     private let attestationData: Data
 
-    init(disabled: Bool = false) throws {
-        let created = FileManager.default.temporaryDirectory
+    private var ownsRoot = true
+
+    init(disabled: Bool = false, existingRoot: String? = nil) throws {
+        let created = existingRoot.map { URL(fileURLWithPath: $0) } ?? FileManager.default.temporaryDirectory
             .appendingPathComponent("aid-admin-emergency-fixture." + UUID().uuidString,
                                     isDirectory: true)
-        try FileManager.default.createDirectory(at: created, withIntermediateDirectories: false)
+        if existingRoot == nil {
+            try FileManager.default.createDirectory(at: created, withIntermediateDirectories: false)
+        }
+        ownsRoot = existingRoot == nil
         guard let resolved = realpath(created.path, nil) else {
             throw EmergencyFailure.rejected("fixture_realpath")
         }
@@ -211,6 +225,8 @@ private final class Fixture {
             sudoersSHA256: emergencySHA256(sudoersData), sudoersSize: sudoersData.count,
             attestationSize: attestationData.count)
 
+        if existingRoot != nil { return }
+
         try directory("/private/etc", 0o755)
         try FileManager.default.createSymbolicLink(
             atPath: root.appendingPathComponent("etc").path,
@@ -232,7 +248,7 @@ private final class Fixture {
         }
     }
 
-    deinit { try? FileManager.default.removeItem(at: root) }
+    deinit { if ownsRoot { try? FileManager.default.removeItem(at: root) } }
 
     func transaction(trustedUID: uid_t = getuid(), effectiveUID: uid_t = getuid()) -> EmergencyTransaction {
         let context = EmergencyContext(
@@ -336,6 +352,307 @@ private extension URL {
 }
 
 private struct Suite {
+    func interruptedFreshProcessMatrix() throws {
+        try expect(geteuid() != 0, "emergency_crash_fixture_must_be_non_root")
+        let executable = try fixtureExecutablePath()
+        for action in ["disable", "recover"] {
+            let steps = action == "disable" ?
+                ["emergency-journal-opened", "emergency-journal-written", "emergency-journal-created",
+                 "sudoers-moved", "marker-temporary-opened", "marker-temporary-written", "marker-temporary-created",
+                 "marker-created", "disabled-final-verification"] :
+                ["emergency-journal-opened", "emergency-journal-written", "emergency-journal-created", "sudoers-restored", "marker-staged",
+                 "marker-removed", "enabled-final-verification"]
+            for step in steps {
+                let fixture = try Fixture(disabled: action == "recover")
+                let crashed = try EmergencyProcessRunner().run(executable: executable,
+                    arguments: ["__emergency-fixture", fixture.root.path, action, step],
+                    environment: EmergencyTransaction.cleanEnvironment)
+                try expect(crashed.status == 73, "crash_point_not_reached_" + step)
+                try expect(fixture.physical(EmergencyTransaction.journalPath).isFile ||
+                           fixture.physical(EmergencyTransaction.journalTemporaryPath).isFile,
+                           "crash_journal_not_retained")
+                // A wholly new process conservatively finishes revocation; no
+                // cached actor state and no fresh-enable authority is inferred.
+                let disabled = try EmergencyProcessRunner().run(executable: executable,
+                    arguments: ["__emergency-fixture", fixture.root.path, "disable", "none"],
+                    environment: EmergencyTransaction.cleanEnvironment)
+                try expect(disabled.status == 0 && fixture.disabledState(),
+                           "fresh_process_reconciliation_" + action + "_" + step)
+                let recovered = try EmergencyProcessRunner().run(executable: executable,
+                    arguments: ["__emergency-fixture", fixture.root.path, "recover", "none"],
+                    environment: EmergencyTransaction.cleanEnvironment)
+                try expect(recovered.status == 0 && fixture.enabledState(),
+                           "fresh_process_recovery_" + step)
+                try expect(!fixture.physical(EmergencyTransaction.journalPath).exists,
+                           "settled_journal_retained")
+            }
+        }
+    }
+
+    func sharedApplyLockAndUnresolvedMatrix() throws {
+        let fixture = try Fixture()
+        let path = fixture.physical(EmergencyTransaction.operationRootPath).appendingPathComponent(".operation.lock")
+        let fd = open(path.path, O_RDWR | O_CREAT | O_EXCL, 0o600)
+        try expect(fd >= 0 && flock(fd, LOCK_EX | LOCK_NB) == 0, "fixture_apply_lock")
+        defer { Darwin.close(fd) }
+        let executable = try fixtureExecutablePath()
+        let disable = try EmergencyProcessRunner().run(executable: executable,
+            arguments: ["__emergency-fixture", fixture.root.path, "disable", "none"],
+            environment: EmergencyTransaction.cleanEnvironment)
+        try expect(disable.status == 0, "cross_process_disable_busy_apply")
+        try expect(fixture.disabledState(), "disable_waited_for_apply_lock")
+        let busy = try expectThrows { _ = try fixture.transaction().recover() }
+        try expect(busy == "emergency_apply_busy" && fixture.disabledState())
+        let childBusy = try EmergencyProcessRunner().run(executable: executable,
+            arguments: ["__emergency-fixture", fixture.root.path, "recover", "none"],
+            environment: EmergencyTransaction.cleanEnvironment)
+        try expect(childBusy.status == 74 && childBusy.output == "emergency_apply_busy",
+                   "cross_process_recovery_busy_apply")
+        try expect(flock(fd, LOCK_UN) == 0, "fixture_apply_unlock")
+        for phase in ["profile_switching", "activating", "recovery_required", "unknown"] {
+            let other = try Fixture(disabled: true)
+            let data = try JSONSerialization.data(withJSONObject: ["schema": 1, "phase": phase])
+            try other.write(EmergencyTransaction.operationPath, data, 0o600)
+            let reason = try expectThrows { _ = try other.transaction().recover() }
+            try expect(reason == "emergency_apply_unresolved" && other.disabledState())
+        }
+        for phase in ["complete", "rollback_verified"] {
+            let other = try Fixture(disabled: true)
+            let data = try JSONSerialization.data(withJSONObject: ["schema": 1, "phase": phase])
+            try other.write(EmergencyTransaction.operationPath, data, 0o600)
+            _ = try other.transaction().recover()
+            try expect(other.enabledState())
+        }
+        for data in [Data("{".utf8), Data("{\"schema\":true,\"phase\":\"complete\"}".utf8),
+                     Data("{\"schema\":3,\"phase\":\"complete\"}".utf8)] {
+            let other = try Fixture(disabled: true)
+            try other.write(EmergencyTransaction.operationPath, data, 0o600)
+            let reason = try expectThrows { _ = try other.transaction().recover() }
+            try expect(reason == "emergency_apply_unresolved" && other.disabledState())
+        }
+    }
+
+    func unsettledCommandPreservesRecoveryState() throws {
+        let fixture = try Fixture()
+        fixture.runner.unknownCall = 3
+        let reason = try expectThrows { _ = try fixture.transaction().disable() }
+        try expect(reason == "emergency_process_unknown" && fixture.disabledState(),
+                   "unsettled_command_rolled_back")
+        try expect(fixture.physical(EmergencyTransaction.journalPath).isFile)
+        fixture.runner.unknownCall = nil
+        _ = try fixture.transaction().recover()
+        try expect(fixture.enabledState())
+    }
+
+    func interruptedMetadataBoundaries() throws {
+        for logical in [EmergencyTransaction.journalPath, EmergencyTransaction.journalTemporaryPath,
+                        EmergencyTransaction.operationPath] {
+            let fixture = try Fixture(disabled: logical == EmergencyTransaction.operationPath)
+            try expect(mkfifo(fixture.physical(logical).path, 0o600) == 0, "fixture_fifo_create")
+            let start = DispatchTime.now().uptimeNanoseconds
+            _ = try expectThrows {
+                if logical == EmergencyTransaction.operationPath { _ = try fixture.transaction().recover() }
+                else { _ = try fixture.transaction().disable() }
+            }
+            try expect(DispatchTime.now().uptimeNanoseconds - start < 1_000_000_000,
+                       "metadata_fifo_did_not_fail_promptly")
+            try expect(fixture.physical(logical).exists, "metadata_fifo_removed")
+        }
+        let partialJournal = try Fixture()
+        try partialJournal.write(EmergencyTransaction.journalTemporaryPath,
+                                 Data("{\"action\":\"dis".utf8), 0o600)
+        _ = try partialJournal.transaction().disable()
+        try expect(partialJournal.disabledState(), "partial_journal_recovery")
+
+        let unknown = try Fixture()
+        let unknownBytes = Data("unknown-third-party-bytes".utf8)
+        try unknown.write(EmergencyTransaction.journalTemporaryPath, unknownBytes, 0o600)
+        _ = try expectThrows { _ = try unknown.transaction().disable() }
+        let retained = try Data(contentsOf: unknown.physical(EmergencyTransaction.journalTemporaryPath))
+        try expect(unknown.enabledState() && retained == unknownBytes, "unknown_metadata_not_preserved")
+
+        let marker = try Fixture()
+        marker.hooks.failStep = "sudoers-moved"
+        marker.hooks.rollbackFails = true
+        _ = try expectThrows { _ = try marker.transaction().disable() }
+        marker.hooks.failStep = nil
+        try marker.write(EmergencyTransaction.markerPath + ".new",
+                         Data(EmergencyTransaction.markerData.prefix(7)), 0o400)
+        _ = try marker.transaction().disable()
+        try expect(marker.disabledState(), "partial_marker_recovery")
+    }
+
+    func ownerResumeFreshAuthentication() throws {
+        let executable = "/fixed/reviewed/aid-admin-emergency-action"
+        let commit = String(repeating: "a", count: 40)
+        func call(_ arguments: [String], _ status: Int32 = 0) -> ScriptedOwnerRunner.Call {
+            .init(arguments: arguments, result: .init(status: status, output: ""))
+        }
+        for invalid in ["", String(repeating: "a", count: 39), String(repeating: "A", count: 40),
+                        commit + "\n", "--help", "/tmp/receipt", commit + " extra"] {
+            let runner = ScriptedOwnerRunner([])
+            let reason = try expectThrows {
+                _ = try EmergencyOwnerOrchestrator(executablePath: executable, runner: runner)
+                    .performResume(commit: invalid)
+            }
+            try expect(reason == "resume_commit_syntax" && runner.calls.isEmpty,
+                       "resume_invalid_reached_auth")
+        }
+        let runner = ScriptedOwnerRunner([
+            call(["-k", "--", executable, "__root-resume", commit]), call(["-k"]),
+        ])
+        let facts = try EmergencyOwnerOrchestrator(executablePath: executable, runner: runner)
+            .performResume(commit: commit)
+        try expect(runner.expected.isEmpty && runner.interactiveCalls == [
+            ["-k", "--", executable, "__root-resume", commit],
+        ], "resume_fresh_auth_boundary")
+        try expect(facts.contains("broker_admission_disabled=true") &&
+                   facts.first == "EMERGENCY_OPERATION_RESUMED_DISABLED" &&
+                   facts.contains("recorded_operation_resumed=true") &&
+                   !facts.contains("operational_state_accepted=true") &&
+                   facts.contains("arbitrary_data_restoration_claimed=false") &&
+                   facts.contains("reenable_requires_separate_fresh_standard_sudo=true"),
+                   "resume_scope_facts")
+        for status: Int32 in [1, 65] {
+            let failed = ScriptedOwnerRunner([
+                call(["-k", "--", executable, "__root-resume", commit], status), call(["-k"]),
+            ])
+            let reason = try expectThrows {
+                _ = try EmergencyOwnerOrchestrator(executablePath: executable, runner: failed)
+                    .performResume(commit: commit)
+            }
+            try expect(reason == "resume_root_transaction_failed" && failed.expected.isEmpty,
+                       "resume_failure_timestamp_clear")
+        }
+        let unknown = ScriptedOwnerRunner([
+            call(["-k", "--", executable, "__root-resume", commit]), call(["-k"]),
+        ])
+        unknown.throwOnCall = 1
+        let reason = try expectThrows {
+            _ = try EmergencyOwnerOrchestrator(executablePath: executable, runner: unknown)
+                .performResume(commit: commit)
+        }
+        try expect(reason == "resume_root_transaction_unknown" && unknown.expected.isEmpty,
+                   "resume_unknown_timestamp_clear")
+
+        let clearFailure = ScriptedOwnerRunner([
+            call(["-k", "--", executable, "__root-resume", commit]), call(["-k"], 1),
+        ])
+        let clearReason = try expectThrows {
+            _ = try EmergencyOwnerOrchestrator(executablePath: executable, runner: clearFailure)
+                .performResume(commit: commit)
+        }
+        try expect(clearReason == "resume_timestamp_clear_failed" && clearFailure.expected.isEmpty,
+                   "resume_timestamp_failure_reported_success")
+    }
+
+    func disabledResumeBoundary() throws {
+        let commit = String(repeating: "b", count: 40)
+        let enabled = try Fixture()
+        var called = false
+        _ = try expectThrows {
+            _ = try enabled.transaction().resume(commit: commit) { _ in
+                called = true
+                return "OPERATION_RESUMED_DISABLED"
+            }
+        }
+        try expect(!called && enabled.enabledState(), "enabled_resume_reached_core")
+
+        let disabled = try Fixture(disabled: true)
+        let result = try disabled.transaction().resume(commit: commit) { captured in
+            try expect(captured == commit, "resume_commit_changed")
+            let lockPath = disabled.physical(EmergencyTransaction.operationRootPath)
+                .appendingPathComponent(".emergency.lock").path
+            let fd = open(lockPath, O_RDWR | O_NOFOLLOW | O_CLOEXEC)
+            try expect(fd >= 0, "resume_lock_fixture_open")
+            defer { Darwin.close(fd) }
+            try expect(flock(fd, LOCK_EX | LOCK_NB) != 0, "resume_missing_authority_lock")
+            try expect(disabled.disabledState(), "resume_callback_not_disabled")
+            return "OPERATION_RESUMED_DISABLED"
+        }
+        try expect(result == "OPERATION_RESUMED_DISABLED" && disabled.disabledState(),
+                   "resume_enabled_admission")
+        let failure = try expectThrows {
+            _ = try disabled.transaction().resume(commit: commit) { _ in
+                throw EmergencyFailure.rejected("fixture_resume_unresolved")
+            }
+        }
+        try expect(failure == "fixture_resume_unresolved" && disabled.disabledState(),
+                   "failed_resume_enabled_admission")
+        let badResult = try expectThrows {
+            _ = try disabled.transaction().resume(commit: commit) { _ in "arbitrary-success" }
+        }
+        try expect(badResult == "resume_result_contract" && disabled.disabledState())
+        let staleResult = try expectThrows {
+            _ = try disabled.transaction().resume(commit: commit) { _ in "OPERATION_RECONCILED_DISABLED" }
+        }
+        try expect(staleResult == "resume_result_contract" && disabled.disabledState(),
+                   "resume_accepted_passive_reconciliation")
+
+        let drift = try Fixture(disabled: true)
+        try drift.mutate(EmergencyTransaction.policyPath, data: Data("drift".utf8))
+        called = false
+        _ = try expectThrows {
+            _ = try drift.transaction().resume(commit: commit) { _ in
+                called = true
+                return "OPERATION_RESUMED_DISABLED"
+            }
+        }
+        try expect(!called && drift.disabledState(), "resume_drift_reached_core")
+
+        let busy = try Fixture(disabled: true)
+        let busyPath = busy.physical(EmergencyTransaction.operationRootPath)
+            .appendingPathComponent(".emergency.lock").path
+        let busyFD = open(busyPath, O_RDWR | O_CREAT | O_EXCL, 0o600)
+        try expect(busyFD >= 0 && flock(busyFD, LOCK_EX | LOCK_NB) == 0, "resume_busy_fixture")
+        defer { Darwin.close(busyFD) }
+        called = false
+        let busyReason = try expectThrows {
+            _ = try busy.transaction().resume(commit: commit) { _ in
+                called = true
+                return "OPERATION_RESUMED_DISABLED"
+            }
+        }
+        try expect(!called && busyReason == "emergency_busy" && busy.disabledState(),
+                   "resume_busy_reached_core")
+
+        for schema in [1, 2] {
+            let fixture = try Fixture(disabled: true)
+            let journal = try JSONSerialization.data(withJSONObject: ["schema": schema, "phase": "resumed"])
+            try fixture.write(EmergencyTransaction.operationPath, journal, 0o600)
+            if schema == 1 {
+                _ = try expectThrows { _ = try fixture.transaction().recover() }
+                try expect(fixture.disabledState(), "legacy_journal_inferred_recovery")
+            } else {
+                _ = try fixture.transaction().recover()
+                try expect(fixture.enabledState(), "resumed_schema2_did_not_converge")
+            }
+        }
+        for phase in ["resume_pending", "resume_committed", "reconciled", "reconciliation_committed"] {
+            let interrupted = try Fixture(disabled: true)
+            let bytes = try JSONSerialization.data(withJSONObject: ["schema": 2, "phase": phase])
+            try interrupted.write(EmergencyTransaction.operationPath, bytes, 0o600)
+            _ = try expectThrows { _ = try interrupted.transaction().recover() }
+            try expect(interrupted.disabledState(), "unfinished_or_passive_recovery_enabled")
+        }
+    }
+
+    func interruptedUnknownStatePreservation() throws {
+        let fixture = try Fixture()
+        fixture.hooks.failStep = "sudoers-moved"
+        fixture.hooks.rollbackFails = true
+        _ = try expectThrows { _ = try fixture.transaction().disable() }
+        let old = fixture.physical(EmergencyTransaction.disabledSudoersPath)
+        let bytes = try Data(contentsOf: old)
+        try FileManager.default.moveItem(at: old, to: old.appendingPathExtension("retained"))
+        try fixture.write(EmergencyTransaction.disabledSudoersPath, bytes, 0o440)
+        let reason = try expectThrows { _ = try fixture.transaction().recover() }
+        try expect(reason == "emergency_interrupted_sudoers_identity")
+        try expect(fixture.physical(EmergencyTransaction.journalPath).isFile &&
+                   !fixture.physical(EmergencyTransaction.sudoersPath).exists,
+                   "unknown_interrupted_state_not_preserved")
+    }
+
     func positiveDisableRecovery() throws {
         let fixture = try Fixture()
         let disabled = try fixture.transaction().disable()
@@ -804,6 +1121,9 @@ private struct Suite {
             executablePath: executable, runner: disable).perform(.disable)
         try expect(disableLines.first == "EMERGENCY_DISABLE_VERIFIED" &&
                    disable.expected.isEmpty, "owner_disable_success")
+        try expect(disableLines.contains("in_flight_apply_state=UNKNOWN") &&
+                   disableLines.contains("in_flight_apply_stopped=false"),
+                   "disable_did_not_report_unknown_inflight")
         try expect(disable.interactiveCalls == [
             ["-k", "--", executable, "__root-disable"],
         ], "owner_disable_interactive_boundary")
@@ -839,6 +1159,35 @@ private struct Suite {
             executablePath: executable, runner: recovery).perform(.recover)
         try expect(recoveryLines.first == "EMERGENCY_RECOVERY_VERIFIED" &&
                    recovery.expected.isEmpty, "owner_recovery_success")
+
+        let unknownDoctor = ScriptedOwnerRunner([
+            call(["-k", "--", executable, "__root-recover"], 0),
+            call(["-n", "/usr/local/libexec/aid-admin", "doctor-root", "--json"], 0),
+            call(["-n", "--", executable, "__root-disable"], 0),
+            call(["-k"], 0),
+            call(["-n", "/usr/local/libexec/aid-admin", "doctor-root", "--json"], 1),
+        ])
+        unknownDoctor.throwOnCall = 2
+        let unknownReason = try expectThrows {
+            _ = try EmergencyOwnerOrchestrator(executablePath: executable,
+                                               runner: unknownDoctor).perform(.recover)
+        }
+        try expect(unknownReason == "recovery_doctor_unknown_rolled_back" &&
+                   unknownDoctor.expected.isEmpty, "unknown_doctor_revocation_cleanup")
+
+        let unknownRollback = ScriptedOwnerRunner([
+            call(["-k", "--", executable, "__root-recover"], 0),
+            call(["-n", "/usr/local/libexec/aid-admin", "doctor-root", "--json"], 1),
+            call(["-n", "--", executable, "__root-disable"], 0),
+            call(["-k"], 0),
+        ])
+        unknownRollback.throwOnCall = 3
+        let unknownRollbackReason = try expectThrows {
+            _ = try EmergencyOwnerOrchestrator(executablePath: executable,
+                                               runner: unknownRollback).perform(.recover)
+        }
+        try expect(unknownRollbackReason == "recovery_verification_failed_rollback_unknown" &&
+                   unknownRollback.expected.isEmpty, "unknown_rollback_timestamp_cleanup")
         try expect(recovery.calls.filter { $0.starts(with: ["-k", "--"]) }.count == 1,
                    "recovery_authentication_boundary")
         try expect(recovery.interactiveCalls == [
@@ -916,6 +1265,18 @@ private struct TestMain {
         if arguments == ["__pty-session-runner"] {
             exit(runPTYSessionRunner())
         }
+        if arguments.count == 4 && arguments[0] == "__emergency-fixture" {
+            do {
+                try expect(geteuid() != 0 && arguments[1].contains("/aid-admin-emergency-fixture."),
+                           "fixture_child_scope")
+                let fixture = try Fixture(existingRoot: arguments[1])
+                fixture.hooks.crashStep = arguments[3]
+                if arguments[2] == "disable" { _ = try fixture.transaction().disable() }
+                else if arguments[2] == "recover" { _ = try fixture.transaction().recover() }
+                else { throw EmergencyFailure.rejected("fixture_child_action") }
+                exit(0)
+            } catch { writeFixtureOutput(String(describing: error)); exit(74) }
+        }
         do {
             let suite = Suite()
             let groups: [(String, () throws -> Void)] = [
@@ -934,6 +1295,13 @@ private struct TestMain {
                 ("foreground_pty_integration", suite.foregroundPTYIntegration),
                 ("owner_orchestration", suite.ownerOrchestrationMatrix),
                 ("retention", suite.noRecursiveOrUnrelatedMutation),
+                ("interrupted_fresh_process", suite.interruptedFreshProcessMatrix),
+                ("shared_apply_lock_unresolved", suite.sharedApplyLockAndUnresolvedMatrix),
+                ("interrupted_unknown_preservation", suite.interruptedUnknownStatePreservation),
+                ("unsettled_command_retention", suite.unsettledCommandPreservesRecoveryState),
+                ("interrupted_metadata_boundaries", suite.interruptedMetadataBoundaries),
+                ("owner_resume_fresh_auth", suite.ownerResumeFreshAuthentication),
+                ("disabled_resume_boundary", suite.disabledResumeBoundary),
             ]
             var completed = 0
             for (_, test) in groups { try test(); completed += 1 }

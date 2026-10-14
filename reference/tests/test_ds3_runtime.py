@@ -2,13 +2,14 @@ import importlib.machinery,importlib.util,json,os,runpy,shutil,subprocess,sys,te
 from types import SimpleNamespace
 from pathlib import Path
 from unittest.mock import Mock,patch
+from lib import game_operation_readiness as game_ready
 P=Path(__file__).resolve().parents[1]
 loader=importlib.machinery.SourceFileLoader('ds3_runtime',str(P/'bin/ds3-runtime'))
 spec=importlib.util.spec_from_loader(loader.name,loader); h=importlib.util.module_from_spec(spec);loader.exec_module(h)
 
 class DS3Tests(unittest.TestCase):
     def setUp(self):
-        self.tmp=tempfile.TemporaryDirectory(dir=P);self.base=Path(self.tmp.name)
+        self.tmp=tempfile.TemporaryDirectory();self.base=Path(self.tmp.name).resolve()
         self.home=self.base/'home'; self.home.mkdir(); self.source=self.home/'Library/Application Support/Adapted Games';self.root=self.source.with_name('Adapted Games DS3')
         self.control=self.home/'AIDev/control';self.control.mkdir(parents=True);(self.control/'bin').mkdir();(self.control/'manifests').mkdir()
         (self.home/'AIDev/bin').mkdir();(self.home/'Games').mkdir();(self.home/'AIDev/state').mkdir()
@@ -129,14 +130,17 @@ class DS3Tests(unittest.TestCase):
     def test_canonical_gate_rejects_worktree_before_commands(self):
         with patch.object(h,'HERE',P),patch.object(h,'run',side_effect=AssertionError('execution')):
             with self.assertRaisesRegex(RuntimeError,'canonical_source_required'):h.source_gate('a'*40)
-    def test_fresh_doctor_git_only_pass_rejects(self):
-        responses=[b'a'*40,b'main',b'',json.dumps({'verdict':'PASS','configurationSourceAccepted':True,'currentSentinelReady':True,'integratedMain':True,'gitOnly':True}).encode()]
-        with patch.object(h.Path,'absolute',return_value=self.control/'bin/ds3-runtime'),patch.object(h,'run',side_effect=responses):
-            with self.assertRaisesRegex(RuntimeError,'fresh_accepted_doctor_required'):h.source_gate('a'*40)
-    def test_source_drift_after_fresh_doctor_rejects(self):
-        d={'verdict':'PASS','configurationSourceAccepted':True,'currentSentinelReady':True,'integratedMain':True,'gitOnly':False}
-        responses=[b'a'*40,b'main',b'',json.dumps(d).encode(),b'b'*40]
-        with patch.object(h.Path,'absolute',return_value=self.control/'bin/ds3-runtime'),patch.object(h,'run',side_effect=responses):
+    def test_unadmitted_or_nonboolean_scoped_readiness_cannot_borrow_pass_label(self):
+        for ready in (False,1,None):
+            report={'verdict':'PASS','gitOnly':True,'scopedCandidateReady':ready}
+            bridge=SimpleNamespace(metadata=game_ready.metadata,bound=game_ready.bound,ready=Mock(return_value=report))
+            responses=[b'a'*40,b'main',b'']
+            with patch.object(h.Path,'absolute',return_value=self.control/'bin/ds3-runtime'),patch.object(h,'run',side_effect=responses),patch.object(h,'readiness_bridge',return_value=bridge):
+                with self.assertRaisesRegex(RuntimeError,'scoped_operation_readiness_required'):h.source_gate('a'*40)
+    def test_source_drift_after_scoped_readiness_rejects(self):
+        bridge=SimpleNamespace(metadata=game_ready.metadata,bound=game_ready.bound,ready=Mock(return_value={'scopedCandidateReady':True}))
+        responses=[b'a'*40,b'main',b'',b'b'*40]
+        with patch.object(h.Path,'absolute',return_value=self.control/'bin/ds3-runtime'),patch.object(h,'run',side_effect=responses),patch.object(h,'readiness_bridge',return_value=bridge):
             with self.assertRaisesRegex(RuntimeError,'clean_exact_main_required'):h.source_gate('a'*40)
     def test_runtime_external_symlink_and_critical_symlink_block(self):
         runtime=self.source/'runtime';(runtime/'outside').symlink_to(self.candidate)

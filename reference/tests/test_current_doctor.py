@@ -31,6 +31,38 @@ SENTINEL_RAW = (ROOT / C.ACCEPTANCE).read_bytes()
 SENTINEL = C.acceptance(SENTINEL_RAW)
 
 
+class FixtureCustodyCliTests(unittest.TestCase):
+    def test_existing_cli_fixed_status_and_retirement_dispatch_without_full_doctor(self):
+        for arguments, expected in ((['--fixture-custody-status'], None),
+                                    (['--retire-fixture-slot','3','--json'], 3)):
+            with self.subTest(arguments=arguments):
+                calls, output = [], []
+                def custody(slot):
+                    calls.append(slot)
+                    return {'scope':'disposable-vendor-fixture-custody','outstanding':1}
+                def vendor(*args, **kwargs):
+                    self.fail('unrelated vendor doctor invoked')
+                self.assertEqual(C.main(arguments, operation=vendor, custody_operation=custody,
+                                        emit=output.append), 0)
+                self.assertEqual(calls, [expected])
+                self.assertEqual(json.loads(output[0])['outstanding'], 1)
+
+    def test_invalid_slot_or_combined_lifecycle_flags_never_dispatch(self):
+        for arguments in (['--retire-fixture-slot','8'], ['--retire-fixture-slot','-1'],
+                          ['--retire-fixture-slot','/private/path'],
+                          ['--fixture-custody-status','--git-only']):
+            with self.subTest(arguments=arguments):
+                self.assertEqual(C.main(arguments, custody_operation=lambda slot:self.fail('dispatched'), emit=lambda value:None), 2)
+
+    def test_capacity_signal_redacted_and_specific(self):
+        from lib.vendor_fixture_custody import CustodyError
+        output = []
+        def capacity(slot):
+            raise CustodyError('fixture_capacity_required')
+        self.assertEqual(C.main(['--fixture-custody-status'], custody_operation=capacity, emit=output.append), 1)
+        self.assertEqual(json.loads(output[0])['reason'], 'fixture_capacity_required')
+
+
 def historical_blob(revision, path):
     result = subprocess.run(
         ("/usr/bin/git", "--no-pager", "--no-replace-objects", "-c",
@@ -822,6 +854,35 @@ class DoctorTests(unittest.TestCase):
         self.assertEqual(value["verdict"], "NEEDS_REVIEW")
         self.assertNotIn("private", output[0])
 
+    def test_retained_closed_fixture_is_diagnostic_not_live_child(self):
+        for handles in ([], [object()]):
+            self.fixture()
+            artifact = object.__new__(C.probe.Fixture)
+            artifact.handles = handles
+            error = OSError("private retained fixture")
+            error.child_settled, error.settlement_failed, error.source_handles_closed = True, False, True
+            error.retained_sources = (artifact,)
+            def closed_failure(_):
+                raise error
+            self.sentinel = closed_failure
+            out = self.rejected()
+            self.assertEqual(out.public['verdict'], 'NEEDS_REVIEW')
+            self.assertEqual(out.public['childSettled'], not handles)
+            self.assertEqual(out.public['sourceHandlesClosed'], not handles)
+            self.assertIs(out.errors[0].retained_sources[0], artifact)
+
+    def test_retained_fixture_public_projection_has_no_private_owner(self):
+        self.fixture()
+        result = self.sentinel(None)
+        result['retainedFixtureCount'] = 1
+        result['privateFixtureDispositions'] = ('/private/do-not-publish',)
+        self.sentinel = lambda _: result
+        value = self.invoke()
+        self.assertEqual(value['retainedFixtureCount'], 1)
+        self.assertEqual(value['fixtureDisposition'], 'manual-diagnosis-required')
+        self.assertEqual(value['verdict'], 'PASS')
+        self.assertNotIn('/private/do-not-publish', json.dumps(C.public_report(value)))
+
     def test_callback_closure_missing_wrong_type_or_retained_owner_stays_unknown(self):
         changes = (("child_settled", None), ("child_settled", 1),
                    ("settlement_failed", None), ("settlement_failed", 0), ("settlement_failed", True),
@@ -1277,6 +1338,27 @@ class NativeGitSourceTests(unittest.TestCase):
              patch.object(C.D.R.catalog.subprocess, "Popen", side_effect=AssertionError("native forbidden")):
             self.assertEqual(git._text("rev-parse", "--verify", "HEAD"), "fake")
         self.assertEqual(len(seen), 1)
+
+    def test_current_git_transport_accepts_only_exact_observed_temp_warning(self):
+        git = C.NativeGit('/fake/home', '/fake/repo', Budget())
+        def result(stderr, code=0):
+            return SimpleNamespace(returncode=code, stdout=b'a'*40+b'\n', stderr=stderr)
+        for count in (0, 1, 2, 4):
+            with patch.object(C.D.process, 'command', return_value=result(git.TEMP_WARNING*count)):
+                self.assertEqual(git._text('rev-parse', '--verify', 'HEAD'), 'a'*40)
+        for stderr in (git.TEMP_WARNING*5, git.TEMP_WARNING+b'fatal: unsafe repository\n',
+                       b'unknown warning\n', git.TEMP_WARNING.rstrip(b'\n'),
+                       git.TEMP_WARNING.replace(b'code 5', b'code 13')):
+            with self.subTest(stderr=stderr), \
+                 patch.object(C.D.process, 'command', return_value=result(stderr)), self.assertRaises(ValueError):
+                git._text('rev-parse', '--verify', 'HEAD')
+        with patch.object(C.D.process, 'command', return_value=result(git.TEMP_WARNING, 1)):
+            with self.assertRaises(ValueError): git._text('rev-parse', '--verify', 'HEAD')
+            self.assertEqual(git._read('merge-base', '--is-ancestor', 'a'*40, 'b'*40, allow_one=True)[0], 1)
+        # The installed/historical verifier is not modified to obtain a PASS.
+        old = C.D.NativeGit('/fake/home', '/fake/repo', Budget())
+        with patch.object(C.D.process, 'command', return_value=result(git.TEMP_WARNING)), self.assertRaises(ValueError):
+            old._text('rev-parse', '--verify', 'HEAD')
 
     def test_lazy_native_wiring_uses_mock_module_exact_doctor_and_mode(self):
         for mode in (False, True):

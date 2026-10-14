@@ -7,14 +7,30 @@ local verifier remains the bootstrap boundary. Nothing here grants apply/trust.
 """
 from lib import config_transitions as F
 from lib import config_transition_source as S
+from lib import current_source_checkpoint as K
 from lib.config_transition_git import _Objects, _identity
 
 MIGRATION_PREVIOUS = "60daf6e2a82b818630acbe3282ca507fb99b7013"
 MIGRATION_PATH = "evidence/config-transitions/global-harness-simplification/acceptance.json"
 PREVIOUS_RECEIPT = "evidence/config-transitions/wine-operation-readiness/acceptance.json"
 MAX_MIGRATION_COMMITS = 128
+OWNER_FIRST_WAVE_PATH = "evidence/config-transitions/owner-first-harness-wave/acceptance.json"
+# Existing accepted Git objects, not a pin to this still-unaccepted candidate.
+# Activation additionally requires the separately registered and reviewed wave
+# transition. A present malformed receipt never falls back to migration replay.
+CHECKPOINT_BINDING = {
+    "commit": "94e0e1999c208aaf4112b611bbfa5c8b65111419",
+    "tree": "897033ec4fc445fd8c53efdbe0dec61987bc6a8c",
+    "receipt": MIGRATION_PATH,
+    "blob": "fc48b8bff18ed15be8790466149f065f694784ee",
+    "reviewed": "77df451b1222d3a5cda5a31d5165f32de89e211d",
+    "reviewed_tree": "c227276d8f3d8f868c6adbc89db64d2fd98c50a8",
+    "previous": MIGRATION_PREVIOUS,
+    "previous_receipt": PREVIOUS_RECEIPT,
+}
 CURRENT_CORE = frozenset(("bin/system-revision-status", "tests/test_system_revision_status.py",
     "tests/test_current_source_admission.py", "tests/test_current_source_doctor.py",
+    "tests/test_current_source_checkpoint.py",
     "tests/test_prepare_productivity_apply.py", "tests/test_project_context_boundary.py",
     "docs/current-source-admission.md", "docs/harness-operations.md"))
 
@@ -25,6 +41,8 @@ def included(tree):
 
 def observe(git, head, current):
     """Read only fixed migration objects plus the actual current tree identity."""
+    if OWNER_FIRST_WAVE_PATH in current:
+        return K.observe(git, head, current, CHECKPOINT_BINDING)
     F._oid(head)
     F._tree(current)
     o = _Objects(git)
@@ -65,6 +83,10 @@ def observe(git, head, current):
 
 
 def admit(observation, head, current):
+    if OWNER_FIRST_WAVE_PATH in current:
+        result = checkpoint_admission(observation, head, current)
+        return dict(_admit_tree(result["checkpointTree"], current, result["rules"]),
+                    headReviewed=head == result["checkpoint"], checkpoint=result["checkpoint"])
     F._keys(observation, ("checkpoint", "checkpointTree", "raw", "baseTree",
                           "candidates", "reviewedTreeId", "head", "ancestor"))
     F.require(observation["head"] == head and observation["ancestor"] is True,
@@ -110,6 +132,10 @@ def admit_tree(checkpoint, current):
     F.require(registration is not None and registration["previous_commit"] == MIGRATION_PREVIOUS,
               "migration_not_registered")
     rules = registration["after"]
+    return _admit_tree(checkpoint, current, rules)
+
+
+def _admit_tree(checkpoint, current, rules):
     rules = dict(rules, protected_paths=rules["protected_paths"] | (CURRENT_CORE & checkpoint.keys()))
     F.validate_candidate(checkpoint, current, "configuration", **rules)
     S.import_scope(checkpoint, current)
@@ -133,6 +159,28 @@ def admit_tree(checkpoint, current):
     return {"accepted": True, "absent": tuple(sorted(absent))}
 
 
+def checkpoint_admission(observation, head, current):
+    """Source-only proof shared by doctor, reviewed-root preparation and witnesses."""
+    F.require(OWNER_FIRST_WAVE_PATH in current, "checkpoint_successor_not_present")
+    pin = observation.get("pinTree", {}) if type(observation) is dict else {}
+    updates = S.policy_updates(pin)
+    F.require(OWNER_FIRST_WAVE_PATH in updates
+              and updates[OWNER_FIRST_WAVE_PATH]["previous_commit"] == CHECKPOINT_BINDING["commit"],
+              "checkpoint_successor_not_registered")
+    registration = updates.get(MIGRATION_PATH)
+    F.require(registration is not None, "migration_not_registered")
+    rules = registration["after"]
+    rules = dict(rules, protected_paths=rules["protected_paths"] | (CURRENT_CORE & pin.keys()))
+    return K.admit(observation, head, current, CHECKPOINT_BINDING, rules, updates)
+
+
+def reviewed_target(git, head, current):
+    """Require exact independently reviewed aggregate HEAD, not a routine tail."""
+    result = checkpoint_admission(observe(git, head, current), head, current)
+    F.require(result["checkpoint"] == head, "root_target_requires_independent_review")
+    return True
+
+
 def admitted_revision(git, commit, *, accepted=True):
     """On-demand marker/witness check without replaying historical transitions."""
     F._oid(commit)
@@ -141,6 +189,14 @@ def admitted_revision(git, commit, *, accepted=True):
     current = git._tree(head)
     observation = observe(git, head, current)
     admit(observation, head, current)
+    if OWNER_FIRST_WAVE_PATH in current:
+        result = checkpoint_admission(observation, head, current)
+        if commit in result["candidateRevisions"]:
+            F.require(not accepted or commit in result["admittedRevisions"], "revision_not_accepted")
+            return True
+        # Pre-pin history retains the exact historical sole-receipt witness.
+        observation = {"checkpoint": CHECKPOINT_BINDING["commit"],
+                       "checkpointTree": observation["pinTree"]}
     checkpoint = observation["checkpoint"]
     F.require(git._read("merge-base", "--is-ancestor", commit, head, allow_one=True)[0] == 0,
               "revision_not_ancestor")

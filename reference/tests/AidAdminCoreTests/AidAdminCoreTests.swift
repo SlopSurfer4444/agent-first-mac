@@ -12,6 +12,7 @@ private let toolStore = "/nix/store/22222222222222222222222222222222-aid-admin-t
 private let versionStore = "/nix/store/44444444444444444444444444444444-darwin-version.json"
 private let secondVersionStore = "/nix/store/55555555555555555555555555555555-darwin-version.json"
 private let narHash = "sha256:" + String(repeating: "1", count: 52)
+private let fixtureBoot = String(repeating: "e", count: 64)
 
 private func darwinVersionData(configurationRevision: String) -> Data {
     Data(("""
@@ -55,6 +56,12 @@ private final class FakeRunner: CommandRunning {
     var rollbackStatus: Int32 = 0
     var mutateOnProfileFailure = true
     var postApplyVerificationFailure = false
+    var checkoutDriftAfterActivation = false
+    var duringMutation: (() throws -> Void)?
+    var afterActivation: (() throws -> Void)?
+    var postValidationUnknown = false
+    var activationUnknown = false
+    private var activationAttempted = false
     var rollbackVerificationFailure = false
     var driftNixStoreAfterFirstInvocation = false
     var root: URL?
@@ -63,6 +70,14 @@ private final class FakeRunner: CommandRunning {
 
     func run(executable: String, arguments: [String], environment: [String: String]) throws -> CommandResult {
         invocations.append((executable, arguments, environment))
+        if executable.hasSuffix("/bin/launchctl") {
+            if arguments == ["print", "system"] { return CommandResult(status: 0, output: "system = {\n}\n") }
+            if arguments == ["print-disabled", "system"] { return CommandResult(status: 0, output: "disabled services = {\n}\n") }
+            if arguments == ["print", "system/org.nixos.activate-system"] {
+                let path = try physical("/Library/LaunchDaemons/org.nixos.activate-system.plist").path
+                return CommandResult(status: 0, output: "system/org.nixos.activate-system = {\n\tpath = \(path)\n\tprogram = /bin/sh\n\targuments = {\n\t\t/bin/sh\n\t\t-c\n\t\tfixture-boot\n\t}\n\tstate = not running\n\truns = 1\n}\n")
+            }
+        }
         if executable.hasSuffix("/usr/bin/git") {
             if arguments.contains("cat-file") && gitFault == .unreachable {
                 return CommandResult(status: 1, output: "")
@@ -78,6 +93,9 @@ private final class FakeRunner: CommandRunning {
             return CommandResult(status: 0, output: "")
         }
         if executable.hasSuffix("/nix-store") {
+            if postValidationUnknown && activationAttempted {
+                throw BrokerFailure.rejected("process_unknown_needs_reconcile")
+            }
             nixStoreInvocations += 1
             if driftNixStoreAfterFirstInvocation && nixStoreInvocations == 1 {
                 try replaceToolApplet("nix-store", destination: "nix-malicious")
@@ -88,6 +106,7 @@ private final class FakeRunner: CommandRunning {
             }
         }
         if executable.hasSuffix("/nix-env") {
+            try duringMutation?()
             if profileSetStatus == 0 || mutateOnProfileFailure { try createTargetGeneration() }
             return CommandResult(status: profileSetStatus, output: "profile-output-must-not-be-audited")
         }
@@ -96,7 +115,12 @@ private final class FakeRunner: CommandRunning {
             return CommandResult(status: rollbackStatus, output: "rollback-output-must-not-be-audited")
         }
         if executable.hasSuffix("/darwin-rebuild"), arguments == ["--switch-generation", "2"] {
+            activationAttempted = true
+            if activationUnknown { throw BrokerFailure.rejected("process_unknown_needs_reconcile") }
+            try createTargetGeneration()
             if activationStatus == 0 { try activateTarget(sabotage: postApplyVerificationFailure) }
+            if checkoutDriftAfterActivation { gitFault = .dirty }
+            try afterActivation?()
             return CommandResult(status: activationStatus, output: "activation-output-must-not-be-audited")
         }
         return CommandResult(status: 99, output: "unexpected")
@@ -160,6 +184,53 @@ private final class PreFailingAuditWriter: AuditWriting {
     }
 }
 
+private func prepareResumeHomeManagerFixture(_ fixture: Fixture) throws {
+    let wrapper = "/nix/store/" + String(repeating: "6", count: 32) + "-activation-agentowner"
+    let generation = "/nix/store/" + String(repeating: "7", count: 32) + "-home-manager-generation"
+    let fonts = "/nix/store/" + String(repeating: "8", count: 32) + "-home-manager-fonts"
+    let marker = "/nix/store/" + String(repeating: "9", count: 32) + "-font-marker"
+    let rsync = "/nix/store/" + String(repeating: "a", count: 32) + "-rsync-3.4.4/bin/rsync"
+    let home = "/Users/agentowner"
+    let destination = home + "/Library/Fonts/HomeManager"
+    func write(_ path: String, _ text: String, mode: mode_t = 0o444) throws {
+        let url = fixture.physical(path)
+        try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+        chmod(url.path, 0o644)
+        try Data(text.utf8).write(to: url)
+        chmod(url.path, mode)
+    }
+    let targetScript = try String(contentsOf: fixture.physical(targetStore + "/activate"), encoding: .utf8)
+    try write(targetStore + "/activate", targetScript + "launchctl asuser \"$(id -u agentowner)\" sudo -u agentowner --set-home \"${hmDryRunArgs[@]}\" " + wrapper + "\n", mode: 0o555)
+    try write(wrapper, "#!/nix/store/" + String(repeating: "b", count: 32) + "-bash/bin/bash\n\nexec " + generation + "/activate --driver-version 1 >&2\n")
+    try write(marker, fonts)
+    let activation = """
+    _iNote "Activating %s" "checkFilesChanged"
+    _cmp \(marker) \(home)/Library/Fonts/.home-manager-fonts-version \\
+      && changedFiles[Library/Fonts/.home-manager-fonts-version]=0 \\
+      || changedFiles[Library/Fonts/.home-manager-fonts-version]=1
+    _iNote "Activating %s" "linkGeneration"
+    # only synthetic files, never executed
+    _iNote "Activating %s" "onFilesChange"
+    if (( ${changedFiles[Library/Fonts/.home-manager-fonts-version]} == 1 )); then
+      if [[ -v DRY_RUN || -v VERBOSE ]]; then
+        echo "Running onChange hook for" Library/Fonts/.home-manager-fonts-version
+      fi
+      if [[ ! -v DRY_RUN ]]; then
+        run mkdir -p \(destination)
+    run \(rsync) $VERBOSE_ARG -acL --chmod=u+w --delete \\
+      \(fonts)/share/fonts/ \(destination)
+
+      fi
+    fi
+
+    _iNote "Activating %s" "setupLaunchAgents"
+    """
+    try write(generation + "/activate", activation)
+    try FileManager.default.createDirectory(at: fixture.physical(fonts + "/share/fonts"), withIntermediateDirectories: true)
+    try FileManager.default.createDirectory(at: fixture.physical(destination), withIntermediateDirectories: true)
+    for path in [generation, fonts, fonts + "/share", fonts + "/share/fonts"] { chmod(fixture.physical(path).path, 0o555) }
+}
+
 private final class Fixture {
     let root: URL
     let uid = getuid()
@@ -191,10 +262,11 @@ private final class Fixture {
     }
 
     func broker(auditWriter: AuditWriting = AtomicAuditWriter(),
-                expectedHash: String? = nil, context alternate: RuntimeContext? = nil) -> AidAdminBroker {
+                expectedHash: String? = nil, context alternate: RuntimeContext? = nil,
+                boot: String = fixtureBoot, checkpoint: @escaping (String) throws -> Void = { _ in }) -> AidAdminBroker {
         AidAdminBroker(context: alternate ?? context, runner: runner, auditWriter: auditWriter,
                        expectedPolicyHash: expectedHash ?? policyHash,
-                       actionID: { actionID })
+                       actionID: { actionID }, operationCheckpoint: checkpoint, bootGeneration: { boot })
     }
 
     func physical(_ logical: String) -> URL {
@@ -800,14 +872,314 @@ struct AidAdminCoreTests {
         try expect(audit["outcome"] as? String == "post_apply_verification_failed_rolled_back")
     }
 
-    func testFinalAuditFailureRollsBackExactly() throws {
+    func testFinalAuditFailurePreservesCommitAndReconciles() throws {
         let fixture = try Fixture()
         let reason = try expectThrows {
             _ = try fixture.broker(auditWriter: ResultFailingAuditWriter()).applySystem(commit: commit)
         }
-        try expect(reason == "final_audit_failed_rolled_back")
-        try expect(try fixture.currentProfileIdentifier() == "1")
-        try expect(try fixture.currentSystemTarget().hasSuffix(URL(fileURLWithPath: previousStore).lastPathComponent))
+        try expect(reason == "applied_audit_incomplete_needs_reconcile")
+        try expect(try fixture.currentProfileIdentifier() == "2")
+        try expect(try fixture.currentSystemTarget().hasSuffix(URL(fileURLWithPath: targetStore).lastPathComponent))
+        try expect(fixture.broker().doctorRoot().verdict == "BLOCKED")
+        let before = fixture.runner.invocations.count
+        try expect(try fixture.broker().applySystem(commit: commit) == 0)
+        try expect(fixture.runner.invocations.dropFirst(before).allSatisfy {
+            !$0.0.hasSuffix("/nix-env") && !$0.0.hasSuffix("/darwin-rebuild")
+        })
+        try expect(fixture.broker().doctorRoot().verdict == "ROOT_CONTRACT_READY")
+    }
+
+    func testSealedApplyDoesNotRollbackForCheckoutDrift() throws {
+        let fixture = try Fixture()
+        fixture.runner.checkoutDriftAfterActivation = true
+        try expect(try fixture.broker().applySystem(commit: commit) == 0)
+        try expect(try fixture.currentProfileIdentifier() == "2")
+        try expect(fixture.runner.invocations.filter { $0.0.hasSuffix("/darwin-rebuild") }.count == 1)
+        let data = try Data(contentsOf: fixture.physical("/var/db/agent-first-mac/staging/operation.json"))
+        let journal = try JSONSerialization.jsonObject(with: data) as! [String: Any]
+        try expect(journal["sourceDrift"] as? Bool == true)
+        try expect(journal["phase"] as? String == "complete")
+    }
+
+    func testAuditFailureBoundariesNeverInvertVisibleApplied() throws {
+        for phase in ["before_open", "after_write", "after_file_sync", "after_rename", "after_directory_sync"] {
+            let fixture = try Fixture()
+            let writer = AtomicAuditWriter(checkpoint: { suffix, observed in
+                if suffix == "result" && observed == phase { throw BrokerFailure.rejected("fixture_audit_io") }
+            })
+            let reason = try expectThrows { _ = try fixture.broker(auditWriter: writer).applySystem(commit: commit) }
+            try expect(reason == "applied_audit_incomplete_needs_reconcile", phase)
+            try expect(try fixture.currentProfileIdentifier() == "2", phase)
+            try expect(fixture.runner.invocations.filter { $0.0.hasSuffix("/darwin-rebuild") }.count == 1)
+            if ["after_rename", "after_directory_sync"].contains(phase) {
+                let visible = try JSONSerialization.jsonObject(with: fixture.auditResult()) as! [String: Any]
+                try expect(visible["outcome"] as? String == "applied")
+            }
+            try expect(try fixture.broker().applySystem(commit: commit) == 0)
+            try expect(fixture.runner.invocations.filter { $0.0.hasSuffix("/darwin-rebuild") }.count == 1)
+        }
+    }
+
+    func testUnknownVerificationAndForeignPreviousNeverRollback() throws {
+        let unknown = try Fixture()
+        unknown.runner.postValidationUnknown = true
+        let reason = try expectThrows { _ = try unknown.broker().applySystem(commit: commit) }
+        try expect(reason == "verification_process_unknown_no_rollback")
+        try expect(unknown.runner.invocations.filter { $0.0.hasSuffix("/darwin-rebuild") }.count == 1)
+        try expect(try unknown.broker().inspectOperation()["state"] == "unknown")
+
+        let foreign = try Fixture()
+        foreign.runner.activationStatus = 23
+        foreign.runner.afterActivation = {
+            let previous = foreign.physical("/nix/var/nix/profiles/system-1-link")
+            try FileManager.default.removeItem(at: previous)
+            try FileManager.default.createSymbolicLink(atPath: previous.path,
+                withDestinationPath: foreign.physical(targetStore).path)
+        }
+        let foreignReason = try expectThrows { _ = try foreign.broker().applySystem(commit: commit) }
+        try expect(foreignReason == "previous_generation_drift_unknown_no_rollback")
+        try expect(foreign.runner.invocations.filter { $0.0.hasSuffix("/darwin-rebuild") }.count == 1)
+    }
+
+    func testExactTargetResumeLeavesDisabled() throws {
+        let newBoot = String(repeating: "f", count: 64)
+        let thirdBoot = String(repeating: "d", count: 64)
+        func resumeBroker(_ fixture: Fixture, auditWriter: AuditWriting = AtomicAuditWriter(), boot: String = fixtureBoot,
+                          checkpoint: @escaping (String) throws -> Void = { _ in }) -> AidAdminBroker {
+            let context = RuntimeContext(rootPrefix: fixture.root.path, trustedUID: fixture.uid, realUID: fixture.uid,
+                effectiveUID: 0, callerHome: fixture.physical("/Users/agentowner").path, callerIdentity: ownerIdentity,
+                currentExecutablePath: fixture.context.currentExecutablePath)
+            return fixture.broker(auditWriter: auditWriter, context: context, boot: boot, checkpoint: checkpoint)
+        }
+        func write(_ fixture: Fixture, _ logical: String, _ data: Data, _ mode: mode_t) throws {
+            let path = fixture.physical(logical)
+            try FileManager.default.createDirectory(at: path.deletingLastPathComponent(), withIntermediateDirectories: true)
+            if pathExistsIncludingSymlink(path.path) { chmod(path.path, 0o600) }
+            try data.write(to: path); chmod(path.path, mode)
+        }
+        func prepare(_ fixture: Fixture) throws {
+            let bootPlist: [String: Any] = ["Label": "org.nixos.activate-system",
+                "ProgramArguments": ["/bin/sh", "-c", "fixture-boot"], "RunAtLoad": true]
+            let bytes = try PropertyListSerialization.data(fromPropertyList: bootPlist, format: .xml, options: 0)
+            for target in [targetStore, previousStore] {
+                chmod(fixture.physical(target).path, 0o755)
+                for suffix in ["Library/LaunchAgents", "Library/LaunchDaemons", "user/Library/LaunchAgents"] {
+                    try FileManager.default.createDirectory(at: fixture.physical(target + "/" + suffix), withIntermediateDirectories: true)
+                }
+                try write(fixture, target + "/Library/LaunchDaemons/org.nixos.activate-system.plist", bytes, 0o444)
+                for suffix in ["Library/LaunchAgents", "Library/LaunchDaemons", "Library", "user/Library/LaunchAgents", "user/Library", "user"] {
+                    chmod(fixture.physical(target + "/" + suffix).path, 0o555)
+                }
+                chmod(fixture.physical(target).path, 0o555)
+            }
+            try write(fixture, "/bin/launchctl", Data("fixture launchctl".utf8), 0o555)
+            try write(fixture, "/Library/LaunchDaemons/org.nixos.activate-system.plist", bytes, 0o644)
+            let script = "# aid-admin-resume-windows-marker-guards-v1\n# aid-admin-resume-rustdesk-marker-guards-v1\n"
+            try write(fixture, targetStore + "/activate", Data(script.utf8), 0o555)
+            // Home Manager's synthetic immutable hook contract is populated below.
+            try prepareResumeHomeManagerFixture(fixture)
+            fixture.runner.postValidationUnknown = true
+            _ = try expectThrows { _ = try fixture.broker().applySystem(commit: commit) }
+            fixture.runner.postValidationUnknown = false
+            let sudoers = fixture.physical("/etc/sudoers.d/agent-first-mac-aid-admin")
+            try FileManager.default.moveItem(atPath: sudoers.path, toPath: sudoers.path + ".disabled")
+            try write(fixture, "/etc/agent-first-mac/aid-admin.disabled",
+                      Data("agent-first-mac-aid-admin-disabled-v1\n".utf8), 0o400)
+        }
+        func mutations(_ fixture: Fixture, after: Int) -> [(String, [String], [String: String])] {
+            fixture.runner.invocations.dropFirst(after).filter {
+                $0.0.hasSuffix("/nix-env") || $0.0.hasSuffix("/darwin-rebuild")
+            }
+        }
+        let success = try Fixture(); try prepare(success)
+        let before = success.runner.invocations.count
+        try expect(try expectThrows { _ = try resumeBroker(success).resumeInterruptedOperation(commit: commit) }
+                   == "resume_requires_changed_last_attempt_boot")
+        try expect(try resumeBroker(success, boot: newBoot).resumeInterruptedOperation(commit: commit) == "OPERATION_RESUMED_DISABLED")
+        try expect(mutations(success, after: before).count == 1, "already_current_resume_must_activate")
+        try expect(mutations(success, after: before).first?.1 == ["--switch-generation", "2"])
+        try expect(try success.broker(boot: newBoot).inspectOperation()["state"] == "resumed")
+        let after = success.runner.invocations.count
+        try expect(try resumeBroker(success, boot: newBoot).resumeInterruptedOperation(commit: commit) == "OPERATION_RESUMED_DISABLED")
+        try expect(mutations(success, after: after).isEmpty, "settled_resume_replayed")
+        try expect(!pathExistsIncludingSymlink(success.physical("/etc/sudoers.d/agent-first-mac-aid-admin").path))
+
+        for fault in ["activation_status", "activation_unknown", "postcondition", "postcondition_unknown"] {
+            let fixture = try Fixture(); try prepare(fixture)
+            if fault == "activation_status" { fixture.runner.activationStatus = 1 }
+            if fault == "activation_unknown" { fixture.runner.activationUnknown = true }
+            if fault == "postcondition" { fixture.runner.postApplyVerificationFailure = true }
+            if fault == "postcondition_unknown" {
+                fixture.runner.afterActivation = { fixture.runner.postValidationUnknown = true }
+            }
+            let start = fixture.runner.invocations.count
+            let reason = try expectThrows { _ = try resumeBroker(fixture, boot: newBoot).resumeInterruptedOperation(commit: commit) }
+            try expect(reason.hasPrefix("resume_failed_or_unknown_disabled:"), reason)
+            try expect(try fixture.broker(boot: newBoot).inspectOperation()["state"] == "unknown")
+            try expect(!mutations(fixture, after: start).contains(where: { $0.1 == ["--switch-generation", "1"] }), "resume_inverted")
+            fixture.runner.activationStatus = 0; fixture.runner.activationUnknown = false
+            fixture.runner.postApplyVerificationFailure = false; fixture.runner.postValidationUnknown = false
+            fixture.runner.afterActivation = nil
+            try expect(try expectThrows { _ = try resumeBroker(fixture, boot: newBoot).resumeInterruptedOperation(commit: commit) }
+                       == "resume_requires_changed_last_attempt_boot")
+            try expect(try resumeBroker(fixture, boot: thirdBoot).resumeInterruptedOperation(commit: commit) == "OPERATION_RESUMED_DISABLED")
+            try expect(try fixture.broker(boot: thirdBoot).inspectOperation()["resume_attempt_count"] == "2")
+        }
+        let audit = try Fixture(); try prepare(audit)
+        let writer = AtomicAuditWriter(checkpoint: { suffix, phase in
+            if suffix == "resume-1-result" && phase == "after_rename" { throw BrokerFailure.rejected("fixture_audit_error") }
+        })
+        try expect(try expectThrows {
+            _ = try resumeBroker(audit, auditWriter: writer, boot: newBoot).resumeInterruptedOperation(commit: commit)
+        } == "resumed_applied_audit_incomplete_disabled")
+        try expect(try audit.broker(boot: newBoot).inspectOperation()["state"] == "resume_committed")
+        let auditBefore = audit.runner.invocations.count
+        try expect(try resumeBroker(audit, boot: newBoot).resumeInterruptedOperation(commit: commit) == "OPERATION_RESUMED_DISABLED")
+        try expect(mutations(audit, after: auditBefore).isEmpty)
+
+        func childResume(_ fixture: Fixture, _ mode: String, _ phase: String) throws -> Int32 {
+            let process = Process()
+            process.executableURL = URL(fileURLWithPath: CommandLine.arguments[0])
+            process.arguments = ["--fixture-child", fixture.root.path, mode, phase]
+            try process.run(); process.waitUntilExit()
+            return process.terminationStatus
+        }
+        for phase in ["resume_pending", "resume_committed"] {
+            let fixture = try Fixture(); try prepare(fixture)
+            try expect(try childResume(fixture, "resume-crash", phase) == 86, "resume_crash_seam_missing")
+            try expect(try fixture.broker(boot: newBoot).inspectOperation()["state"] == phase)
+            let start = fixture.runner.invocations.count
+            if phase == "resume_pending" {
+                try expect(try expectThrows {
+                    _ = try resumeBroker(fixture, boot: newBoot).resumeInterruptedOperation(commit: commit)
+                } == "resume_requires_changed_last_attempt_boot")
+                try expect(mutations(fixture, after: start).isEmpty)
+                try expect(try resumeBroker(fixture, boot: thirdBoot).resumeInterruptedOperation(commit: commit) == "OPERATION_RESUMED_DISABLED")
+            } else {
+                try expect(try fixture.broker(boot: newBoot).inspectOperation()["next_action"] == "fresh_authenticated_exact_target_resume_audit_only")
+                try expect(try resumeBroker(fixture, boot: newBoot).resumeInterruptedOperation(commit: commit) == "OPERATION_RESUMED_DISABLED")
+                try expect(mutations(fixture, after: start).isEmpty, "committed_resume_replayed")
+            }
+        }
+        let busy = try Fixture(); try prepare(busy)
+        busy.runner.duringMutation = {
+            try expect(try childResume(busy, "resume-busy", "") == 0, "resume_competing_process_not_busy")
+        }
+        try expect(try resumeBroker(busy, boot: newBoot).resumeInterruptedOperation(commit: commit) == "OPERATION_RESUMED_DISABLED")
+
+        let drift = try Fixture(); try prepare(drift)
+        let driftStart = drift.runner.invocations.count
+        let driftReason = try expectThrows {
+            _ = try resumeBroker(drift, boot: newBoot, checkpoint: { phase in
+                if phase == "resume_pending" {
+                    try write(drift, "/Library/LaunchDaemons/org.nixos.activate-system.plist", Data("foreign after journal".utf8), 0o644)
+                }
+            }).resumeInterruptedOperation(commit: commit)
+        }
+        try expect(driftReason.hasPrefix("resume_failed_or_unknown_disabled:"), driftReason)
+        try expect(mutations(drift, after: driftStart).isEmpty, "preactivation_foreign_drift_mutated")
+        try expect(try drift.broker(boot: newBoot).inspectOperation()["state"] == "unknown")
+
+        let fontDrift = try Fixture(); try prepare(fontDrift)
+        let fontDriftPath = fontDrift.physical("/Users/agentowner/Library/Fonts/HomeManager/owner-added.ttf")
+        var fontDriftBefore = stat()
+        let fontDriftStart = fontDrift.runner.invocations.count
+        _ = try expectThrows {
+            _ = try resumeBroker(fontDrift, boot: newBoot, checkpoint: { phase in
+                if phase == "resume_pending" {
+                    try write(fontDrift, "/Users/agentowner/Library/Fonts/HomeManager/owner-added.ttf", Data("late foreign font".utf8), 0o644)
+                    try expect(lstat(fontDriftPath.path, &fontDriftBefore) == 0)
+                }
+            }).resumeInterruptedOperation(commit: commit)
+        }
+        var fontDriftAfter = stat()
+        try expect(lstat(fontDriftPath.path, &fontDriftAfter) == 0 && fontDriftBefore.st_ino == fontDriftAfter.st_ino)
+        try expect(try Data(contentsOf: fontDriftPath) == Data("late foreign font".utf8))
+        try expect(mutations(fontDrift, after: fontDriftStart).isEmpty, "late_foreign_font_activated")
+
+        for fault in ["schema1", "entry_guards", "retained_stage", "wrong_commit", "previous_generation", "foreign_fonts"] {
+            let fixture = try Fixture(); try prepare(fixture)
+            if fault == "schema1" {
+                let path = fixture.physical("/var/db/agent-first-mac/staging/operation.json")
+                var record = try JSONSerialization.jsonObject(with: Data(contentsOf: path)) as! [String: Any]
+                record["schema"] = 1
+                for key in ["bootGeneration", "previousNarHash", "targetNarHash", "previousRevision"] { record.removeValue(forKey: key) }
+                try JSONSerialization.data(withJSONObject: record, options: [.sortedKeys]).write(to: path)
+            }
+            if fault == "entry_guards" { try write(fixture, targetStore + "/activate", Data("old activate".utf8), 0o555) }
+            if fault == "retained_stage" { try FileManager.default.createDirectory(at: fixture.physical("/Applications/.gametomac-stage.retained"), withIntermediateDirectories: true) }
+            if fault == "foreign_fonts" {
+                try write(fixture, "/Users/agentowner/Library/Fonts/HomeManager/owner-added.ttf", Data("foreign owner font".utf8), 0o644)
+            }
+            if fault == "previous_generation" {
+                let path = fixture.physical("/nix/var/nix/profiles/system-1-link")
+                try FileManager.default.removeItem(at: path)
+                try FileManager.default.createSymbolicLink(atPath: path.path, withDestinationPath: fixture.physical(targetStore).path)
+            }
+            var fontBefore = stat()
+            if fault == "foreign_fonts" {
+                try expect(lstat(fixture.physical("/Users/agentowner/Library/Fonts/HomeManager/owner-added.ttf").path, &fontBefore) == 0)
+            }
+            let start = fixture.runner.invocations.count
+            _ = try expectThrows {
+                _ = try resumeBroker(fixture, boot: newBoot).resumeInterruptedOperation(commit: fault == "wrong_commit" ? tree : commit)
+            }
+            try expect(mutations(fixture, after: start).isEmpty, "resume_negative_mutated")
+            if fault == "foreign_fonts" {
+                var fontAfter = stat()
+                try expect(lstat(fixture.physical("/Users/agentowner/Library/Fonts/HomeManager/owner-added.ttf").path, &fontAfter) == 0 && fontBefore.st_ino == fontAfter.st_ino)
+                try expect(try Data(contentsOf: fixture.physical("/Users/agentowner/Library/Fonts/HomeManager/owner-added.ttf")) == Data("foreign owner font".utf8), "foreign_font_removed")
+            }
+            try expect(!pathExistsIncludingSymlink(fixture.physical("/etc/sudoers.d/agent-first-mac-aid-admin").path))
+        }
+    }
+
+    func testCrossProcessBusyAndCrashRecovery() throws {
+        let fixture = try Fixture()
+        func child(_ mode: String, _ phase: String = "") throws -> Int32 {
+            let process = Process()
+            process.executableURL = URL(fileURLWithPath: CommandLine.arguments[0])
+            process.arguments = ["--fixture-child", fixture.root.path, mode, phase]
+            process.standardOutput = FileHandle.nullDevice
+            process.standardError = FileHandle.nullDevice
+            try process.run(); process.waitUntilExit()
+            return process.terminationStatus
+        }
+        fixture.runner.duringMutation = {
+            try expect(try child("busy") == 0, "second_process_not_busy")
+        }
+        try expect(try fixture.broker().applySystem(commit: commit) == 0)
+
+        for phase in ["sealed", "profile_pending", "profile_ready", "activation_pending", "committed", "complete",
+                      "audit_after_write", "audit_after_rename"] {
+            let crashFixture = try Fixture()
+            let process = Process()
+            process.executableURL = URL(fileURLWithPath: CommandLine.arguments[0])
+            process.arguments = ["--fixture-child", crashFixture.root.path, "crash", phase]
+            try process.run(); process.waitUntilExit()
+            try expect(process.terminationStatus == 86, "crash_seam_not_reached_" + phase)
+            let inspect = try crashFixture.broker().inspectOperation()
+            try expect(inspect["state"] == (phase.hasPrefix("audit_") ? "committed" : phase))
+            let before = crashFixture.runner.invocations.count
+            if phase == "committed" || phase.hasPrefix("audit_") {
+                try expect(try crashFixture.broker().applySystem(commit: commit) == 0)
+                try expect(crashFixture.runner.invocations.dropFirst(before).allSatisfy {
+                    !$0.0.hasSuffix("/nix-env") && !$0.0.hasSuffix("/darwin-rebuild")
+                }, "duplicate_activation_on_reconcile")
+            } else if phase == "sealed" {
+                let reason = try expectThrows { _ = try crashFixture.broker().applySystem(commit: commit) }
+                try expect(reason == "interrupted_before_mutation_reconciled_no_apply")
+            } else if phase == "profile_ready" {
+                try expect(try crashFixture.broker().applySystem(commit: commit) == 70)
+                try expect(try crashFixture.currentProfileIdentifier() == "1")
+            } else if phase != "complete" {
+                let reason = try expectThrows { _ = try crashFixture.broker().applySystem(commit: commit) }
+                try expect(reason.contains("operation_unknown_requires_owner_reconciliation"))
+                try expect(crashFixture.runner.invocations.dropFirst(before).allSatisfy {
+                    !$0.0.hasSuffix("/nix-env") && !$0.0.hasSuffix("/darwin-rebuild")
+                }, "unknown_state_started_mutation")
+            }
+        }
     }
 
     func testRollbackCommandAndVerificationFailuresAreDistinct() throws {
@@ -844,6 +1216,32 @@ struct AidAdminCoreTests {
 @main
 struct TestMain {
     static func main() throws {
+        if CommandLine.arguments.count == 5 && CommandLine.arguments[1] == "--fixture-child" {
+            let root = CommandLine.arguments[2]
+            let mode = CommandLine.arguments[3]
+            let phase = CommandLine.arguments[4]
+            let runner = FakeRunner(); runner.root = URL(fileURLWithPath: root)
+            let policyBytes = try Data(contentsOf: URL(fileURLWithPath: root + "/etc/agent-first-mac/aid-admin-policy.json"))
+            let context = RuntimeContext(rootPrefix: root, trustedUID: getuid(), realUID: getuid(), effectiveUID: 0,
+                callerHome: root + (mode.hasPrefix("resume-") ? "/Users/agentowner" : "/home/agentowner"), callerIdentity: ownerIdentity,
+                currentExecutablePath: root + "/usr/local/libexec/aid-admin")
+            let writer = AtomicAuditWriter(checkpoint: { suffix, observed in
+                if mode == "crash" && suffix == "result" && phase == "audit_" + observed { _exit(86) }
+            })
+            let broker = AidAdminBroker(context: context, runner: runner, auditWriter: writer,
+                expectedPolicyHash: sha256Hex(policyBytes), actionID: { actionID },
+                operationCheckpoint: { observed in if (mode == "crash" || mode == "resume-crash") && observed == phase { _exit(86) } },
+                bootGeneration: { mode.hasPrefix("resume-") ? String(repeating: "f", count: 64) : fixtureBoot })
+            do {
+                if mode.hasPrefix("resume-") { _ = try broker.resumeInterruptedOperation(commit: commit) }
+                else { _ = try broker.applySystem(commit: commit) }
+                exit(90)
+            }
+            catch {
+                if (mode == "busy" || mode == "resume-busy") && String(describing: error) == "operation_busy" { exit(0) }
+                throw error
+            }
+        }
         let suite = AidAdminCoreTests()
         let tests: [(String, () throws -> Void)] = [
             ("commit_and_schema", suite.testCommitAndStrictSchemaRejections),
@@ -858,17 +1256,26 @@ struct TestMain {
             ("preaudit_and_gate", suite.testPreAuditAndPreparationGateNeverMutateProfile),
             ("activation_rollback", suite.testActivationFailureRollbackIsExactAndKeepsGeneration),
             ("post_verify_rollback", suite.testPostApplyVerificationFailureRollsBackExactly),
-            ("final_audit_rollback", suite.testFinalAuditFailureRollsBackExactly),
+            ("final_audit_reconcile", suite.testFinalAuditFailurePreservesCommitAndReconciles),
+            ("sealed_checkout_drift", suite.testSealedApplyDoesNotRollbackForCheckoutDrift),
+            ("audit_failure_boundaries", suite.testAuditFailureBoundariesNeverInvertVisibleApplied),
+            ("unknown_foreign_no_inverse", suite.testUnknownVerificationAndForeignPreviousNeverRollback),
+            ("exact_target_resume", suite.testExactTargetResumeLeavesDisabled),
+            ("cross_process_crash", suite.testCrossProcessBusyAndCrashRecovery),
             ("rollback_failure_distinction", suite.testRollbackCommandAndVerificationFailuresAreDistinct),
             ("profile_failure_rollback", suite.testProfileUpdateFailureAlsoRollsBackUncertainMutation),
         ]
+        var executed = 0
         for (name, test) in tests {
+            if CommandLine.arguments.count == 3 && CommandLine.arguments[1] == "--only" && name != CommandLine.arguments[2] { continue }
             do { try test() }
             catch {
                 FileHandle.standardError.write(Data("FAIL \(name): \(error)\n".utf8))
                 exit(1)
             }
+            executed += 1
         }
-        print("{\"result\":\"pass\",\"tests\":\(tests.count)}")
+        try expect(executed > 0, "no_tests_selected")
+        print("{\"result\":\"pass\",\"tests\":\(executed)}")
     }
 }

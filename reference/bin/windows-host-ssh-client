@@ -25,6 +25,7 @@ import tempfile
 
 
 ALIAS = "windows-host"
+PROXY = "/Applications/Tailscale.app/Contents/MacOS/tailscale nc %h %p"
 EXPECTED_FINGERPRINT = re.compile(r"^SHA256:[A-Za-z0-9+/]{20,}$")
 EXPECTED_USER = re.compile(r"^[A-Za-z0-9_.-]{1,64}$")
 
@@ -72,7 +73,7 @@ def resolve_windows_peer() -> str:
         check=True,
         stdout=subprocess.PIPE,
         stderr=subprocess.DEVNULL,
-        text=True,
+        text=True, timeout=15,
     )
     data = json.loads(proc.stdout)
     matches: list[str] = []
@@ -99,7 +100,7 @@ def scan_ed25519_host_key(host: str) -> tuple[str, str, str]:
         check=True,
         stdout=subprocess.PIPE,
         stderr=subprocess.DEVNULL,
-        text=True,
+        text=True, timeout=15,
     )
     rows = [line.split() for line in proc.stdout.splitlines()
             if line and not line.startswith("#")]
@@ -145,6 +146,96 @@ def render_alias_config(host: str, user: str) -> bytes:
         "  TCPKeepAlive yes\n"
         "  RequestTTY no\n"
     ).encode("utf-8")
+
+
+def render_proxy_config(host: str, user: str) -> bytes:
+    return render_alias_config(host, user) + (
+        f"  ProxyCommand {PROXY}\n"
+        "  HostKeyAlgorithms ssh-ed25519\n"
+        "  GlobalKnownHostsFile /dev/null\n"
+        "  BatchMode yes\n"
+        "  ConnectTimeout 10\n"
+    ).encode()
+
+
+def replace_exact(path: Path, expected: bytes, replacement: bytes) -> None:
+    if (not path.is_file() or path.is_symlink()
+            or path.stat().st_mode & 0o777 != 0o600
+            or path.read_bytes() != expected or path.parent.is_symlink()):
+        fail("transport_target_drift")
+    descriptor, staged = tempfile.mkstemp(prefix=".windows-host.", dir=path.parent)
+    try:
+        os.fchmod(descriptor, 0o600)
+        with os.fdopen(descriptor, "wb") as handle:
+            handle.write(replacement)
+            handle.flush()
+            os.fsync(handle.fileno())
+        if path.is_symlink() or path.read_bytes() != expected:
+            fail("transport_concurrent_drift")
+        os.replace(staged, path)
+    finally:
+        if os.path.exists(staged):
+            os.unlink(staged)
+
+
+def transport_restore(paths: dict[str, Path]) -> None:
+    journal = paths["state"] / "transport-backup.json"
+    if not journal.is_file() or journal.is_symlink() or journal.stat().st_mode & 0o777 != 0o600:
+        fail("transport_backup_missing_or_unsafe")
+    data = json.loads(journal.read_text())
+    replacements = []
+    for name in ("alias", "receipt"):
+        old = base64.b64decode(data[name]["before"], validate=True)
+        new = base64.b64decode(data[name]["after"], validate=True)
+        path = paths[name]
+        if not path.is_file() or path.is_symlink() or path.stat().st_mode & 0o777 != 0o600:
+            fail("transport_recovery_drift")
+        current = path.read_bytes()
+        if current not in (old, new):
+            fail("transport_recovery_drift")
+        replacements.append((path, current, old))
+    # Validate both before restoring either; retain journal for interrupted recovery.
+    for path, current, old in replacements:
+        replace_exact(path, current, old)
+    journal.unlink()
+
+
+def migrate_transport() -> bool:
+    paths = layout(canonical_home())
+    validate_key_prestate(paths)
+    receipt = load_receipt(paths)
+    if not exact_managed(paths, receipt):
+        fail("managed_bytes_drift")
+    if receipt.get("transport") == "tailscale-nc":
+        doctor()
+        return False
+    if "transport" in receipt:
+        fail("unsupported_transport")
+    old_alias = render_alias_config(receipt["host"], receipt["user"])
+    if paths["alias"].read_bytes() != old_alias:
+        fail("legacy_alias_not_exact")
+    tailscale_cli()
+    new_alias = render_proxy_config(receipt["host"], receipt["user"])
+    old_receipt = paths["receipt"].read_bytes()
+    receipt["transport"] = "tailscale-nc"
+    receipt["managed"]["alias"] = sha256_bytes(new_alias)
+    new_receipt = (json.dumps(receipt, sort_keys=True) + "\n").encode()
+    journal = paths["state"] / "transport-backup.json"
+    # A prior interrupted transaction must be explicitly recovered, never overwritten.
+    backup = {}
+    for name, before, after in (("alias", old_alias, new_alias),
+                                ("receipt", old_receipt, new_receipt)):
+        backup[name] = {"before": base64.b64encode(before).decode(),
+                        "after": base64.b64encode(after).decode()}
+    atomic_write(journal, (json.dumps(backup, sort_keys=True) + "\n").encode(), 0o600)
+    try:
+        replace_exact(paths["alias"], old_alias, new_alias)
+        replace_exact(paths["receipt"], old_receipt, new_receipt)
+        doctor()
+    except Exception:
+        transport_restore(paths)
+        raise
+    return True
 
 
 def atomic_write(path: Path, data: bytes, mode: int) -> None:
@@ -293,24 +384,62 @@ def doctor() -> None:
     current_host = resolve_windows_peer()
     if current_host != receipt["host"]:
         fail("runtime_peer_drift")
-    _, _, public_body = scan_ed25519_host_key(current_host)
-    if public_blob_fingerprint(public_body) != receipt["hostFingerprint"]:
+    proxy = receipt.get("transport") == "tailscale-nc"
+    if receipt.get("transport") not in (None, "tailscale-nc"):
+        fail("unsupported_transport")
+    # Enrollment still keyscans and checks the independent fingerprint. Routine
+    # health instead validates that exact pin and lets strict SSH authenticate
+    # the actual peer; another unauthenticated scan adds no stronger identity.
+    rows = paths["known"].read_text().splitlines()
+    if len(rows) != 1:
+        fail("known_host_pin_invalid")
+    row = rows[0].split()
+    if len(row) != 3 or row[1] != "ssh-ed25519":
+        fail("known_host_pin_invalid")
+    parts = row[0].split("|")
+    try:
+        if len(parts) != 4 or parts[:2] != ["", "1"]:
+            fail("known_host_pin_invalid")
+        salt, host_digest = (base64.b64decode(value, validate=True) for value in parts[2:])
+    except ValueError as exc:
+        raise ProfileError("known_host_pin_invalid") from exc
+    if (len(salt) != 20 or len(host_digest) != 20
+            or not hmac.compare_digest(host_digest, hmac.new(
+                salt, current_host.encode(), hashlib.sha1).digest())
+            or public_blob_fingerprint(row[2]) != receipt["hostFingerprint"]):
         fail("pinned_host_key_drift")
+    expected_alias = (render_proxy_config if proxy else render_alias_config)(
+        current_host, receipt["user"])
+    if (paths["alias"].read_bytes() != expected_alias
+            or paths["main"].read_bytes() != render_main_config()):
+        fail("managed_policy_drift")
     effective = subprocess.run(
         ["/usr/bin/ssh", "-G", ALIAS], check=True,
-        stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True,
-    ).stdout.lower().splitlines()
+        stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, timeout=10,
+    ).stdout.splitlines()
     required = {
         "stricthostkeychecking true",
         "passwordauthentication no",
         "kbdinteractiveauthentication no",
         "identitiesonly yes",
         "forwardagent no",
+        "preferredauthentications publickey",
+        "pubkeyauthentication yes",
     }
+    if proxy:
+        required.update({f"proxycommand {PROXY}", "hostkeyalgorithms ssh-ed25519",
+                         "globalknownhostsfile /dev/null", "batchmode yes",
+                         f"userknownhostsfile {paths['known']}"})
     if not required.issubset(set(effective)):
         fail("effective_ssh_policy_drift")
     smoke = subprocess.run(
-        ["/usr/bin/ssh", "-T", ALIAS, "printf BRIDGE_STRICT_OK"],
+        ["/usr/bin/ssh", "-T", "-o", "BatchMode=yes",
+         "-o", "StrictHostKeyChecking=yes", "-o", "HostKeyAlgorithms=ssh-ed25519",
+         "-o", f"UserKnownHostsFile={paths['known']}", "-o", "GlobalKnownHostsFile=/dev/null",
+         "-o", "PreferredAuthentications=publickey", "-o", "PasswordAuthentication=no",
+         "-o", "KbdInteractiveAuthentication=no", "-o", "IdentitiesOnly=yes",
+         "-o", "ForwardAgent=no", "-o", "PermitLocalCommand=no",
+         ALIAS, "printf BRIDGE_STRICT_OK"],
         check=True, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
         text=True, timeout=20,
     ).stdout
@@ -343,6 +472,8 @@ def parser() -> argparse.ArgumentParser:
         item.add_argument("--user", required=True)
     sub.add_parser("doctor")
     sub.add_parser("rollback")
+    sub.add_parser("migrate-transport")
+    sub.add_parser("restore-transport")
     return result
 
 
@@ -361,6 +492,13 @@ def main() -> int:
             print("doctor_pass=true")
             print("strict_host_key_checking=true")
             print("key_only_smoke=true")
+        elif args.command == "migrate-transport":
+            changed = migrate_transport()
+            print("transport_pass=true")
+            print(f"transport_noop={'false' if changed else 'true'}")
+        elif args.command == "restore-transport":
+            transport_restore(layout(canonical_home()))
+            print("transport_restore_pass=true")
         elif args.command == "rollback":
             rollback()
             print("rollback_pass=true")

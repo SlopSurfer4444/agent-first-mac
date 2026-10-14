@@ -20,8 +20,8 @@ Git. Public reference files confer no permission to change a host.
 `reference/` preserves implementation source with personal names and aliases
 replaced. It is deliberately not the accepted control repository. Private Git
 history, acceptance evidence, installation bundles and selected host manifests
-are absent. Other manifests are relocated and wrapped as examples so the runtime
-cannot discover them as operational configuration. Historical fixed hashes and
+are absent. Authored public examples live outside runtime discovery and are not
+installation inputs. Historical fixed hashes and
 cross-references may be unresolved; they must not be replaced with invented PASS
 records. Original operating notes and incident history are not distributed.
 

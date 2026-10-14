@@ -11,7 +11,10 @@ class AdmissionTests(unittest.TestCase):
         self.temp=tempfile.TemporaryDirectory();self.home=Path(self.temp.name).resolve()
         (self.home/'AIDev/state').mkdir(parents=True,mode=0o700)
         self.request=h.Admission(self.home,'prince')
-        self.patches=[patch.object(h.Admission,'start_watch'),patch.object(h.Admission,'processes',return_value=[])]
+        self.identity=lambda pid:{'pid':pid,'birth':'100:1','group':pid}
+        self.patches=[patch.object(h.Admission,'start_watch'),patch.object(h.Admission,'processes',return_value=[]),
+                      patch.object(h.Admission,'process_groups',return_value=[]),patch.object(h,'boot_identity',return_value='b'*64),
+                      patch.object(h,'process_identity',side_effect=self.identity)]
         for fixture_patch in self.patches:fixture_patch.start()
     def tearDown(self):
         for fixture_patch in reversed(self.patches):fixture_patch.stop()
@@ -24,43 +27,44 @@ class AdmissionTests(unittest.TestCase):
         self.assertEqual(self.request.pending.read_bytes(),before)
     def test_pending_alive_child_blocks_during_delayed_server_start(self):
         with self.request.locked():self.request.begin();self.request.dispatched([Mock(pid=123)])
-        with patch.object(h.Admission,'active',return_value=False),patch.object(h.os,'kill') as kill:
+        with patch.object(h.Admission,'active',return_value=False),patch.object(h,'process_identity',side_effect=lambda pid:self.identity(pid) if pid==123 else None):
             with self.assertRaisesRegex(h.Blocked,'launch_in_progress'):h.Admission(self.home,'ds3').begin()
-        kill.assert_called_once_with(123,0)
     def test_active_helper_or_prewarm_server_does_not_release_pending(self):
         self.request.begin();self.request.dispatched([Mock(pid=123)])
-        with patch.object(h.Admission,'active',return_value=True),patch.object(h.os,'kill'):
+        with patch.object(h.Admission,'active',return_value=True),patch.object(h,'process_identity',side_effect=lambda pid:self.identity(pid) if pid==123 else None):
             with self.assertRaisesRegex(h.Blocked,'launch_in_progress'):h.Admission(self.home,'cs2').begin()
         self.assertTrue(self.request.pending.exists())
-        with patch.object(h.Admission,'active',return_value=True),patch.object(h.os,'kill',side_effect=ProcessLookupError):
+        with patch.object(h.Admission,'active',return_value=True),patch.object(h,'process_identity',return_value=None):
             with self.assertRaisesRegex(h.Blocked,'profile_active'):h.Admission(self.home,'cs2').begin()
         self.assertTrue(self.request.pending.exists())
-    def test_stale_known_child_requires_all_prefixes_and_process_absence(self):
+    def test_stale_known_child_requires_reserved_prefix_and_descendant_absence(self):
         self.request.begin();self.request.dispatched([Mock(pid=123)])
-        with patch.object(h.os,'kill',side_effect=ProcessLookupError),patch.object(h.Admission,'active',return_value=False) as active,patch.object(h.subprocess,'run',return_value=Mock(returncode=0,stdout=b'/Applications/Steam.app/Contents/MacOS/steam_osx\n')):
+        with patch.object(h,'process_identity',return_value=None),patch.object(h.Admission,'active',return_value=False) as active:
             self.request.reconcile()
-        self.assertEqual([c.args[0] for c in active.call_args_list],['prince','cs2','ds3','prince']);self.assertFalse(self.request.pending.exists())
+        self.assertEqual([c.args[0] for c in active.call_args_list],['prince']);self.assertFalse(self.request.pending.exists())
     def test_unknown_request_explicit_recovery_refuses_running_wine(self):
         self.request.begin();before=self.request.pending.read_bytes()
-        with patch.object(h.Admission,'active',return_value=False),patch.object(h.Admission,'processes',return_value=[(1,'/owned/engine/bin/wine')]):
+        runtime=self.home/'Library/Application Support/Adapted Games/runtime/engine/bin/wine'
+        with patch.object(h,'process_identity',return_value=None),patch.object(h.Admission,'active',return_value=False),patch.object(h.Admission,'process_groups',return_value=[(1,0,1,str(runtime))]):
             with self.assertRaisesRegex(h.Blocked,'pending_launch_unconfirmed'):self.request.recover()
         self.assertEqual(self.request.pending.read_bytes(),before)
     def test_unknown_recovery_blocks_preloader_and_arbitrary_windows_child(self):
         self.request.begin()
-        for row in ('/runtime/wine64-preloader','/runtime/wine-preloader','[wine64]','(wine64-preloader)','[steam.exe]','/prefix/cs2.exe','/prefix/DarkSoulsIII.exe'):
-            with self.subTest(row=row),patch.object(h.Admission,'active',return_value=False),patch.object(h.Admission,'processes',return_value=[(1,row)]):
+        client,_=self.request.paths()
+        for row in ('[wine64]','(wine64-preloader)','[steam.exe]',str(client.parent/'unknown.exe')):
+            with self.subTest(row=row),patch.object(h,'process_identity',return_value=None),patch.object(h.Admission,'active',return_value=False),patch.object(h.Admission,'process_groups',return_value=[(1,0,1,row)]):
                 with self.assertRaisesRegex(h.Blocked,'pending_launch_unconfirmed'):self.request.recover()
             self.assertTrue(self.request.pending.exists())
     def test_explicit_recovery_safe_noop_after_success(self):
         self.request.begin()
-        with patch.object(h.Admission,'active',return_value=False),patch.object(h.subprocess,'run',return_value=Mock(returncode=0,stdout=b'')):
+        with patch.object(h,'process_identity',return_value=None),patch.object(h.Admission,'active',return_value=False):
             self.assertEqual(self.request.recover()['state'],'PENDING_LAUNCH_RECOVERED')
         self.assertEqual(self.request.recover()['state'],'NO_PENDING_LAUNCH')
-    def test_recovery_does_not_clear_alive_child_or_active_other_prefix(self):
+    def test_recovery_does_not_clear_alive_child_or_active_target_prefix(self):
         self.request.begin();self.request.dispatched([Mock(pid=123)])
-        with patch.object(h.os,'kill'):
+        with patch.object(h,'process_identity',side_effect=lambda pid:self.identity(pid) if pid==123 else None):
             with self.assertRaisesRegex(h.Blocked,'launch_in_progress'):self.request.recover()
-        with patch.object(h.os,'kill',side_effect=ProcessLookupError),patch.object(h.Admission,'active',side_effect=[False,True]):
+        with patch.object(h,'process_identity',return_value=None),patch.object(h.Admission,'active',return_value=True):
             with self.assertRaisesRegex(h.Blocked,'profile_active'):self.request.recover()
         self.assertTrue(self.request.pending.exists())
     def test_pending_symlink_hardlink_invalid_json_and_pid_types_reject(self):
@@ -83,7 +87,7 @@ class AdmissionTests(unittest.TestCase):
         token=self.request.record()['request']
         with patch.object(h.Admission,'summary',return_value={'targetActive':True}) as summary:
             self.request.watch(token)
-        summary.assert_called_once_with('prince',goal='client');self.assertEqual(self.request.record()['phase'],'confirmed')
+        summary.assert_called_once_with('prince',processes=[],goal='client');self.assertEqual(self.request.record()['phase'],'confirmed')
         self.request.reconcile();self.assertFalse(self.request.pending.exists())
         self.request.begin();self.assertNotEqual(self.request.record()['request'],token)
     def test_cs2_steam_milestone_then_play_with_owned_client_open(self):
@@ -144,6 +148,106 @@ class AdmissionTests(unittest.TestCase):
         with patch.object(h.Admission,'active') as active:
             with self.assertRaisesRegex(h.Blocked,'pending_launch_unconfirmed'):self.request.begin()
         active.assert_not_called();self.assertEqual(self.request.record()['phase'],'prepared')
+    def test_reused_pid_and_new_group_are_not_old_launch_ownership(self):
+        self.request.begin();self.request.dispatched([Mock(pid=123)])
+        reused={'pid':123,'birth':'101:2','group':123}
+        with patch.object(h,'process_identity',side_effect=lambda pid:reused if pid==123 else None),patch.object(h.Admission,'active',return_value=False),patch.object(h.Admission,'process_groups',return_value=[(123,1,123,'/Applications/Unrelated.app/tool')]):
+            self.assertEqual(self.request.recover()['state'],'PENDING_LAUNCH_RECOVERED')
+    def test_reboot_does_not_bind_new_same_pid_but_target_still_blocks(self):
+        self.request.begin();self.request.dispatched([Mock(pid=123)])
+        with patch.object(h,'boot_identity',return_value='c'*64),patch.object(h,'process_identity') as identity,patch.object(h.Admission,'active',return_value=True):
+            with self.assertRaisesRegex(h.Blocked,'profile_active'):self.request.recover()
+        identity.assert_not_called()
+        with patch.object(h,'boot_identity',return_value='c'*64),patch.object(h.Admission,'active',return_value=False),patch.object(h.Admission,'process_groups',return_value=[(123,1,123,'/unrelated/tool.exe')]):
+            self.request.recover()
+    def test_dispatcher_and_orphaned_group_descendant_are_protected(self):
+        self.request.begin()
+        with self.assertRaisesRegex(h.Blocked,'launch_dispatcher_active'):self.request.recover()
+        self.request.dispatched([Mock(pid=123)])
+        with patch.object(h,'process_identity',return_value=None),patch.object(h.Admission,'active',return_value=False),patch.object(h.Admission,'process_groups',return_value=[(456,1,123,'/unknown/native-child')]):
+            with self.assertRaisesRegex(h.Blocked,'launch_descendant_active'):self.request.recover()
+    def test_scoped_recovery_ignores_unrelated_full_path_wine_app_and_other_retired_route(self):
+        self.request.begin()
+        def target_only(route):
+            self.assertEqual(route,'prince');return False
+        with patch.object(h,'process_identity',return_value=None),patch.object(h.Admission,'active',side_effect=target_only),patch.object(h.Admission,'process_groups',return_value=[(88,1,88,'/independent/prefix/tool.exe'),(89,1,88,'/independent/runtime/engine/bin/wine')]):
+            self.request.recover()
+    def test_absent_route_has_no_server_probe_but_dangling_resolver_is_unknown(self):
+        with patch.object(h.subprocess,'run',side_effect=AssertionError('no external process')):
+            self.assertFalse(self.request.active('ds3'))
+            resolver=self.home/'AIDev/bin/ds3-play';resolver.parent.mkdir();resolver.symlink_to('/absent/old/ds3-play')
+            with self.assertRaisesRegex(h.Blocked,'absent_route_has_resolver'):self.request.active('ds3')
+    def test_retired_route_metadata_is_explicit_and_unknown_archive_drift_blocks(self):
+        base=self.home/'Library/Application Support';namespace=base/'.Adapted Games DS3.lifecycle';namespace.mkdir(parents=True,mode=0o700)
+        archive=base/'Adapted Games DS3 retired aaaaaaaaaaaa';archive.mkdir(mode=0o700);facts=archive.lstat()
+        value={'schema':1,'owner':'control-ds3-marshal-fix','state':'complete','operation':'retire','direction':'forward','commit':'a'*40,
+               'binding':{'archive':str(archive),'rootIdentity':{'dev':facts.st_dev,'ino':facts.st_ino,'mode':0o700,'kind':'directory'}},'steps':[],'active':None,
+               'directoryIdentity':{'dev':namespace.stat().st_dev,'ino':namespace.stat().st_ino,'mode':0o700,'kind':'directory'}}
+        (namespace/'journal.json').write_text(json.dumps(value))
+        self.assertEqual(self.request.route_status('ds3'),'RETIRED');self.assertFalse(self.request.active('ds3'))
+        archive.chmod(0o750)
+        with self.assertRaisesRegex(h.Blocked,'retired_route_archive_drift'):self.request.active('ds3')
+    def test_malformed_or_completed_install_journal_cannot_turn_unknown_into_absence(self):
+        base=self.home/'Library/Application Support';namespace=base/'.Adapted Games DS3.lifecycle';namespace.mkdir(parents=True,mode=0o700)
+        value={'schema':1,'owner':'control-ds3-marshal-fix','state':'complete','operation':'install','direction':'forward','commit':'a'*40,
+               'binding':{},'steps':[],'active':None,'directoryIdentity':{}}
+        for operation in ('install',['malformed'],None):
+            value['operation']=operation;(namespace/'journal.json').write_text(json.dumps(value))
+            with self.assertRaisesRegex(h.Blocked,'route_recovery_required'):self.request.route_status('ds3')
+    def test_observer_recomputes_remaining_after_lock_and_record_cost(self):
+        self.request.begin();self.request.dispatched([Mock(pid=123)])
+        value=self.request.record();clock=[0.0];observations=[]
+        def record():clock[0]+=1.9;return value
+        def processes(timeout=5):observations.append(timeout);clock[0]+=timeout;return []
+        with patch.object(h.time,'monotonic',side_effect=lambda:clock[0]),patch.object(h.Admission,'record',side_effect=record),patch.object(h.Admission,'processes',side_effect=processes):
+            self.request.watch(value['request'],timeout=2)
+        self.assertEqual(len(observations),1);self.assertAlmostEqual(observations[0],0.1);self.assertAlmostEqual(clock[0],2)
+    def test_child_and_watch_observation_cannot_overwrite_a_changed_request(self):
+        self.request.begin();original=self.request.record()
+        changed=dict(original,request='c'*32)
+        def identity(pid):self.request.pending.write_text(json.dumps(changed));return self.identity(pid)
+        with patch.object(h,'process_identity',side_effect=identity):
+            with self.assertRaisesRegex(h.Blocked,'admission_request_changed'):self.request.dispatched([Mock(pid=123)])
+        self.assertEqual(self.request.record(),changed)
+        self.request.pending.write_text(json.dumps(original));self.request.dispatched([Mock(pid=123)])
+        watched=self.request.record();changed=dict(watched,request='c'*32)
+        def observed(timeout=5):self.request.pending.write_text(json.dumps(changed));return [(88,str(self.request.paths()[0]))]
+        with patch.object(h.Admission,'processes',side_effect=observed):self.request.watch(watched['request'])
+        self.assertEqual(self.request.record(),changed)
+    def test_old_schema1_never_manufactures_incarnation_and_retains_conservative_recovery(self):
+        self.request.publish({'schema':1,'route':'prince','phase':'prepared','children':[],'request':'a'*32,'goal':'client'})
+        with patch.object(h.Admission,'active',return_value=False),patch.object(h.Admission,'process_groups',return_value=[(88,1,88,'/independent/tool.exe')]):
+            with self.assertRaisesRegex(h.Blocked,'pending_launch_unconfirmed'):self.request.recover()
+        self.assertEqual(self.request.record()['schema'],1)
+    def test_missing_child_birth_does_not_publish_fake_dispatch_or_retry(self):
+        self.request.begin();before=self.request.pending.read_bytes()
+        with patch.object(h,'process_identity',return_value=None):
+            with self.assertRaisesRegex(h.Blocked,'process_incarnation_unavailable'):self.request.dispatched([Mock(pid=123)])
+        self.assertEqual(self.request.pending.read_bytes(),before)
+    def test_observer_backoff_samples_and_deadline_are_bounded(self):
+        self.request.begin();self.request.dispatched([Mock(pid=123)])
+        clock=[0.0];sleeps=[];observations=[]
+        def sleep(seconds):sleeps.append(seconds);clock[0]+=seconds
+        def observe(timeout=5):observations.append(timeout);clock[0]+=min(0.002,timeout);return []
+        with patch.object(h.time,'monotonic',side_effect=lambda:clock[0]),patch.object(h.time,'sleep',side_effect=sleep),patch.object(h.Admission,'processes',side_effect=observe):
+            self.request.watch(self.request.record()['request'])
+        self.assertLessEqual(len(observations),100);self.assertLessEqual(clock[0],190.002)
+        self.assertGreater(max(sleeps),0.25);self.assertLess(observations[-1],0.011)
+        self.assertEqual(self.request.record()['phase'],'dispatched')
+    def test_observer_early_milestone_and_timeout_keep_truthful_state(self):
+        self.request.begin();self.request.dispatched([Mock(pid=123)])
+        client,_=self.request.paths()
+        with patch.object(h.Admission,'processes',return_value=[(7,str(client))]):self.request.watch(self.request.record()['request'])
+        self.assertEqual(self.request.record()['phase'],'confirmed')
+        self.request.reconcile();self.request.begin();self.request.dispatched([Mock(pid=123)])
+        before=self.request.record()
+        with patch.object(h.Admission,'processes',side_effect=subprocess.TimeoutExpired('ps',1)):self.request.watch(before['request'])
+        self.assertEqual(self.request.record(),before)
+    def test_schema2_birth_boot_group_types_reject_without_mutation(self):
+        self.request.begin();good=self.request.record()
+        for changes in ({'boot':None},{'dispatcher':{'pid':True,'birth':'100:1','group':3}},{'dispatcher':{'pid':3,'birth':'unknown','group':3}}):
+            raw=dict(good,**changes);self.request.pending.write_text(json.dumps(raw))
+            with self.assertRaisesRegex(h.Blocked,'invalid_admission_record'):self.request.record()
 class HubValidationTests(unittest.TestCase):
     def setUp(self):
         self.temp=tempfile.TemporaryDirectory();self.home=Path(self.temp.name).resolve();self.root=self.home/'hub'
@@ -197,4 +301,24 @@ class ExactIdentityTests(unittest.TestCase):
         for raw in (b'unknown',b' 1 /first\n 1 /second\n',b' 0 /bad\n'):
             with patch.object(h.subprocess,'run',return_value=Mock(returncode=0,stdout=raw)):
                 with self.assertRaisesRegex(h.Blocked,'process_identity_unavailable'):request.processes()
+
+class NativeIncarnationTests(unittest.TestCase):
+    def test_darwin_birth_and_boot_queries_use_fixed_bounded_abi_not_argv(self):
+        def proc(pid,flavor,arg,out,size):
+            self.assertEqual((pid,flavor,arg,size),(123,3,0,136))
+            value=out._obj;value.pid=pid;value.uid=os.getuid();value.pgid=pid;value.seconds=100;value.micros=7
+            return size
+        library=Mock(proc_pidinfo=Mock(side_effect=proc))
+        with patch.object(h.ctypes,'CDLL',return_value=library):
+            self.assertEqual(h.process_identity(123),{'pid':123,'birth':'100:7','group':123})
+        def boot(name,out,size,unused,length):
+            self.assertEqual(name,b'kern.boottime');self.assertEqual(size._obj.value,16)
+            out._obj.seconds=100;out._obj.micros=7;return 0
+        with patch.object(h.ctypes,'CDLL',return_value=Mock(sysctlbyname=Mock(side_effect=boot))):
+            self.assertEqual(h.boot_identity(),hashlib.sha256(b'100:7').hexdigest())
+    def test_native_absence_is_distinct_from_short_or_permission_unknown(self):
+        with patch.object(h.ctypes,'CDLL',return_value=Mock(proc_pidinfo=Mock(return_value=0))),patch.object(h.ctypes,'get_errno',return_value=h.errno.ESRCH):
+            self.assertIsNone(h.process_identity(123))
+        with patch.object(h.ctypes,'CDLL',return_value=Mock(proc_pidinfo=Mock(return_value=1))):
+            with self.assertRaisesRegex(h.Blocked,'process_incarnation_unavailable'):h.process_identity(123)
 if __name__=='__main__':unittest.main()

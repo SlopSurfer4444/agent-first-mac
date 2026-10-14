@@ -15,6 +15,7 @@ let
 in
 {
   system.activationScripts.extraActivation.text = lib.mkAfter ''
+    # aid-admin-resume-windows-marker-guards-v1
     echo "reconciling the owner-authorized Windows App lifecycle..." >&2
 
     app='/Applications/Windows App.app'
@@ -27,7 +28,8 @@ in
 
     fail() {
       echo "Windows App lifecycle failure: $1" >&2
-      return 1
+      # Abort even when called from an if/|| context; do not rely on set -e.
+      exit 1
     }
 
     plist_raw() {
@@ -60,7 +62,7 @@ in
     }
 
     verify_app() {
-      test -d "$app" || return 1
+      test -d "$app" && ! test -L "$app" || return 1
       test "$(plist_raw "$app" CFBundleIdentifier)" = com.microsoft.rdc.macos \
         || return 1
       app_version=$(plist_raw "$app" CFBundleShortVersionString) || return 1
@@ -73,14 +75,69 @@ in
       test -x "$app/Contents/MacOS/Windows App"
     }
 
-    install_marker() {
-      test -f "$marker_source" || return 1
+    no_marker_acl() {
+      # POSIX mode bits alone do not exclude ACL-granted non-root writers.
+      acl_listing=$(/bin/ls -lde "$1" 2>/dev/null) || return 1
+      test -n "$acl_listing" || return 1
+      case "$acl_listing" in
+        ??????????+*|*"
+"*) return 1 ;;
+      esac
+    }
+
+    safe_marker_directory() {
+      test -d "$1" && ! test -L "$1" || return 1
+      case "$(/usr/bin/stat -f '%u:%Lp' "$1" 2>/dev/null)" in
+        0:7[0145][0145]) ;;
+        *) return 1 ;;
+      esac
+      no_marker_acl "$1"
+    }
+
+    marker_prestate() {
+      test -f "$marker_source" && ! test -L "$marker_source" || return 1
+      safe_marker_directory /var/db/agent-first-mac || return 1
       if test -e "$marker_dir" || test -L "$marker_dir"; then
-        test -d "$marker_dir" && ! test -L "$marker_dir" || return 1
-      else
+        safe_marker_directory "$marker_dir" || return 1
+      fi
+      if test -e "$marker" || test -L "$marker"; then
+        test -f "$marker" && ! test -L "$marker" \
+          && test "$(/usr/bin/stat -f '%u:%Lp:%l' "$marker" 2>/dev/null)" = 0:644:1 \
+          && no_marker_acl "$marker" \
+          && /usr/bin/cmp -s "$marker_source" "$marker" || return 1
+      fi
+    }
+
+    install_marker() {
+      marker_prestate || return 1
+      # Exact existing ownership is a real no-op, not a marker rewrite.
+      if test -e "$marker"; then return 0; fi
+      if ! test -d "$marker_dir"; then
         /usr/bin/install -d -o root -g wheel -m 0755 "$marker_dir" || return 1
       fi
-      /usr/bin/install -o root -g wheel -m 0644 "$marker_source" "$marker"
+      # The broker holds the one root-operation owner. Parent admission excludes
+      # unprivileged writers; this is not protection against a competing root.
+      marker_prestate || return 1
+      ! test -e "$marker" && ! test -L "$marker" || return 1
+      /usr/bin/install -o root -g wheel -m 0644 "$marker_source" "$marker" || return 1
+      marker_prestate
+    }
+
+    install_receipts_absent() {
+      # A successful complete inventory distinguishes absence from probe error.
+      # Never print inventory, and never replay vendor scripts over a partial
+      # receipt merely because the application directory is currently absent.
+      receipt_inventory=$(/usr/sbin/pkgutil --pkgs) || return 1
+      case "
+$receipt_inventory
+" in
+        *"
+$receipt
+"*|*"
+com.microsoft.rdc.installer.scripts
+"*) return 1 ;;
+      esac
+      return 0
     }
 
     verify_managed() {
@@ -89,11 +146,13 @@ in
         && test "$(/bin/cat "$marker")" = "$expected_marker"
     }
 
+    marker_prestate || fail conflicting_or_unsafe_managed_marker
     if ${if windowsAppEnabled then "true" else "false"}; then
       if ! verify_managed; then
         if test -e "$app" || test -L "$app"; then
           verify_app || fail competing_or_untrusted_application
         else
+          install_receipts_absent || fail partial_or_unobserved_package_receipts
           test "$(/usr/bin/shasum -a 256 "$pkg" | /usr/bin/awk '{print $1}')" \
             = 47052e0aba8d5b2ad9a5468349f72bee317b69c07300a40ccadefb96050b1251 \
             || fail package_checksum

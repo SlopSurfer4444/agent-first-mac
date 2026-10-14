@@ -25,7 +25,8 @@ PROFILE_HOME = WORKSPACE + "/profile-home"
 TMP = PROFILE_HOME + "/tmp"
 GIT = WORKSPACE + "/.git"
 NEW_DIRS = (WORKSPACE, OUTSIDE, PROFILE_HOME, TMP, GIT, GIT + "/objects", GIT + "/refs")
-PROFILE = (ROOT / "codex/quarantine.config.toml").read_bytes()
+# Historical fixture allocator still binds its exact predecessor profile.
+PROFILE = (ROOT / "tests/fixtures/phase5-quarantine-before-temp-deny.config.toml").read_bytes()
 FILE_PATHS = (WORKSPACE + "/visible.txt",) + tuple(WORKSPACE + "/" + leaf for leaf in Q.SECRET_LEAVES) + (
     OUTSIDE + "/outside.txt", PROFILE_HOME + "/quarantine.config.toml", GIT + "/HEAD")
 

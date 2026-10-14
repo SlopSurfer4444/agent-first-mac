@@ -1,6 +1,12 @@
 import CryptoKit
 import Darwin
 import Foundation
+#if canImport(AidAdminCore)
+import AidAdminCore
+#endif
+#if canImport(AidAdminRuntime)
+import AidAdminRuntime
+#endif
 
 public enum BootstrapFailure: Error, CustomStringConvertible, Equatable {
     case rejected(String)
@@ -10,8 +16,8 @@ public enum BootstrapFailure: Error, CustomStringConvertible, Equatable {
     }
 }
 
-private func require(_ condition: @autoclosure () -> Bool, _ reason: String) throws {
-    if !condition() { throw BootstrapFailure.rejected(reason) }
+private func require(_ condition: @autoclosure () throws -> Bool, _ reason: String) throws {
+    if try !condition() { throw BootstrapFailure.rejected(reason) }
 }
 
 public func bootstrapSHA256(_ data: Data) -> String {
@@ -175,15 +181,16 @@ public protocol BootstrapCommandRunning {
 public final class BootstrapProcessRunner: BootstrapCommandRunning {
     public init() {}
     public func run(executable: String, arguments: [String], environment: [String: String]) throws -> Int32 {
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: executable)
-        process.arguments = arguments
-        process.environment = environment
-        process.standardOutput = FileHandle.nullDevice
-        process.standardError = FileHandle.nullDevice
-        try process.run()
-        process.waitUntilExit()
-        return process.terminationStatus
+        #if canImport(AidAdminRuntime)
+        let result = try BoundedProcess.run(executable: executable, arguments: arguments,
+                                            environment: environment,
+                                            limits: .init(timeout: 30, maximumOutputBytes: 65536))
+        try require(result.settled, "bootstrap_process_unsettled_UNKNOWN")
+        try require(result.outcome == .exited, "bootstrap_process_" + result.outcome.rawValue)
+        return result.status
+        #else
+        throw BootstrapFailure.rejected("bootstrap_bounded_runtime_unavailable")
+        #endif
     }
 }
 
@@ -200,7 +207,7 @@ public struct NoBootstrapHooks: BootstrapHooks {
     public func beforeRollback() throws {}
 }
 
-private struct FileSnapshot {
+private struct FileSnapshot: Codable, Equatable {
     let existed: Bool
     let sha256: String
     let size: Int
@@ -208,13 +215,22 @@ private struct FileSnapshot {
     let gid: gid_t
     let mode: mode_t
     var backup: String?
+    var device: UInt64 = 0
+    var inode: UInt64 = 0
 }
 
-private struct TransactionState {
+private struct TransactionState: Codable {
     var createdDirectories: [String] = []
     var files: [String: FileSnapshot] = [:]
     var mutationStarted = false
     var staging = ""
+    var schema = 1
+    var phase = "prepared"
+    var post: [String: FileSnapshot] = [:]
+    var stagedFiles: [String: FileSnapshot] = [:]
+    var directoryIdentities: [String: [UInt64]] = [:]
+    var directoryStaging: [String: String] = [:]
+    var boundDirectories: [String: [UInt64]] = [:]
 }
 
 public final class BootstrapInstaller {
@@ -227,6 +243,7 @@ public final class BootstrapInstaller {
     public static let emergencyDisablePath = "/etc/agent-first-mac/aid-admin.disabled"
     public static let disabledSudoersPath = "/etc/sudoers.d/agent-first-mac-aid-admin.disabled"
     private static let bootstrapRoot = "/var/db/agent-first-mac/bootstrap"
+    private static let journalPath = bootstrapRoot + "/active.json"
     private static let token = "@@AGENT_OWNER@@"
     private static let cleanEnvironment = [
         "HOME": "/var/empty", "LANG": "C", "LC_ALL": "C",
@@ -254,6 +271,9 @@ public final class BootstrapInstaller {
                     "inputs_hash_argument")
         try require(request.inputsSize > 0 && request.inputsSize <= 64 * 1024 * 1024,
                     "inputs_size_argument")
+        let leases = try acquireLeases()
+        defer { for fd in leases { Darwin.close(fd) } }
+        _ = try reconcileLocked()
         try preflightState()
 
         var transaction = TransactionState()
@@ -264,6 +284,7 @@ public final class BootstrapInstaller {
             try require(identifier.range(of: "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
                                          options: .regularExpression) != nil, "transaction_identifier")
             transaction.staging = Self.bootstrapRoot + "/transaction-" + identifier
+            try require(!exists(transaction.staging), "transaction_already_exists_UNKNOWN")
             try ensureDirectory(transaction.staging, mode: 0o700, state: &transaction)
 
             let stagedInputs = transaction.staging + "/install-inputs.json"
@@ -310,6 +331,46 @@ public final class BootstrapInstaller {
             let stagedAttestation = transaction.staging + "/aid-admin-install.json"
             try writeExclusive(attestation, logical: stagedAttestation, mode: 0o400)
 
+            // Freeze every preimage and the exact inode to be published before
+            // the first externally visible artifact mutation.
+            let attestationPin = ArtifactPin(sha256: bootstrapSHA256(attestation), size: attestation.count)
+            for (source, target, mode, pin) in [
+                (stagedBroker, Self.binaryPath, mode_t(0o555), inputs.broker),
+                (stagedPolicy, Self.policyPath, mode_t(0o444), inputs.policy),
+                (stagedAttestation, Self.attestationPath, mode_t(0o400), attestationPin),
+                (stagedRendered, Self.sudoersPath, mode_t(0o440), inputs.renderedSudoers),
+            ] {
+                var prior = try trustedFileSnapshotIfPresent(target, mode: mode)
+                prior.backup = transaction.staging + "/prior-" + URL(fileURLWithPath: target).lastPathComponent
+                transaction.files[target] = prior
+                let publication = transaction.staging + "/new-" + URL(fileURLWithPath: target).lastPathComponent
+                let bytes = try readTrustedFile(source, mode: source == stagedRendered ? 0o440 : 0o400,
+                                                maximum: 64 * 1024 * 1024)
+                try writeExclusive(bytes, logical: publication, mode: mode)
+                try verifyPin(publication, pin: pin, mode: mode)
+                transaction.post[target] = try trustedFileSnapshot(publication, mode: mode)
+            }
+            transaction.mutationStarted = true
+            for target in transaction.files.keys {
+                var parent = URL(fileURLWithPath: target).deletingLastPathComponent().path
+                while parent != "/" {
+                    if exists(parent) {
+                        var facts = stat()
+                        try require(stat(physical(parent), &facts) == 0, "parent_binding")
+                        transaction.boundDirectories[parent] = [UInt64(facts.st_dev), UInt64(facts.st_ino)]
+                    }
+                    parent = URL(fileURLWithPath: parent).deletingLastPathComponent().path
+                }
+            }
+            for name in try FileManager.default.contentsOfDirectory(atPath: physical(transaction.staging)) {
+                let path = transaction.staging + "/" + name
+                var facts = stat()
+                try require(lstat(physical(path), &facts) == 0, "staging_snapshot")
+                transaction.stagedFiles[name] = try trustedFileSnapshot(path, mode: facts.st_mode & 0o777)
+            }
+            try saveJournal(transaction)
+            try hooks.afterMutation(step: "journal-prepared")
+
             try ensureDirectory("/etc/sudoers.d", mode: 0o755, state: &transaction)
             try ensureDirectory("/etc/agent-first-mac", mode: 0o755, state: &transaction)
             try ensureDirectory("/usr/local", mode: 0o755, state: &transaction)
@@ -326,20 +387,31 @@ public final class BootstrapInstaller {
             try replaceTarget(stagedPolicy, target: Self.policyPath, mode: 0o444,
                               pin: inputs.policy, state: &transaction)
             try hooks.afterMutation(step: "policy")
-            let attestationPin = ArtifactPin(sha256: bootstrapSHA256(attestation), size: attestation.count)
             try replaceTarget(stagedAttestation, target: Self.attestationPath, mode: 0o400,
                               pin: attestationPin, state: &transaction)
             try hooks.afterMutation(step: "attestation")
             try replaceTarget(stagedRendered, target: Self.sudoersPath, mode: 0o440,
                               pin: inputs.renderedSudoers, state: &transaction)
             try hooks.afterMutation(step: "sudoers")
+            let verificationLease = try acquireEmergencyLease()
+            defer { Darwin.close(verificationLease) }
             try verifyInstalled(inputs: inputs, attestation: attestationPin)
             try hooks.afterMutation(step: "final-verification")
+            transaction.phase = "committed"
+            try saveJournal(transaction)
+            try hooks.afterMutation(step: "journal-committed")
             try cleanupStaging(state: &transaction, success: true)
             return "INSTALL_TRANSACTION_COMMITTED"
         } catch {
             let original = String(describing: error)
+            if original.contains("unsettled_UNKNOWN") { throw error }
+            if transaction.mutationStarted && (exists(Self.emergencyDisablePath) || exists(Self.disabledSudoersPath)) {
+                throw BootstrapFailure.rejected("bootstrap_emergency_revocation_UNKNOWN")
+            }
             if transaction.mutationStarted {
+                if transaction.phase == "committed" {
+                    throw BootstrapFailure.rejected(original + "_committed_cleanup_pending")
+                }
                 do {
                     try hooks.beforeRollback()
                     try rollback(state: &transaction)
@@ -368,6 +440,212 @@ public final class BootstrapInstaller {
                     context.invokingOwner.name.range(of: "^[a-z_][a-z0-9_-]{0,31}$",
                                                      options: .regularExpression) != nil,
                     "invoking_owner_contract")
+    }
+
+    /// Fresh-process reconciliation precedes admission of a new request. This
+    /// entrypoint performs no new installation and preserves unknown state.
+    public func reconcileInterruptedInstall() throws -> String {
+        try validateContext()
+        let leases = try acquireLeases()
+        defer { for fd in leases { Darwin.close(fd) } }
+        return try reconcileLocked()
+    }
+
+    private func acquireLeases() throws -> [Int32] {
+        var setup = TransactionState()
+        try ensureDirectory("/var/db/agent-first-mac", mode: 0o755, state: &setup)
+        try ensureDirectory(Self.bootstrapRoot, mode: 0o700, state: &setup)
+        var result: [Int32] = []
+        do {
+            let paths = ["/var/db/agent-first-mac/.operation.lock"]
+            for path in paths {
+                try validateAncestors(path)
+                let fd = Darwin.open(physical(path), O_RDWR | O_CREAT | O_NOFOLLOW | O_CLOEXEC, 0o600)
+                try require(fd >= 0, "bootstrap_lock_open_UNKNOWN")
+                result.append(fd)
+                var facts = stat()
+                try require(fstat(fd, &facts) == 0 && (facts.st_mode & S_IFMT) == S_IFREG &&
+                            facts.st_uid == context.trustedUID && facts.st_gid == context.trustedGID &&
+                            facts.st_nlink == 1 && (facts.st_mode & 0o7777) == 0o600,
+                            "bootstrap_lock_contract_UNKNOWN")
+                try require(flock(fd, LOCK_EX | LOCK_NB) == 0, "bootstrap_operation_BUSY")
+            }
+            let applyJournal = Self.brokerStagingPath + "/operation.json"
+            if exists(applyJournal) {
+                let bytes = try readTrustedFile(applyJournal, mode: 0o600, maximum: 16384)
+                #if canImport(AidAdminCore)
+                try validateSettledApplyJournal(bytes)
+                #else
+                throw BootstrapFailure.rejected("broker_operation_pending_UNKNOWN")
+                #endif
+            }
+            return result
+        } catch {
+            for fd in result { Darwin.close(fd) }
+            throw error
+        }
+    }
+
+    private func saveJournal(_ state: TransactionState) throws {
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys]
+        let bytes = try encoder.encode(state)
+        try require(bytes.count <= 128 * 1024, "journal_bound")
+        // The prior record remains authoritative until this fsynced candidate
+        // is renamed. A leftover candidate is never interpreted as authority.
+        let temporary = Self.journalPath + ".next"
+        if exists(temporary) {
+            _ = try readTrustedFile(temporary, mode: 0o400, maximum: 128 * 1024)
+            try require(unlink(physical(temporary)) == 0, "journal_candidate_retire")
+        }
+        try writeExclusive(bytes, logical: temporary, mode: 0o400)
+        try require(rename(physical(temporary), physical(Self.journalPath)) == 0, "journal_publish")
+        try syncParent(Self.journalPath)
+    }
+
+    private func acquireEmergencyLease() throws -> Int32 {
+        let path = "/var/db/agent-first-mac/.emergency.lock"
+        try validateAncestors(path)
+        let fd = Darwin.open(physical(path), O_RDWR | O_CREAT | O_NOFOLLOW | O_CLOEXEC, 0o600)
+        try require(fd >= 0, "emergency_lock_open_UNKNOWN")
+        do {
+            var facts = stat()
+            try require(fstat(fd, &facts) == 0 && (facts.st_mode & S_IFMT) == S_IFREG &&
+                        facts.st_uid == context.trustedUID && facts.st_gid == context.trustedGID &&
+                        facts.st_nlink == 1 && (facts.st_mode & 0o7777) == 0o600,
+                        "emergency_lock_contract_UNKNOWN")
+            try require(flock(fd, LOCK_EX | LOCK_NB) == 0, "emergency_operation_BUSY")
+            return fd
+        } catch { Darwin.close(fd); throw error }
+    }
+
+    private func reconcileLocked() throws -> String {
+        try require(!exists(Self.emergencyDisablePath) && !exists(Self.disabledSudoersPath),
+                    "bootstrap_emergency_revocation_UNKNOWN")
+        guard exists(Self.journalPath) else {
+            let entries = try FileManager.default.contentsOfDirectory(atPath: physical(Self.bootstrapRoot))
+            try require(entries.isEmpty, "bootstrap_orphan_UNKNOWN")
+            return "NO_INTERRUPTED_INSTALL"
+        }
+        do {
+            let bytes = try readTrustedFile(Self.journalPath, mode: 0o400, maximum: 128 * 1024)
+            var state = try JSONDecoder().decode(TransactionState.self, from: bytes)
+            let encoder = JSONEncoder(); encoder.outputFormatting = [.sortedKeys]
+            try require(try encoder.encode(state) == bytes, "journal_noncanonical_UNKNOWN")
+            let targets = Set([Self.binaryPath, Self.policyPath, Self.attestationPath, Self.sudoersPath])
+            try require(state.schema == 1 && state.mutationStarted &&
+                        ["prepared", "committed", "rolled-back"].contains(state.phase) &&
+                        Set(state.files.keys) == targets && Set(state.post.keys) == targets &&
+                        state.staging.range(of: "^" + Self.bootstrapRoot + "/transaction-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", options: .regularExpression) != nil,
+                        "journal_schema_UNKNOWN")
+            let directories = Set(["/etc/sudoers.d", "/etc/agent-first-mac", "/usr/local",
+                "/usr/local/libexec", "/var/log/agent-first-mac", Self.auditPath,
+                Self.brokerStagingPath, Self.bootstrapRoot, "/var/db/agent-first-mac", state.staging])
+            try require(Set(state.createdDirectories).isSubset(of: directories) &&
+                        Set(state.createdDirectories).count == state.createdDirectories.count,
+                        "journal_directory_scope_UNKNOWN")
+            for target in targets {
+                try require(state.files[target]?.backup == state.staging + "/prior-" + URL(fileURLWithPath: target).lastPathComponent,
+                            "journal_backup_scope_UNKNOWN")
+            }
+            try require(state.directoryIdentities.keys.allSatisfy { directories.contains($0) },
+                        "journal_directory_identity_scope_UNKNOWN")
+            let boundParents: Set<String> = ["/etc", "/etc/agent-first-mac", "/etc/sudoers.d",
+                "/usr", "/usr/local", "/usr/local/libexec"]
+            try require(Set(state.boundDirectories.keys).isSubset(of: boundParents),
+                        "journal_bound_directory_scope_UNKNOWN")
+            for (target, candidate) in state.directoryStaging {
+                try require(directories.contains(target) && candidate == state.staging + "/directory-" + target.replacingOccurrences(of: "/", with: "_"),
+                            "journal_directory_candidate_UNKNOWN")
+            }
+            if state.phase == "prepared" {
+                try validateDirectory(state.staging, mode: 0o700)
+                try rollback(state: &state)
+                return "INTERRUPTED_INSTALL_ROLLED_BACK"
+            }
+            if state.phase == "committed" {
+                try validateRecoveryState(state, committed: true)
+            } else {
+                for (path, snapshot) in state.files {
+                    try require(try matches(path, snapshot), "rollback_terminal_UNKNOWN")
+                }
+            }
+            try cleanupStaging(state: &state, success: state.phase == "committed")
+            return state.phase == "committed" ? "INSTALL_TRANSACTION_COMMITTED" : "INTERRUPTED_INSTALL_ROLLED_BACK"
+        } catch {
+            throw BootstrapFailure.rejected("bootstrap_recovery_UNKNOWN_" + String(describing: error))
+        }
+    }
+
+    private func matches(_ path: String, _ snapshot: FileSnapshot) throws -> Bool {
+        if !snapshot.existed { return !exists(path) }
+        if !exists(path) { return false }
+        let current = try trustedFileSnapshot(path, mode: snapshot.mode)
+        return current.sha256 == snapshot.sha256 && current.size == snapshot.size &&
+            current.uid == snapshot.uid && current.gid == snapshot.gid &&
+            current.device == snapshot.device && current.inode == snapshot.inode
+    }
+
+    private func validateRecoveryState(_ state: TransactionState, committed: Bool) throws {
+        try validateBoundDirectories(state)
+        for logical in state.createdDirectories where logical != state.staging &&
+            logical != Self.bootstrapRoot && logical != "/var/db/agent-first-mac" {
+            if exists(logical) { try validateDirectoryIdentity(logical, state: state) }
+            else if let candidate = state.directoryStaging[logical], exists(candidate) {
+                try validateDirectoryIdentity(candidate, state: state, expectedPath: logical)
+            } else if state.phase == "prepared" {
+                throw BootstrapFailure.rejected("directory_missing_UNKNOWN")
+            }
+        }
+        for (path, prior) in state.files {
+            guard let post = state.post[path] else { throw BootstrapFailure.rejected("journal_post_UNKNOWN") }
+            if let backup = prior.backup, exists(backup) {
+                try require(prior.existed && (try matches(backup, prior)), "foreign_backup_UNKNOWN")
+            }
+            if committed {
+                try require(try matches(path, post), "committed_target_UNKNOWN")
+            } else if try matches(path, prior) {
+                // No target mutation, or an already completed rollback step.
+                continue
+            } else {
+                try require(!exists(path) || (try matches(path, post)), "foreign_target_UNKNOWN")
+                if prior.existed {
+                    try require(try matches(prior.backup!, prior), "backup_identity_UNKNOWN")
+                }
+            }
+        }
+    }
+
+    private func validateBoundDirectories(_ state: TransactionState) throws {
+        for (logical, expected) in state.boundDirectories {
+            var facts = stat()
+            try validateAncestors(logical + "/entry")
+            try require(stat(physical(logical), &facts) == 0 &&
+                        expected == [UInt64(facts.st_dev), UInt64(facts.st_ino)],
+                        "bound_directory_drift_UNKNOWN")
+        }
+        for logical in state.directoryIdentities.keys where exists(logical) {
+            try validateDirectoryIdentity(logical, state: state)
+        }
+    }
+
+    private func validateAncestors(_ logical: String) throws {
+        let parts = logical.split(separator: "/").dropLast()
+        var path = ""
+        for part in parts {
+            path += "/" + part
+            var facts = stat()
+            if !context.fixtureMode && ["/etc", "/var"].contains(path) {
+                let expected = "/private" + path
+                try require(try FileManager.default.destinationOfSymbolicLink(atPath: path) == expected.dropFirst(),
+                            "system_alias_contract")
+                try require(stat(expected, &facts) == 0, "ancestor_stat")
+            } else {
+                try require(lstat(physical(path), &facts) == 0, "ancestor_stat")
+            }
+            try require((facts.st_mode & S_IFMT) == S_IFDIR && facts.st_uid == context.trustedUID &&
+                        (facts.st_mode & 0o022) == 0, "ancestor_contract_UNKNOWN")
+        }
     }
 
     private func validateOwner(_ request: BootstrapRequest) throws -> BootstrapInvokingOwner {
@@ -453,13 +731,14 @@ public final class BootstrapInstaller {
     }
 
     private func readTrustedFile(_ logical: String, mode: mode_t, maximum: Int) throws -> Data {
+        try validateAncestors(logical)
         let fd = Darwin.open(physical(logical), O_RDONLY | O_NOFOLLOW)
         try require(fd >= 0, "trusted_open")
         defer { Darwin.close(fd) }
         var before = stat()
         try require(fstat(fd, &before) == 0 && (before.st_mode & S_IFMT) == S_IFREG &&
                     before.st_uid == context.trustedUID && before.st_gid == context.trustedGID &&
-                    (before.st_mode & 0o777) == mode, "trusted_file_contract")
+                    before.st_nlink == 1 && (before.st_mode & 0o7777) == mode, "trusted_file_contract")
         return try readBounded(fd: fd, before: before, maximum: maximum, reason: "trusted_file_race")
     }
 
@@ -495,30 +774,44 @@ public final class BootstrapInstaller {
 
     private func replaceTarget(_ staged: String, target: String, mode: mode_t,
                                pin: ArtifactPin, state: inout TransactionState) throws {
-        var snapshot = try trustedFileSnapshotIfPresent(target, mode: mode)
-        if snapshot.existed {
-            let backup = state.staging + "/prior-" + URL(fileURLWithPath: target).lastPathComponent
-            try require(rename(physical(target), physical(backup)) == 0, "prior_backup_failed")
-            snapshot.backup = backup
+        try validateBoundDirectories(state)
+        let emergencyLease = target == Self.sudoersPath ? try acquireEmergencyLease() : -1
+        defer { if emergencyLease >= 0 { Darwin.close(emergencyLease) } }
+        if target == Self.sudoersPath {
+            try require(!exists(Self.emergencyDisablePath) && !exists(Self.disabledSudoersPath),
+                        "bootstrap_emergency_revocation_UNKNOWN")
         }
-        state.files[target] = snapshot
-        state.mutationStarted = true
-        let data = try readTrustedFile(staged, mode: target == Self.sudoersPath ? 0o440 : 0o400,
-                                       maximum: 64 * 1024 * 1024)
-        try atomicWrite(data, target: target, mode: mode)
+        guard let snapshot = state.files[target], let post = state.post[target] else {
+            throw BootstrapFailure.rejected("journal_binding_UNKNOWN")
+        }
+        try require(try matches(target, snapshot), "target_preimage_UNKNOWN")
+        let publication = state.staging + "/new-" + URL(fileURLWithPath: target).lastPathComponent
+        try require(try matches(publication, post), "publication_identity_UNKNOWN")
+        try hooks.afterMutation(step: "before-backup-" + URL(fileURLWithPath: target).lastPathComponent)
+        if snapshot.existed {
+            let backup = snapshot.backup!
+            try require(!exists(backup), "backup_exists_UNKNOWN")
+            try require(renameatx_np(AT_FDCWD, physical(target), AT_FDCWD, physical(backup), UInt32(RENAME_EXCL)) == 0, "prior_backup_failed")
+            try syncParent(target)
+            try syncParent(backup)
+        }
+        try hooks.afterMutation(step: "after-backup-" + URL(fileURLWithPath: target).lastPathComponent)
+        try validateBoundDirectories(state)
+        if target == Self.sudoersPath {
+            try require(!exists(Self.emergencyDisablePath) && !exists(Self.disabledSudoersPath),
+                        "bootstrap_emergency_revocation_UNKNOWN")
+        }
+        try require(!exists(target), "target_publication_conflict_UNKNOWN")
+        try require(renameatx_np(AT_FDCWD, physical(publication), AT_FDCWD, physical(target), UInt32(RENAME_EXCL)) == 0, "install_rename_failed")
+        try syncParent(target)
+        try syncParent(publication)
+        try hooks.afterMutation(step: "after-publication-" + URL(fileURLWithPath: target).lastPathComponent)
         try verifyPin(target, pin: pin, mode: mode)
     }
 
-    private func atomicWrite(_ data: Data, target: String, mode: mode_t) throws {
-        let temporary = target + ".bootstrap-new"
-        try require(!exists(temporary), "install_temporary_exists")
-        try writeExclusive(data, logical: temporary, mode: mode)
-        try require(rename(physical(temporary), physical(target)) == 0, "install_rename_failed")
-        try syncParent(target)
-    }
-
     private func writeExclusive(_ data: Data, logical: String, mode: mode_t) throws {
-        let fd = Darwin.open(physical(logical), O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW, mode)
+        try validateAncestors(logical)
+        let fd = Darwin.open(physical(logical), O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, mode)
         try require(fd >= 0, "exclusive_write_open")
         defer { Darwin.close(fd) }
         try require(fchown(fd, context.trustedUID, context.trustedGID) == 0 &&
@@ -544,15 +837,27 @@ public final class BootstrapInstaller {
     }
 
     private func trustedFileSnapshot(_ logical: String, mode: mode_t) throws -> FileSnapshot {
+        var before = stat()
+        try require(lstat(physical(logical), &before) == 0, "snapshot_initial_stat")
         let data = try readTrustedFile(logical, mode: mode, maximum: 64 * 1024 * 1024)
         var facts = stat()
-        try require(lstat(physical(logical), &facts) == 0, "snapshot_stat")
+        try require(lstat(physical(logical), &facts) == 0 && before.st_dev == facts.st_dev &&
+                    before.st_ino == facts.st_ino && before.st_mode == facts.st_mode &&
+                    before.st_size == facts.st_size && before.st_uid == facts.st_uid &&
+                    before.st_gid == facts.st_gid && before.st_nlink == facts.st_nlink &&
+                    before.st_mtimespec.tv_sec == facts.st_mtimespec.tv_sec &&
+                    before.st_mtimespec.tv_nsec == facts.st_mtimespec.tv_nsec &&
+                    before.st_ctimespec.tv_sec == facts.st_ctimespec.tv_sec &&
+                    before.st_ctimespec.tv_nsec == facts.st_ctimespec.tv_nsec,
+                    "snapshot_identity_drift_UNKNOWN")
         return FileSnapshot(existed: true, sha256: bootstrapSHA256(data), size: data.count,
                             uid: facts.st_uid, gid: facts.st_gid, mode: facts.st_mode & 0o777,
-                            backup: nil)
+                            backup: nil, device: UInt64(facts.st_dev), inode: UInt64(facts.st_ino))
     }
 
     private func verifyInstalled(inputs: InstallInputs, attestation: ArtifactPin) throws {
+        try require(!exists(Self.emergencyDisablePath) && !exists(Self.disabledSudoersPath),
+                    "bootstrap_emergency_revocation_UNKNOWN")
         try verifyPin(Self.binaryPath, pin: inputs.broker, mode: 0o555)
         try verifyPin(Self.policyPath, pin: inputs.policy, mode: 0o444)
         try verifyPin(Self.attestationPath, pin: attestation, mode: 0o400)
@@ -562,20 +867,41 @@ public final class BootstrapInstaller {
     }
 
     private func rollback(state: inout TransactionState) throws {
+        try require(!exists(Self.emergencyDisablePath) && !exists(Self.disabledSudoersPath),
+                    "bootstrap_emergency_revocation_UNKNOWN")
+        // Check the entire set before touching anything. A foreign target is
+        // not permission to restore a backup over it.
+        try validateRecoveryState(state, committed: false)
         for target in [Self.sudoersPath, Self.attestationPath, Self.policyPath, Self.binaryPath] {
+            let emergencyLease = target == Self.sudoersPath ? try acquireEmergencyLease() : -1
+            defer { if emergencyLease >= 0 { Darwin.close(emergencyLease) } }
+            try require(!exists(Self.emergencyDisablePath) && !exists(Self.disabledSudoersPath),
+                        "bootstrap_emergency_revocation_UNKNOWN")
             guard let snapshot = state.files[target] else { continue }
-            if exists(target) { try require(unlink(physical(target)) == 0, "rollback_unlink") }
+            if try matches(target, snapshot) { continue }
+            if exists(target) {
+                try require(try matches(target, state.post[target]!), "rollback_foreign_UNKNOWN")
+                try require(unlink(physical(target)) == 0, "rollback_unlink")
+                try syncParent(target)
+            }
             if snapshot.existed {
+                try require(!exists(Self.emergencyDisablePath) && !exists(Self.disabledSudoersPath),
+                            "bootstrap_emergency_revocation_UNKNOWN")
                 guard let backup = snapshot.backup else {
                     throw BootstrapFailure.rejected("rollback_backup_missing")
                 }
-                try require(rename(physical(backup), physical(target)) == 0, "rollback_restore")
+                try require(renameatx_np(AT_FDCWD, physical(backup), AT_FDCWD, physical(target), UInt32(RENAME_EXCL)) == 0, "rollback_restore")
+                try syncParent(target)
+                try syncParent(backup)
                 let restored = try trustedFileSnapshot(target, mode: snapshot.mode)
                 try require(restored.sha256 == snapshot.sha256 && restored.size == snapshot.size &&
                             restored.uid == snapshot.uid && restored.gid == snapshot.gid,
                             "rollback_file_verification")
             }
+            try hooks.afterMutation(step: "rollback-" + URL(fileURLWithPath: target).lastPathComponent)
         }
+        state.phase = "rolled-back"
+        try saveJournal(state)
         try cleanupStaging(state: &state, success: false)
         let expected = [Self.binaryPath, Self.policyPath, Self.attestationPath, Self.sudoersPath,
                         Self.auditPath, Self.brokerStagingPath]
@@ -588,10 +914,40 @@ public final class BootstrapInstaller {
     }
 
     private func cleanupStaging(state: inout TransactionState, success: Bool) throws {
+        try validateBoundDirectories(state)
         if !state.staging.isEmpty && exists(state.staging) {
             let prefix = physical(Self.bootstrapRoot) + "/transaction-"
             try require(physical(state.staging).hasPrefix(prefix), "staging_cleanup_scope")
-            try FileManager.default.removeItem(atPath: physical(state.staging))
+            try validateDirectoryIdentity(state.staging, state: state)
+            if state.mutationStarted {
+                let names = try FileManager.default.contentsOfDirectory(atPath: physical(state.staging))
+                for name in names {
+                    let path = state.staging + "/" + name
+                    if let directory = state.directoryStaging.first(where: { $0.value == path }) {
+                        try validateDirectoryIdentity(path, state: state, expectedPath: directory.key)
+                        try require(try FileManager.default.contentsOfDirectory(atPath: physical(path)).isEmpty,
+                                    "directory_candidate_foreign_UNKNOWN")
+                        continue
+                    }
+                    let prior = state.files.values.first { $0.backup == path && $0.existed }
+                    guard let expected = prior ?? state.stagedFiles[name] else {
+                        throw BootstrapFailure.rejected("staging_foreign_UNKNOWN")
+                    }
+                    try require(try matches(path, expected), "staging_identity_UNKNOWN")
+                }
+                for name in names {
+                    let path = state.staging + "/" + name
+                    if state.directoryStaging.values.contains(path) {
+                        try require(rmdir(physical(path)) == 0, "staging_directory_retire")
+                    } else {
+                        try require(unlink(physical(path)) == 0, "staging_retire")
+                    }
+                }
+                try require(rmdir(physical(state.staging)) == 0, "staging_directory_retire")
+                try syncParent(state.staging)
+            } else {
+                try FileManager.default.removeItem(atPath: physical(state.staging))
+            }
         }
         let keepOnSuccess = Set(["/etc/sudoers.d", "/etc/agent-first-mac",
                                  "/usr/local", "/usr/local/libexec",
@@ -599,10 +955,18 @@ public final class BootstrapInstaller {
                                  Self.auditPath, Self.brokerStagingPath,
                                  "/var/db/agent-first-mac"])
         for logical in state.createdDirectories.reversed() {
+            if logical == Self.bootstrapRoot || logical == "/var/db/agent-first-mac" ||
+                logical == state.staging { continue }
             if success && keepOnSuccess.contains(logical) { continue }
             if exists(logical) {
+                try validateDirectoryIdentity(logical, state: state)
                 try require(rmdir(physical(logical)) == 0, "directory_cleanup_not_empty")
+                try syncParent(logical)
             }
+        }
+        if exists(Self.journalPath) {
+            try require(unlink(physical(Self.journalPath)) == 0, "journal_retire")
+            try syncParent(Self.journalPath)
         }
     }
 
@@ -612,23 +976,49 @@ public final class BootstrapInstaller {
             try validateDirectory(logical, mode: mode)
             return
         }
-        try require(mkdir(physical(logical), mode) == 0, "directory_create")
-        try require(chown(physical(logical), context.trustedUID, context.trustedGID) == 0 &&
-                    chmod(physical(logical), mode) == 0, "directory_owner_mode")
+        let candidate = state.mutationStarted ? state.staging + "/directory-" + logical.replacingOccurrences(of: "/", with: "_") : logical
+        try require(mkdir(physical(candidate), mode) == 0, "directory_create")
+        try require(chown(physical(candidate), context.trustedUID, context.trustedGID) == 0 &&
+                    chmod(physical(candidate), mode) == 0, "directory_owner_mode")
         state.createdDirectories.append(logical)
-        try validateDirectory(logical, mode: mode)
+        try validateDirectory(candidate, mode: mode)
+        var identity = stat()
+        try require(lstat(physical(candidate), &identity) == 0, "directory_identity")
+        state.directoryIdentities[logical] = [UInt64(identity.st_dev), UInt64(identity.st_ino)]
+        if state.mutationStarted {
+            state.directoryStaging[logical] = candidate
+            try syncParent(candidate)
+            try saveJournal(state)
+            try hooks.afterMutation(step: "before-directory-publication-" + logical)
+            try require(!exists(logical) && renameatx_np(AT_FDCWD, physical(candidate), AT_FDCWD, physical(logical), UInt32(RENAME_EXCL)) == 0,
+                        "directory_publication_UNKNOWN")
+            try syncParent(candidate)
+        }
+        try syncParent(logical)
+        if state.mutationStarted { try hooks.afterMutation(step: "after-directory-publication-" + logical) }
     }
 
     private func validateDirectory(_ logical: String, mode: mode_t) throws {
+        try validateAncestors(logical)
         var facts = stat()
         try require(lstat(physical(logical), &facts) == 0 && (facts.st_mode & S_IFMT) == S_IFDIR &&
                     facts.st_uid == context.trustedUID && facts.st_gid == context.trustedGID &&
-                    (facts.st_mode & 0o777) == mode, "directory_contract")
+                    (facts.st_mode & 0o022) == 0 &&
+                    (facts.st_mode & 0o7777) == mode, "directory_contract")
+    }
+
+    private func validateDirectoryIdentity(_ logical: String, state: TransactionState, expectedPath: String? = nil) throws {
+        var facts = stat()
+        try validateAncestors(logical)
+        try require(lstat(physical(logical), &facts) == 0 && (facts.st_mode & S_IFMT) == S_IFDIR &&
+                    facts.st_uid == context.trustedUID && facts.st_gid == context.trustedGID &&
+                    state.directoryIdentities[expectedPath ?? logical] == [UInt64(facts.st_dev), UInt64(facts.st_ino)],
+                    "directory_identity_UNKNOWN")
     }
 
     private func syncParent(_ logical: String) throws {
         let parent = URL(fileURLWithPath: physical(logical)).deletingLastPathComponent().path
-        let fd = Darwin.open(parent, O_RDONLY | O_DIRECTORY)
+        let fd = Darwin.open(parent, O_RDONLY | O_DIRECTORY | O_NOFOLLOW)
         try require(fd >= 0, "parent_sync_open")
         defer { Darwin.close(fd) }
         try require(fsync(fd) == 0, "parent_sync")

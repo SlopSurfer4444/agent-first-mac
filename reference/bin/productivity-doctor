@@ -8,12 +8,17 @@ import re
 import subprocess
 import sys
 
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "lib"))
+from productivity_ownership import (PREFERENCES, managed_preferences,
+                                   collect_homebrew_conflicts, classify_observation,
+                                   targeted_application_collision)
+
 
 ROOT = Path(__file__).resolve().parent.parent
 MANIFEST = ROOT / "manifests/productivity-baseline.json"
 
 
-def command(argv, timeout=None):
+def command(argv, timeout=20):
     return subprocess.run(argv, text=True, stdout=subprocess.PIPE,
                           stderr=subprocess.STDOUT, check=False, timeout=timeout)
 
@@ -111,59 +116,32 @@ def main():
     check("configuration_revision", revision["compatible"])
 
     target = manifest["desiredState"] if expected_active else manifest["prestate"]
-    if require_mode[0] == "--manifest":
-        widget_active = manifest["fullColorWidgetsActive"]
-    else:
-        widget_active = require_mode[0] == "--target"
-    widget_target = (manifest["desiredState"] if widget_active
-                     else manifest["prestate"])
-    expected_defaults = {
-        ("NSGlobalDomain", "AppleIconAppearanceTheme"): target["iconAppearance"],
-        ("NSGlobalDomain", "AppleInterfaceStyleSwitchesAutomatically"):
-            "1" if expected_active else "0",
-        ("NSGlobalDomain", "AppleShowAllExtensions"): "1" if expected_active else "0",
-        ("NSGlobalDomain", "InitialKeyRepeat"): str(target["initialKeyRepeat"]),
-        ("NSGlobalDomain", "KeyRepeat"): str(target["keyRepeat"]),
-        ("NSGlobalDomain", "com.apple.trackpad.scaling"):
-            str(target["trackpadScaling"]).rstrip("0").rstrip("."),
-        ("com.apple.dock", "autohide"): "1" if target["dockAutohide"] else "0",
-        ("com.apple.dock", "minimize-to-application"): "1" if expected_active else "0",
-        ("com.apple.dock", "mru-spaces"): "0" if expected_active else "1",
-        ("com.apple.dock", "show-recents"): "0" if expected_active else "1",
-        ("com.apple.dock", "wvous-br-corner"):
-            str(target["bottomRightHotCornerRaw"]),
-        ("com.apple.finder", "AppleShowAllExtensions"): "1" if expected_active else "0",
-        ("com.apple.finder", "ShowPathbar"): "1" if expected_active else "0",
-        ("com.apple.finder", "ShowStatusBar"): "1" if expected_active else "0",
-        ("com.apple.AppleMultitouchTrackpad", "Clicking"): "1",
-        ("com.apple.AppleMultitouchTrackpad", "TrackpadRightClick"): "1",
-        ("com.apple.AppleMultitouchTrackpad", "TrackpadThreeFingerDrag"):
-            "1" if expected_active else "0",
-        ("com.apple.WindowManager", "GloballyEnabled"): "0",
-        ("com.apple.WindowManager", "EnableStandardClickToShowDesktop"):
-            "1" if target["clickWallpaperToShowDesktop"] else "0",
-        ("com.apple.WindowManager", "EnableTilingByEdgeDrag"): "1",
-        ("com.apple.WindowManager", "EnableTopTilingByEdgeDrag"): "1",
-        ("com.apple.WindowManager", "EnableTilingOptionAccelerator"): "1",
-        ("com.apple.WindowManager", "EnableTiledWindowMargins"): "0",
-        ("com.apple.widgets", "widgetAppearance"):
-            str(widget_target["widgetAppearanceRaw"]),
-    }
-    for (domain, key), value in expected_defaults.items():
-        check("default_" + re.sub(r"[^A-Za-z0-9]+", "_", domain + "_" + key),
-              default(domain, key) == value)
-
-    expected_screenshot = (Path.home() / "Pictures/Screenshots" if expected_active
-                           else Path.home() / "Desktop")
-    check("screenshot_location",
-          default("com.apple.screencapture", "location") == str(expected_screenshot))
-    if expected_active:
-        try:
-            mode = expected_screenshot.stat().st_mode & 0o777
-            check("screenshot_directory", expected_screenshot.is_dir() and
-                  expected_screenshot.stat().st_uid == os.getuid() and mode == 0o700)
-        except OSError:
-            check("screenshot_directory", False)
+    # Released preferences are not health failures and --prestate cannot replay
+    # or require historical owner settings. Only exact reviewed opt-in keys apply.
+    managed = managed_preferences(manifest)
+    widget_active = manifest["fullColorWidgetsActive"]
+    for key in managed:
+        if key not in PREFERENCES:
+            continue
+        value = manifest["desiredState"][key]
+        if key == "widgetAppearance":
+            value = manifest["desiredState"]["widgetAppearanceRaw"]
+        if key == "screenshotLocationClass":
+            value = str(Path.home() / "Pictures/Screenshots")
+            try:
+                directory = Path(value)
+                facts = directory.stat()
+                check("managed_screenshot_directory", directory.is_dir() and
+                      facts.st_uid == os.getuid() and facts.st_mode & 0o777 == 0o700)
+            except OSError:
+                check("managed_screenshot_directory", False)
+        elif type(value) is bool:
+            value = "1" if value else "0"
+        elif type(value) is float:
+            value = str(value).rstrip("0").rstrip(".")
+        else:
+            value = str(value)
+        check("managed_preference_" + key, default(*PREFERENCES[key]) == value)
 
     firewall = "\n".join(command([
         "/usr/libexec/ApplicationFirewall/socketfilterfw", option]).stdout
@@ -177,28 +155,39 @@ def main():
     check("firewall_stealth", ("stealth mode is on" in firewall) ==
           target["firewallStealthMode"])
 
-    power = command(["/usr/bin/pmset", "-g", "custom"]).stdout
+    power = (command(["/usr/bin/pmset", "-g", "custom"]).stdout
+             if any(key in managed for key in ("batteryLowPowerMode", "acLowPowerMode")) else "")
     sections = power.split("AC Power:")
     battery = sections[0]
     ac = sections[1] if len(sections) == 2 else ""
-    check("battery_low_power", re.search(
-        r"^\s*lowpowermode\s+" +
-        ("1" if target["batteryLowPowerMode"] else "0") + r"\s*$",
-        battery, re.MULTILINE) is not None)
-    check("ac_low_power", re.search(r"^\s*lowpowermode\s+0\s*$", ac,
-                                    re.MULTILINE) is not None)
+    if "batteryLowPowerMode" in managed:
+        check("battery_low_power", re.search(
+            r"^\s*lowpowermode\s+" +
+            ("1" if manifest["desiredState"]["batteryLowPowerMode"] else "0") + r"\s*$",
+            battery, re.MULTILINE) is not None)
+    if "acLowPowerMode" in managed:
+        check("ac_low_power", re.search(r"^\s*lowpowermode\s+0\s*$", ac,
+                                       re.MULTILINE) is not None)
 
     app_root = Path(manifest["target"]["applicationRoot"])
+    ownership = {}
     for app in manifest["applications"]:
         bundle = app_root / app["bundleName"]
         prefix = "app_" + app["name"].lower()
+        collision = targeted_application_collision(manifest, app) if expected_active else "clear"
+        live_id = plist_value(bundle, "CFBundleIdentifier") if bundle.is_dir() else None
+        ownership[app["name"]] = classify_observation(
+            managed=expected_active, present=bundle.is_dir(),
+            identity_matches=(live_id == app["bundleIdentifier"] if bundle.is_dir() else None),
+            competing_owner=collision == "conflict", observed=collision != "unknown")
+        check(prefix + "_single_owner", ownership[app["name"]]["state"] not in ("conflict", "unknown"))
         if not expected_active:
             check(prefix + "_absent", not bundle.exists())
             continue
         check(prefix + "_present", bundle.is_dir())
         if not bundle.is_dir():
             continue
-        check(prefix + "_bundle_id", plist_value(bundle, "CFBundleIdentifier") ==
+        check(prefix + "_bundle_id", live_id ==
               app["bundleIdentifier"])
         check(prefix + "_version", plist_value(bundle, "CFBundleShortVersionString") ==
               app["version"])
@@ -210,11 +199,8 @@ def main():
             "/usr/sbin/spctl", "--assess", "--type", "execute", str(bundle)
         ]).returncode == 0)
 
-    brew_formulae = command(["/opt/homebrew/bin/brew", "list", "--formula"])
-    brew_casks = command(["/opt/homebrew/bin/brew", "list", "--cask"])
-    check("homebrew_empty", brew_formulae.returncode == 0 and
-          brew_casks.returncode == 0 and not brew_formulae.stdout.strip() and
-          not brew_casks.stdout.strip())
+    brew = collect_homebrew_conflicts(dict(manifest, profileActive=expected_active), command)
+    check("homebrew_declared_collisions", brew["status"] == "clear" and brew["observed"])
     check("filevault_on", "FileVault is On" in command([
         "/usr/bin/fdesetup", "status"]).stdout)
 
@@ -229,6 +215,11 @@ def main():
         "checks": checks,
         "configurationRevisionStatus": final_revision,
         "problems": sorted(problems),
+        "preferenceOwnership": "owner-editable-preserved",
+        "managedPreferenceKeys": managed,
+        "ownershipObservations": ownership,
+        "homebrewOwnershipObservation": brew,
+        "completeInventory": False,
         "readOnly": True,
         "systemMutationsPerformed": False,
     }, indent=2, sort_keys=True))

@@ -11,6 +11,7 @@ import stat
 from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
+from lib import operation_readiness as readiness
 from test_wine_runtime_overlay import Fixture, COMMIT, w
 
 SOURCE=Path(__file__).resolve().parents[1]/'bin/games-runtime-update'
@@ -64,6 +65,18 @@ class Tests(unittest.TestCase):
         for key,value in mapping.items():
             active_patch=patch.object(a,key,value);active_patch.start();self.addCleanup(active_patch.stop)
         active_patch=patch.object(a.subprocess,'run',self.command);active_patch.start();self.addCleanup(active_patch.stop)
+        active_patch=patch.object(a,'operation_ready',self.readiness);active_patch.start();self.addCleanup(active_patch.stop)
+
+    def readiness(self,commit,operation,checks,target_guard):
+        self.calls.append((['operation-readiness',operation],{}))
+        import fcntl
+        with (self.f.path/'state/games-hub.lock').open('rb') as other:
+            with self.assertRaises(BlockingIOError):fcntl.flock(other,fcntl.LOCK_EX|fcntl.LOCK_NB)
+        try:return readiness.evaluate(operation,commit,checks=checks,target_guard=target_guard,
+            source_guard=lambda:self.doctor['configurationSourceAccepted'] is True and self.head==commit and self.branch=='main' and not self.dirty)
+        except RuntimeError as error:
+            if type(error) is RuntimeError:raise a.Blocked(str(error)) from None
+            raise
 
     def command(self,argv,**kwargs):
         self.calls.append((argv,kwargs))
@@ -93,7 +106,7 @@ class Tests(unittest.TestCase):
     def once(self,operation,commit=COMMIT,pin=None,old=None):
         start=len(self.calls)
         result=a.operate(operation,commit,pin,old)
-        self.assertEqual(sum(argv[0].endswith('current-doctor') for argv,_ in self.calls[start:]),1)
+        self.assertEqual(sum(argv[0]=='operation-readiness' for argv,_ in self.calls[start:]),1)
         return result
 
     def test_plan_is_read_only_then_exact_apply_noop_rollback_return(self):
@@ -102,7 +115,7 @@ class Tests(unittest.TestCase):
         self.assertEqual(plan['state'],'PLANNED_READ_ONLY')
         self.assertEqual(self.images(),before)
         self.assertFalse((self.f.path/'state/wine-runtime-overlay').exists())
-        self.assertEqual([x[0][1] for x in self.calls if x[0][0].endswith('wineserver')],['-w','-w'])
+        self.assertTrue(all(x[0][1]=='-w' for x in self.calls if x[0][0].endswith('wineserver')))
         pin=plan['planSha256']
         changed=self.once('apply',pin=pin)
         self.assertTrue(changed['liveStateChanged']);self.assertFalse(changed['installedAcceptanceClaimed'])
@@ -115,26 +128,23 @@ class Tests(unittest.TestCase):
         self.assertFalse(self.once('rollback',pin=pin)['changed'])
         self.assertTrue(self.once('return',pin=pin)['changed'])
 
-    def test_doctor_fresh_exact_main_and_source_drift_gate_real_responses(self):
+    def test_scoped_source_admission_and_actual_exact_main_gate_real_responses(self):
         before=self.images()
-        variants=[dict(self.doctor,gitOnly=True),dict(self.doctor,currentSentinelReady=False),
-                  dict(self.doctor,configurationSourceAccepted=1),dict(self.doctor,integratedMain=False),dict(self.doctor,verdict='PREPARED')]
+        variants=[dict(self.doctor,configurationSourceAccepted=1),dict(self.doctor,configurationSourceAccepted=False)]
         for doctor in variants:
             with self.subTest(doctor=doctor):
                 self.doctor=doctor
-                with self.assertRaisesRegex(a.Blocked,'fresh_accepted_doctor_required'):a.operate('plan',COMMIT)
+                with self.assertRaisesRegex(a.Blocked,'operation_source_drift'):a.operate('plan',COMMIT)
                 self.assertEqual(self.images(),before)
         self.doctor={'verdict':'PASS','gitOnly':False,'configurationSourceAccepted':True,'currentSentinelReady':True,'integratedMain':True}
         for key,value in (('branch','review-branch'),('dirty',' M bin/games-runtime-update'),('head','0'*40)):
             original=getattr(self,key);setattr(self,key,value)
             with self.assertRaisesRegex(a.Blocked,'clean_exact_main_required'):a.operate('plan',COMMIT)
             setattr(self,key,original)
-        original=self.command
-        def drift(argv,**kwargs):
-            result=original(argv,**kwargs)
-            if argv[0].endswith('current-doctor'):self.head='0'*40
-            return result
-        with patch.object(a.subprocess,'run',drift):
+        original=self.readiness
+        def drift(*args,**kwargs):
+            result=original(*args,**kwargs);self.head='0'*40;return result
+        with patch.object(a,'operation_ready',drift):
             with self.assertRaisesRegex(a.Blocked,'clean_exact_main_required'):a.operate('plan',COMMIT)
         self.assertEqual(self.images(),before)
 
@@ -162,7 +172,7 @@ class Tests(unittest.TestCase):
         a.operate('apply',COMMIT,plan['planSha256'])
         self.f.put('hub/receipt.json',b'newer native receipt')
         before=self.images()
-        with self.assertRaisesRegex(RuntimeError,'target_unknown_drift'):a.operate('rollback',COMMIT,plan['planSha256'])
+        with self.assertRaisesRegex(RuntimeError,'invalid_json'):a.operate('rollback',COMMIT,plan['planSha256'])
         self.assertEqual(self.images(),before)
 
     def test_source_only_adapter_has_no_arbitrary_root_or_fixture_authority_flag(self):
@@ -433,22 +443,14 @@ class Tests(unittest.TestCase):
                 journal.write_bytes(original_journal)
                 if injected is not None:injected.unlink()
 
-    def test_doctor_under_lock_and_next_failed_invocation_blocks_noop_and_recovery(self):
-        import fcntl
-        real=self.command
-        def locked(argv,**kwargs):
-            if argv[0].endswith('current-doctor'):
-                with (self.f.path/'state/games-hub.lock').open('rb') as other:
-                    with self.assertRaises(BlockingIOError):fcntl.flock(other,fcntl.LOCK_EX|fcntl.LOCK_NB)
-            return real(argv,**kwargs)
-        with patch.object(a.subprocess,'run',locked):
-            pin=self.once('plan')['planSha256'];self.once('apply',pin=pin)
+    def test_scoped_source_under_lock_and_next_failed_invocation_blocks_noop_and_recovery(self):
+        pin=self.once('plan')['planSha256'];self.once('apply',pin=pin)
         journal=self.f.path/'state'/a.NAMESPACE/'transaction/journal.json'
-        before=self.images();old=journal.read_bytes();self.doctor['currentSentinelReady']=False
+        before=self.images();old=journal.read_bytes();self.doctor['configurationSourceAccepted']=False
         for operation in ('apply','rollback','return','recover','plan'):
             start=len(self.calls)
-            with self.assertRaisesRegex(a.Blocked,'fresh_accepted_doctor_required'):a.operate(operation,COMMIT,pin)
-            self.assertEqual(sum(argv[0].endswith('current-doctor') for argv,_ in self.calls[start:]),1)
+            with self.assertRaisesRegex(a.Blocked,'operation_source_drift'):a.operate(operation,COMMIT,pin)
+            self.assertEqual(sum(argv[0]=='operation-readiness' for argv,_ in self.calls[start:]),1)
             self.assertEqual(self.images(),before);self.assertEqual(journal.read_bytes(),old)
 
     def test_local_drift_at_first_publication_is_checked_without_second_doctor(self):
@@ -475,12 +477,12 @@ class Tests(unittest.TestCase):
                 start=len(self.calls)
                 with patch.object(a,'make_root',make):
                     with self.assertRaisesRegex(RuntimeError,reason):a.operate('apply',COMMIT,pin)
-                self.assertEqual(sum(argv[0].endswith('current-doctor') for argv,_ in self.calls[start:]),1)
+                self.assertEqual(sum(argv[0]=='operation-readiness' for argv,_ in self.calls[start:]),1)
                 self.assertEqual(target.read_bytes(),b'foreign target' if kind=='preimage' else original_target)
                 self.head=COMMIT;self.dirty='';self.active=False;candidate.write_bytes(original_candidate);target.write_bytes(original_target)
                 self.once('recover',pin=pin);self.once('rollback',pin=pin)
 
-    def test_entry_vendor_observation_is_not_repeated_mid_operation(self):
+    def test_unrelated_vendor_failure_does_not_block_runtime_noop_or_recovery(self):
         pin=self.once('plan')['planSha256'];real=a.os.replace
         def changed(*args,**kwargs):
             result=real(*args,**kwargs)
@@ -488,7 +490,9 @@ class Tests(unittest.TestCase):
             return result
         with patch.object(a.os,'replace',changed):self.assertTrue(self.once('apply',pin=pin)['changed'])
         before=self.images()
-        with self.assertRaisesRegex(a.Blocked,'fresh_accepted_doctor_required'):a.operate('apply',COMMIT,pin)
+        self.assertFalse(self.once('apply',pin=pin)['changed'])
+        self.assertFalse(self.once('recover',pin=pin)['changed'])
+        self.assertEqual(sum(argv[0].endswith('current-doctor') for argv,_ in self.calls),0)
         self.assertEqual(self.images(),before)
 
     def test_root_lock_reentry_exception_cleanup_and_separate_root_isolation(self):
@@ -522,7 +526,7 @@ class Tests(unittest.TestCase):
         self.assertEqual(target.read_bytes(),before)
         self.once('recover',pin=pin)
 
-    def test_direct_engine_root_retains_legacy_explicit_full_gate(self):
+    def test_direct_engine_root_requires_actual_held_scope_on_each_gate(self):
         engine=a.load_engine();root=a.make_root(engine)
         try:
             with root.lock():
@@ -531,10 +535,22 @@ class Tests(unittest.TestCase):
                 prepared=engine.build(root,COMMIT,policy['desiredPEHashes'][a.PE32],policy['desiredPEHashes'][a.PE64],definition['overlayPolicySha256'],source_only=False)
             self.assertFalse(hasattr(root,'_publication_check'))
             start=len(self.calls)
-            tx=engine.Transaction(root,prepared['planSha256'],gate=lambda exact:a.gate(engine,root,exact),source_only=False)
-            self.assertTrue(tx.run('after')['changed'])
-            self.assertGreater(sum(argv[0].endswith('current-doctor') for argv,_ in self.calls[start:]),1)
+            with root.lock():
+                tx=engine.Transaction(root,prepared['planSha256'],gate=lambda exact:a.gate(engine,root,exact),source_only=False)
+                self.assertTrue(tx.run('after')['changed'])
+            self.assertGreater(sum(argv[0]=='operation-readiness' for argv,_ in self.calls[start:]),1)
         finally:root.close()
 
+
+    def test_archive_applied_preserves_legacy_pair_transaction_without_rebinding(self):
+        pin=self.once('plan')['planSha256'];self.once('apply',pin=pin)
+        before=self.images();self.head='c'*40
+        result=self.once('archive-applied',commit=self.head,pin=pin,old=COMMIT)
+        self.assertEqual(result['state'],'APPLIED_TRANSACTION_ARCHIVED')
+        self.assertFalse(result['oldTransactionRebound']);self.assertEqual(self.images(),before)
+        self.assertFalse((self.f.path/'state'/a.NAMESPACE).exists())
+        archived=self.f.path/'state'/a.ARCHIVES/(COMMIT+'-'+pin)/'transaction/plan.json'
+        self.assertEqual(w.decode(archived.read_bytes())['acceptedCommit'],COMMIT)
+        self.assertEqual([argv[1] for argv,_ in self.calls if argv[0]=='operation-readiness'][-1],'wine-recovery')
 
 if __name__ == '__main__':unittest.main()

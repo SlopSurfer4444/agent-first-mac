@@ -27,11 +27,13 @@ class CodexWindowsHostSshAppServerHolderTests(unittest.TestCase):
     def test_websocket_validator_accepts_only_upgrade(self):
         valid = (
             b"HTTP/1.1 101 Switching Protocols\r\n"
-            b"Upgrade: websocket\r\nConnection: Upgrade\r\n\r\n"
+            b"Upgrade: websocket\r\nConnection: Upgrade\r\n"
+            b"Sec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\n\r\n"
         )
-        self.assertTrue(module.validate_websocket_upgrade(valid))
+        key = "dGhlIHNhbXBsZSBub25jZQ=="
+        self.assertTrue(module.validate_websocket_upgrade(valid, key))
         self.assertFalse(module.validate_websocket_upgrade(
-            b"HTTP/1.1 200 OK\r\n\r\n"
+            b"HTTP/1.1 200 OK\r\n\r\n", key
         ))
 
     def test_manifest_preserves_unrelated_state(self):
@@ -49,7 +51,7 @@ class CodexWindowsHostSshAppServerHolderTests(unittest.TestCase):
         self.assertIn("replace_receipt", source)
         self.assertIn("receipt_rebind_postcheck_failed_restored", source)
         self.assertIn("rollback_target_hash_mismatch", source)
-        self.assertIn("apply_failed_rolled_back", source)
+        self.assertIn("apply_failed_recovery_required_state_preserved", source)
         self.assertNotIn("killpg", source)
 
 

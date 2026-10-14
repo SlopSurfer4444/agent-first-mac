@@ -138,6 +138,280 @@ GLOBAL_HARNESS_PATHS = frozenset((
     'tests/test_current_source_doctor.py',
     'tests/test_prepare_productivity_apply.py',
 ))
+# Preparation snapshot of the owner-authorized wave, not acceptance evidence.
+# Refresh against the union of every intermediate delta and the final candidate,
+# not just endpoint differences: added-then-retired scaffolds remain in scope.
+# Never discover authorization paths dynamically from a working tree or receipt.
+OWNER_FIRST_WAVE_PREVIOUS = "94e0e1999c208aaf4112b611bbfa5c8b65111419"
+OWNER_FIRST_WAVE_PATH = "evidence/config-transitions/owner-first-harness-wave/acceptance.json"
+OWNER_FIRST_WAVE_PATHS = frozenset((
+    "AGENTS.md",
+    "ARCHITECTURE.md",
+    "Package.swift",
+    "Sources/AidAdmin/main.swift",
+    "Sources/AidAdminApply/main.swift",
+    "Sources/AidAdminBootstrapCore/AidAdminBootstrapCore.swift",
+    "Sources/AidAdminCore/AidAdminCore.swift",
+    "Sources/AidAdminCore/OperationJournal.swift",
+    "Sources/AidAdminCore/RecoveryReceipt.swift",
+    "Sources/AidAdminCore/ResumeHomeManager.swift",
+    "Sources/AidAdminCore/ResumeLaunchd.swift",
+    "Sources/AidAdminEmergencyAction/main.swift",
+    "Sources/AidAdminEmergencyCore/AidAdminEmergencyCore.swift",
+    "Sources/AidAdminRuntime/BoundedProcess.swift",
+    "bin/aid",
+    "bin/aid-harness-offramp",
+    "bin/build-phase4-emergency-bundle",
+    "bin/build-phase4-install-bundle",
+    "bin/check-codex-windows-host-ssh-app-server-holder",
+    "bin/check-productivity-baseline",
+    "bin/codex-windows-host-ssh-app-server-holder",
+    "bin/codex-windows-host-ssh-stdio-compat",
+    "bin/codex-quarantine",
+    "bin/cs2-play",
+    "bin/cs2-standalone",
+    "bin/current-doctor",
+    "bin/ds3-runtime",
+    "bin/game-app-launcher-update",
+    "bin/game-app-launchers",
+    "bin/game-launch-admission",
+    "bin/game-launch-reliability-update",
+    "bin/games-hub",
+    "bin/games-play",
+    "bin/games-runtime-update",
+    "bin/windows-host-ssh-client",
+    "bin/phase5-config-transaction",
+    "bin/phase5-preflight",
+    "bin/phase5-trusted-probe",
+    "bin/prepare-productivity-apply",
+    "bin/productivity-doctor",
+    "bin/root-operation-recovery-observe",
+    "bin/shell-nofile",
+    "bin/wine-runtime-overlay",
+    "bin/workstation-drift-snapshot",
+    "bin/workstation-maintenance-cycle",
+    "codex/hooks.json",
+    "codex/hooks/phase5-contract.py",
+    "codex/quarantine.config.toml",
+    "darwin/productivity.nix",
+    "darwin/rustdesk-controller.nix",
+    "darwin/windows-app.nix",
+    "docs/aid.md",
+    "docs/codex-windows-host-ssh-app-server-holder.md",
+    "docs/codex-windows-host-ssh-stdio-compat.md",
+    "docs/current-source-admission.md",
+    "docs/windows-host-ssh-client.md",
+    "docs/harness-operations.md",
+    "docs/maintenance.md",
+    "docs/operation-readiness.md",
+    "docs/post-phase5-sentinel.md",
+    "docs/project-context-boundary.md",
+    "docs/shell-nofile.md",
+    "docs/wave-games.md",
+    "docs/wave-offramp.md",
+    "docs/wave-owner-freedom.md",
+    "docs/wave-quarantine-boundary.md",
+    "docs/wave-recovery-coverage.md",
+    "docs/wave-root-recovery.md",
+    "docs/wave-shell-legacy.md",
+    "docs/wave-ssh.md",
+    "docs/wave-vendor-correctness.md",
+    "docs/wine-runtime-overlay.md",
+    "lib/config_transition_source.py",
+    "lib/current_doctor_native.py",
+    "lib/current_source_admission.py",
+    "lib/current_source_checkpoint.py",
+    "lib/game_operation_readiness.py",
+    "lib/harness_offramp.py",
+    "lib/operation_readiness.py",
+    "lib/prepared_receipt.py",
+    "lib/productivity_ownership.py",
+    "lib/root_operation_recovery.py",
+    "lib/vendor_compatibility_policy.py",
+    "lib/vendor_compatibility_probe.py",
+    "lib/vendor_fixture_custody.py",
+    "lib/workstation_maintenance_delivery.py",
+    "manifests/codex-windows-host-ssh-app-server-holder.json",
+    "manifests/codex-windows-host-ssh-stdio-compat.json",
+    "manifests/game-launch-reliability.json",
+    "manifests/games-hub.json",
+    "manifests/harness-hook-retirement.json",
+    "manifests/productivity-baseline.json",
+    "manifests/quarantine-boundary-successor.json",
+    "manifests/wine-runtime-overlay.json",
+    "manifests/wine-runtime-overlay.schema.json",
+    "manifests/wine-runtime-update.json",
+    "manifests/wine-runtime-update.schema.json",
+    "manifests/workstation-maintenance.json",
+    "skills/manage-workstation/SKILL.md",
+    "tests/AidAdminBootstrapTests/AidAdminBootstrapTests.swift",
+    "tests/AidAdminCoreTests/AidAdminCoreTests.swift",
+    "tests/AidAdminEmergencyTests/AidAdminEmergencyTests.swift",
+    "tests/AidAdminResumeHomeManagerTests/AidAdminResumeHomeManagerTests.swift",
+    "tests/AidAdminResumeLaunchdTests/AidAdminResumeLaunchdTests.swift",
+    "tests/AidAdminRuntimeTests/AidAdminRuntimeTests.swift",
+    "tests/fixtures/harness-hooks-pre-retirement.json",
+    "tests/fixtures/phase5-quarantine-before-current-cli.zsh",
+    "tests/fixtures/phase5-quarantine-before-temp-deny.config.toml",
+    "tests/test_aid.py",
+    "tests/test_codex_windows-host_ssh_app_server_holder.py",
+    "tests/test_codex_windows-host_ssh_stdio_compat.py",
+    "tests/test_config_transition_source.py",
+    "tests/test_current_doctor.py",
+    "tests/test_current_doctor_native.py",
+    "tests/test_current_source_checkpoint.py",
+    "tests/test_ds3_lifecycle_recovery.py",
+    "tests/test_ds3_runtime.py",
+    "tests/test_ds3_window_repair.py",
+    "tests/test_game_launch_admission.py",
+    "tests/test_game_launch_reliability_update.py",
+    "tests/test_game_operation_readiness.py",
+    "tests/test_games_runtime_update.py",
+    "tests/test_windows-host_ssh_client.py",
+    "tests/test_harness_offramp.py",
+    "tests/test_operation_readiness.py",
+    "tests/test_phase5_current_quarantine.py",
+    "tests/test_phase5_quarantine_fixture.py",
+    "tests/test_phase5_quarantine_launcher_outer.py",
+    "tests/test_phase5_quarantine_outer.py",
+    "tests/test_phase5_vendor_floor.py",
+    "tests/test_prepare_productivity_apply.py",
+    "tests/test_prepared_receipt.py",
+    "tests/test_productivity_owner_freedom.py",
+    "tests/test_productivity_power_policy.py",
+    "tests/test_project_context_boundary.py",
+    "tests/test_quarantine_boundary_successor.py",
+    "tests/test_root_bundle_successor.py",
+    "tests/test_root_operation_recovery.py",
+    "tests/test_root_resume_module_guards.py",
+    "tests/test_sessionstart_exposure.py",
+    "tests/test_vendor_compatibility_policy.py",
+    "tests/test_vendor_compatibility_probe.py",
+    "tests/test_vendor_fixture_custody.py",
+    "tests/test_wave_recovery_coverage.py",
+    "tests/test_wave_shell_legacy.py",
+    "tests/test_wave_ssh_exchange.py",
+    "tests/test_wave_ssh_lifecycle.py",
+    "tests/test_wave_ssh_protocol.py",
+    "tests/test_wave_trusted_version.py",
+    "tests/test_wine_runtime_extended.py",
+    "tests/test_workstation_drift_snapshot.py",
+    "tests/test_workstation_maintenance_cycle.py",
+    "tests/test_workstation_maintenance_delivery.py",
+))
+# Lasting protection is intentionally separate from the one-time mutation list.
+# lib/, Sources/, codex/ and skills/ remain protected by existing prefixes; normal
+# payload wrappers, app preferences, observation tools and descriptive wave docs
+# do not become authorities merely because this wave changed them.
+OWNER_FIRST_WAVE_PROTECTED = frozenset((
+    # Direct operation/custody adapters and their authority declarations.
+    "bin/aid-harness-offramp", "bin/codex-windows-host-ssh-app-server-holder",
+    "bin/codex-windows-host-ssh-stdio-compat", "bin/shell-nofile",
+    "bin/workstation-maintenance-cycle",
+    "manifests/harness-hook-retirement.json",
+    "manifests/codex-windows-host-ssh-app-server-holder.json",
+    "manifests/codex-windows-host-ssh-stdio-compat.json",
+    "manifests/workstation-maintenance.json",
+    # Acceptance-critical source, authority and receipt/recovery regressions.
+    "manifests/quarantine-boundary-successor.json",
+    "tests/test_quarantine_boundary_successor.py",
+    "tests/fixtures/phase5-quarantine-before-current-cli.zsh",
+    "tests/fixtures/phase5-quarantine-before-temp-deny.config.toml",
+    "tests/test_current_source_checkpoint.py", "tests/test_operation_readiness.py",
+    "tests/test_harness_offramp.py", "tests/test_prepared_receipt.py",
+    "tests/test_root_resume_module_guards.py", "tests/test_game_operation_readiness.py",
+    "tests/test_codex_windows-host_ssh_app_server_holder.py",
+    "tests/test_codex_windows-host_ssh_stdio_compat.py",
+    "tests/test_wave_shell_legacy.py", "tests/test_wave_ssh_lifecycle.py",
+    "tests/test_wave_ssh_protocol.py", "tests/test_wave_ssh_exchange.py",
+    "tests/test_aid.py", "tests/test_sessionstart_exposure.py",
+    "tests/test_project_context_boundary.py",
+    "tests/test_root_bundle_successor.py",
+    "tests/test_workstation_maintenance_delivery.py",
+    "tests/test_workstation_maintenance_cycle.py",
+    "tests/test_vendor_fixture_custody.py",
+    "tests/AidAdminResumeHomeManagerTests/AidAdminResumeHomeManagerTests.swift",
+    "tests/AidAdminResumeLaunchdTests/AidAdminResumeLaunchdTests.swift",
+    "tests/AidAdminRuntimeTests/AidAdminRuntimeTests.swift",
+    "tests/fixtures/harness-hooks-pre-retirement.json",
+    # Normative admission/operation/off-ramp contracts, not descriptive reports.
+    "docs/current-source-admission.md", "docs/harness-operations.md",
+    "docs/operation-readiness.md", "docs/wave-offramp.md",
+))
+
+# Fresh unaccepted candidate on canonical 97ce4ae, not a descendant of the
+# independently accepted 849a241 sibling. Preserve that sibling and its receipt;
+# this lineage must publish its own genuine wave receipt after combined review.
+# Component scope is provisional until the integration owner freezes all paths.
+OWNER_FIRST_WAVE_DELIVERY_PATHS = frozenset((
+    "lib/config_transition_source.py", "tests/test_config_transition_source.py",
+    "tests/test_current_source_checkpoint.py", "docs/current-source-admission.md",
+    "docs/owner-first-delivery-recovery.md", "manifests/windows-host-ssh-client.json",
+    "lib/game_delivery_bridge.py", "tests/test_game_delivery_bridge.py",
+    "tests/test_game_delivery_order.py", "docs/wave-games.md",
+    "tests/test_game_operation_readiness.py",
+    "bin/quarantine-delivery", "lib/quarantine_delivery.py",
+    "tests/test_quarantine_delivery.py", "docs/quarantine-delivery.md",
+    "manifests/root-runtime-release.json", "lib/root_delivery.py",
+    "bin/root-delivery", "tests/test_root_delivery.py", "docs/root-runtime-delivery.md",
+    "lib/root_runtime_health.py", "bin/root-runtime-doctor", "tests/test_root_runtime_health.py",
+    "bin/aid", "manifests/aid-catalog.json", "tests/test_aid.py", "docs/aid.md",
+    "bin/ds3-policy-source-bootstrap", "bin/ds3-runtime", "bin/games-runtime-update",
+    "bin/wine-runtime-overlay", "docs/wine-runtime-overlay.md",
+    "manifests/wine-runtime-update.schema.json", "tests/test_ds3_policy_source_bootstrap.py",
+    "tests/test_games_installed_policy.py", "tests/test_wine_installed_policy.py",
+    "bin/workstation-guidance-delivery", "lib/workstation_guidance_delivery.py",
+    "tests/test_workstation_guidance_delivery.py", "manifests/workstation-guidance-delivery.json",
+    "docs/workstation-guidance-delivery.md",
+))
+# New authorities and acceptance-critical contracts only. Ordinary Wine payload
+# wrappers/schema documentation do not become protected merely by changing here.
+# lib/ is already protected by the unchanged inherited prefix.
+OWNER_FIRST_WAVE_DELIVERY_PROTECTED = frozenset((
+    "bin/quarantine-delivery", "tests/test_quarantine_delivery.py", "docs/quarantine-delivery.md",
+    "bin/root-delivery", "bin/root-runtime-doctor", "manifests/root-runtime-release.json",
+    "tests/test_root_delivery.py", "tests/test_root_runtime_health.py", "docs/root-runtime-delivery.md",
+    "bin/ds3-policy-source-bootstrap", "tests/test_ds3_policy_source_bootstrap.py",
+    "tests/test_games_installed_policy.py", "tests/test_wine_installed_policy.py",
+    "docs/owner-first-delivery-recovery.md",
+    "tests/test_game_delivery_bridge.py", "tests/test_game_delivery_order.py",
+    "bin/workstation-guidance-delivery", "tests/test_workstation_guidance_delivery.py",
+    "manifests/workstation-guidance-delivery.json", "docs/workstation-guidance-delivery.md",
+))
+# Explicit union; retain the original reviewed scope, including its four retired
+# scaffolds, without claiming that those commits occur on this new lineage.
+OWNER_FIRST_WAVE_PATHS = OWNER_FIRST_WAVE_PATHS | OWNER_FIRST_WAVE_DELIVERY_PATHS
+OWNER_FIRST_WAVE_PROTECTED = OWNER_FIRST_WAVE_PROTECTED | OWNER_FIRST_WAVE_DELIVERY_PROTECTED
+
+# Narrow correction after the real integrated wave; historical wave scope and
+# protections stay immutable. This registration alone is not source acceptance.
+VENDOR_FIXTURE_CUSTODY_REPAIR_PREVIOUS = "207e8f3fa2acfc70a588337ef129fb9a91699b1e"
+VENDOR_FIXTURE_CUSTODY_REPAIR_PATH = "evidence/config-transitions/vendor-fixture-custody-repair/acceptance.json"
+VENDOR_FIXTURE_CUSTODY_REPAIR_PATHS = frozenset((
+    "lib/vendor_fixture_custody.py", "lib/vendor_compatibility_probe.py",
+    "tests/test_vendor_fixture_custody.py", "tests/test_vendor_compatibility_probe.py",
+    "lib/config_transition_source.py", "tests/test_config_transition_source.py",
+    "tests/test_current_source_checkpoint.py", "docs/vendor-fixture-custody-repair.md",
+))
+
+SCHEDULER_DESCRIPTOR_REPAIR_PREVIOUS = "6e8d675db89af967e4375e75ef0ab5563e4b9208"
+SCHEDULER_DESCRIPTOR_REPAIR_PATH = "evidence/config-transitions/scheduler-descriptor-repair/acceptance.json"
+SCHEDULER_DESCRIPTOR_REPAIR_PATHS = frozenset((
+    "lib/workstation_maintenance_delivery.py", "tests/test_workstation_maintenance_delivery.py",
+    "lib/config_transition_source.py", "tests/test_config_transition_source.py",
+    "tests/test_current_source_checkpoint.py", "docs/scheduler-descriptor-repair.md",
+))
+
+PRODUCT_SURFACE_PREVIOUS = "fac9dd5d7925695c7d0a8b5a3f8af536ef71c3dd"
+PRODUCT_SURFACE_PATH = "evidence/config-transitions/product-surface/acceptance.json"
+PRODUCT_SURFACE_PATHS = frozenset((
+    "README.md", "docs/index.md", "docs/usage.md", "docs/installation.md",
+    "docs/recovery.md", "docs/history/index.md", "bin/aid", "tests/test_aid.py", "docs/aid.md",
+    "lib/config_transition_source.py", "tests/test_config_transition_source.py",
+    "tests/test_current_source_checkpoint.py", "tests/test_product_surface.py",
+    "docs/product-surface-admission.md",
+))
+
 # Payload doctors report the current reviewed manifest; they are not source
 # admission, broker or trust authorities. Their July versions are history,
 # not a permanent constraint on future reviewed app versions/preferences.
@@ -176,6 +450,13 @@ def global_harness_policy(anchor):
     return rules
 
 
+def owner_first_wave_policy(anchor):
+    # Never retroactively require successor files in historical accepted trees.
+    rules = dict(global_harness_policy(anchor))
+    rules["protected_paths"] = rules["protected_paths"] | OWNER_FIRST_WAVE_PROTECTED
+    return rules
+
+
 def policy_updates(anchor):
     return {POLICY_V2_PATH: {"previous_commit": POLICY_V2_PREVIOUS,
                             "paths": POLICY_V2_PATHS, "after": policy_v2(anchor)},
@@ -192,7 +473,19 @@ def policy_updates(anchor):
                 "paths": CURRENT_DOCTOR_DIAGNOSTICS_PATHS, "after": policy_v2(anchor)},
             GLOBAL_HARNESS_PATH: {
                 "previous_commit": GLOBAL_HARNESS_PREVIOUS,
-                "paths": GLOBAL_HARNESS_PATHS, "after": global_harness_policy(anchor)}}
+                "paths": GLOBAL_HARNESS_PATHS, "after": global_harness_policy(anchor)},
+            OWNER_FIRST_WAVE_PATH: {
+                "previous_commit": OWNER_FIRST_WAVE_PREVIOUS,
+                "paths": OWNER_FIRST_WAVE_PATHS, "after": owner_first_wave_policy(anchor)},
+            VENDOR_FIXTURE_CUSTODY_REPAIR_PATH: {
+                "previous_commit": VENDOR_FIXTURE_CUSTODY_REPAIR_PREVIOUS,
+                "paths": VENDOR_FIXTURE_CUSTODY_REPAIR_PATHS, "after": owner_first_wave_policy(anchor)},
+            SCHEDULER_DESCRIPTOR_REPAIR_PATH: {
+                "previous_commit": SCHEDULER_DESCRIPTOR_REPAIR_PREVIOUS,
+                "paths": SCHEDULER_DESCRIPTOR_REPAIR_PATHS, "after": owner_first_wave_policy(anchor)},
+            PRODUCT_SURFACE_PATH: {
+                "previous_commit": PRODUCT_SURFACE_PREVIOUS,
+                "paths": PRODUCT_SURFACE_PATHS, "after": owner_first_wave_policy(anchor)}}
 
 
 def import_scope(before, after):

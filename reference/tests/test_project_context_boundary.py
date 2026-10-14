@@ -125,8 +125,11 @@ class ProjectContextTests(unittest.TestCase):
     def test_control_quarantine_and_canonical_aliases_keep_separate_guidance(self):
         for path in (self.control, self.control_worktree):
             message = self.context(str(path))
-            self.assertIn("Control intent is root-equivalent", message)
+            self.assertIn("Control source can affect live hooks", message)
             self.assertIn("ARCHITECTURE.md", message)
+            self.assertIn("docs/harness-operations.md", message)
+            self.assertIn("Source-only work needs no live doctor", message)
+            self.assertNotIn("independent review", message)
         message = self.context(str(self.quarantine))
         self.assertIn("This input is quarantined", message)
         self.assertIn("do not use secrets, user MCP/apps", message)
@@ -168,11 +171,36 @@ class ProjectContextTests(unittest.TestCase):
                 H.main()
             self.assertNotIn("continue", json.loads(output.getvalue()))
             self.assertIn("context is unavailable", output.getvalue())
-        for operation, event in (("warn", "PreToolUse"), ("verify", "Stop")):
+        for operation in ("warn", "verify"):
             with patch.object(H.sys, "argv", [str(SOURCE), operation]), \
-                    patch.object(H.sys, "stdin", io.StringIO(json.dumps({"hook_event_name": event}))):
-                with self.assertRaises(SystemExit) as caught:H.main()
-            self.assertEqual(caught.exception.code, 2)
+                    patch.object(H.sys, "stdin", side_effect=AssertionError("legacy stdin read")), \
+                    patch.object(H, "canonical_home", side_effect=AssertionError("home read")), \
+                    patch.object(H.subprocess, "run", side_effect=AssertionError("command executed")):
+                self.assertIsNone(H.main())
+
+    def test_legacy_policing_direct_calls_are_inert_for_dirty_or_local_work(self):
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output), \
+                patch.object(H, "zone", side_effect=AssertionError("registry route queried")), \
+                patch.object(H, "canonical_home", side_effect=AssertionError("home read")), \
+                patch.object(H.subprocess, "run", side_effect=AssertionError("Git queried")):
+            for command in ("cargo install --path . --root ./fixture-tools", "gem install --install-dir ./vendor",
+                            "brew install fixture", "sudo installer -pkg fixture.pkg -target /", "x" * 40000):
+                self.assertFalse(H.workstation_bypass(command))
+                H.warn({"tool_name": "Bash", "tool_input": {"command": command}})
+            for value in ({}, None, {"cwd": str(self.control), "dirty": True}):
+                H.verify(value, home=self.home, registry_path=self.registry)
+        self.assertEqual(output.getvalue(), "")
+
+    def test_successor_definition_has_one_dynamic_context_and_no_policing(self):
+        value = json.loads((ROOT / "codex/hooks.json").read_text())
+        self.assertEqual(set(value["hooks"]), {"SessionStart"})
+        definitions = value["hooks"]["SessionStart"]
+        self.assertEqual(len(definitions), 1)
+        commands = definitions[0]["hooks"]
+        self.assertEqual(len(commands), 1)
+        self.assertTrue(commands[0]["command"].endswith('" context'))
+        self.assertNotIn("printf", commands[0]["command"])
 
     def test_candidate_cli_sessionstart_is_neutral_without_installed_hook_execution(self):
         result = subprocess.run([sys.executable, "-B", str(SOURCE), "context"],
@@ -183,6 +211,29 @@ class ProjectContextTests(unittest.TestCase):
         self.assertEqual(set(json.loads(result.stdout)), {"hookSpecificOutput"})
         self.assertIn("grants no repository trust or permissions", result.stdout)
         self.assertNotIn(str(self.external), result.stdout)
+
+    def test_malformed_and_oversized_event_payload_is_bounded_nonblocking(self):
+        for raw in ("not JSON", "[]", "{" * 80, "x" * (H.EVENT_LIMIT + 1)):
+            output = io.StringIO()
+            source = io.StringIO(raw)
+            with patch.object(H.sys, "argv", [str(SOURCE), "context"]), \
+                    patch.object(H.sys, "stdin", source), contextlib.redirect_stdout(output):
+                self.assertIsNone(H.main())
+            self.assertLessEqual(source.tell(), H.EVENT_LIMIT + 1)
+            message = json.loads(output.getvalue())["hookSpecificOutput"]["additionalContext"]
+            self.assertIn("context is unavailable", message)
+            self.assertLess(len(output.getvalue()), 700)
+            self.assertNotIn("continue", json.loads(output.getvalue()))
+
+    def test_disposable_or_external_context_creates_no_control_lifecycle(self):
+        before = {str(p.relative_to(self.root)): p.read_bytes()
+                  for p in self.root.rglob("*") if p.is_file()}
+        self.neutral(self.external)
+        self.neutral(self.worktree)
+        self.neutral(self.generic)
+        self.assertEqual(before, {str(p.relative_to(self.root)): p.read_bytes()
+                                  for p in self.root.rglob("*") if p.is_file()})
+        self.assertEqual(list(self.registry.parent.iterdir()), [])
 
 
 if __name__ == "__main__":

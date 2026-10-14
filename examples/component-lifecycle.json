@@ -1,0 +1,14 @@
+{
+  "publicReferenceOnly": true,
+  "warning": "Illustrative design vocabulary, not a runtime manifest or installation instruction.",
+  "component": {
+    "id": "example-editor",
+    "ownership": "vendor-managed",
+    "desiredManagement": "observe-only",
+    "versionPolicy": "signed-vendor-floor",
+    "healthScope": "target-specific functional observation",
+    "dataBoundary": "Application-owned documents and profiles excluded from Git.",
+    "changeBoundary": "Explicit requested action; observation does not authorize mutation.",
+    "recoveryBoundary": "Operation-specific recovery preserves unrelated owner state."
+  }
+}

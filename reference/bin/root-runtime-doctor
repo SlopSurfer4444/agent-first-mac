@@ -1,0 +1,9 @@
+#!/usr/bin/python3 -I -B
+"""Read-only successor root component health; no arbitrary command or path."""
+import sys
+from pathlib import Path
+sys.dont_write_bytecode = True
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from lib.root_runtime_health import main
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv[1:]))

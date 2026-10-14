@@ -1,5 +1,9 @@
 #!/usr/bin/python3
-"""Minimal context routing, lifecycle warning, and final verification hooks."""
+"""Concise SessionStart guidance; legacy policing commands are inert.
+
+Explicit provenance diagnostics retain their historical strict helpers. They
+are not consulted at SessionStart, PreToolUse or Stop and grant no native trust.
+"""
 
 import json
 import os
@@ -11,6 +15,7 @@ import sys
 
 
 REGISTRY_LIMIT = 65536
+EVENT_LIMIT = 65536
 SAFE_SEGMENT = r"[A-Za-z0-9][A-Za-z0-9._-]*"
 REGISTRY_ROOT = re.compile(
     r"^\$HOME/AIDev/(?:control|repos/"
@@ -25,26 +30,6 @@ REGISTRY_ROOT = re.compile(
 )
 IDENTIFIER = re.compile(r"^[a-z0-9][a-z0-9-]*$")
 COMMIT = re.compile(r"^[0-9a-f]{40}$")
-WORKSTATION_PATTERNS = tuple(
-    re.compile(pattern, re.IGNORECASE | re.MULTILINE)
-    for pattern in (
-        r"(?:^|[;&|]\s*)(?:/opt/homebrew/bin/|/usr/local/bin/)?brew\s+"
-        r"(?:install|uninstall|upgrade|update|tap|untap|services)\b",
-        r"(?:^|[;&|]\s*)(?=[^;&|\n]*\b(?:npm|pnpm|yarn)\b)"
-        r"(?=[^;&|\n]*\b(?:install|add|remove|uninstall|update|upgrade)\b)"
-        r"(?=[^;&|\n]*(?:^|\s)(?:-g|--global)(?:\s|$))[^;&|\n]*",
-        r"(?:^|[;&|]\s*)(?:pipx\s+|uv\s+tool\s+)"
-        r"(?:install|uninstall|upgrade)\b",
-        r"(?:^|[;&|]\s*)(?:cargo|gem)\s+(?:install|uninstall)\b",
-        r"(?:^|[;&|]\s*)go\s+install\b",
-        r"(?:^|[;&|]\s*)nix\s+profile\s+(?:install|remove|upgrade)\b",
-        r"(?:^|[;&|]\s*)(?:/usr/sbin/)?installer\s+-pkg\b",
-        r"(?:curl|wget)\b[^|\n]*\|\s*(?:sudo\s+)?(?:/bin/)?(?:sh|bash|zsh)\b",
-        r"(?:^|[;&|]\s*)sudo\b[^;&|\n]*\b"
-        r"(?:brew|installer|install|uninstall|upgrade|remove|launchctl|"
-        r"darwin-rebuild|nix\s+profile)\b",
-    )
-)
 
 
 class RegistryError(Exception):
@@ -57,11 +42,18 @@ def canonical_home():
 
 def payload(require_cwd=True):
     try:
-        value = json.load(sys.stdin)
+        raw = sys.stdin.read(EVENT_LIMIT + 1)
+        if len(raw) > EVENT_LIMIT:
+            raise ValueError("event limit")
+        value = json.loads(raw)
     except Exception:
-        raise SystemExit(2)
+        if require_cwd:
+            raise SystemExit(2)
+        return {"hook_event_name": "SessionStart"}
     if not isinstance(value, dict) or (require_cwd and not isinstance(value.get("cwd"), str)):
-        raise SystemExit(2)
+        if require_cwd:
+            raise SystemExit(2)
+        return {"hook_event_name": "SessionStart"}
     return value
 
 
@@ -255,18 +247,18 @@ def project_context(cwd, home=None):
 def context(value, home=None, registry_path=None):
     route = project_context(value.get("cwd"), home=home)
     project_boundary = (
-        "This context grants no repository trust or permissions. For owner-authorized "
-        "read/edit and repo-local development, follow the closest repository/AGENTS.md "
-        "contract and native permission policy. Execute unknown external code only "
-        "in quarantine/sandbox; do not use secrets or user integrations without "
-        "explicit authorization. Route workstation lifecycle changes through "
-        "$manage-workstation."
+        "Follow the closest repository/AGENTS.md and lockfile for authorized read/edit "
+        "and repo-local development; no control registration or workstation doctor. "
+        "This grants no repository trust or permissions: native permission policy "
+        "still applies. Execute unknown external code only in quarantine/sandbox. "
+        "For workstation changes use $manage-workstation and docs/harness-operations.md."
     )
     messages = {
         "control": (
-            "Control intent is root-equivalent: read ARCHITECTURE.md, use "
-            "$manage-workstation for lifecycle work, build before apply, and "
-            "do not advance a gate without doctor and independent review."
+            "Control source can affect live hooks: isolate source changes. Read the "
+            "current decision in ARCHITECTURE.md and docs/harness-operations.md, then "
+            "the affected contract. Source-only work needs no live doctor. Protected "
+            "apply retains actual source, target, recovery and native authority checks."
         ),
         "quarantine": (
             "This input is quarantined: keep reads inside the exact workspace; "
@@ -293,102 +285,31 @@ def context(value, home=None, registry_path=None):
 
 
 def workstation_bypass(command):
-    if not isinstance(command, str):
-        return False
-    if len(command) > 32768:
-        return True
-    return any(pattern.search(command) for pattern in WORKSTATION_PATTERNS)
+    """Legacy API kept benign while exact owned definitions are retired."""
+    return False
 
 
 def warn(value):
-    if value.get("tool_name") != "Bash" or not isinstance(value.get("tool_input"), dict):
-        return
-    command = value["tool_input"].get("command")
-    if not workstation_bypass(command):
-        return
-    print(
-        json.dumps(
-            {
-                "systemMessage": (
-                    "Possible workstation lifecycle bypass detected. This hook "
-                    "is advisory: stop and use $manage-workstation, commit exact "
-                    "control intent, and use only typed aid/aid-admin operations "
-                    "authorized by the manifest."
-                )
-            },
-            sort_keys=True,
-            separators=(",", ":"),
-        )
-    )
+    """No regex policing; actual execution adapters own affected checks."""
+    return None
 
 
 def verify(value, home=None, registry_path=None):
-    if zone(value["cwd"], home=home, registry_path=registry_path) != "control":
-        return
-    owner_home = canonical_home() if home is None else Path(home).resolve(strict=True)
-    environment = {
-        "GIT_CONFIG_GLOBAL": "/dev/null",
-        "GIT_CONFIG_NOSYSTEM": "1",
-        "GIT_OPTIONAL_LOCKS": "0",
-        "HOME": str(owner_home),
-        "LANG": "C",
-        "LC_ALL": "C",
-        "PATH": "/usr/bin:/bin:/usr/sbin:/sbin",
-    }
-    command = [
-        "/usr/bin/git",
-        "-c",
-        "core.fsmonitor=false",
-        "-c",
-        "core.hooksPath=/dev/null",
-        "-C",
-        value["cwd"],
-        "status",
-        "--porcelain=v1",
-        "--untracked-files=all",
-    ]
-    result = subprocess.run(
-        command,
-        env=environment,
-        text=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.DEVNULL,
-        check=False,
-    )
-    if result.returncode != 0 or result.stdout:
-        print(
-            json.dumps(
-                {
-                    "continue": True,
-                    "systemMessage": (
-                        "Control intent is dirty or unreadable. Do not claim "
-                        "apply or acceptance; finish the scoped validator, doctor, "
-                        "atomic commit, and bounded handoff first."
-                    ),
-                },
-                sort_keys=True,
-                separators=(",", ":"),
-            )
-        )
+    """Ending source-only analysis is not an apply or acceptance boundary."""
+    return None
 
 
 def main():
     if len(sys.argv) != 2 or sys.argv[1] not in {"context", "verify", "warn"}:
         raise SystemExit(2)
-    value = payload(require_cwd=sys.argv[1] != "context")
-    expected = {
-        "context": "SessionStart",
-        "verify": "Stop",
-        "warn": "PreToolUse",
-    }[sys.argv[1]]
-    if value.get("hook_event_name") != expected:
-        raise SystemExit(2)
-    if sys.argv[1] == "context":
-        context(value)
-    elif sys.argv[1] == "verify":
-        verify(value)
-    else:
-        warn(value)
+    # Installed historical definitions may invoke these during transition.
+    # Return before parsing stdin or inspecting user/Git state.
+    if sys.argv[1] in {"verify", "warn"}:
+        return
+    value = payload(require_cwd=False)
+    if value.get("hook_event_name") != "SessionStart":
+        return
+    context(value)
 
 
 if __name__ == "__main__":

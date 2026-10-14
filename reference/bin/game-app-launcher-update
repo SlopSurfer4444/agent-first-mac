@@ -73,7 +73,8 @@ def update(commit,candidate):
     return {'state':'GAME_APP_ERRORS_INSTALLED','changed':True,'gameStarted':False}
 
 def rollback(commit,apply_commit):
-    h.source_gate(commit);h.need(type(apply_commit) is str and re.fullmatch('[0-9a-f]{40}',apply_commit),'invalid_apply_commit')
+    h.need(type(apply_commit) is str and re.fullmatch('[0-9a-f]{40}',apply_commit),'invalid_apply_commit')
+    h.source_gate(commit,'rollback',lambda:check(h.HUB/('.game-app-errors-'+apply_commit),apply_commit))
     restore(h.HUB/('.game-app-errors-'+apply_commit),apply_commit);h.status()
     return {'state':'GAME_APP_ERRORS_ROLLED_BACK','gameStarted':False}
 
