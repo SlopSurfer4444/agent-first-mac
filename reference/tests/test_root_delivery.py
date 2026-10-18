@@ -163,17 +163,18 @@ class DeliveryTests(unittest.TestCase):
     def test_native_gate_order_and_no_launcher_before_preflight(self):
         events = []
         def gate(*, full, operation_check=None):
+            self.assertFalse(full, 'unrelated full vendor gate')
             events.append('full' if full else 'git')
             if operation_check:
                 operation_check(D.BASE, source_guard=lambda: True)
         with patch.object(D, 'load_release', return_value=self.release), patch.object(D, 'admitted_source', gate), \
                 patch.object(D.pwd, 'getpwuid', return_value=type('Owner', (), {'pw_dir': str(self.home)})()):
             staged = D.native('stage', self.install, self.emergency)
-            self.assertEqual(events, ['full', 'git'])
+            self.assertEqual(events, ['git'])
             self.assertNotIn('launcher', staged)
             self.assertNotIn('launcher', D.native('verify'))
         with patch.object(D, 'load_release', return_value=self.release), \
-                patch.object(D, 'admitted_source', side_effect=D.Fault('full_blocked')), \
+                patch.object(D, 'admitted_source', side_effect=D.Fault('source_unadmitted')), \
                 patch.object(D, 'stage_release') as stage:
             with self.assertRaises(D.Fault):
                 D.native('stage', self.install, self.emergency)
@@ -185,10 +186,49 @@ class DeliveryTests(unittest.TestCase):
             self.assertEqual(D.main(['verify', '--emergency-bundle', str(self.emergency)]), 1)
         native.assert_not_called()
 
-    def test_handoff_requires_fresh_full_gate_and_known_predecessor(self):
+    def test_connected_native_source_gate_never_launches_vendor_and_keeps_target_guards(self):
+        from lib import current_doctor_native as N
+        root = self.home / 'AIDev/control'
+        root.mkdir(parents=True, mode=0o700)
+        doctor = SimpleNamespace(public_report=lambda value, **kwargs: value)
+        calls = []
+        source_ok = [True]
+        def native(loaded, git_only, *, operation_check):
+            self.assertIs(loaded, doctor)
+            self.assertIs(git_only, True, 'unrelated vendor sentinel requested')
+            calls.append(git_only)
+            if not source_ok[0]:
+                raise D.Fault('source_unadmitted')
+            self.assertIs(operation_check(D.BASE, source_guard=lambda: True), True)
+            return {'integratedMain': True, 'verdict': 'GIT_ONLY_VALID'}
+        with patch.object(D, 'ROOT', root), patch.object(D, 'load_release', return_value=self.release), \
+                patch.object(D.pwd, 'getpwuid', return_value=SimpleNamespace(pw_dir=str(self.home))), \
+                patch.object(D.importlib.machinery.SourceFileLoader, 'load_module', return_value=doctor), \
+                patch.object(N, 'native', side_effect=native), \
+                patch.object(N.probe, 'observe', side_effect=AssertionError('vendor launch forbidden')):
+            source_ok[0] = False
+            with patch.object(D, 'stage_release') as stage, self.assertRaises(D.Fault):
+                D.native('stage', self.install, self.emergency)
+            stage.assert_not_called()
+            source_ok[0] = True
+            artifact = self.install / self.release['artifacts']['broker']['file']
+            original = artifact.read_bytes()
+            artifact.chmod(0o700)
+            artifact.write_bytes(b'unknown target')
+            artifact.chmod(0o555)
+            with self.assertRaises(D.Fault):
+                D.native('stage', self.install, self.emergency)
+            artifact.chmod(0o700)
+            artifact.write_bytes(original)
+            artifact.chmod(0o555)
+            self.assertEqual(D.native('stage', self.install, self.emergency)['status'], 'STAGED')
+        self.assertEqual(calls, [True, True, True])
+
+    def test_handoff_requires_held_source_and_known_predecessor_not_vendor(self):
         self.stage()
         events = []
         def gate(*, full, operation_check=None):
+            self.assertFalse(full, 'unrelated full vendor gate')
             events.append('full' if full else 'git')
             if operation_check:
                 operation_check(D.BASE, source_guard=lambda: True)
@@ -201,7 +241,7 @@ class DeliveryTests(unittest.TestCase):
                 patch.object(D.pwd, 'getpwuid', return_value=SimpleNamespace(pw_dir=str(self.home))), \
                 patch.dict(sys.modules, {'lib.root_runtime_health': SimpleNamespace(native_health=health)}):
             result = D.native('handoff')
-            self.assertEqual(events, ['full', 'git', 'health'])
+            self.assertEqual(events, ['git', 'health'])
             self.assertEqual(result['status'], 'OWNER_NATIVE_HANDOFF')
             self.assertEqual(Path(result['launcher']).name, 'launch-owner-authenticated-install.zsh')
             self.assertFalse(result['installerExecuted'])

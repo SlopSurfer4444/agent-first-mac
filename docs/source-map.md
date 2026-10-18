@@ -15,6 +15,10 @@ These are reference sources, not instructions to activate them on your Mac.
 | Harness off-ramp | [implementation](../reference/lib/harness_offramp.py) |
 | Optional games | [hub](../reference/bin/games-hub), [updater](../reference/bin/games-runtime-update) |
 | Optional Windows | [client](../reference/bin/windows-host-ssh-client) |
+| Scoped delivery consumers | [guidance successor](../reference/bin/workstation-guidance-successor), [guidance delivery](../reference/lib/workstation_guidance_delivery.py), [schedule delivery](../reference/lib/workstation_maintenance_delivery.py) |
+| Custody across reboot | [custody](../reference/lib/vendor_fixture_custody.py), [namespace tests](../reference/tests/test_custody_namespace.py) |
+| Optional remote desktop tunnel | [tunnel](../reference/bin/rustdesk-ssh-tunnel), [mocked tests](../reference/tests/test_rustdesk_ssh_tunnel.py) |
+| Optional native game admission | [plan](../reference/bin/game-native-admission-plan), [transaction](../reference/lib/game_native_admission_transaction.py), [source closure](../reference/lib/game_launch_native/README.md) |
 
 Historical Phase modules remain because current modules import them and because
 they explain recovery/admission behavior. Live manifests, original Git ancestry,

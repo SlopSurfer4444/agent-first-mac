@@ -31,7 +31,7 @@ is not a game distribution or a supported Wine installation.
 
 ## Safe first command
 
-With Python 3.11+ and Git:
+On macOS with Python 3.11+ and Git (the selected suite includes native Darwin custody probes in disposable fixtures):
 
 ```sh
 python3 tools/test_reference.py

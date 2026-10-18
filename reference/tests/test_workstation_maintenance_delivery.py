@@ -475,26 +475,23 @@ class DeliveryTests(unittest.TestCase):
                     self.assertEqual(attempts, [operation])
                 finally: fixture.doCleanups()
 
-    def test_install_preflight_then_fresh_held_admission_spans_mutation(self):
+    def test_install_held_admission_spans_mutation_without_vendor_preflight(self):
         gates, guard_state = [], [True]
         def admission(root, *, full, operation_check=None):
             gates.append(full)
-            if full: return {"verdict": "PASS"}
+            self.assertFalse(full, 'unrelated full vendor gate')
             return operation_check("f" * 40, source_guard=lambda: guard_state[0])
         owner = type("Owner", (), {"pw_dir": str(self.home)})()
         with patch.object(M, "ROOT", self.root), patch.object(M.pwd, "getpwuid", return_value=owner), patch.object(M, "runner", self.native), patch.object(M, "admitted_source", side_effect=admission):
             result = M.native_schedule("install")
-        self.assertEqual(gates, [True, False])
+        self.assertEqual(gates, [False])
         self.assertEqual(result["status"], "INSTALLED")
         self.assertEqual(result["operation"], "install")
         self.assertEqual(self.native.calls.count("bootstrap"), 1)
 
-    def test_source_drift_after_full_preflight_prevents_install(self):
+    def test_source_drift_under_held_admission_prevents_install(self):
         def admission(root, *, full, operation_check=None):
-            if full:
-                path = self.root / M.MANIFEST
-                path.write_bytes(path.read_bytes() + b"\n")
-                return {"verdict": "PASS"}
+            self.assertFalse(full, 'unrelated full vendor gate')
             return operation_check("f" * 40, source_guard=lambda: False)
         owner = type("Owner", (), {"pw_dir": str(self.home)})()
         with patch.object(M, "ROOT", self.root), patch.object(M.pwd, "getpwuid", return_value=owner), patch.object(M, "runner", self.native), patch.object(M, "admitted_source", side_effect=admission):
@@ -502,6 +499,60 @@ class DeliveryTests(unittest.TestCase):
         self.assertEqual(result["status"], "UNAVAILABLE")
         self.assertNotIn("bootstrap", self.native.calls)
         self.assertFalse((self.home / "Library/LaunchAgents" / M.PLIST).exists())
+
+    def test_connected_install_source_gate_never_requests_full_vendor_probe(self):
+        from lib import current_doctor_native as N
+        doctor = type('Doctor', (), {'public_report': staticmethod(lambda value, **kwargs: value)})()
+        calls = []
+        original_load = M.importlib.machinery.SourceFileLoader.load_module
+        def load(loader, *args):
+            return doctor if loader.name == 'maintenance_install_doctor' else original_load(loader, *args)
+        def native(loaded, git_only, *, operation_check):
+            self.assertIs(loaded, doctor)
+            self.assertIs(git_only, True, 'unrelated vendor sentinel requested')
+            calls.append(git_only)
+            self.assertIs(operation_check('f' * 40, source_guard=lambda: True), True)
+            return {'integratedMain': True, 'verdict': 'GIT_ONLY_VALID'}
+        owner = type('Owner', (), {'pw_dir': str(self.home)})()
+        with patch.object(M, 'ROOT', self.root), patch.object(M.pwd, 'getpwuid', return_value=owner), \
+                patch.object(M, 'runner', self.native), \
+                patch.object(M.importlib.machinery.SourceFileLoader, 'load_module', load), \
+                patch.object(N, 'native', side_effect=native), \
+                patch.object(N.probe, 'observe', side_effect=AssertionError('vendor launch forbidden')):
+            result = M.native_schedule('install')
+        self.assertEqual(result['status'], 'INSTALLED')
+        self.assertEqual(calls, [True])
+        self.assertEqual(self.native.calls.count('bootstrap'), 1)
+
+    def test_actual_manifest_drift_at_prepared_retains_recovery_without_publication(self):
+        manifest = self.root / M.MANIFEST
+        original = manifest.read_bytes()
+        observed = []
+        def admission(root, *, full, operation_check=None):
+            self.assertFalse(full)
+            def source_guard():
+                stable = manifest.read_bytes() == original
+                observed.append(stable)
+                return stable
+            return operation_check('f' * 40, source_guard=source_guard)
+        original_init = M.Schedule.__init__
+        def initialize(schedule, *args, **kwargs):
+            def change(phase):
+                if phase == 'prepared':
+                    manifest.write_bytes(original + b'\n')
+            kwargs['fault'] = change
+            original_init(schedule, *args, **kwargs)
+        owner = type('Owner', (), {'pw_dir': str(self.home)})()
+        with patch.object(M, 'ROOT', self.root), patch.object(M.pwd, 'getpwuid', return_value=owner), \
+                patch.object(M, 'runner', self.native), patch.object(M, 'admitted_source', side_effect=admission), \
+                patch.object(M.Schedule, '__init__', initialize):
+            result = M.native_schedule('install')
+        self.assertEqual(result['status'], 'RECOVERY_REQUIRED')
+        self.assertIn(False, observed)
+        self.assertNotIn('bootstrap', self.native.calls)
+        self.assertFalse((self.home / 'Library/LaunchAgents' / M.PLIST).exists())
+        self.assertEqual(self.row()['phase'], 'prepared')
+        self.assertTrue((self.home / 'AIDev/state/maintenance' / M.PAYLOAD).is_file())
 
     def test_own_agent_addition_nonactionable_but_unrelated_service_change_unknown(self):
         original = self.observation

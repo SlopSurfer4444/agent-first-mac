@@ -78,6 +78,105 @@ class ReadinessTests(unittest.TestCase):
                 self.assertTrue(value['liveGateSatisfied'])
                 self.assertFalse(value['machineMutationAuthorized'])
 
+    def test_all_connected_routes_ignore_vendor_but_reject_relevant_failures(self):
+        import tempfile
+        from pathlib import Path
+        from lib import current_doctor_native as N
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory).resolve()
+            root = home/'AIDev/control'
+            root.mkdir(parents=True)
+            calls = []
+            def native(doctor, git_only, *, operation_check):
+                self.assertTrue(git_only, 'unrelated vendor route invoked')
+                calls.append(git_only)
+                operation_check('a'*40, source_guard=lambda: True)
+                return C.report(historical=True, source=True, accepted=True,
+                    integrated=True, git_only=True)
+            with patch.object(Path, 'home', return_value=home), \
+                 patch.object(O.importlib.machinery.SourceFileLoader, 'load_module', return_value=C), \
+                 patch.object(N, 'native', side_effect=native), \
+                 patch.object(N.probe, 'observe', side_effect=AssertionError('vendor custody invalid')):
+                for operation in ('wine-install', 'wine-recovery', 'ssh-holder',
+                                  'shell-apply', 'shell-recovery', 'harness-disable'):
+                    checks = {key: lambda: True for key in O.DEPENDENCIES[operation]}
+                    value = O.require_scoped_operation_ready(root, operation, 'a'*40,
+                        checks=checks, target_guard=lambda: True)
+                    self.assertTrue(value['scopedCandidateReady'])
+                    self.assertFalse(value['liveGateSatisfied'])
+                    for dependency in checks:
+                        failed = dict(checks, **{dependency: lambda: False})
+                        with self.subTest(operation=operation, dependency=dependency), \
+                             self.assertRaisesRegex(RuntimeError, 'operation_dependency_'):
+                            O.require_scoped_operation_ready(root, operation, 'a'*40,
+                                checks=failed, target_guard=lambda: True)
+                self.assertTrue(calls)
+
+    def test_scoped_result_requires_actual_admission_callback_and_exact_commit(self):
+        import tempfile
+        from pathlib import Path
+        from lib import current_doctor_native as N
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory).resolve()
+            root = home/'AIDev/control'
+            root.mkdir(parents=True)
+            checks = {'payload-owner': lambda: True, 'recovery': lambda: True}
+            for mode in ('no-callback', 'unadmitted', 'wrong-commit', 'source-drift', 'target-drift'):
+                def native(doctor, git_only, *, operation_check):
+                    if mode != 'no-callback':
+                        operation_check(('b' if mode == 'wrong-commit' else 'a')*40,
+                                        source_guard=lambda: mode != 'source-drift')
+                    return C.report(historical=True, source=True,
+                        accepted=mode != 'unadmitted', integrated=mode != 'unadmitted',
+                        git_only=True)
+                with self.subTest(mode=mode), \
+                     patch.object(Path, 'home', return_value=home), \
+                     patch.object(O.importlib.machinery.SourceFileLoader, 'load_module', return_value=C), \
+                     patch.object(N, 'native', side_effect=native), \
+                     self.assertRaises(RuntimeError):
+                    O.require_scoped_operation_ready(root, 'shell-recovery', 'a'*40,
+                        checks=checks, target_guard=lambda: mode != 'target-drift')
+
+    def test_shell_consumer_runs_actual_scoped_wrapper_and_preserves_owner_collision(self):
+        import os
+        import runpy
+        import tempfile
+        from pathlib import Path
+        from lib import current_doctor_native as N
+        shell = runpy.run_path(str(Path(__file__).resolve().parents[1]/'bin/shell-nofile'))
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory).resolve()
+            root = home/'AIDev/control'
+            root.mkdir(parents=True)
+            shell['gate'].__globals__.update(HOME=home, CONTROL=root, HERE=root,
+                                             __file__=str(root/'bin/shell-nofile'))
+            calls = []
+            def native(doctor, git_only, *, operation_check):
+                self.assertTrue(git_only)
+                calls.append(git_only)
+                operation_check('a'*40, source_guard=lambda: True)
+                return C.report(historical=True, source=True, accepted=True,
+                    integrated=True, git_only=True)
+            fd = os.open(home, os.O_RDONLY | os.O_DIRECTORY)
+            try:
+                with patch.object(Path, 'home', return_value=home), \
+                     patch.object(O.importlib.machinery.SourceFileLoader, 'load_module', return_value=C), \
+                     patch.object(N, 'native', side_effect=native), \
+                     patch.object(N.probe, 'observe', side_effect=AssertionError('retained vendor fixture')):
+                    for action in ('apply', 'rollback'):
+                        report = shell['gate']('a'*40, fd, action)
+                        self.assertTrue(report['scopedCandidateReady'])
+                        self.assertFalse(report['liveGateSatisfied'])
+                        shell['transaction'](fd, action, 'a'*40)
+                    self.assertFalse((home/shell['TARGET']).exists())
+                    (home/shell['TARGET']).write_bytes(b'# owner shell\n')
+                    with self.assertRaisesRegex(RuntimeError, 'unowned_zshrc_collision'):
+                        shell['gate']('a'*40, fd, 'apply')
+                    self.assertEqual((home/shell['TARGET']).read_bytes(), b'# owner shell\n')
+                self.assertEqual(calls, [True, True, True])
+            finally:
+                os.close(fd)
+
     def test_reviewed_target_cli_is_explicit_git_only_and_cannot_mix_audit(self):
         calls = []
         def operation(git_only, **kwargs):

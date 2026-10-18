@@ -21,7 +21,8 @@ The public skill example is not auto-installed or active. Original checksum/comm
 anchors are not recomputed into fabricated trust. References to omitted runtime
 files remain in implementation source and do not confer local authority.
 
-The portable test runner checks selected logic only. It does not certify the
+The selected test runner requires macOS (including native custody fixture probes),
+Python 3.11+ and Git. It checks selected logic only. It does not certify the
 whole historical suite, root broker installation, a new Mac, compatibility with
 future Codex versions, or a working Windows bridge. No timing or live PASS from
 the original machine is a result for this public checkout.

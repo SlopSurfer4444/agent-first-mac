@@ -411,31 +411,138 @@ class Transaction:
         return {'state':end.upper(),'changed':True,'liveStateChanged':True,'installedAcceptanceClaimed':False,
                 'sourceRollbackSuccessorRequired':side=='before','validationScope':'launch-closure-and-declared-guards','runtimeHealthClaimed':False}
 
-def downstream_overlay_proof(root,commit,old_commit,launch_plan):
-    """Read-only proof that one exact applied overlay consumed launch images.
+def renderer_successor(root,commit,old_commit):
+    """Read-only exact six-target renderer closure; return its proven preimage view."""
+    renderer_encode=lambda value:(json.dumps(value,indent=2)+'\n').encode()
+    manifest=decode(root.read('ds3/manifest.json')[0]);override=manifest.get('rendererOverride')
+    if override is None:return root,None
+    e=engine()
+    override_fields={'d3d11Sha256','provenanceSha256','policySha256','transactionCommit','diagnosticCapable'}
+    need(type(override) is dict and set(override) in (override_fields,override_fields|{'nativeBorderlessCapable','traceProtocolVersion'})
+         and all(pin(override.get(k)) for k in ('d3d11Sha256','provenanceSha256','policySha256'))
+         and type(override.get('diagnosticCapable')) is bool
+         and ('nativeBorderlessCapable' not in override or type(override['nativeBorderlessCapable']) is bool)
+         and ('traceProtocolVersion' not in override or type(override['traceProtocolVersion']) is int and override['traceProtocolVersion']==2)
+         and manifest.get('schema')==4 and pin(override.get('transactionCommit'),40),'renderer_successor_override')
+    revision=override['transactionCommit'];git=['/usr/bin/git','-c','core.hooksPath=/dev/null','-C',CONTROL]
+    common=command(git+['merge-base',old_commit,revision]).decode().strip()
+    need(common in (old_commit,revision),'renderer_successor_ancestry')
+    command(git+['merge-base','--is-ancestor',revision,commit])
+    base='ds3/.renderer-'+revision
+    with root.parent('ds3/.unused') as (fd,_,check):
+        names=os.listdir(fd);transactions=[n for n in names if n.startswith('.renderer-')]
+        need(len(transactions)<=8 and not any(n.startswith('.ds3-renderer-') for n in names),'renderer_successor_pending_inventory')
+        for name in transactions:
+            need(re.fullmatch(r'\.renderer-[0-9a-f]{40}',name) is not None,'renderer_successor_transaction_name')
+            other,other_mode=root.read('ds3/'+name+'/record.json');value=e.decode(other,limit=32*1024*1024)
+            need(other_mode==0o600 and type(value) is dict and value.get('phase')=='complete' and value.get('intent') is None,'renderer_successor_pending')
+        check()
+    # A previous launch generation may already include this renderer. Its
+    # unchanged endpoints are bound by the historical overlay below; rewinding
+    # that baseline would discard the generation being proved.
+    if revision!=old_commit and common==revision:
+        for rel,wanted_mode in (('ds3/runtime/engine/lib/wine/x86_64-windows/d3d11.dll',0o755),
+                                ('ds3/profiles/ds3/drive_c/windows/system32/d3d11.dll',0o644)):
+            data,mode=root.read(rel)
+            need(mode==wanted_mode and digest(data)==override['d3d11Sha256'],'renderer_baseline_pair_drift')
+        root.bound();root._operation_lock_check()
+        return root,None
+    raw,mode=root.read(base+'/record.json');need(mode==0o600,'renderer_successor_record_mode')
+    record=e.decode(raw,limit=32*1024*1024)
+    targets={'runtime':'ds3/runtime/engine/lib/wine/x86_64-windows/d3d11.dll',
+             'prefix':'ds3/profiles/ds3/drive_c/windows/system32/d3d11.dll',
+             'manifest':'ds3/manifest.json','borderless':'ds3/borderless/manifest.json',
+             'borderlessReceipt':'ds3/borderless/receipt.json','receipt':'ds3/receipt.json'}
+    need(type(record) is dict and set(record)=={'schema','commit','policy','images','treeRows','phase','direction','intent'}
+         and type(record['schema']) is int and record['schema']==1 and record['commit']==revision
+         and record['phase']=='complete' and record['direction']=='after' and record['intent'] is None
+         and type(record['images']) is dict and set(record['images'])==set(targets),'renderer_successor_record')
+    policy=record['policy'];source_names={'d3d11.dll','source.tar.gz','provenance.json'}
+    policy_fields={'schema','id','owner','previousRendererSha256','candidateFiles','diagnosticCapable'}
+    need(type(policy) is dict and type(policy.get('schema')) is int and policy['schema'] in (1,2)
+         and set(policy)==(policy_fields|{'nativeBorderlessCapable','traceProtocolVersion'} if policy['schema']==2 else policy_fields)
+         and (policy['schema']==1 or type(policy['nativeBorderlessCapable']) is bool) and policy['id']=='ds3-renderer-update'
+         and (policy['schema']==1 or type(policy['traceProtocolVersion']) is int and policy['traceProtocolVersion']==2)
+         and policy['owner']=='control-ds3-marshal-fix' and pin(policy['previousRendererSha256'])
+         and type(policy['candidateFiles']) is dict and set(policy['candidateFiles'])==source_names
+         and all(pin(h) for h in policy['candidateFiles'].values()) and type(policy['diagnosticCapable']) is bool,
+         'renderer_successor_policy')
+    historical=command(git+['show',revision+':manifests/ds3-renderer-update.json'])
+    need(renderer_encode(decode(historical))==renderer_encode(policy),'renderer_successor_source_binding')
+    for rel,names in ((base,{'record.json','source'}|{k+'.'+s for k in targets for s in ('before','after')}),(base+'/source',source_names)):
+        with root.parent(rel+'/.unused') as (fd,_,check):
+            facts=os.fstat(fd);need(facts.st_uid==os.getuid() and stat.S_IMODE(facts.st_mode)==0o700 and set(os.listdir(fd))==names,'renderer_successor_inventory');check()
+    files={}
+    for name in source_names:
+        data,mode=root.read(base+'/source/'+name);need(mode==0o600 and digest(data)==policy['candidateFiles'][name],'renderer_successor_candidate');files[name]=data
+    provenance=decode(files['provenance.json'])
+    need(type(provenance) is dict and provenance.get('d3d11Sha256')==policy['candidateFiles']['d3d11.dll']
+         and provenance.get('sourceArchiveSha256')==policy['candidateFiles']['source.tar.gz']
+         and provenance.get('nativeBridgeModified') is False and provenance.get('diagnosticCapable')==policy['diagnosticCapable'],'renderer_successor_provenance')
+    if policy['schema']==2:need(provenance.get('nativeBorderlessCapable') is policy['nativeBorderlessCapable'],'renderer_successor_borderless_provenance')
+    if policy['schema']==2:need(type(provenance.get('traceProtocolVersion')) is int and provenance['traceProtocolVersion']==policy['traceProtocolVersion'],'renderer_successor_trace_protocol_provenance')
+    images={side:{} for side in ('before','after')};modes={}
+    for key,row in record['images'].items():
+        need(type(row) is dict and set(row)=={'before','after','mode'} and type(row['mode']) is int
+             and row['mode']==(0o755 if key=='runtime' else 0o644 if key=='prefix' else 0o600),'renderer_successor_image')
+        modes[key]=row['mode']
+        for side in images:
+            data,mode=root.read(base+'/'+key+'.'+side)
+            need(mode==0o600 and pin(row[side]) and digest(data)==row[side],'renderer_successor_backup');images[side][key]=data
+        need(root.read(targets[key])==(images['after'][key],modes[key]),'renderer_successor_endpoint')
+    old=decode(images['before']['manifest']);br=decode(images['before']['borderless'])
+    receipt=decode(images['before']['receipt']);brr=decode(images['before']['borderlessReceipt'])
+    need(old.get('schema')==4,'renderer_successor_predecessor_schema')
+    rel='engine/lib/wine/x86_64-windows/d3d11.dll';previous=policy['previousRendererSha256'];desired=policy['candidateFiles']['d3d11.dll']
+    prior=old.get('rendererOverride');prior_hash=old.get('sourceCriticalHashes',{}).get(rel)
+    if prior is not None:
+        need(type(prior) is dict and set(prior) in (override_fields,override_fields|{'nativeBorderlessCapable','traceProtocolVersion'})
+             and all(pin(prior.get(k)) for k in ('d3d11Sha256','provenanceSha256','policySha256'))
+             and ('nativeBorderlessCapable' not in prior or type(prior['nativeBorderlessCapable']) is bool)
+             and ('traceProtocolVersion' not in prior or type(prior['traceProtocolVersion']) is int and prior['traceProtocolVersion']==2)
+             and pin(prior.get('transactionCommit'),40) and type(prior.get('diagnosticCapable')) is bool,'renderer_successor_prior_override')
+        # The retained launch/overlay generation already owns this renderer.
+        # Rewind only its new successor, never an older baseline transaction.
+        need(prior['transactionCommit']!=revision,'renderer_successor_prior_cycle')
+        command(git+['merge-base','--is-ancestor',prior['transactionCommit'],old_commit])
+        prior_hash=prior['d3d11Sha256']
+    need(prior_hash==previous and digest(images['before']['runtime'])==digest(images['before']['prefix'])==previous,'renderer_successor_predecessor')
+    rows=record['treeRows'];actual=e.tree_rows(root,'ds3/runtime')
+    need(type(rows) is list and len(rows)==len(actual),'renderer_successor_rows')
+    wanted_rows=[list(row) for row in actual];matches=[r for r in wanted_rows if r[0]==rel]
+    need(len(matches)==1 and matches[0]==[rel,0o755,desired],'renderer_successor_rows')
+    matches[0][2]=previous;need(wanted_rows==rows,'renderer_successor_rows')
+    new_override={'d3d11Sha256':desired,'provenanceSha256':policy['candidateFiles']['provenance.json'],
+                  'policySha256':digest(renderer_encode(policy)),'transactionCommit':revision,'diagnosticCapable':policy['diagnosticCapable']}
+    if policy['schema']==2:new_override.update(nativeBorderlessCapable=policy['nativeBorderlessCapable'],traceProtocolVersion=policy['traceProtocolVersion'])
+    wanted={'runtime':files['d3d11.dll'],'prefix':files['d3d11.dll'],'manifest':renderer_encode(dict(old,rendererOverride=new_override)),
+            'borderless':renderer_encode(dict(br,nativeBinding=dict(br['nativeBinding'],d3d11Sha256=desired)))}
+    tree=e.tree_hash(actual)
+    wanted['receipt']=renderer_encode(dict(receipt,manifestSha256=digest(wanted['manifest']),runtimeTreeSha256=tree))
+    wanted['borderlessReceipt']=renderer_encode(dict(brr,manifestSha256=digest(wanted['borderless']),baseManifestSha256=digest(wanted['manifest']),baseRuntimeTreeSha256=tree))
+    need(wanted==images['after'] and override==new_override,'renderer_successor_derived_images')
+    preimages={targets[key]:(data,modes[key]) for key,data in images['before'].items()}
+    class PreimageView:
+        def __getattr__(self,name):return getattr(root,name)
+        def read(self,rel,**kwargs):return preimages[rel] if rel in preimages else root.read(rel,**kwargs)
+    root.bound();root._operation_lock_check()
+    return PreimageView(),{'commit':revision,'recordSha256':digest(raw),'receipt':image(root.read('ds3/receipt.json'))}
 
-    This never executes historical code, grants readiness or edits either
-    transaction. Only the fixed extended-runtime kind may supersede the three
-    overlapping launch targets; all other launch endpoints remain exact.
+
+def downstream_overlay_proof(root,commit,old_commit,launch_plan):
+    """Prove a bounded unique chain of retained applied overlays, without execution.
+
+    Historical snapshots must link every target and full runtime tree into the
+    next snapshot. Only the final snapshot is compared to installed endpoints.
+    Prepared, rollback and ambiguous histories never supply a predecessor.
     """
-    e=engine();namespace='wine-runtime-overlay'
+    root,renderer=renderer_successor(root,commit,old_commit)
+    e=engine();state=root.anchors['state'];root.bound();root._operation_lock_check()
     owner=b'{"schema":1,"owner":"control-games-hub","purpose":"wine-runtime-overlay"}\n'
-    state=root.anchors['state'];root.bound();root._operation_lock_check()
-    need(state.read(namespace+'/owner.json')==(owner,0o600),'downstream_owner')
-    with state.parent(namespace+'/.unused') as (fd,_,check):
-        need(stat.S_IMODE(os.fstat(fd).st_mode)==0o700 and set(os.listdir(fd))=={'owner.json','transaction'},'downstream_namespace_inventory');check()
-    raw,mode=state.read(namespace+'/transaction/plan.json')
-    need(mode==0o600,'downstream_plan_mode');plan_raw=e.decode(raw,limit=e.MAX_PLAN_BYTES)
-    next_commit=plan_raw.get('acceptedCommit')
-    need(pin(next_commit,40) and next_commit not in (old_commit,commit),'downstream_commit')
+    archives='wine-runtime-overlay-archives'
+    archive_owner=b'{"schema":1,"owner":"control-games-hub","purpose":"wine-runtime-overlay-archives"}\n'
     git=['/usr/bin/git','-c','core.hooksPath=/dev/null','-C',CONTROL]
-    need(command(git+['cat-file','-t',next_commit]).decode().strip()=='commit','downstream_commit_type')
-    for before,after in ((old_commit,next_commit),(next_commit,commit)):
-        command(git+['merge-base','--is-ancestor',before,after])
     def blob(revision,path):return command(git+['show',revision+':'+path])
-    historical_policy=blob(next_commit,'manifests/wine-runtime-overlay.json')
-    historical_source=blob(next_commit,'manifests/ds3-source-hub-v1.json')
-    historical_lifecycle=blob(next_commit,'bin/ds3-runtime')
     historical_launch=blob(old_commit,POLICY)
     need(digest(historical_launch)==launch_plan['policySha256'],'downstream_launch_policy_binding')
     launch_value=decode(historical_launch)
@@ -453,73 +560,171 @@ def downstream_overlay_proof(root,commit,old_commit,launch_plan):
             need(row['before']==launch_value['previousFiles'][key],'downstream_launch_predecessor_binding')
         wanted=image(launch_receipts[key]) if key in launch_receipts else launch_value['desiredFiles'][key]
         need(row['after']==wanted,'downstream_launch_after_binding')
-    class View:
-        def __getattr__(self,name):return getattr(root,name)
-        @contextlib.contextmanager
-        def parent(self,rel):
-            if rel.startswith('state/transaction'):
-                need(rel=='state/transaction' or rel.startswith('state/transaction/'),'downstream_state_path')
-                with state.parent(namespace+'/'+rel.split('/',1)[1]) as value:yield value
-            else:
-                with root.parent(rel) as value:yield value
-        def read(self,rel,**kwargs):
-            if rel=='payload/policy.json':return historical_policy,root.read('source/manifests/wine-runtime-overlay.json')[1]
-            if rel=='payload/source-hub-v1.json':return historical_source,root.read('source/manifests/ds3-source-hub-v1.json')[1]
-            return e.Root.read(self,rel,**kwargs)
-        def exists(self,rel):return e.Root.exists(self,rel)
-    view=View();tx=e.Transaction(view,digest(raw),source_only=False)
-    need(tx.plan['kind']=='wine-winemac-oleacc-runtime-overlay','downstream_kind')
-    journal=tx.journal()
-    need(journal['phase']=='applied' and journal['intent'] is None
-         and view.read('state/transaction/journal.json')[1]==0o600,'downstream_not_settled')
-    inventory={'plan.json','journal.json'}|{key+'.'+side for key in tx.order for side in ('before','after')}
-    with view.parent('state/transaction/.unused') as (fd,_,check):
-        need(stat.S_IMODE(os.fstat(fd).st_mode)==0o700 and set(os.listdir(fd))==inventory,'downstream_transaction_inventory');check()
-    for rel in (*tx.targets.values(),'state/transaction/journal.json'):
-        need(not view.exists(e.Root.stage_name(rel)),'downstream_pending_stage')
-    e.verify_images(view,tx.plan['guards'])
-    need(tx.side('after'),'downstream_after_drift')
+    def node(namespace,successor=None):
+        need(state.read(namespace+'/owner.json')==(owner,0o600),'downstream_owner')
+        with state.parent(namespace+'/.unused') as (fd,_,check):
+            need(stat.S_IMODE(os.fstat(fd).st_mode)==0o700 and set(os.listdir(fd))=={'owner.json','transaction'},'downstream_namespace_inventory');check()
+        raw,mode=state.read(namespace+'/transaction/plan.json')
+        need(mode==0o600,'downstream_plan_mode');plan_raw=e.decode(raw,limit=e.MAX_PLAN_BYTES)
+        need(type(plan_raw) is dict,'downstream_plan_schema')
+        next_commit=plan_raw.get('acceptedCommit')
+        need(pin(next_commit,40) and next_commit!=commit,'downstream_commit')
+        same_launch_commit=next_commit==old_commit
+        need(not same_launch_commit or successor is None and namespace=='wine-runtime-overlay'
+             and plan_raw.get('kind')=='wine-runtime-installed-policy-overlay','downstream_same_commit_scope')
+        need(command(git+['cat-file','-t',next_commit]).decode().strip()=='commit','downstream_commit_type')
+        later=successor.plan['acceptedCommit'] if successor is not None else commit
+        need(next_commit!=later,'downstream_chain_cycle')
+        for before,after in ((old_commit,next_commit),(next_commit,later)):
+            command(git+['merge-base','--is-ancestor',before,after])
+        if successor is not None:
+            need(namespace==archives+'/'+next_commit+'-'+digest(raw),'downstream_archive_binding')
+        historical_policy=blob(next_commit,'manifests/wine-runtime-overlay.json')
+        historical_source=blob(next_commit,'manifests/ds3-source-hub-v1.json')
+        historical_lifecycle=blob(next_commit,'bin/ds3-runtime')
+        class View:
+            def __getattr__(self,name):return getattr(root,name)
+            @contextlib.contextmanager
+            def parent(self,rel):
+                if rel.startswith('state/transaction'):
+                    need(rel=='state/transaction' or rel.startswith('state/transaction/'),'downstream_state_path')
+                    with state.parent(namespace+'/'+rel.split('/',1)[1]) as value:yield value
+                else:
+                    with root.parent(rel) as value:yield value
+            def read(self,rel,**kwargs):
+                if rel=='payload/policy.json':return historical_policy,root.read('source/manifests/wine-runtime-overlay.json')[1]
+                if rel=='payload/source-hub-v1.json':return historical_source,root.read('source/manifests/ds3-source-hub-v1.json')[1]
+                if not rel.startswith('state/transaction'):return root.read(rel,**kwargs)
+                return e.Root.read(self,rel,**kwargs)
+            def exists(self,rel):return e.Root.exists(self,rel)
+        view=View();tx=e.Transaction(view,digest(raw),source_only=False)
+        installed_policy=tx.plan['kind']=='wine-runtime-installed-policy-overlay'
+        extended=installed_policy or tx.plan['kind']=='wine-winemac-oleacc-runtime-overlay'
+        if same_launch_commit:
+            need(all(e.image(*tx.images[key]['before'])==launch_plan['targets'][key]['after']
+                     for key in ('ds3.lifecycle','hub.receipt','ds3.receipt')),'downstream_same_commit_link')
+        need(extended or tx.plan['kind']=='wine-winemac-pe-pair-overlay','downstream_kind')
+        journal=tx.journal()
+        need(journal['phase']=='applied' and journal['intent'] is None
+             and view.read('state/transaction/journal.json')[1]==0o600,'downstream_not_settled')
+        inventory={'plan.json','journal.json'}|{key+'.'+side for key in tx.order for side in ('before','after')}
+        with view.parent('state/transaction/.unused') as (fd,_,check):
+            need(stat.S_IMODE(os.fstat(fd).st_mode)==0o700 and set(os.listdir(fd))==inventory,'downstream_transaction_inventory');check()
+        for rel in (*tx.targets.values(),'state/transaction/journal.json'):
+            need(not view.exists(e.Root.stage_name(rel)),'downstream_pending_stage')
+        e.verify_images(view,tx.plan['guards'])
+        if successor is None:
+            need(tx.side('after'),'downstream_after_drift')
+        else:
+            need(set(tx.targets)<=set(successor.targets),'downstream_chain_scope')
+            for key in tx.targets:
+                need(tx.images[key]['after']==successor.images[key]['before'],'downstream_chain_images')
+            for name in ('hub','ds3'):
+                need(tx.plan['runtimeRows'][name]['after']==successor.plan['runtimeRows'][name]['before'],'downstream_chain_rows')
+        policy=e.decode(historical_policy)
+        need(type(policy) is dict and set(policy)==(e.EXTENDED_POLICY_FIELDS if extended else e.POLICY_FIELDS) and type(policy.get('schema')) is int
+             and policy['schema']==(2 if extended else 1) and policy.get('id')=='wine-runtime-overlay'
+             and policy.get('owner')=='control-games-hub','downstream_policy_schema')
+        desired=policy['desiredRuntimeHashes' if extended else 'desiredPEHashes']
+        need(type(desired) is dict and set(desired)==(set(e.RUNTIME_PAYLOADS) if extended else {e.PE32,e.PE}) and all(pin(x) for x in desired.values()),'downstream_runtime_scope')
+        hm,hr,dm,dr,br=[e.decode(tx.images[key]['before'][0]) for key in ('hub.manifest','hub.receipt','ds3.manifest','ds3.receipt','ds3.borderless-receipt')]
+        need(digest(tx.images['hub.manifest']['before'][0])==policy['previousHubManifestSha256']
+             and digest(tx.images['ds3.manifest']['before'][0])==policy['previousDS3ManifestSha256']
+             and hm.get('criticalHashes')==policy['previousHubCriticalHashes']
+             and digest(historical_source)==policy['sourceHubManifestSha256']==dm.get('sourceHubManifestSha256')
+             and e.decode(historical_source).get('criticalHashes')==policy['sourceCriticalHashes']==dm.get('sourceCriticalHashes'),
+             'downstream_before_policy_binding')
+        need(tx.images['ds3.lifecycle']['after'][0]==historical_lifecycle
+             and digest(historical_lifecycle)==policy['lifecycleSha256'],'downstream_lifecycle_binding')
+        for name in ('hub','ds3'):
+            before_rows,after_rows=[tx.plan['runtimeRows'][name][side] for side in ('before','after')]
+            wanted=[[row[0],row[1],desired[row[0]]] if row[0] in desired else row for row in before_rows]
+            need(after_rows==wanted,'downstream_runtime_rows')
+            if successor is None:need(e.tree_rows(view,name+'/runtime')==after_rows,'downstream_runtime_rows')
+            for suffix,rel in ((('pe32',e.PE32),('pe64',e.PE),('unix',e.UNIX),('ole32',e.OLE32),('ole64',e.OLE64)) if extended else (('pe32',e.PE32),('pe64',e.PE))):
+                key=name+'.'+suffix;old,new=tx.images[key]['before'],tx.images[key]['after']
+                need(new[1]==old[1] and digest(new[0])==desired[rel]
+                     and [rel,old[1],digest(old[0])] in before_rows,'downstream_runtime_images')
+        wanted_hm=dict(hm,criticalHashes=dict(hm['criticalHashes'],**desired),runtimeOverlayPolicySha256=digest(historical_policy))
+        if installed_policy:
+            e.verify_policy_inventory(view)
+            for key,wanted in (('ds3.policy-source',historical_policy),('ds3.source-hub',historical_source)):
+                need(tx.images[key]['before'][1]==tx.images[key]['after'][1]==0o600
+                     and tx.images[key]['after'][0]==wanted,'downstream_installed_policy_transition')
+            class BeforePolicyView:
+                def __getattr__(self,name):return getattr(view,name)
+                def read(self,rel,**kwargs):
+                    for key in ('ds3.policy-source','ds3.source-hub'):
+                        if rel==tx.targets[key]:return tx.images[key]['before']
+                    return view.read(rel,**kwargs)
+            predecessor=None;launch_proof=None
+            if dm.get('schema') in (3,4) and same_launch_commit:
+                predecessor=launch_before['ds3.lifecycle'][0]
+                # This proof is local to an exactly linked retained current
+                # operation. It cannot authorize an arbitrary old helper.
+                class HistoricalLaunchProof:
+                    before_lifecycle=predecessor
+                    installed_lifecycle=tx.images['ds3.lifecycle']['before'][0]
+                    def revalidate(self):
+                        root.bound();root._operation_lock_check()
+                        launch_raw,launch_mode=root.read('state/transaction/plan.json')
+                        need(launch_mode==0o600 and decode(launch_raw)==launch_plan,'downstream_launch_plan_drift')
+                        j,jmode=root.read('state/transaction/journal.json')
+                        need(jmode==0o600 and decode(j)=={'schema':1,'planSha256':digest(launch_raw),'phase':'applied','intent':None},'downstream_launch_not_settled')
+                        for key in ('ds3.lifecycle','hub.receipt','ds3.receipt'):
+                            need(read(root,'state/transaction/'+key+'.before')==launch_before[key]
+                                 and image(read(root,'state/transaction/'+key+'.after'))==launch_plan['targets'][key]['after']
+                                 and view.read('state/transaction/'+key+'.before')==tx.images[key]['before']
+                                 and e.image(*tx.images[key]['before'])==launch_plan['targets'][key]['after'],'downstream_launch_proof_drift')
+                launch_proof=HistoricalLaunchProof();launch_proof.revalidate()
+            kwargs={'launch_proof':launch_proof} if dm.get('schema')==4 and launch_proof is not None else {}
+            e.verify_policy_source(BeforePolicyView(),dm,hm,tx.images['ds3.lifecycle']['before'][0],predecessor,**kwargs)
+        wanted_dm=dict(dm,schema=4 if installed_policy else 3 if extended else 2,runtimeOverrides=desired,runtimeOverlayPolicySha256=digest(historical_policy))
+        for key,wanted in (('hub.manifest',wanted_hm),('ds3.manifest',wanted_dm)):
+            need(tx.images[key]['after']==(e.encode(wanted),tx.images[key]['before'][1]),'downstream_manifest_transition')
+        for name,receipt in (('hub',hr),('ds3',dr)):
+            wanted=dict(receipt,commit=next_commit,manifestSha256=digest(tx.images[name+'.manifest']['after'][0]),
+                        runtimeTreeSha256=e.tree_hash(tx.plan['runtimeRows'][name]['after']))
+            if name=='ds3':wanted['lifecycleSha256']=policy['lifecycleSha256']
+            need(tx.images[name+'.receipt']['after']==(e.encode(wanted),tx.images[name+'.receipt']['before'][1]),'downstream_receipt_transition')
+        wanted_br=dict(br,commit=next_commit,baseManifestSha256=digest(tx.images['ds3.manifest']['after'][0]),
+                       baseRuntimeTreeSha256=e.tree_hash(tx.plan['runtimeRows']['ds3']['after']))
+        need(tx.images['ds3.borderless-receipt']['after']==(e.encode(wanted_br),tx.images['ds3.borderless-receipt']['before'][1]),'downstream_borderless_transition')
+        return tx, {'commit':next_commit,'planSha256':digest(raw),
+                    'journalSha256':digest(view.read('state/transaction/journal.json')[0])}
+    current,proof=node('wine-runtime-overlay')
     shared={'ds3.lifecycle','hub.receipt','ds3.receipt'}
-    for key in shared:
-        need(e.image(*tx.images[key]['before'])==launch_plan['targets'][key]['after'],'downstream_before_link')
-    policy=e.decode(historical_policy)
-    need(type(policy) is dict and set(policy)==e.EXTENDED_POLICY_FIELDS and type(policy.get('schema')) is int
-         and policy['schema']==2 and policy.get('id')=='wine-runtime-overlay'
-         and policy.get('owner')=='control-games-hub','downstream_policy_schema')
-    desired=policy['desiredRuntimeHashes']
-    need(type(desired) is dict and set(desired)==set(e.RUNTIME_PAYLOADS) and all(pin(x) for x in desired.values()),'downstream_runtime_scope')
-    hm,hr,dm,dr,br=[e.decode(tx.images[key]['before'][0]) for key in ('hub.manifest','hub.receipt','ds3.manifest','ds3.receipt','ds3.borderless-receipt')]
-    need(digest(tx.images['hub.manifest']['before'][0])==policy['previousHubManifestSha256']
-         and digest(tx.images['ds3.manifest']['before'][0])==policy['previousDS3ManifestSha256']
-         and hm.get('criticalHashes')==policy['previousHubCriticalHashes']
-         and digest(historical_source)==policy['sourceHubManifestSha256']==dm.get('sourceHubManifestSha256')
-         and e.decode(historical_source).get('criticalHashes')==policy['sourceCriticalHashes']==dm.get('sourceCriticalHashes'),
-         'downstream_before_policy_binding')
-    need(tx.images['ds3.lifecycle']['after'][0]==historical_lifecycle
-         and digest(historical_lifecycle)==policy['lifecycleSha256'],'downstream_lifecycle_binding')
-    for name in ('hub','ds3'):
-        before_rows,after_rows=[tx.plan['runtimeRows'][name][side] for side in ('before','after')]
-        wanted=[[row[0],row[1],desired[row[0]]] if row[0] in desired else row for row in before_rows]
-        need(after_rows==wanted and e.tree_rows(view,name+'/runtime')==after_rows,'downstream_runtime_rows')
-        for suffix,rel in (('pe32',e.PE32),('pe64',e.PE),('unix',e.UNIX),('ole32',e.OLE32),('ole64',e.OLE64)):
-            key=name+'.'+suffix;old,new=tx.images[key]['before'],tx.images[key]['after']
-            need(new[1]==old[1] and digest(new[0])==desired[rel]
-                 and [rel,old[1],digest(old[0])] in before_rows,'downstream_runtime_images')
-    wanted_hm=dict(hm,criticalHashes=dict(hm['criticalHashes'],**desired),runtimeOverlayPolicySha256=digest(historical_policy))
-    wanted_dm=dict(dm,schema=3,runtimeOverrides=desired,runtimeOverlayPolicySha256=digest(historical_policy))
-    for key,wanted in (('hub.manifest',wanted_hm),('ds3.manifest',wanted_dm)):
-        need(tx.images[key]['after']==(e.encode(wanted),tx.images[key]['before'][1]),'downstream_manifest_transition')
-    for name,receipt in (('hub',hr),('ds3',dr)):
-        wanted=dict(receipt,commit=next_commit,manifestSha256=digest(tx.images[name+'.manifest']['after'][0]),
-                    runtimeTreeSha256=e.tree_hash(tx.plan['runtimeRows'][name]['after']))
-        if name=='ds3':wanted['lifecycleSha256']=policy['lifecycleSha256']
-        need(tx.images[name+'.receipt']['after']==(e.encode(wanted),tx.images[name+'.receipt']['before'][1]),'downstream_receipt_transition')
-    wanted_br=dict(br,commit=next_commit,baseManifestSha256=digest(tx.images['ds3.manifest']['after'][0]),
-                   baseRuntimeTreeSha256=e.tree_hash(tx.plan['runtimeRows']['ds3']['after']))
-    need(tx.images['ds3.borderless-receipt']['after']==(e.encode(wanted_br),tx.images['ds3.borderless-receipt']['before'][1]),'downstream_borderless_transition')
+    endpoints={key:e.image(*current.images[key]['after']) for key in shared}
+    chain=[proof];seen={proof['planSha256']}
+    while any(e.image(*current.images[key]['before'])!=launch_plan['targets'][key]['after'] for key in shared):
+        need(len(chain)<8,'downstream_chain_limit')
+        need(state.read(archives+'/owner.json')==(archive_owner,0o600),'downstream_archive_owner')
+        with state.parent(archives+'/.unused') as (fd,_,check):
+            names=set(os.listdir(fd));need(stat.S_IMODE(os.fstat(fd).st_mode)==0o700 and 'owner.json' in names and len(names)<=33,'downstream_archive_inventory');check()
+        matches=[]
+        for name in sorted(names-{'owner.json'}):
+            need(re.fullmatch('[0-9a-f]{40}-[0-9a-f]{64}',name) is not None,'downstream_archive_name')
+            namespace=archives+'/'+name
+            raw,mode=state.read(namespace+'/transaction/plan.json')
+            need(mode==0o600,'downstream_plan_mode')
+            plan=e.decode(raw,limit=e.MAX_PLAN_BYTES)
+            journal_raw,journal_mode=state.read(namespace+'/transaction/journal.json')
+            journal=e.decode(journal_raw)
+            need(type(plan) is dict and type(journal) is dict,'downstream_archive_schema')
+            # Prepared neighbours are retained evidence, never an applied link.
+            if journal.get('phase')!='applied':continue
+            need(journal_mode==0o600 and journal.get('intent') is None and journal.get('planSha256')==digest(raw),'downstream_archive_journal')
+            targets=plan.get('targets',{})
+            need(type(targets) is dict,'downstream_archive_targets')
+            if all(type(targets.get(key)) is dict and targets[key].get('after')==e.image(*current.images[key]['before']) for key in shared):
+                matches.append(namespace)
+        need(len(matches)==1,'downstream_chain_missing_or_ambiguous')
+        current,proof=node(matches[0],current)
+        need(proof['planSha256'] not in seen,'downstream_chain_cycle')
+        seen.add(proof['planSha256']);chain.append(proof)
     root.bound();root._operation_lock_check()
-    return {'commit':next_commit,'planSha256':digest(raw),'journalSha256':digest(view.read('state/transaction/journal.json')[0]),
-            'endpoints':{key:e.image(*tx.images[key]['after']) for key in shared}}
+    if renderer is not None:endpoints['ds3.receipt']=renderer['receipt']
+    return {'chain':chain,'endpoints':endpoints,'renderer':renderer}
 
 
 def archive_settled(root,commit,old_commit,expected,event=lambda _:None):

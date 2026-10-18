@@ -5,12 +5,15 @@ budget, not an OS disk quota. In-flight writes may overshoot; never delete the
 overshoot or infer settlement from process/time observations.
 """
 import fcntl
+import ctypes
 import errno
+import hashlib
 import json
 import os
 import re
 import secrets
 import stat
+import struct
 from pathlib import Path
 
 from lib import phase5_runtime_paths as paths
@@ -50,6 +53,48 @@ def stamp(info):
             "st_nlink", "st_size", "st_mtime_ns", "st_ctime_ns")]
 
 
+def namespace_boot():
+    """Private kernel boot provenance, not a durable machine identifier."""
+    class Timeval(ctypes.Structure):
+        _fields_ = [("seconds", ctypes.c_long), ("micros", ctypes.c_int)]
+    value = Timeval()
+    size = ctypes.c_size_t(ctypes.sizeof(value))
+    libc = ctypes.CDLL('/usr/lib/libSystem.B.dylib', use_errno=True)
+    libc.sysctlbyname.argtypes = (ctypes.c_char_p, ctypes.c_void_p,
+        ctypes.POINTER(ctypes.c_size_t), ctypes.c_void_p, ctypes.c_size_t)
+    libc.sysctlbyname.restype = ctypes.c_int
+    need(libc.sysctlbyname(b'kern.boottime', ctypes.byref(value), ctypes.byref(size), None, 0) == 0
+         and size.value == ctypes.sizeof(value) and value.seconds > 0
+         and 0 <= value.micros < 1000000)
+    return hashlib.sha256(('%d:%d' % (value.seconds, value.micros)).encode()).hexdigest()
+
+
+def namespace_persistent_identity(fd):
+    """Read stable volume/birth identity from a held Darwin descriptor.
+
+    This private metadata is only for the empty custody namespace. It never
+    replaces the exact device/inode guards on fixtures or live descriptors.
+    No path-based diskutil invocation or permissive unsupported-FS fallback.
+    """
+    class Attrlist(ctypes.Structure):
+        _fields_ = [('count', ctypes.c_uint16), ('reserved', ctypes.c_uint16)] + [
+            (name, ctypes.c_uint32) for name in ('common', 'volume', 'directory', 'file', 'fork')]
+    libc = ctypes.CDLL('/usr/lib/libSystem.B.dylib', use_errno=True)
+    libc.fgetattrlist.argtypes = (ctypes.c_int, ctypes.c_void_p, ctypes.c_void_p,
+                                ctypes.c_size_t, ctypes.c_ulong)
+    libc.fgetattrlist.restype = ctypes.c_int
+    def query(common, volume):
+        attrs = Attrlist(5, 0, common, volume, 0, 0, 0)
+        buffer = ctypes.create_string_buffer(20)
+        need(libc.fgetattrlist(fd, ctypes.byref(attrs), buffer, 20, 0) == 0
+             and struct.unpack_from('=I', buffer.raw)[0] == 20)
+        return buffer.raw[4:]
+    volume = query(0, 0x80040000)  # ATTR_VOL_INFO | ATTR_VOL_UUID
+    seconds, nanos = struct.unpack('=qq', query(0x200, 0))  # ATTR_CMN_CRTIME
+    need(any(volume) and seconds > 0 and 0 <= nanos < 1000000000)
+    return {'volume': volume.hex(), 'birth': [seconds, nanos]}
+
+
 def names(descriptor, maximum=MAX_ENTRIES):
     """Incremental fixed-work listing, never materialize unknown cardinality."""
     result = []
@@ -61,10 +106,14 @@ def names(descriptor, maximum=MAX_ENTRIES):
 
 
 class Custody:
-    def __init__(self, scratch, home, uid, *, create=True, envelope=None, checkpoint=None):
+    def __init__(self, scratch, home, uid, *, create=True, envelope=None, checkpoint=None,
+                 persistent_identity=None, boot_identity=None):
         self.scratch, self.home, self.uid = scratch, home, uid
         self.envelope = envelope or (lambda handle, module: module.require_empty_envelope(handle))
         self.checkpoint = checkpoint or (lambda point: None)
+        self.persistent_identity = persistent_identity or namespace_persistent_identity
+        self.boot = (boot_identity or namespace_boot)()
+        need(type(self.boot) is str and re.fullmatch('[0-9a-f]{64}', self.boot) is not None)
         self.handles, self.lock = [], None
         self.fds, self.close_attempts = [], {}
         self.created = False
@@ -89,9 +138,7 @@ class Custody:
                 self._hold(self.directory)
                 self.envelope(self.directory, paths)
                 marker, _ = self._read("namespace.json")
-                need(type(marker) is dict and set(marker) == {"schema", "identity", "lock"}
-                     and type(marker["schema"]) is int and marker["schema"] == 1
-                     and marker["identity"] == identity(os.fstat(self.directory.descriptor)))
+                self._namespace_marker(marker, include_lock=False)
             self.lock = os.open("lock", os.O_RDWR | (os.O_CREAT | os.O_EXCL if self.created else 0) | os.O_NOFOLLOW | os.O_CLOEXEC,
                                 0o600, dir_fd=self.directory.descriptor)
             self._register(self.lock)
@@ -100,17 +147,33 @@ class Custody:
                  and stat.S_IMODE(info.st_mode) == 0o600 and info.st_nlink == 1 and info.st_size == 0)
             self.lock_identity = identity(info)
             need(identity(os.stat("lock", dir_fd=self.directory.descriptor, follow_symlinks=False)) == self.lock_identity)
-            if self.created:
-                os.fsync(self.lock)
-                self._publish("namespace.json", {"schema": 1,
-                    "identity": identity(os.fstat(self.directory.descriptor)),
-                    "lock": self.lock_identity}, None)
-            else:
-                need(marker["lock"] == self.lock_identity)
             try:
                 fcntl.flock(self.lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
             except BlockingIOError:
                 raise CustodyError("fixture_custody_busy") from None
+            if self.created:
+                os.fsync(self.lock)
+                self._publish("namespace.json", self._new_namespace_marker(), None)
+            else:
+                # Re-read only after acquiring the named lock: neither a pre-lock
+                # marker nor a pre-lock empty-slot observation can admit refresh.
+                marker, prior = self._read("namespace.json")
+                refresh = self._namespace_marker(marker, include_lock=True)
+                if create and marker['schema'] == 1 and set(names(self.directory.descriptor, SLOTS + 2)) == {'namespace.json', 'lock'}:
+                    # Exact legacy identity was verified above. Upgrade only an
+                    # empty namespace; never infer identity for a stale marker.
+                    refresh = True
+                if refresh:
+                    need(set(names(self.directory.descriptor, SLOTS + 2)) == {'namespace.json', 'lock'})
+                    need(create, 'fixture_namespace_refresh_required')
+                    self.checkpoint('namespace-refresh-ready')
+                    self.directory.verify()
+                    self._verify_lock()
+                    need(set(names(self.directory.descriptor, SLOTS + 2)) == {'namespace.json', 'lock'})
+                    need(self._namespace_marker(marker, include_lock=True) or marker['schema'] == 1)
+                    self._publish('namespace.json', self._new_namespace_marker(), prior)
+                    installed, _ = self._read('namespace.json')
+                    need(self._namespace_marker(installed, include_lock=True) is False)
             os.fsync(self.directory.descriptor)
             allowed = {"namespace.json", "lock"} | {str(slot) + ".json" for slot in range(SLOTS)}
             need(set(names(self.directory.descriptor, len(allowed))) <= allowed)
@@ -123,6 +186,49 @@ class Custody:
                 original.source_handles_closed = False
                 original.custody_close_error = error
             raise original from None
+
+    def _persistent(self, fd):
+        value = self.persistent_identity(fd)
+        need(type(value) is dict and set(value) == {'volume', 'birth'}
+             and type(value['volume']) is str and re.fullmatch('[0-9a-f]{32}', value['volume']) is not None
+             and value['volume'] != '0' * 32 and type(value['birth']) is list
+             and len(value['birth']) == 2 and all(type(n) is int for n in value['birth'])
+             and value['birth'][0] > 0 and 0 <= value['birth'][1] < 1000000000)
+        return value
+
+    def _new_namespace_marker(self):
+        directory = self._persistent(self.directory.descriptor)
+        lock = self._persistent(self.lock)
+        need(directory['volume'] == lock['volume'])
+        return {'schema': 2, 'identity': identity(os.fstat(self.directory.descriptor)),
+                'lock': self.lock_identity, 'boot': self.boot,
+                'persistent': {'directory': directory, 'lock': lock}}
+
+    def _namespace_marker(self, marker, *, include_lock):
+        need(type(marker) is dict and type(marker.get('schema')) is int)
+        if marker['schema'] == 1:
+            # Legacy markers have no stable volume/boot proof. Preserve their
+            # existing exact-identity semantics; never infer a remount or adopt.
+            need(set(marker) == {'schema', 'identity', 'lock'}
+                 and marker['identity'] == identity(os.fstat(self.directory.descriptor)))
+            if include_lock:
+                need(marker['lock'] == self.lock_identity)
+            return False
+        need(marker['schema'] == 2 and set(marker) == {'schema', 'identity', 'lock', 'boot', 'persistent'}
+             and type(marker['boot']) is str and re.fullmatch('[0-9a-f]{64}', marker['boot']) is not None
+             and type(marker['persistent']) is dict and set(marker['persistent']) == {'directory', 'lock'})
+        changed_boot = marker['boot'] != self.boot
+        for key, fd, persistent_key in [('identity', self.directory.descriptor, 'directory')] + (
+                [('lock', self.lock, 'lock')] if include_lock else []):
+            row = marker[key]
+            current = identity(os.fstat(fd))
+            need(type(row) is list and len(row) == 4 and all(type(n) is int and n >= 0 for n in row)
+                 and (row[1:] == current[1:] if changed_boot else row == current)
+                 and marker['persistent'][persistent_key] == self._persistent(fd))
+        if include_lock:
+            need(marker['persistent']['directory']['volume'] == marker['persistent']['lock']['volume']
+                 and marker['identity'][0] == marker['lock'][0])
+        return changed_boot
 
     def _register(self, descriptor):
         need(descriptor not in self.fds)
@@ -236,8 +342,16 @@ class Custody:
                     dst_dir_fd=self.directory.descriptor, follow_symlinks=False)
             os.unlink(temporary, dir_fd=self.directory.descriptor)
         else:
-            _, current = self._read(leaf)
+            previous, current = self._read(leaf)
             need(current == prior)
+            if leaf == 'namespace.json':
+                # Last pre-publication check, after record-written callbacks:
+                # no old or newly appeared artifact may be silently rebound.
+                need(set(names(self.directory.descriptor, SLOTS + 3)) ==
+                     {'namespace.json', 'lock', 'namespace.json.pending'})
+                need(self._namespace_marker(previous, include_lock=True) or previous['schema'] == 1)
+                self.directory.verify()
+                self._verify_lock()
             os.replace(temporary, leaf, src_dir_fd=self.directory.descriptor,
                        dst_dir_fd=self.directory.descriptor)
         self.checkpoint("record-published")

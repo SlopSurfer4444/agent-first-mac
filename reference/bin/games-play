@@ -26,7 +26,7 @@ def admission(home,route,goal=None):
         with os.fdopen(os.dup(fd),'rb') as stream:raw=stream.read()
         after=os.fstat(fd)
         keys=('st_dev','st_ino','st_mode','st_uid','st_nlink','st_size','st_mtime_ns','st_ctime_ns')
-        if any(getattr(facts,k)!=getattr(after,k) for k in keys) or hashlib.sha256(raw).hexdigest()!='e445e867abad4816b4b4960f78116ae993a97941c19e8881c380787c40cb7146':
+        if any(getattr(facts,k)!=getattr(after,k) for k in keys) or hashlib.sha256(raw).hexdigest()!='54730cf9cba654d5822317dadb72bfe88ed2bf77b1ec3264a29d2b6711de1210':
             raise RuntimeError('admission_helper_changed')
     finally:os.close(fd)
     namespace={'__name__':'game_launch_admission','__admission_source':raw}

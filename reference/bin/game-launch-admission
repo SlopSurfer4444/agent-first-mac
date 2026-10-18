@@ -92,6 +92,18 @@ def valid_identity(value,optional=False):
         and type(value['pid']) is int and 1<value['pid']<2**31 and type(value['group']) is int and 1<value['group']<2**31
         and type(value['birth']) is str and re.fullmatch('[1-9][0-9]{0,19}:[0-9]{1,6}',value['birth']) is not None)
 
+NATIVE_COMPANION=Path('AIDev/lib/game-launch-admission-v2/binding/native_launch_binding.py')
+NATIVE_COMPANION_SHA='5d6d8e393b50768d618b3f81df4dbb5edaa1d9fbddea9b0b518cbc73ed0b338e'
+
+def native_module(home):
+    path=Path(home)/NATIVE_COMPANION
+    raw=regular(path,65536)
+    require(hashlib.sha256(raw).hexdigest()==NATIVE_COMPANION_SHA,'native_companion_changed')
+    ns={'__name__':'game_launch_native','__file__':str(path),'require':require,'regular':regular,
+        'directory':directory,'decode':decode,'Blocked':Blocked,'process_identity':process_identity,'valid_identity':valid_identity}
+    exec(compile(raw,str(path),'exec'),ns)
+    return ns
+
 class Admission:
     def __init__(self,home,route,goal=None):
         self.home=Path(home);self.route=route
@@ -115,11 +127,12 @@ class Admission:
 
     def record(self):
         if not self.pending.exists() and not self.pending.is_symlink():return None
-        value=decode(regular(self.pending,4096))
+        value=decode(regular(self.pending,32768))
         legacy=value.get('schema')==1
-        require(type(value.get('schema')) is int and value['schema'] in (1,2)
+        native=value.get('schema')==4
+        require(type(value.get('schema')) is int and value['schema'] in (1,2,4)
                 and set(value)==({'schema','route','phase','children','request','goal'} if legacy else
-                    {'schema','route','phase','children','request','goal','boot','dispatcher'})
+                    {'schema','route','phase','children','request','goal','boot','dispatcher'}|({'nativeBinding','nativeOwner','targetObservation'} if native else set()))
                 and value['route'] in ('cs2','ds3','prince','steam')
                 and value['phase'] in ('prepared','dispatched','confirmed') and value['goal'] in ('client','game') and type(value['children']) is list
                 and len(value['children'])<=2 and (all(type(pid) is int and pid>1 for pid in value['children']) if legacy else
@@ -131,6 +144,14 @@ class Admission:
         if not legacy:
             require(type(value['boot']) is str and re.fullmatch('[0-9a-f]{64}',value['boot'])
                     and valid_identity(value['dispatcher']),'invalid_admission_record')
+        if native:
+            require(value['route']=='ds3' and value['goal']=='game','invalid_native_record')
+            native_module(self.home)['shape'](value['nativeBinding'])
+            require(valid_identity(value['nativeOwner'],optional=value['phase']=='prepared'),'invalid_native_owner')
+            observation=value['targetObservation']
+            if value['phase']=='confirmed':
+                native_module(self.home)['observation_shape'](observation,value['nativeBinding'],value['nativeOwner'],value['children'])
+            else:require(observation is None,'invalid_native_observation')
         return value
 
     def publish(self,value,expected=None):
@@ -139,7 +160,7 @@ class Admission:
             name='.game-launch-pending-'+secrets.token_hex(16)
             fd=os.open(name,os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW,0o600,dir_fd=parent)
             try:
-                raw=(json.dumps(value,sort_keys=True)+'\n').encode();offset=0
+                raw=(json.dumps(value,sort_keys=True)+'\n').encode();require(len(raw)<=32768,'admission_record_size');offset=0
                 while offset<len(raw):
                     written=os.write(fd,raw[offset:]);require(written>0,'admission_write_failed');offset+=written
                 os.fsync(fd);bound();require(self.record()==expected,'admission_request_changed');bound()
@@ -220,6 +241,17 @@ class Admission:
     def reconcile(self):
         previous=self.record()
         if previous is None:return
+        if previous['schema']==4:
+            if previous['phase']=='confirmed':
+                # Device numbers and file facts may change across a reboot.
+                # Retire that old proof only through current scoped recovery,
+                # never by relaxing same-boot binding or target ownership.
+                if previous['boot']!=boot_identity():self.recover();return
+                self.native_target_settled(previous);self.withdraw(previous);return
+            if previous['phase']=='prepared':raise Blocked('pending_launch_unconfirmed')
+            # Only the original watcher may record the bound native milestone.
+            # An absent target cannot retroactively prove a successful launch.
+            self.recover();return
         if previous['phase']=='confirmed':self.withdraw(previous);return
         if previous['phase']=='prepared':raise Blocked('pending_launch_unconfirmed')
         if self.summary(previous['route'],goal=previous['goal'])['targetActive']:
@@ -228,10 +260,25 @@ class Admission:
 
     def begin(self):
         self.reconcile()
+        binding=None
+        if self.route=='ds3' and self.goal=='game':
+            routes=self.home/'Library/Application Support/Adapted Games DS3/profiles/ds3/native-applications.routes'
+            if routes.exists() or routes.is_symlink():binding=native_module(self.home)['bind'](self.home,self.route,self.goal)
+        owner=None
+        if binding is not None:
+            rows=self.processes()
+            require(not any(command in (binding['approval']['loader'],binding['approval']['target'],binding['approval']['image'])
+                        for _,command in rows),'native_target_already_active')
+            clients=[pid for pid,command in rows if command==str(self.paths()[0])]
+            require(len(clients)<=1,'native_launch_owner_ambiguous')
+            if clients:
+                owner=process_identity(clients[0]);require(valid_identity(owner),'native_launch_owner_unknown')
         dispatcher=process_identity(os.getpid())
         require(valid_identity(dispatcher),'process_incarnation_unavailable')
-        self.publish({'schema':2,'route':self.route,'phase':'prepared','children':[],
-                      'request':secrets.token_hex(16),'goal':self.goal,'boot':boot_identity(),'dispatcher':dispatcher})
+        value={'schema':4 if binding is not None else 2,'route':self.route,'phase':'prepared','children':[],
+               'request':secrets.token_hex(16),'goal':self.goal,'boot':boot_identity(),'dispatcher':dispatcher}
+        if binding is not None:value.update(nativeBinding=binding,nativeOwner=owner,targetObservation=None)
+        self.publish(value)
 
     def dispatched(self,children):
         value=self.record()
@@ -242,7 +289,13 @@ class Admission:
         # A child that disappears before publication leaves the prepared request
         # explicitly recoverable; missing birth identity is never invented.
         require(all(valid_identity(child) and child['group']==child['pid'] for child in identities),'process_incarnation_unavailable')
-        require(value.get('schema')==2 and value['boot']==boot_identity(),'admission_request_changed')
+        require(value.get('schema') in (2,4) and value['boot']==boot_identity(),'admission_request_changed')
+        if value['schema']==4:
+            require(len(identities)==1,'native_launch_owner_ambiguous')
+            native_module(self.home)['unchanged'](self.home,value['nativeBinding'])
+            if value['nativeOwner'] is None:value['nativeOwner']=identities[0]
+            else:
+                require(process_identity(value['nativeOwner']['pid'])==value['nativeOwner'],'native_launch_owner_changed')
         value.update(phase='dispatched',children=identities);self.publish(value,expected=before)
         self.start_watch(value['request'])
 
@@ -275,8 +328,18 @@ class Admission:
                     if remaining<=0:return
                     rows=self.processes(timeout=min(5,remaining))
                     if time.monotonic()>deadline:return
-                    if self.summary(value['route'],processes=rows,goal=value['goal'])['targetActive']:
-                        before=dict(value);value['phase']='confirmed';self.publish(value,expected=before);return
+                    observation=None
+                    if value['schema']==4:
+                        remaining=deadline-time.monotonic()
+                        if remaining<=0:return
+                        observation=native_module(self.home)['observe'](self.home,value['nativeBinding'],value['nativeOwner'],value['children'],rows,remaining,self.processes)
+                        target=observation is not None
+                    else:target=self.summary(value['route'],processes=rows,goal=value['goal'])['targetActive']
+                    if time.monotonic()>deadline:return
+                    if target:
+                        before=dict(value);value['phase']='confirmed'
+                        if value['schema']==4:value['targetObservation']=observation
+                        self.publish(value,expected=before);return
             except Blocked as error:
                 if str(error)!='launcher_busy':return
             except (OSError,UnicodeError,subprocess.SubprocessError):return
@@ -353,6 +416,7 @@ class Admission:
     def recover(self):
         value=self.record()
         if value is None:return {'state':'NO_PENDING_LAUNCH'}
+        if value['schema']==4 and value['phase']=='confirmed':self.native_target_settled(value,verify_binding=False)
         legacy=value['schema']==1
         same_boot=legacy or value['boot']==boot_identity()
         groups=set()
@@ -395,6 +459,16 @@ class Admission:
         # Recheck the immutable record after the bounded process observations.
         require(self.record()==value,'admission_request_changed');self.withdraw(value)
         return {'state':'PENDING_LAUNCH_RECOVERED','gameplayVerified':False}
+
+    def native_target_settled(self,value,verify_binding=True):
+        if verify_binding:native_module(self.home)['unchanged'](self.home,value['nativeBinding'])
+        if value['boot']==boot_identity():
+            target=value['targetObservation']['identity'];current=process_identity(target['pid'])
+            require(current is None or current['birth']!=target['birth'],'game_active')
+        # No generic wrapper or exact target still present may be silently
+        # discarded as a different or late game. Ambiguity preserves the record.
+        require(not any(command in (value['nativeBinding']['approval']['loader'],value['nativeBinding']['approval']['target'],value['nativeBinding']['approval']['image'])
+                    for _,command in self.processes()),'native_target_already_active')
 
 if __name__=='__main__':
     import sys

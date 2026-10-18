@@ -335,7 +335,7 @@ def verify_policy_inventory(root):
         check()
 
 
-def verify_policy_source(root, dm, hm, lifecycle, predecessor_lifecycle=None):
+def verify_policy_source(root, dm, hm, lifecycle, predecessor_lifecycle=None, launch_proof=None):
     """Exact installed metadata closure; no current canonical policy dependency."""
     verify_policy_inventory(root)
     policy_raw,mode=root.read('ds3/policy-source/overlay-policy.json')
@@ -346,8 +346,12 @@ def verify_policy_source(root, dm, hm, lifecycle, predecessor_lifecycle=None):
          and type(policy.get('schema')) is int and policy['schema'] == 2
          and policy.get('id') == 'wine-runtime-overlay' and policy.get('owner') == 'control-games-hub', 'installed_policy_schema')
     if predecessor_lifecycle is not None:
-        need(dm.get('schema') == 3 and type(predecessor_lifecycle) is bytes,
-             'installed_policy_predecessor_scope')
+        need(type(predecessor_lifecycle) is bytes and (dm.get('schema') == 3 or
+             dm.get('schema') == 4 and launch_proof is not None), 'installed_policy_predecessor_scope')
+        if dm.get('schema') == 4:
+            launch_proof.revalidate()
+            need(launch_proof.before_lifecycle == predecessor_lifecycle
+                 and launch_proof.installed_lifecycle == lifecycle, 'installed_policy_launch_binding')
     bound_lifecycle = lifecycle if predecessor_lifecycle is None else predecessor_lifecycle
     need(digest(policy_raw) == dm.get('runtimeOverlayPolicySha256')
          and digest(source_raw) == dm.get('sourceHubManifestSha256')
@@ -363,7 +367,7 @@ def verify_policy_source(root, dm, hm, lifecycle, predecessor_lifecycle=None):
          and hm.get('runtimeOverlayPolicySha256') == dm.get('runtimeOverlayPolicySha256'), 'installed_policy_hub_binding')
 
 
-def build(root, commit, pe32_sha256, pe64_sha256, policy_sha256, publish=True, source_only=True, runtime_sha256=None, installed_policy_source=False, predecessor_lifecycle=None):
+def build(root, commit, pe32_sha256, pe64_sha256, policy_sha256, publish=True, source_only=True, runtime_sha256=None, installed_policy_source=False, predecessor_lifecycle=None, launch_proof=None):
     """Build one versioned fixed runtime transaction; payload pins mandatory."""
     need(pin(commit, 40) and pin(pe32_sha256) and pin(pe64_sha256) and pin(policy_sha256), 'invalid_pins')
     need(type(source_only) is bool,'invalid_route_metadata')
@@ -372,6 +376,8 @@ def build(root, commit, pe32_sha256, pe64_sha256, policy_sha256, publish=True, s
     need(digest(payload[PE32]) == pe32_sha256 and digest(payload[PE]) == pe64_sha256, 'payload_pin_mismatch')
     extended = runtime_sha256 is not None
     need(type(installed_policy_source) is bool and (not installed_policy_source or extended), 'installed_policy_scope')
+    need(launch_proof is None or installed_policy_source and predecessor_lifecycle is not None,
+         'installed_policy_predecessor_scope')
     need(predecessor_lifecycle is None or installed_policy_source,
          'installed_policy_predecessor_scope')
     desired = runtime_sha256 if extended else {PE32:pe32_sha256,PE:pe64_sha256}
@@ -391,7 +397,7 @@ def build(root, commit, pe32_sha256, pe64_sha256, policy_sha256, publish=True, s
         # Only the fixed adapter supplies this optional first-migration input,
         # after proving the actual settled launch transaction before/after pair.
         # It is not a CLI field, authority token, or schema4 downgrade route.
-        verify_policy_source(root,dm,hm,old['ds3.lifecycle'][0],predecessor_lifecycle)
+        verify_policy_source(root,dm,hm,old['ds3.lifecycle'][0],predecessor_lifecycle,launch_proof)
     need(type(hm.get('criticalHashes')) is dict and type(dm.get('sourceCriticalHashes')) is dict
          and all(type(k) is str and pin(v) for pins in (hm['criticalHashes'],dm['sourceCriticalHashes']) for k,v in pins.items())
          and pin(dm.get('candidateSha256')) and pin(dm.get('donorSha256')) and pin(dm.get('sourceHubManifestSha256')), 'installed_pin_schema')
@@ -421,7 +427,7 @@ def build(root, commit, pe32_sha256, pe64_sha256, policy_sha256, publish=True, s
     borderless = decode(root.read('ds3/borderless/manifest.json')[0])
     need(type(borderless) is dict, 'borderless_schema')
     need(br.get('manifestSha256') == digest(root.read('ds3/borderless/manifest.json')[0]), 'borderless_manifest_drift')
-    need(borderless.get('nativeBinding') == {'winemetalSha256':dm.get('candidateSha256'),'donorSha256':dm.get('donorSha256'),'d3d11Sha256':dm['sourceCriticalHashes'].get('engine/lib/wine/x86_64-windows/d3d11.dll')}, 'borderless_native_binding_drift')
+    need(borderless.get('nativeBinding') == {'winemetalSha256':dm.get('candidateSha256'),'donorSha256':dm.get('donorSha256'),'d3d11Sha256':dm.get('rendererOverride',{}).get('d3d11Sha256',dm['sourceCriticalHashes'].get('engine/lib/wine/x86_64-windows/d3d11.dll'))}, 'borderless_native_binding_drift')
     guards = {rel: image(*root.read(rel)) for rel in GUARDS}
     for name,key in (('helper.exe','helperSha256'),('helper.c','sourceSha256'),('build-provenance.json','provenanceSha256'),('final-fixture-results.json','fixtureReportSha256')):
         need(guards['ds3/borderless/'+name]['sha256'] == borderless.get(key), 'borderless_helper_drift')
@@ -430,6 +436,9 @@ def build(root, commit, pe32_sha256, pe64_sha256, policy_sha256, publish=True, s
         need(guards[rel]['sha256'] == receipt.get(key), 'installed_helper_drift')
     ds3_pins = dict(dm['sourceCriticalHashes'], **{METAL:dm['candidateSha256'],DONOR:dm['donorSha256']})
     ds3_pins.update(overrides)
+    if dm.get('rendererOverride'):
+        renderer=dm['rendererOverride'];need(type(renderer) is dict and pin(renderer.get('d3d11Sha256')),'renderer_pin_schema')
+        ds3_pins['engine/lib/wine/x86_64-windows/d3d11.dll']=renderer['d3d11Sha256']
     for name, pins in (('hub',hm['criticalHashes']),('ds3',ds3_pins)):
         actual = {row[0]: row[2] for row in rows[name] if row[1] != 'link'}
         need(all(actual.get(rel) == expected for rel, expected in pins.items()), 'critical_hash_drift')

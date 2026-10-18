@@ -215,7 +215,7 @@ class GuidanceTests(unittest.TestCase):
         self.assertEqual(self.stage.stat().st_ino, inode)
         self.assertEqual(self.path.read_bytes(), self.old)
 
-    def test_full_gate_then_held_source_before_execute_and_failure_stops(self):
+    def test_held_source_before_execute_and_failure_stops(self):
         from lib import workstation_maintenance_delivery as D
         canonical = Path(G.pwd.getpwuid(os.getuid()).pw_dir) / "AIDev/control"
         calls = []
@@ -228,11 +228,109 @@ class GuidanceTests(unittest.TestCase):
         with patch.object(G, "ROOT", canonical), patch.object(G.Path, "cwd", return_value=canonical), \
              patch.object(D, "admitted_source", admitted), patch.object(G, "execute", execute), patch("builtins.print"):
             self.assertEqual(G.main(["apply"]), 0)
-        self.assertEqual(calls, ["full", "held", "execute"])
+        self.assertEqual(calls, ["held", "execute"])
         with patch.object(G, "ROOT", canonical), patch.object(G.Path, "cwd", return_value=canonical), \
              patch.object(D, "admitted_source", side_effect=RuntimeError("blocked")), \
              patch.object(G, "execute") as execute_mock, patch("builtins.print"):
             self.assertEqual(G.main(["apply"]), 1); execute_mock.assert_not_called()
+
+
+class SuccessorGuidanceTests(GuidanceTests):
+    """Run the same crash, foreign-state and inode suite on the new namespace."""
+    def setUp(self):
+        super().setUp()
+        self.recovery = self.home.joinpath(*G.STATE, G.SUCCESSOR)
+        self.stage = self.path.parent / ".workstation-guidance-scoped-readiness-v1"
+
+    def run_action(self, action, checkpoint=lambda _: None, source_guard=lambda: True):
+        return G.execute(self.home, action, admission=lambda work, guard: work(),
+            checkpoint=checkpoint, source_guard=source_guard, operation=G.SUCCESSOR)
+
+    def test_production_source_and_manifest_exact(self):
+        self.mock_source.stop()
+        try:
+            manifest, raw = G.source(G.SUCCESSOR)
+            self.assertEqual(manifest["preimageSha256"], G.POSTIMAGE)
+            self.assertEqual(G.H.digest(raw), G.SUCCESSOR_HASH)
+            self.assertEqual(manifest["recoverySuffix"], "/".join(G.STATE + (G.SUCCESSOR,)))
+            legacy, before = G.source()
+            self.assertEqual(G.H.digest(before), G.POSTIMAGE)
+            self.assertEqual(legacy["source"], "skills/manage-workstation/SKILL.md")
+        finally: self.mock_source.start()
+
+    def test_scoped_cli_uses_held_source_only_and_denies_failed_source(self):
+        from lib import workstation_maintenance_delivery as D
+        canonical = Path(G.pwd.getpwuid(os.getuid()).pw_dir) / "AIDev/control"
+        calls = []
+        def admitted(root, *, full, operation_check=None):
+            self.assertFalse(full, "unrelated vendor health must not be invoked")
+            calls.append("held")
+            self.assertIs(operation_check("a" * 40, source_guard=lambda: True), True)
+        def execute(home, action, *, admission, source_guard, operation):
+            self.assertEqual(operation, G.SUCCESSOR)
+            calls.append("execute")
+            return admission(lambda: {"status": "INSTALLED"}, lambda: True)
+        with patch.object(G, "ROOT", canonical), patch.object(G.Path, "cwd", return_value=canonical), \
+             patch.object(D, "admitted_source", admitted), patch.object(G, "execute", execute), patch("builtins.print"):
+            self.assertEqual(G.main(["apply"], operation=G.SUCCESSOR), 0)
+        self.assertEqual(calls, ["held", "execute"])
+        with patch.object(G, "ROOT", canonical), patch.object(G.Path, "cwd", return_value=canonical), \
+             patch.object(D, "admitted_source", side_effect=RuntimeError("unaccepted source")), \
+             patch.object(G, "execute") as execute_mock, patch("builtins.print"):
+            self.assertEqual(G.main(["apply"], operation=G.SUCCESSOR), 1)
+            execute_mock.assert_not_called()
+
+    def test_closed_cli_rejects_override_and_unknown_operation(self):
+        for args in (["apply", "--home", "/tmp"], ["apply", "--operation", G.OPERATION],
+                     ["apply", "--source", "other"], ["apply", "--hash", "a" * 64]):
+            with self.subTest(args=args), patch("sys.stderr"), self.assertRaises(SystemExit):
+                G.main(args, operation=G.SUCCESSOR)
+        with self.assertRaisesRegex(G.H.OfframpError, "fixed_operation"):
+            G.execute(self.home, "apply", admission=lambda work, guard: work(), operation="arbitrary")
+
+    def test_both_operations_share_lock_and_preserve_target_on_contention(self):
+        custody = G.H.Directory(self.home, G.STATE, create=True)
+        try:
+            G.fcntl.flock(custody.fd, G.fcntl.LOCK_EX | G.fcntl.LOCK_NB)
+            for operation in (G.OPERATION, G.SUCCESSOR):
+                with self.subTest(operation=operation), self.assertRaises(BlockingIOError):
+                    G.execute(self.home, "apply", admission=lambda work, guard: work(), operation=operation)
+                self.assertEqual(self.path.read_bytes(), self.old)
+                self.assertEqual(self.path.stat().st_ino, self.original_inode)
+                self.assertFalse(self.home.joinpath(*G.STATE, operation).exists())
+        finally:
+            custody.close()
+
+    def test_legacy_custody_survives_successor_and_sequential_rollback(self):
+        old_manifest = copy.deepcopy(self.manifest)
+        middle = self.new
+        latest = b"scoped guidance successor\n"
+        new_manifest = copy.deepcopy(self.manifest)
+        new_manifest.update(preimageSha256=G.H.digest(middle), postimageSha256=G.H.digest(latest))
+        G.source.side_effect = lambda operation=G.OPERATION: \
+            (old_manifest, middle) if operation == G.OPERATION else (new_manifest, latest)
+        def operate(action, operation):
+            return G.execute(self.home, action, admission=lambda work, guard: work(), operation=operation)
+        self.assertEqual(operate("apply", G.OPERATION)["status"], "INSTALLED")
+        middle_inode = self.path.stat().st_ino
+        old_recovery = self.home.joinpath(*G.STATE, G.OPERATION)
+        old_stage = self.path.parent / G.STAGE
+        snapshot = {p.name: (p.read_bytes(), p.stat().st_ino) for p in old_recovery.iterdir()}
+        displaced = old_stage.read_bytes(), old_stage.stat().st_ino
+        self.assertEqual(operate("apply", G.SUCCESSOR)["status"], "INSTALLED")
+        self.assertEqual(operate("apply", G.SUCCESSOR)["status"], "UNCHANGED")
+        self.assertEqual(operate("status", G.SUCCESSOR)["status"], "INSTALLED")
+        with self.assertRaises(G.H.OfframpError): operate("rollback", G.OPERATION)
+        self.assertEqual(self.path.read_bytes(), latest)
+        self.assertEqual(snapshot, {p.name: (p.read_bytes(), p.stat().st_ino) for p in old_recovery.iterdir()})
+        self.assertEqual(displaced, (old_stage.read_bytes(), old_stage.stat().st_ino))
+        self.assertEqual(operate("rollback", G.SUCCESSOR)["status"], "ROLLED_BACK")
+        self.assertEqual((self.path.read_bytes(), self.path.stat().st_ino), (middle, middle_inode))
+        self.assertEqual(operate("status", G.OPERATION)["status"], "INSTALLED")
+        self.assertEqual(operate("rollback", G.OPERATION)["status"], "ROLLED_BACK")
+        self.assertEqual((self.path.read_bytes(), self.path.stat().st_ino), (self.old, self.original_inode))
+        self.assertEqual(operate("status", G.OPERATION)["status"], "ROLLED_BACK")
+        self.assertTrue(self.recovery.exists())
 
 
 if __name__ == "__main__": unittest.main()

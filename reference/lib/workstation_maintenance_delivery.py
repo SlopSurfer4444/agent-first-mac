@@ -310,6 +310,11 @@ class Schedule:
         self.row["phase"] = phase
         self.raw = self.files.write(JOURNAL, self.row, self.raw)
         self.fault(phase)
+        # Journal publication/checkpoint may outlive the previous source check.
+        # Do not continue into public target publication or native dispatch with
+        # changed source; the durable phase remains recoverable, not cleared.
+        if hasattr(self, "source_guard"):
+            need(self.source_guard() is True, "current_source_drift")
 
     def owned(self, *, required=True):
         self.parent.verify()
@@ -578,11 +583,6 @@ def native_schedule(operation):
             finally:
                 if parent is not None: parent.close()
         schedule = Schedule(store, ROOT, home, runner, create=operation in {"install", "recover"})
-        if operation in {"install", "recover", "remove"}:
-            pending_install = operation == "recover" and schedule.row is not None and schedule.row["phase"] in {"preparing", "prepared", "published", "starting"}
-            if operation == "install" or pending_install:
-                # Full preflight must finish before any lifecycle mutation.
-                admitted_source(ROOT, full=True)
         if operation in {"plan", "status"}:
             if schedule.row is None:
                 need(schedule.files.read(PLIST, fd=schedule.parent.fd) is None and schedule.observe() == "ABSENT", "schedule_collision_or_unknown")
@@ -600,8 +600,9 @@ def native_schedule(operation):
             value["operation"] = operation
             result.append(value)
             return True
-        # Fresh accepted-current Git-only custody spans every mutation. A
-        # successful earlier full doctor is not a historical source pin.
+        # Accepted-current source custody spans the lifecycle mutation. The
+        # schedule checks its exact plist/job/recovery state; unrelated vendor
+        # schema capability is not a prerequisite for this launchd lifecycle.
         admitted_source(ROOT, full=False, operation_check=mutation)
         need(len(result) == 1, "source_unadmitted")
         return result[0]

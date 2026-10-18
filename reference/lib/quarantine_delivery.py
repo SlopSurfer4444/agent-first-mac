@@ -165,9 +165,9 @@ def main(arguments=None):
         if args.action in ("plan", "status"):
             result = execute(home, args.action, args.operation, admission=None)
         else:
-            # Before even creating recovery directories, require full readiness.
-            # Keep accepted source held across preparation and all publication.
-            admitted_source(ROOT, full=True)
+            # Hold admitted source across exact-pair preparation/publication.
+            # This does not run a vendor: effective sandbox capability is a
+            # separate scoped observation, not a global publication gate.
             result = []
             def run(head, *, source_guard):
                 def admission(work, guard):

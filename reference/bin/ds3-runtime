@@ -2,7 +2,7 @@
 """Reviewed DS3-only adoption; preparation and installation never start a game."""
 import sys
 sys.dont_write_bytecode = True
-import ctypes, fcntl, hashlib, importlib.machinery, importlib.util, json, os, pwd, re, shutil, stat, subprocess, tempfile
+import contextlib, ctypes, fcntl, hashlib, importlib.machinery, importlib.util, json, os, pwd, re, shutil, stat, subprocess, tempfile, time
 import xml.etree.ElementTree as ET
 from pathlib import Path
 HOME = Path(pwd.getpwuid(os.getuid()).pw_dir)
@@ -19,6 +19,7 @@ METAL = 'engine/lib/wine/x86_64-unix/winemetal.so'
 DONOR = 'engine/lib/wine/x86_64-unix/winemetal-airconv-original.so'
 NATIVE_LOADER = 'engine/lib/wine/x86_64-unix/wine'
 MAX_ENTRIES = 100000
+ADMISSION_SHA = '54730cf9cba654d5822317dadb72bfe88ed2bf77b1ec3264a29d2b6711de1210'
 
 def admission(home,route,goal=None):
     # Execute exactly the reviewed helper bytes from the stable installed route.
@@ -35,7 +36,7 @@ def admission(home,route,goal=None):
         with os.fdopen(os.dup(fd),'rb') as stream:raw=stream.read()
         after=os.fstat(fd)
         keys=('st_dev','st_ino','st_mode','st_uid','st_nlink','st_size','st_mtime_ns','st_ctime_ns')
-        if any(getattr(facts,k)!=getattr(after,k) for k in keys) or hashlib.sha256(raw).hexdigest()!='e445e867abad4816b4b4960f78116ae993a97941c19e8881c380787c40cb7146':
+        if any(getattr(facts,k)!=getattr(after,k) for k in keys) or hashlib.sha256(raw).hexdigest()!=ADMISSION_SHA:
             raise RuntimeError('admission_helper_changed')
     finally:os.close(fd)
     namespace={'__name__':'game_launch_admission','__admission_source':raw}
@@ -48,7 +49,7 @@ INSTALLED_POLICY_FILES = {'overlay-policy.json','source-hub-v1.json'}
 RUNTIME_OVERLAY_POLICY_FIELDS = {'schema','id','owner','previousHubManifestSha256','previousDS3ManifestSha256','previousHubCriticalHashes','sourceHubManifestSha256','sourceCriticalHashes','desiredPEHashes','lifecycleSha256'}
 RUNTIME_OVERRIDE_PATHS = {'engine/lib/wine/i386-windows/winemac.drv', 'engine/lib/wine/x86_64-windows/winemac.drv'}
 RUNTIME_EXTENDED_PATHS = RUNTIME_OVERRIDE_PATHS | {'engine/lib/wine/x86_64-unix/winemac.so','engine/lib/wine/i386-windows/oleacc.dll','engine/lib/wine/x86_64-windows/oleacc.dll'}
-DS3_MANIFEST_FIELDS = ['architecture', 'aspectFit', 'aspectPolicySha256', 'authorization', 'candidateBuildFiles', 'candidateSha256', 'candidateState', 'capabilities', 'dataBoundary', 'destination', 'donorSha256', 'followPolicySha256', 'fontPathCount', 'graphicsPolicy', 'id', 'marshalSources', 'owner', 'primaryOwner', 'processGate', 'provenance', 'provenanceSha256', 'remove', 'resolver', 'rollback', 'schema', 'singleLauncher', 'smokeTest', 'sourceCriticalHashes', 'sourceHubManifestSha256', 'versionPolicy', 'windowEnumEvidence', 'windowMode']
+DS3_MANIFEST_FIELDS = ['architecture', 'aspectFit', 'aspectPolicySha256', 'authorization', 'candidateBuildFiles', 'candidateSha256', 'candidateState', 'capabilities', 'dataBoundary', 'destination', 'donorSha256', 'followPolicySha256', 'fontPathCount', 'graphicsPolicy', 'id', 'marshalSources', 'owner', 'primaryOwner', 'processGate', 'provenance', 'provenanceSha256', 'remove', 'resolver', 'rollback', 'schema', 'singleLauncher', 'smokeTest', 'sourceCriticalHashes', 'sourceHubManifestSha256', 'versionPolicy', 'windowEnumEvidence', 'windowMode', 'rendererOverride', 'launchAdmissionOverride']
 
 def need(ok, reason):
     if not ok: raise RuntimeError(reason)
@@ -97,6 +98,7 @@ def manifest(p):
     need(set(m) <= allowed and (m['schema'] >= 2 or 'runtimeOverrides' not in m and 'runtimeOverlayPolicySha256' not in m), 'manifest_field_schema')
     for k in ('candidateSha256', 'provenanceSha256'):
         need(pinned(m.get(k)), 'candidate_pins_pending')
+    # This pins the original installed default, not the owner's current mode.
     need(m.get('windowMode') == 'WINDOW', 'unsupported_graphics_policy')
     need(pinned(m.get('sourceHubManifestSha256')), 'hub_manifest_pin')
     expected = None
@@ -142,7 +144,12 @@ def manifest(p):
         policy = load(policy_path)
         need(type(policy) is dict and set(policy) == (RUNTIME_OVERLAY_POLICY_FIELDS - {'desiredPEHashes'} | {'desiredRuntimeHashes'} if m['schema'] >= 3 else RUNTIME_OVERLAY_POLICY_FIELDS) and type(policy.get('schema')) is int and policy.get('schema') == (2 if m['schema'] >= 3 else 1) and policy.get('id') == 'wine-runtime-overlay' and policy.get('owner') == 'control-games-hub', 'overlay_policy_identity')
         need(pinned(m.get('runtimeOverlayPolicySha256')) and m['runtimeOverlayPolicySha256'] == sha(policy_path), 'overlay_policy_pin')
-        need(pinned(policy.get('lifecycleSha256')) and policy['lifecycleSha256'] == sha(lifecycle_path), 'overlay_lifecycle_pin')
+        override=renderer_fields(m)
+        if override and 'nativeRuntimeHashes' in override:
+            need(pinned(policy.get('lifecycleSha256')) and policy['lifecycleSha256']==renderer_overlay_lifecycle(m)
+                 and (native_admission_lifecycle(m) if m.get('launchAdmissionOverride') is not None else override['lifecycleSha256'])==sha(lifecycle_path),'overlay_renderer_lifecycle_pin')
+        else:
+            need(pinned(policy.get('lifecycleSha256')) and policy['lifecycleSha256'] == sha(lifecycle_path), 'overlay_lifecycle_pin')
         need(policy.get('desiredRuntimeHashes' if m['schema'] >= 3 else 'desiredPEHashes') == overrides and policy.get('sourceHubManifestSha256') == m['sourceHubManifestSha256'] and policy.get('sourceCriticalHashes') == m['sourceCriticalHashes'], 'overlay_source_binding')
         current_hub = load(hub_path)
         need(type(current_hub) is dict and type(current_hub.get('criticalHashes')) is dict, 'current_hub_schema')
@@ -151,6 +158,10 @@ def manifest(p):
             need(current_hub.get('id') == 'games-hub' and current_hub.get('owner') == 'control-games-hub'
                  and type(policy.get('previousHubCriticalHashes')) is dict
                  and current_hub['criticalHashes'] == dict(policy['previousHubCriticalHashes'],**overrides), 'installed_policy_hub_binding')
+    renderer_fields(m)
+    if 'launchAdmissionOverride' in m:
+        need(m['schema']==4 and 'nativeRuntimeHashes' in (m.get('rendererOverride') or {}),'native_admission_manifest_scope')
+        native_admission_lifecycle(m)
     return m
 
 def installed_critical_hashes(m):
@@ -159,6 +170,9 @@ def installed_critical_hashes(m):
     pins = dict(m['sourceCriticalHashes'])
     pins[METAL] = m['candidateSha256']; pins[DONOR] = m['donorSha256']
     if m['schema'] >= 2: pins.update(m['runtimeOverrides'])
+    if renderer_fields(m): pins[RENDERER_REL]=renderer_hash(m)
+    if renderer_fields(m) and 'dxgiSha256' in renderer_fields(m):pins[DXGI_REL]=renderer_dxgi_hash(m)
+    pins.update(renderer_native_hashes(m))
     return pins
 
 def code_tree(p, allow_source_hardlinks=False, allow_installed_loader_hardlinks=False):
@@ -232,6 +246,10 @@ def source_gate(commit,action='apply',candidate=None,apply_commit=None):
         nodes.append(namespace)
         if (namespace/'journal.json').exists():nodes.append(namespace/'journal.json')
     if bootstrap.exists():nodes.append(bootstrap)
+    if action in ('virtual-fullscreen','rollback-virtual-fullscreen'):
+        nodes.extend((PREFIX/CONFIG_REL,PREFIX/'user.reg'))
+        tx=virtual_fullscreen_transaction(commit if action=='virtual-fullscreen' else apply_commit)
+        if tx.exists():nodes.extend((tx,*[tx/name for name in ('record.json','graphics.before','graphics.after','registry.before','registry.after')]))
     if action in ('repair-window','rollback-window'):
         window_repair_pending_guard();nodes.extend((PREFIX/CONFIG_REL,PREFIX/'user.reg'))
         if action=='rollback-window':
@@ -241,6 +259,8 @@ def source_gate(commit,action='apply',candidate=None,apply_commit=None):
     def owner():
         desired=manifest(HERE/MANIFEST);need(desired['owner']=='control-ds3-marshal-fix','operation_payload_owner')
         if ROOT.exists():need(load(ROOT/'receipt.json').get('owner')=='control-ds3-marshal-fix','operation_payload_owner')
+        if action in ('virtual-fullscreen','rollback-virtual-fullscreen'):
+            verify_installed(allow_virtual_transaction=virtual_fullscreen_transaction(commit if action=='virtual-fullscreen' else apply_commit));verify_borderless()
         if action in ('repair-window','rollback-window'):verify_installed();verify_borderless()
         return True
     def recovery():
@@ -251,7 +271,7 @@ def source_gate(commit,action='apply',candidate=None,apply_commit=None):
             # original pre/postimages; a new operation captures current owner
             # state through its existing verifier/retire inventory.
             if j['state']=='pending':
-                need(action not in ('repair-window','rollback-window'),'lifecycle_recovery_required');lifecycle_validate(j,published)
+                need(action not in ('repair-window','rollback-window','virtual-fullscreen','rollback-virtual-fullscreen'),'lifecycle_recovery_required');lifecycle_validate(j,published)
         elif bootstrap.exists() or bootstrap.is_symlink():
             safe_file(bootstrap);need(bootstrap.stat().st_size<=32*1024*1024,'lifecycle_journal_limit');raw=bootstrap.read_bytes()
             if action=='install' and candidate is not None:
@@ -286,6 +306,7 @@ def source_gate(commit,action='apply',candidate=None,apply_commit=None):
     d=bridge.ready(CONTROL,commit,'wine-recovery' if action in ('recover','retire','rollback-window') else 'wine-install',checks=checks,target_guard=guard)
     need(d.get('scopedCandidateReady') is True,'scoped_operation_readiness_required')
     exact()
+    return exact
 
 def source_check(m):
     safe_directory(SOURCE)
@@ -339,7 +360,7 @@ def borderless_candidate(m, candidate):
     need(type(report.get('cases')) is list and len(report['cases']) == 4 and all(r.get('pass') is True and r.get('exit') == r.get('expectedExit') for r in report['cases']), 'borderless_fixture_failure')
 
 def borderless_binding(m, base):
-    need(m['nativeBinding'] == {'winemetalSha256':base['candidateSha256'],'donorSha256':base['donorSha256'],'d3d11Sha256':base['sourceCriticalHashes']['engine/lib/wine/x86_64-windows/d3d11.dll']}, 'borderless_native_drift')
+    need(m['nativeBinding'] == {'winemetalSha256':renderer_metal_hash(base),'donorSha256':base['donorSha256'],'d3d11Sha256':renderer_hash(base)}, 'borderless_native_drift')
 
 def verify_borderless():
     destination = ROOT/'borderless'; safe_directory(destination)
@@ -414,7 +435,7 @@ def verify_app_shortcuts(receipt, expected):
     for name in expected.values():
         p = HOME/'Games'/name; need(not p.exists() and not p.is_symlink(), 'legacy_shortcut_collision')
 
-def verify_installed():
+def verify_installed(allow_virtual_transaction=None):
     safe_directory(ROOT); m = manifest(ROOT/'manifest.json'); r = load(ROOT/'receipt.json')
     need(r.get('owner') == m['owner'] and r.get('manifestSha256') == sha(ROOT/'manifest.json'), 'installed_owner_or_manifest_drift')
     for name,key in (('ds3-runtime','lifecycleSha256'),('ds3-play','launcherSha256')):
@@ -422,6 +443,8 @@ def verify_installed():
     expected = installed_critical_hashes(m)
     for rel,digest in expected.items(): need(sha(ROOT/'runtime'/rel) == digest, 'installed_critical_drift')
     need(code_tree(ROOT/'runtime',allow_installed_loader_hardlinks=True) == r.get('runtimeTreeSha256'), 'installed_runtime_drift')
+    virtual_fullscreen_pending_guard(allow_virtual_transaction)
+    native_admission_pending_guard();renderer_pending_guard();renderer_verify_binding(m)
     snapshot(PREFIX); safe_directory(ROOT/'logs')
     resolver = HOME/'AIDev/bin/ds3-play'
     safe_directory(resolver.parent)
@@ -473,6 +496,196 @@ def window_config():
     backup.write_bytes(raw); backup.chmod(0o600); p.write_bytes(after)
     return {'preimageSha256':hashlib.sha256(raw).hexdigest(),'postimageSha256':sha(p)}
 
+
+# Fixed DS3 virtual-fullscreen preferences; no new runtime or executable scope.
+VIRTUAL_XML_FIELDS = ('ScreenMode','Resolution-FullScreenWidth','Resolution-FullScreenHeight')
+VIRTUAL_REG_FIELDS = (
+    (r'Software\\Wine\\X11 Driver', 'EmulateModeset', 'Y'),
+    (r'Software\\Wine\\AppDefaults\\darksoulsiii.exe\\X11 Driver', 'EmulateModeset', 'Y'),
+    (r'Software\\Wine\\AppDefaults\\darksoulsiii.exe\\Mac Driver', 'CaptureDisplaysForFullscreen', 'N'))
+
+
+def virtual_private_file(path, limit=32 * 1024 * 1024):
+    path = Path(path)
+    for parent in [*reversed(path.parents), path.parent]:
+        s = parent.lstat()
+        need(stat.S_ISDIR(s.st_mode) and s.st_uid in (0, os.getuid()) and (not s.st_mode & 18), 'unsafe_parent')
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    try:
+        s = os.fstat(fd)
+        need(stat.S_ISREG(s.st_mode) and s.st_uid == os.getuid() and (s.st_nlink == 1) and (not s.st_mode & 18) and (s.st_size <= limit), 'unsafe_file')
+        raw = b''
+        while len(raw) <= limit:
+            part = os.read(fd, min(1024 * 1024, limit + 1 - len(raw)))
+            if not part:
+                break
+            raw += part
+        after = os.fstat(fd)
+        keys = ('st_dev', 'st_ino', 'st_size', 'st_mtime_ns', 'st_ctime_ns', 'st_mode', 'st_nlink')
+        need(len(raw) <= limit and all((getattr(s, k) == getattr(after, k) for k in keys)), 'file_changed')
+        need(path.lstat().st_ino == s.st_ino and path.lstat().st_dev == s.st_dev, 'file_replaced')
+        return (raw, stat.S_IMODE(s.st_mode))
+    finally:
+        os.close(fd)
+
+def virtual_xml_values(raw):
+    need(len(raw) <= 131072 and (not raw.startswith((b'\xff\xfe', b'\xfe\xff'))), 'xml_encoding')
+    try:
+        text = raw.decode('utf-16-le', 'strict')
+        need('<!DOCTYPE' not in text and '<!ENTITY' not in text, 'xml_entity')
+        tree = ET.fromstring(text)
+    except (UnicodeError, ET.ParseError):
+        raise RuntimeError('xml_invalid') from None
+    need(tree.tag == 'config', 'xml_root')
+    values = {}
+    for tag in VIRTUAL_XML_FIELDS:
+        rows = list(tree.iter(tag))
+        need(len(rows) == len(tree.findall(tag)) == 1 and (not rows[0].attrib) and (not len(rows[0])) and (rows[0].text is not None), 'xml_field')
+        value = rows[0].text
+        need(text.count('<' + tag + '>' + value + '</' + tag + '>') == 1, 'xml_exact_field')
+        values[tag] = value
+    need(values['ScreenMode'] in ('WINDOW', 'FULLSCREEN'), 'xml_mode')
+    for tag in VIRTUAL_XML_FIELDS[1:]:
+        need(re.fullmatch('[1-9][0-9]{2,3}', values[tag]) is not None, 'xml_dimension')
+    return (text, values)
+
+def virtual_replace_xml(text, values, desired):
+    for tag in VIRTUAL_XML_FIELDS:
+        text = text.replace('<' + tag + '>' + values[tag] + '</' + tag + '>', '<' + tag + '>' + desired[tag] + '</' + tag + '>', 1)
+    return text.encode('utf-16-le')
+
+def virtual_reg_sections(raw):
+    need(len(raw) <= 16 * 1024 * 1024 and b'\x00' not in raw and raw.startswith(b'WINE REGISTRY Version 2'), 'registry_encoding')
+    lines = raw.splitlines(keepends=True)
+    headers = []
+    for (i, line) in enumerate(lines):
+        if line.startswith(b'['):
+            m = re.fullmatch(b'\\[([^\\r\\n]+)\\](?: [0-9]+)?\\r?\\n?', line)
+            need(m is not None, 'registry_section')
+            headers.append((i, m[1].decode('utf-8', 'surrogateescape')))
+    sections = {}
+    for (n, (start, name)) in enumerate(headers):
+        need(name.lower() not in sections, 'registry_duplicate_section')
+        end = headers[n + 1][0] if n + 1 < len(headers) else len(lines)
+        sections[name.lower()] = (start, end)
+    return (lines, sections)
+
+def virtual_reg_field(raw, section, name):
+    (lines, sections) = virtual_reg_sections(raw)
+    bounds = sections.get(section.lower())
+    if bounds is None:
+        return (None, False)
+    matches = []
+    for i in range(bounds[0] + 1, bounds[1]):
+        if re.match(b'\\s*"' + re.escape(name.encode()) + b'"\\s*=', lines[i], re.I):
+            matches.append(i)
+    need(len(matches) <= 1, 'registry_duplicate_value')
+    if not matches:
+        return (None, True)
+    line = lines[matches[0]]
+    need(re.fullmatch(b'"' + re.escape(name.encode()) + b'"="[^"\\\\\\r\\n]*"\\r?\\n?', line, re.I) is not None, 'registry_value_type')
+    return (line.decode('ascii'), True)
+
+def virtual_set_reg_field(raw, section, name, line):
+    (lines, sections) = virtual_reg_sections(raw)
+    bounds = sections.get(section.lower())
+    newline = b'\r\n' if b'\r\n' in raw else b'\n'
+    if bounds is None:
+        if line is None:
+            return raw
+        return raw + (b'' if raw.endswith(b'\n') else newline) + newline + b'[' + section.encode() + b']' + newline + line.encode().rstrip(b'\r\n') + newline
+    indices = [i for i in range(bounds[0] + 1, bounds[1]) if re.match(b'\\s*"' + re.escape(name.encode()) + b'"\\s*=', lines[i], re.I)]
+    need(len(indices) <= 1, 'registry_duplicate_value')
+    if indices:
+        replacement = b'' if line is None else line.encode()
+        if replacement and (not replacement.endswith(b'\n')) and (indices[0] + 1 < len(lines)):
+            replacement += newline
+        lines[indices[0]] = replacement
+    elif line is not None:
+        lines.insert(bounds[0] + 1, line.encode().rstrip(b'\r\n') + newline)
+    return b''.join(lines)
+
+def virtual_patch_registry(raw):
+    receipt = []
+    after = raw
+    for (section, name, value) in VIRTUAL_REG_FIELDS:
+        (before, section_existed) = virtual_reg_field(raw, section, name)
+        new = '"' + name + '"="' + value + '"' + ('\r\n' if b'\r\n' in raw else '\n')
+        receipt.append({'section': section, 'name': name, 'before': before, 'after': new, 'section_existed': section_existed})
+        after = virtual_set_reg_field(after, section, name, new)
+    return (after, receipt)
+
+def virtual_restore_registry(raw, receipt):
+    changed = [row for row in receipt if row['before'] != row['after']]
+    for row in changed:
+        current,_ = virtual_reg_field(raw,row['section'],row['name'])
+        normalize = lambda value: None if value is None else value.rstrip('\r\n').lower()
+        need(normalize(current) in (normalize(row['before']),normalize(row['after'])),'registry_restore_conflict')
+    after = raw
+    for row in changed:
+        after = virtual_set_reg_field(after,row['section'],row['name'],row['before'])
+        if not row['section_existed']:
+            lines,sections = virtual_reg_sections(after);bounds = sections.get(row['section'].lower())
+            if bounds and all(not x.strip() for x in lines[bounds[0]+1:bounds[1]]):
+                del lines[bounds[0]:bounds[1]];after = b''.join(lines)
+    return after
+
+
+def virtual_write_private(path, raw):
+    path = Path(path);before = lifecycle_facts(path.parent);parent = lifecycle_parent_fd(path)
+    try:
+        held = os.fstat(parent);need((held.st_dev,held.st_ino)==(before['dev'],before['ino']),'virtual_fullscreen_parent_changed')
+        fd = os.open(path.name,os.O_CREAT|os.O_EXCL|os.O_WRONLY|os.O_NOFOLLOW,0o600,dir_fd=parent)
+        try:
+            with os.fdopen(os.dup(fd),'wb') as out:out.write(raw);out.flush();os.fsync(out.fileno())
+        finally:os.close(fd)
+        os.fsync(parent);need(lifecycle_facts(path.parent)==before,'virtual_fullscreen_parent_changed')
+    finally:os.close(parent)
+
+
+def virtual_save(path, value):
+    data = (json.dumps(value, indent=2) + '\n').encode()
+    if not path.exists():
+        return virtual_write_private(path, data)
+    (before, _) = virtual_private_file(path)
+    virtual_atomic_replace(path, before, data, 384)
+
+def virtual_atomic_replace(path, before, after, mode, expected_mode=None):
+    """Held-directory, compare-and-replace only. Source generation is rechecked."""
+    need(virtual_target_path(Path(path)), 'virtual_fullscreen_target_scope')
+    path = Path(path)
+    parent = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    fd = None
+    name = None
+    try:
+        (current, current_mode) = virtual_private_file(path)
+        need(current == before and current_mode == (mode if expected_mode is None else expected_mode), 'replace_preimage_changed')
+        old = path.lstat()
+        (fd, name) = tempfile.mkstemp(prefix='.virtual-fullscreen-write-', dir=path.parent)
+        with os.fdopen(os.dup(fd), 'wb') as f:
+            f.write(after)
+            f.flush()
+            os.fsync(f.fileno())
+        os.fchmod(fd, mode);os.fsync(fd)
+        now = os.stat(path.name, dir_fd=parent, follow_symlinks=False)
+        need((now.st_dev, now.st_ino, now.st_mtime_ns, now.st_ctime_ns, now.st_size) == (old.st_dev, old.st_ino, old.st_mtime_ns, old.st_ctime_ns, old.st_size), 'replace_target_changed')
+        need(virtual_private_file(path)[0] == before, 'replace_preimage_changed')
+        held = os.fstat(parent)
+        named = path.parent.lstat()
+        need((held.st_dev, held.st_ino) == (named.st_dev, named.st_ino), 'replace_parent_changed')
+        os.replace(Path(name).name, path.name, src_dir_fd=parent, dst_dir_fd=parent)
+        name = None
+        os.fsync(parent)
+        observed,observed_mode = virtual_private_file(path)
+        need(observed==after and observed_mode==mode,'virtual_fullscreen_postimage_changed')
+    finally:
+        if fd is not None:
+            os.close(fd)
+        if name is not None:
+            os.unlink(name)
+        os.close(parent)
+
+
 def verify_window_config():
     # DS3 rewrites selected window dimensions during normal play. Bounds admit
     # ordinary display sizes; they do not prove game support for arbitrary sizes.
@@ -488,13 +701,213 @@ def verify_window_config():
         elements = [x for x in tree.iter() if x.tag == tag]
         need(len(elements) == 1 and len(tree.findall(tag)) == 1 and not elements[0].attrib and len(elements[0]) == 0 and elements[0].text is not None, 'ds3_window_config_drift')
         return elements[0].text.strip()
-    need(value('ScreenMode') == 'WINDOW', 'ds3_window_config_drift')
+    mode = value('ScreenMode'); need(mode in ('WINDOW','FULLSCREEN'), 'ds3_window_config_drift')
+    if mode == 'FULLSCREEN': verify_virtual_fullscreen_registry()
+    stem = 'Resolution-FullScreen' if mode == 'FULLSCREEN' else 'Resolution-WindowScreen'
     dimensions = []
-    for tag,minimum,maximum in (('Resolution-WindowScreenWidth',640,7680),('Resolution-WindowScreenHeight',360,4320)):
+    for tag,minimum,maximum in ((stem+'Width',640,7680),(stem+'Height',360,4320)):
         number = value(tag)
         need(re.fullmatch('[1-9][0-9]{2,3}',number) is not None, 'ds3_window_config_drift')
         number = int(number); need(minimum <= number <= maximum, 'ds3_window_config_drift'); dimensions.append(number)
-    return {'windowMode':'WINDOW','windowWidth':dimensions[0],'windowHeight':dimensions[1]}
+    if mode == 'FULLSCREEN': return {'windowMode':mode,'fullscreenWidth':dimensions[0],'fullscreenHeight':dimensions[1]}
+    return {'windowMode':mode,'windowWidth':dimensions[0],'windowHeight':dimensions[1]}
+
+def virtual_fullscreen_plan(graphics, registry, preset=None):
+    need(preset in (None,'1080','1440'),'unsupported_resolution')
+    text,before = virtual_xml_values(graphics);after = dict(before,ScreenMode='FULLSCREEN')
+    if preset is not None:
+        after.update(zip(VIRTUAL_XML_FIELDS[1:],('1920','1080') if preset=='1080' else ('2560','1440')))
+    result_graphics = virtual_replace_xml(text,before,after)
+    result_registry,fields = virtual_patch_registry(registry)
+    return result_graphics,result_registry,{'graphics':{'before':before,'after':after},'registry':fields}
+
+
+def virtual_restore_xml(raw, fields):
+    text,current = virtual_xml_values(raw);desired = dict(current)
+    for tag in VIRTUAL_XML_FIELDS:
+        if fields['before'][tag] != fields['after'][tag]:
+            need(current[tag] in (fields['before'][tag],fields['after'][tag]),'xml_restore_conflict')
+            desired[tag] = fields['before'][tag]
+    return virtual_replace_xml(text,current,desired)
+
+
+def virtual_fullscreen_registry_enabled():
+    raw,_ = virtual_private_file(PREFIX/'user.reg',16*1024*1024)
+    for section,name,expected in VIRTUAL_REG_FIELDS:
+        line,_ = virtual_reg_field(raw,section,name)
+        if not (line is not None and re.fullmatch('"'+re.escape(name)+'"="'+expected+'"\\r?\\n?',line,re.I) is not None):
+            return False
+
+    return True
+
+
+def verify_virtual_fullscreen_registry():
+    need(virtual_fullscreen_registry_enabled(),'virtual_fullscreen_registry_required')
+
+def virtual_live_query_value(raw,section,name,expected):
+    need(type(raw) is bytes and len(raw)<=65536 and b'\x00' not in raw,'virtual_fullscreen_live_query_output')
+    try:lines = [line.strip() for line in raw.decode('ascii').splitlines() if line.strip()]
+    except UnicodeError:raise RuntimeError('virtual_fullscreen_live_query_output') from None
+    key = section.replace(chr(92)*2,chr(92))
+    need(len(lines)==2 and lines[0].lower()==('HKEY_CURRENT_USER'+chr(92)+key).lower() and re.fullmatch(re.escape(name)+r'\s+REG_SZ\s+'+expected,lines[1],re.I) is not None,'virtual_fullscreen_live_policy_required')
+
+
+def verify_virtual_fullscreen_live(request):
+    deadline = time.monotonic()+9
+    client = request.paths()[0]
+    candidates = [pid for pid,command in request.processes(timeout=2) if command==str(client)]
+    need(len(candidates)==1,'virtual_fullscreen_client_ambiguous')
+    identity = request.record.__func__.__globals__['process_identity'];before = identity(candidates[0])
+    need(request.record.__func__.__globals__['valid_identity'](before),'virtual_fullscreen_client_unknown')
+    program = ROOT/'runtime/engine/lib/wine/x86_64-windows/reg.exe';safe_file(program)
+    env = wine_env(ROOT/'runtime',PREFIX)
+    for section,name,expected in VIRTUAL_REG_FIELDS:
+        remaining = deadline-time.monotonic();need(remaining>0,'virtual_fullscreen_live_query_deadline')
+        key = 'HKCU'+chr(92)+section.replace(chr(92)*2,chr(92))
+        result = subprocess.run([str(ROOT/'runtime/engine/bin/wine'),str(program),'query',key,'/v',name],env=env,stdin=subprocess.DEVNULL,capture_output=True,timeout=min(3,remaining))
+        need(result.returncode==0 and not result.stderr,'virtual_fullscreen_live_query_failed')
+        virtual_live_query_value(result.stdout,section,name,expected)
+    need(time.monotonic()<=deadline and identity(candidates[0])==before,'virtual_fullscreen_client_changed')
+    remaining = deadline-time.monotonic();need(remaining>0,'virtual_fullscreen_live_query_deadline')
+    rows = request.processes(timeout=min(2,remaining));fresh = request.summary(processes=rows)
+    final_identity = identity(candidates[0])
+    need(time.monotonic()<=deadline and final_identity==before and [pid for pid,command in rows if command==str(client)]==[before['pid']],'virtual_fullscreen_client_changed')
+    need(fresh['clientActive'] and not fresh['targetActive'] and not fresh['foreignSteam'],'virtual_fullscreen_session_changed')
+    # The real shared lock is retained; no foreign reservation may appear.
+    # begin() performs the final approved native-alias scan before dispatch.
+    need(request.record() is None,'virtual_fullscreen_admission_changed')
+    return {'state':'LIVE_REGISTRY_VERIFIED','client':before,'fields':3}
+
+
+def virtual_fullscreen_transaction(commit):
+    need(type(commit) is str and re.fullmatch('[0-9a-f]{40}',commit) is not None,'invalid_apply_commit')
+    return ROOT/('.virtual-fullscreen-'+commit)
+
+
+def virtual_target_path(path):
+    return path in (PREFIX/CONFIG_REL,PREFIX/'user.reg') or (path.name=='record.json' and path.parent.parent==ROOT and re.fullmatch(r'\.virtual-fullscreen-[0-9a-f]{40}',path.parent.name) is not None)
+
+
+def virtual_fullscreen_record(commit, backups=True):
+    transaction = virtual_fullscreen_transaction(commit)
+    raw,_ = virtual_private_file(transaction/'record.json',65536)
+    def unique(rows):
+        result = {}
+        for key,value in rows:need(key not in result,'virtual_fullscreen_duplicate_record_key');result[key]=value
+        return result
+    record = json.loads(raw,object_pairs_hook=unique)
+    need(type(record) is dict and set(record)=={'schema','applyCommit','preset','state','prefix','files'} and type(record['schema']) is int and record['schema']==1 and record['applyCommit']==commit and record['preset'] in (None,'1080','1440') and record['state'] in ('prepared','complete','rolling-back','rolled-back'),'virtual_fullscreen_record')
+    need(type(record['prefix']) is dict and set(record['prefix'])=={'dev','ino'} and all(type(x) is int for x in record['prefix'].values()),'virtual_fullscreen_record')
+    need(type(record['files']) is dict and set(record['files'])=={'graphics','registry'},'virtual_fullscreen_record')
+    for kind in ('graphics','registry'):
+        row = record['files'][kind]
+        need(type(row) is dict and set(row)=={'mode','before','after','fields'} and type(row['mode']) is int and 0<row['mode']<=0o777 and not row['mode']&0o022 and pinned(row['before']) and pinned(row['after']),'virtual_fullscreen_record')
+    if backups:
+        images = {}
+        for kind,limit in (('graphics',131072),('registry',16*1024*1024)):
+            for side in ('before','after'):
+                image,_ = virtual_private_file(transaction/(kind+'.'+side),limit)
+                need(digest_bytes(image)==record['files'][kind][side],'virtual_fullscreen_backup_changed');images[(kind,side)] = image
+        gx,rx,fields = virtual_fullscreen_plan(images['graphics','before'],images['registry','before'],record['preset'])
+        need(gx==images['graphics','after'] and rx==images['registry','after'] and all(record['files'][kind]['fields']==fields[kind] for kind in ('graphics','registry')),'virtual_fullscreen_backup_scope')
+    return record
+
+
+def virtual_fullscreen_pending_guard(allow=None):
+    paths = sorted(ROOT.glob('.virtual-fullscreen-*'))
+    need(len(paths)<=8,'virtual_fullscreen_history_limit')
+    for path in paths:
+        need(not path.is_symlink() and path.is_dir() and re.fullmatch(r'\.virtual-fullscreen-[0-9a-f]{40}',path.name) is not None,'virtual_fullscreen_recovery_required')
+        record = virtual_fullscreen_record(path.name[-40:],backups=path==allow)
+        need(record['state'] in ('complete','rolled-back') or path==allow,'virtual_fullscreen_recovery_required')
+
+
+def virtual_fullscreen_preflight(commit,apply_commit=None):
+    transaction = virtual_fullscreen_transaction(commit if apply_commit is None else apply_commit)
+    window_repair_pending_guard();virtual_fullscreen_pending_guard(transaction)
+    source_gate(commit,'virtual-fullscreen' if apply_commit is None else 'rollback-virtual-fullscreen',apply_commit=apply_commit)
+    base,_ = verify_installed(allow_virtual_transaction=transaction);verify_borderless()
+    need(base.get('aspectFit') is True,'virtual_fullscreen_requires_aspect')
+    request = admission(HOME,'ds3');request.reconcile();need(request.record() is None,'pending_launch_requires_recovery')
+    inactive(ROOT/'runtime',PREFIX)
+    return transaction
+
+
+def virtual_fullscreen_apply_record(transaction,record,rollback=False):
+    facts = PREFIX.lstat();need(not PREFIX.is_symlink() and (facts.st_dev,facts.st_ino)==(record['prefix']['dev'],record['prefix']['ino']),'virtual_fullscreen_prefix_changed')
+    candidates = []
+    for kind,path,limit in (('registry',PREFIX/'user.reg',16*1024*1024),('graphics',PREFIX/CONFIG_REL,131072)):
+        row = record['files'][kind];current,mode = virtual_private_file(path,limit)
+        need(mode==row['mode'] or (kind=='registry' and row['mode']==0o600 and mode==0o644),'virtual_fullscreen_mode_changed')
+        if rollback:
+            desired = (virtual_restore_registry if kind=='registry' else virtual_restore_xml)(current,row['fields'])
+        else:
+            need(digest_bytes(current) in (row['before'],row['after']),'virtual_fullscreen_preimage_changed')
+            desired = virtual_private_file(transaction/(kind+'.after'),limit)[0]
+            need(digest_bytes(desired)==row['after'],'virtual_fullscreen_backup_changed')
+        candidates.append((path,current,desired,mode,row['mode']))
+    # Both field sets are validated before the first publication.
+    for path,current,desired,mode,original in candidates:
+        if current!=desired or mode!=original:virtual_atomic_replace(path,current,desired,original,expected_mode=mode)
+
+
+def virtual_fullscreen_state(transaction,record,state):
+    current = virtual_fullscreen_record(record['applyCommit'])
+    need(current==record,'virtual_fullscreen_record_changed')
+    after = dict(record,state=state)
+    virtual_save(transaction/'record.json',after)
+    record.update(after)
+
+
+def virtual_fullscreen(commit,preset=None):
+    need(preset in (None,'1080','1440'),'unsupported_resolution')
+    transaction = virtual_fullscreen_preflight(commit)
+    if transaction.exists() or transaction.is_symlink():
+        record = virtual_fullscreen_record(commit);need(record['preset']==preset,'virtual_fullscreen_request_changed')
+        if record['state']=='complete':
+            observed = verify_window_config();need(observed['windowMode']=='FULLSCREEN','virtual_fullscreen_current_mode_changed')
+            return dict(observed,state='DS3_VIRTUAL_FULLSCREEN_CONFIGURED',changed=False,gameStarted=False)
+        need(record['state']=='prepared','virtual_fullscreen_already_rolled_back')
+    else:
+        gx,gm = virtual_private_file(PREFIX/CONFIG_REL,131072);rx,rm = virtual_private_file(PREFIX/'user.reg',16*1024*1024)
+        after_g,after_r,fields = virtual_fullscreen_plan(gx,rx,preset)
+        p = PREFIX.lstat();record = {'schema':1,'applyCommit':commit,'preset':preset,'state':'prepared','prefix':{'dev':p.st_dev,'ino':p.st_ino},'files':{kind:{'mode':mode,'before':digest_bytes(before),'after':digest_bytes(after),'fields':fields[kind]} for kind,mode,before,after in (('graphics',gm,gx,after_g),('registry',rm,rx,after_r))}}
+        # No profile write occurs until this complete namespace is published.
+        need(len(json_bytes(record))<=65536,'virtual_fullscreen_record_size')
+        stage = Path(tempfile.mkdtemp(prefix='.vfs-settings-',dir=ROOT))
+        for name,data in (('graphics.before',gx),('graphics.after',after_g),('registry.before',rx),('registry.after',after_r),('record.json',json_bytes(record))):virtual_write_private(stage/name,data)
+        lifecycle_sync(stage)
+        root_before = lifecycle_facts(ROOT);parent = lifecycle_parent_fd(transaction)
+        try:
+            held = os.fstat(parent);need((held.st_dev,held.st_ino)==(root_before['dev'],root_before['ino']),'virtual_fullscreen_parent_changed')
+            need(lifecycle_facts(ROOT)==root_before,'virtual_fullscreen_parent_changed')
+            lifecycle_rename(stage.name,transaction.name,parent,parent);os.fsync(parent)
+            need(lifecycle_facts(ROOT)==root_before,'virtual_fullscreen_parent_changed')
+        finally:os.close(parent)
+    record = virtual_fullscreen_record(commit)
+    inactive(ROOT/'runtime',PREFIX)
+    try:
+        virtual_fullscreen_apply_record(transaction,record)
+        observed = verify_window_config();need(observed['windowMode']=='FULLSCREEN','virtual_fullscreen_postimage')
+        virtual_fullscreen_state(transaction,record,'complete')
+    except Exception:
+        # A known interrupted apply owes restoration; unknown third states remain.
+        virtual_fullscreen_state(transaction,record,'rolling-back')
+        virtual_fullscreen_apply_record(transaction,record,rollback=True)
+        virtual_fullscreen_state(transaction,record,'rolled-back')
+        raise
+    return dict(observed,state='DS3_VIRTUAL_FULLSCREEN_CONFIGURED',changed=True,gameStarted=False)
+
+
+def rollback_virtual_fullscreen(commit,apply_commit):
+    transaction = virtual_fullscreen_preflight(commit,apply_commit)
+    record = virtual_fullscreen_record(apply_commit)
+    virtual_fullscreen_state(transaction,record,'rolling-back')
+    virtual_fullscreen_apply_record(transaction,record,rollback=True)
+    virtual_fullscreen_state(transaction,record,'rolled-back')
+    observed = verify_window_config()
+    return dict(observed,state='DS3_VIRTUAL_FULLSCREEN_ROLLED_BACK',gameStarted=False)
+
 
 def lifecycle_directory():
     # Outside ROOT: retirement must never move away its own recovery route.
@@ -1181,9 +1594,10 @@ def resolution_plan(raw, preset):
         rows = list(tree.iter(tag))
         need(len(rows) == len(tree.findall(tag)) == 1 and not rows[0].attrib and not len(rows[0]) and rows[0].text is not None, 'resolution_graphics_drift')
         result = rows[0].text; need(text.count('<'+tag+'>'+result+'</'+tag+'>') == 1, 'resolution_graphics_drift'); return result
-    need(value('ScreenMode') == 'WINDOW', 'resolution_window_required')
+    mode = value('ScreenMode'); need(mode in ('WINDOW','FULLSCREEN'), 'resolution_window_required')
+    stem = 'Resolution-FullScreen' if mode == 'FULLSCREEN' else 'Resolution-WindowScreen'
     dimensions = (2560,1440) if preset == '1440' else (1920,1080)
-    for tag,minimum,maximum,target in zip(('Resolution-WindowScreenWidth','Resolution-WindowScreenHeight'),(640,360),(7680,4320),dimensions):
+    for tag,minimum,maximum,target in zip((stem+'Width',stem+'Height'),(640,360),(7680,4320),dimensions):
         number = value(tag); need(re.fullmatch('[1-9][0-9]{2,3}',number) is not None and minimum <= int(number) <= maximum, 'resolution_preimage_drift')
         text = text.replace('<'+tag+'>'+number+'</'+tag+'>','<'+tag+'>'+str(target)+'</'+tag+'>',1)
     return text.encode('utf-16-le')
@@ -1554,14 +1968,727 @@ def rollback_window(commit,apply_commit):
     need(sha(target)==record['beforeSha256'] and target.stat().st_mode & 0o777==record['mode'],'window_repair_rollback_drift')
     return {'state':'DS3_WINDOW_REPAIR_ROLLED_BACK','changed':True,'gameStarted':False}
 
+# Separate DS3-only renderer transaction; Wine overlay retains its five-file scope.
+RENDERER_REL = 'engine/lib/wine/x86_64-windows/d3d11.dll'
+RENDERER_PREFIX = 'drive_c/windows/system32/d3d11.dll'
+DXGI_REL = 'engine/lib/wine/x86_64-windows/dxgi.dll'
+DXGI_PREFIX = 'drive_c/windows/system32/dxgi.dll'
+RENDERER_POLICY = 'manifests/ds3-renderer-update.json'
+RENDERER_FILES = {'d3d11.dll','provenance.json','source.tar.gz'}
+RENDERER_NATIVE = {'nativeWinemac':('engine/lib/wine/x86_64-unix/winemac.so','winemac.so'),
+                   'nativeMetal':(METAL,'winemetal.so'),
+                   'nativeNtdll':('engine/lib/wine/x86_64-unix/ntdll.so','ntdll.so')}
+RENDERER_NATIVE_MODES = {'nativeWinemac':0o755,'nativeMetal':0o644,'nativeNtdll':0o755}
+RENDERER_PE_IDENTITIES = {'engine/lib/wine/x86_64-windows/ntdll.dll','engine/lib/wine/i386-windows/ntdll.dll'}
+RENDERER_NATIVE_FILES = RENDERER_FILES | {'winemac.so','winemetal.so','ntdll.so','ds3-runtime'}
+RENDERER_MAX_GENERATIONS = 16
+RENDERER_LAUNCH_FILES = {'launchHelper':'game-launch-admission','launchHub':'games-play','launchCs2':'cs2-play'}
+RENDERER_LAUNCH_MODES = {'launchHelper':0o600,'launchHub':0o755,'launchCs2':0o755,'launchHubReceipt':0o600,'launchCs2Receipt':0o600}
+_RENDERER_LAUNCH_POLICY = None
+_RENDERER_CS2_GUARD = None
+
+def renderer_launch_targets():
+    return {'launchHelper':HOME/'AIDev/bin/game-launch-admission',
+            'launchHub':HOME/'Library/Application Support/Adapted Games/games-play',
+            'launchCs2':HOME/'Library/Application Support/CS2 Standalone/cs2-play',
+            'launchHubReceipt':HOME/'Library/Application Support/Adapted Games/receipt.json',
+            'launchCs2Receipt':HOME/'Library/Application Support/CS2 Standalone/runtime/.owner.json'}
+
+@contextlib.contextmanager
+def renderer_launch_scope(policy):
+    # Only a validated source policy can admit both exact sides during an
+    # update/recovery. Ordinary play/status retain the current lifecycle pin.
+    global _RENDERER_LAUNCH_POLICY
+    renderer_policy_validate(policy);previous=_RENDERER_LAUNCH_POLICY
+    if policy['schema']==8:
+        need(previous is None or previous==policy,'renderer_launch_scope_conflict')
+        _RENDERER_LAUNCH_POLICY=policy
+    try:yield
+    finally:_RENDERER_LAUNCH_POLICY=previous
+
+def renderer_launch_helper_pins():
+    p=_RENDERER_LAUNCH_POLICY
+    return (ADMISSION_SHA,) if p is None else (p['launchAdmission']['launchHelper'],p['candidateFiles']['game-launch-admission'])
+
+@contextlib.contextmanager
+def renderer_cs2_locked():
+    global _RENDERER_CS2_GUARD
+    path=HOME/'Library/Application Support/CS2 Standalone/.launcher.lock';safe_directory(path.parent)
+    fd=os.open(path,os.O_RDONLY|os.O_NOFOLLOW|os.O_NONBLOCK)
+    try:
+        facts=os.fstat(fd)
+        need(stat.S_ISREG(facts.st_mode) and facts.st_uid==os.getuid() and facts.st_nlink==1 and not facts.st_mode&0o077,'renderer_launch_lock')
+        try:fcntl.flock(fd,fcntl.LOCK_EX|fcntl.LOCK_NB)
+        except BlockingIOError:raise RuntimeError('launcher_busy') from None
+        def bound():
+            named=path.lstat();opened=os.fstat(fd)
+            need(stat.S_ISREG(named.st_mode) and (named.st_dev,named.st_ino,named.st_mode,named.st_uid)==(facts.st_dev,facts.st_ino,facts.st_mode,facts.st_uid)
+                 and (opened.st_dev,opened.st_ino)==(facts.st_dev,facts.st_ino),'renderer_launch_lock_changed')
+        previous=_RENDERER_CS2_GUARD;_RENDERER_CS2_GUARD=bound
+        try:bound();yield;bound()
+        finally:_RENDERER_CS2_GUARD=previous
+    finally:os.close(fd)
+
+ADMISSION_BRIDGE_PATH = HOME/'AIDev/lib/game-launch-admission-v2/bridge.py'
+ADMISSION_BRIDGE_SHA = '44ebf32f246af00762d59925461d9f9c0787a664dbc3b0d66c82fafaa3f857c1'
+
+def native_admission_bridge():
+    safe_file(ADMISSION_BRIDGE_PATH)
+    raw=ADMISSION_BRIDGE_PATH.read_bytes()
+    need(len(raw)<=65536 and digest_bytes(raw)==ADMISSION_BRIDGE_SHA,'native_admission_bridge_changed')
+    namespace={'__name__':'game_native_admission_bridge','__file__':str(ADMISSION_BRIDGE_PATH)}
+    exec(compile(raw,str(ADMISSION_BRIDGE_PATH),'exec'),namespace)
+    return namespace
+
+def native_admission_lifecycle(m):
+    need(type(m.get('launchAdmissionOverride')) is dict,'native_admission_helper_binding')
+    if renderer_admission_record(m) is not None:
+        return renderer_admission_lifecycle(m)
+    need(m['launchAdmissionOverride'].get('admissionSha256') in renderer_launch_helper_pins(),'native_admission_helper_binding')
+    return native_admission_bridge()['verify'](ROOT,m)
+
+def native_admission_pending_guard():
+    if any(ROOT.glob('.native-admission-*')):
+        native_admission_bridge()['pending_guard'](ROOT)
+
+def renderer_native_hashes(m):
+    return (renderer_fields(m) or {}).get('nativeRuntimeHashes',{})
+
+def renderer_metal_hash(m):
+    return renderer_native_hashes(m).get(METAL,m['candidateSha256'])
+
+def renderer_binding_transaction(m):
+    override=renderer_fields(m);need(override is not None,'renderer_override_required')
+    revision=override['transactionCommit']
+    admitted=[renderer_transaction(revision,admission=True),renderer_transaction(revision,launch=True),renderer_transaction(revision,d3d=True)]
+    present=[p for p in admitted if p.exists() or p.is_symlink()]
+    need(len(present)<=1,'renderer_proof_generation')
+    if present:return present[0]
+    return renderer_transaction(revision,native='nativeRuntimeHashes' in override)
+
+def renderer_admission_record(m):
+    override=renderer_fields(m)
+    if override is None:return None
+    paths=[renderer_transaction(override['transactionCommit'],admission=True),renderer_transaction(override['transactionCommit'],launch=True),renderer_transaction(override['transactionCommit'],d3d=True)]
+    present=[p for p in paths if p.exists() or p.is_symlink()]
+    need(len(present)<=1,'renderer_proof_generation')
+    if not present:return None
+    path=present[0]
+    record,images=renderer_read(path)
+    need(record['policy']['schema']>=4 and override['policySha256']==digest_bytes(json_bytes(record['policy'])),'renderer_admission_binding')
+    return record,images
+
+def renderer_admission_base_policy(base):
+    need(type(base) is dict and set(base)=={'descriptor','intent','intentSha256','images','assetReceipts'},'renderer_admission_base_schema')
+    d=base['descriptor']
+    need(type(d) is dict and set(d)=={'acceptedCommit','policySha256','lifecycleSha256','admissionSha256'}
+         and type(d['acceptedCommit']) is str and re.fullmatch('[0-9a-f]{40}',d['acceptedCommit'])
+         and all(pinned(d[k]) for k in d if k!='acceptedCommit'),'renderer_admission_descriptor')
+    need(type(base['intent']) is dict and pinned(base['intentSha256'])
+         and digest_bytes((json.dumps(base['intent'],sort_keys=True,indent=2)+'\n').encode())==base['intentSha256']
+         and type(base['images']) is dict and set(base['images'])=={'lifecycle','manifest','receipt','borderlessReceipt'}
+         and all(pinned(v) for v in base['images'].values())
+         and type(base['assetReceipts']) is dict and set(base['assetReceipts'])=={'companions','native'}
+         and all(pinned(v) for v in base['assetReceipts'].values()),'renderer_admission_base_schema')
+    need(d['admissionSha256']==base['intent'].get('sourceFiles',{}).get('bin/game-launch-admission'),'renderer_admission_historical_helper')
+    return base
+
+def renderer_admission_snapshots(descriptor,seen=None):
+    # Immutable bridge44 readers/derivation are reused without its live endpoint
+    # assertion: graphics legitimately supersedes four admission afterimages.
+    b=native_admission_bridge();seen=set() if seen is None else seen
+    revision=descriptor['acceptedCommit'];need(revision not in seen and len(seen)<8,'renderer_admission_history');seen.add(revision)
+    paths=[b['proof_directory'](ROOT,revision,schema) for schema in (1,2)]
+    paths=[path for path in paths if path.exists() or path.is_symlink()]
+    need(len(paths)==1,'renderer_admission_proof_generation');directory=paths[0];r=b['_record'](directory);p=r['policy']
+    need(r['phase']=='complete' and r['direction']=='after'
+         and descriptor==dict(acceptedCommit=revision,policySha256=b['sha'](b['json_bytes'](p)),lifecycleSha256=p['lifecycleSha256'],admissionSha256=p['admissionSha256']),'renderer_admission_policy_binding')
+    images={side:{key:b['_read'](directory/(key+'.'+side),0o600,b['MAX_IMAGE']) for key in b['TARGETS']} for side in ('before','after')}
+    need(all(b['sha'](raw)==r['images'][key][side] for side,values in images.items() for key,raw in values.items()),'renderer_admission_backup_drift')
+    need(b['derive'](images['before'],p,revision,images['after']['lifecycle'])==images['after'],'renderer_admission_derived_images')
+    if p['schema']==2:
+        previous=renderer_admission_snapshots(p['previousAdmission'],seen)
+        need(previous['after']==images['before'],'renderer_admission_chain')
+    need(b['sha'](b['_read'](HOME/'AIDev/bin/game-launch-admission',limit=65536)) in renderer_launch_helper_pins(),'native_admission_helper_drift')
+    return images
+
+def renderer_ntdll_approval(base,pin):
+    renderer_admission_base_policy(base);need(pinned(pin),'renderer_ntdll_pin_scope')
+    b=native_admission_bridge();intent=base['intent'];route=intent['nativeRoute']
+    app=ROOT/'native/Dark Souls III Native.app';loader=app/'Contents/MacOS/wine'
+    target=PREFIX/'drive_c/Program Files (x86)/Steam/steamapps/common/DARK SOULS III/Game/DarkSoulsIII.exe'
+    approval={'schema':2,'owner':b['OWNER'],'route':'ds3','prefix':str(PREFIX),'image':route['image'],'machine':0x8664,'target':str(target),'loader':str(loader),'bundleIdentifier':route['bundleIdentifier'],'files':{str(target):route['targetSha256'],str(loader):route['bundleFiles']['Contents/MacOS/wine']['sha256'],str(app/'Contents/Info.plist'):route['bundleFiles']['Contents/Info.plist']['sha256'],str(ROOT/'runtime/engine/lib/wine/x86_64-unix/ntdll.so'):pin,str(ROOT/'runtime/engine/bin/wineserver'):intent['preserveServerSha256']}}
+    return b['json_bytes'](approval)
+
+def renderer_admission_base_check(base, ntdll_pins=None):
+    renderer_admission_base_policy(base);b=native_admission_bridge();b['pending_guard'](ROOT);images=renderer_admission_snapshots(base['descriptor'])
+    need({key:digest_bytes(raw) for key,raw in images['after'].items()}==base['images'],'renderer_admission_base_images')
+    for namespace,path in (('companions',HOME/'AIDev/lib/game-launch-admission-v2/receipt.json'),('native',ROOT/'native/receipt.json')):
+        raw=b['_read'](path,0o600);receipt=b['decode'](raw)
+        need(digest_bytes(raw)==base['assetReceipts'][namespace] and receipt.get('schema')==1
+             and receipt.get('owner')==b['OWNER'] and receipt.get('namespace')==namespace,'renderer_admission_asset_receipt')
+        if namespace=='companions':need(receipt.get('acceptedCommit')==base['descriptor']['acceptedCommit'] and receipt.get('policySha256')==base['intentSha256'],'renderer_admission_asset_binding')
+        else:need(base['intent']['assetPredecessor']['nativeReceiptSha256']==digest_bytes(raw),'renderer_admission_asset_binding')
+    intent=base['intent'];companions=intent['companions']
+    need(type(companions) is dict and set(companions)=={'binding/native_launch_binding.py','bridge.py','native-identity/native_identity.py','native-identity/prefix_identity.py','native-identity/prefix_probe','native-identity/probe'},'renderer_admission_companion_scope')
+    for relative,row in companions.items():
+        need(digest_bytes(b['_read'](HOME/'AIDev/lib/game-launch-admission-v2'/relative,row['mode'],64*1024*1024))==row['sha256'],'renderer_admission_companion_drift')
+    route=intent['nativeRoute'];app=ROOT/'native/Dark Souls III Native.app';loader=app/'Contents/MacOS/wine'
+    target=PREFIX/'drive_c/Program Files (x86)/Steam/steamapps/common/DARK SOULS III/Game/DarkSoulsIII.exe'
+    need(route['machine']==0x8664 and route['image']==r'C:\Program Files (x86)\Steam\steamapps\common\DARK SOULS III\Game\DarkSoulsIII.exe','renderer_admission_route')
+    approval={'schema':2,'owner':b['OWNER'],'route':'ds3','prefix':str(PREFIX),'image':route['image'],'machine':0x8664,'target':str(target),'loader':str(loader),'bundleIdentifier':route['bundleIdentifier'],'files':{str(target):route['targetSha256'],str(loader):route['bundleFiles']['Contents/MacOS/wine']['sha256'],str(app/'Contents/Info.plist'):route['bundleFiles']['Contents/Info.plist']['sha256'],str(ROOT/'runtime/engine/lib/wine/x86_64-unix/ntdll.so'):intent['preserveRuntimeHashes']['engine/lib/wine/x86_64-unix/ntdll.so'],str(ROOT/'runtime/engine/bin/wineserver'):intent['preserveServerSha256']}}
+    # Pins are supplied only by a validated immutable renderer transaction/policy.
+    # Original native admission remains unchanged; only this exact file may evolve.
+    ntdll_path=str(ROOT/'runtime/engine/lib/wine/x86_64-unix/ntdll.so')
+    pins=(approval['files'][ntdll_path],) if ntdll_pins is None else tuple(ntdll_pins)
+    need(1<=len(pins)<=2 and all(pinned(v) for v in pins),'renderer_ntdll_pin_scope')
+    approval_candidates=[]
+    for pin in pins:
+        value=dict(approval,files=dict(approval['files'],**{ntdll_path:pin}))
+        approval_candidates.append(b['json_bytes'](value))
+    need(b['_read'](HOME/'AIDev/state/ds3-native-launch-approval.json',0o600) in approval_candidates
+         and b['_read'](PREFIX/'native-applications.routes',0o600)==('WINE-NATIVE-APPLICATIONS\t1\n8664\t'+route['image']+'\t'+str(loader)+'\n').encode(),'renderer_admission_capability_drift')
+    for path,expected in approval['files'].items():need(digest_bytes(b['_read'](Path(path),limit=512*1024*1024)) in (pins if path==ntdll_path else (expected,)),'renderer_admission_native_target_drift')
+    for relative,row in route['bundleFiles'].items():
+        need(relative in ('Contents/MacOS/wine','Contents/Info.plist','Contents/_CodeSignature/CodeResources')
+             and digest_bytes(b['_read'](app/relative,row['mode'],512*1024*1024))==row['sha256'],'renderer_admission_bundle_drift')
+    return images
+
+def renderer_admission_ancestry(record,images,max_generations=RENDERER_MAX_GENERATIONS,sides=('after',)):
+    # Admitted graphics are a subset of the already bounded full overlay
+    # history. Keep one ceiling; upgrade reserves a full-history slot first.
+    base=record['policy']['nativeAdmissionBase']
+    pins=tuple(dict.fromkeys(digest_bytes(images[side]['nativeNtdll']) for side in sides)) if record['policy']['schema']>=5 else None
+    native=renderer_admission_base_check(base,pins);seen=set()
+    launch_before={key:images['before'][key] for key in RENDERER_LAUNCH_MODES} if record['policy']['schema']==8 else None
+    for generation in range(max_generations):
+        need(record['commit'] not in seen and record['policy'].get('nativeAdmissionBase')==base,'renderer_admission_ancestry');seen.add(record['commit'])
+        before=images['before']
+        if all(before[key]==native['after'][key] for key in base['images']):
+            if launch_before is not None:
+                need(all(digest_bytes(launch_before[key])==base['intent']['sourceFiles']['bin/'+name] for key,name in RENDERER_LAUNCH_FILES.items()),'renderer_launch_history_anchor')
+            return
+        prior=json.loads(before['manifest']);path=renderer_binding_transaction(prior);previous,older=renderer_read(path)
+        need(previous['policy']['schema']>=4 and previous['phase']=='complete' and previous['direction']=='after' and previous['intent'] is None
+             and all(before[k]==older['after'][k] for k in set(before)&set(older['after']))
+             and set(older['after'])-set(before) <= (set(RENDERER_LAUNCH_MODES) if previous['policy']['schema']==8 else set())
+             and set(before)-set(older['after']) <= {'nativeApproval','dxgiRuntime','dxgiPrefix',*(RENDERER_LAUNCH_MODES if record['policy']['schema']==8 else ())},'renderer_admission_ancestry')
+        if previous['policy']['schema']==8:
+            if launch_before is not None:
+                need(all(launch_before[key]==older['after'][key] for key in RENDERER_LAUNCH_MODES),'renderer_launch_history_chain')
+            else:
+                for key,path in renderer_launch_targets().items():
+                    need(path.stat().st_mode&0o777==RENDERER_LAUNCH_MODES[key] and sha(path)==previous['images'][key]['after'],'renderer_launch_endpoint_drift')
+            launch_before={key:older['before'][key] for key in RENDERER_LAUNCH_MODES}
+        record,images=previous,older
+    raise RuntimeError('renderer_admission_depth')
+
+def renderer_admission_lifecycle(m):
+    record,images=renderer_admission_record(m)
+    need(record['phase']=='complete' and record['direction']=='after' and record['intent'] is None,'renderer_recovery_required')
+    renderer_admission_ancestry(record,images)
+    need(json.loads(images['after']['manifest'])==m,'renderer_admission_manifest_binding')
+    for name,path in renderer_targets(record['policy']).items():
+        need(sha(path)==record['images'][name]['after'] and path.stat().st_mode&0o777==record['images'][name]['mode'],'renderer_admission_endpoint_drift')
+    return record['policy']['candidateFiles']['ds3-runtime']
+
+def renderer_overlay_lifecycle(m,max_generations=RENDERER_MAX_GENERATIONS):
+    # Follow the renderer chain, joining an admitted helper through its retained
+    # native snapshots rather than pretending it was the historical renderer.
+    seen=set();current=m;baseline=None
+    admitted_head=renderer_admission_record(m)
+    for generation in range(max_generations+1):
+        override=renderer_fields(current)
+        if not override or 'nativeRuntimeHashes' not in override:
+            need(baseline is not None,'renderer_lifecycle_ancestry');return baseline
+        need(generation<max_generations,'renderer_lifecycle_depth')
+        revision=override['transactionCommit'];need(revision not in seen,'renderer_lifecycle_cycle');seen.add(revision)
+        record,images=renderer_read(renderer_binding_transaction(current))
+        need(record['policy']['schema'] in (3,4,5,6,7,8,9) and digest_bytes(images['after']['lifecycle'])==override['lifecycleSha256'],'renderer_lifecycle_ancestry')
+        baseline=digest_bytes(images['before']['lifecycle']);current=json.loads(images['before']['manifest']);prior=renderer_fields(current)
+        if prior and 'nativeRuntimeHashes' in prior and prior['lifecycleSha256']!=baseline:
+            need(record['policy']['schema']>=4,'renderer_lifecycle_ancestry')
+            renderer_admission_ancestry(*(admitted_head or (record,images)))
+            joined=renderer_admission_snapshots(record['policy']['nativeAdmissionBase']['descriptor'])
+            # Native admission does not change the underlying renderer metadata.
+            need(json.loads(joined['after']['manifest'])['rendererOverride']==prior,'renderer_lifecycle_ancestry')
+            baseline=prior['lifecycleSha256']
+    raise RuntimeError('renderer_lifecycle_depth')
+
+def renderer_file_limit(name):
+    return 512*1024*1024 if name=='source.tar.gz' else 64*1024*1024
+
+
+def renderer_fields(m):
+    override=m.get('rendererOverride')
+    if override is not None:
+        fields={'d3d11Sha256','provenanceSha256','policySha256','transactionCommit','diagnosticCapable'}
+        need(m['schema']==4 and type(override) is dict and set(override) in (fields,fields|{'nativeBorderlessCapable','traceProtocolVersion'},fields|{'nativeBorderlessCapable','traceProtocolVersion','nativeRuntimeHashes','lifecycleSha256'},fields|{'nativeBorderlessCapable','traceProtocolVersion','nativeRuntimeHashes','lifecycleSha256','dxgiSha256'})
+             and all(pinned(override[k]) for k in ('d3d11Sha256','provenanceSha256','policySha256'))
+             and ('nativeBorderlessCapable' not in override or type(override['nativeBorderlessCapable']) is bool)
+             and ('traceProtocolVersion' not in override or type(override['traceProtocolVersion']) is int and override['traceProtocolVersion']==2)
+             and type(override['diagnosticCapable']) is bool and re.fullmatch('[0-9a-f]{40}',override['transactionCommit']) is not None,'renderer_override_schema')
+        if 'nativeRuntimeHashes' in override:
+            need(type(override['nativeRuntimeHashes']) is dict and set(override['nativeRuntimeHashes'])=={rel for rel,_ in RENDERER_NATIVE.values()}
+                 and all(pinned(v) for v in override['nativeRuntimeHashes'].values()) and pinned(override['lifecycleSha256']),'renderer_native_override_schema')
+    if override is not None and 'dxgiSha256' in override:need(pinned(override['dxgiSha256']),'renderer_dxgi_override')
+    return override
+
+def renderer_dxgi_hash(m):
+    return (renderer_fields(m) or {}).get('dxgiSha256',m['sourceCriticalHashes'][DXGI_REL])
+
+def renderer_hash(m):
+    override=renderer_fields(m)
+    return override['d3d11Sha256'] if override else m['sourceCriticalHashes'][RENDERER_REL]
+
+def renderer_targets(policy=None):
+    targets = {'runtime':ROOT/'runtime'/RENDERER_REL,'prefix':PREFIX/RENDERER_PREFIX,
+            'manifest':ROOT/'manifest.json','borderless':ROOT/'borderless/manifest.json',
+            'borderlessReceipt':ROOT/'borderless/receipt.json','receipt':ROOT/'receipt.json'}
+    if policy is not None and policy.get('schema') in (3,4,5,6,7,8,9):
+        targets = dict({key:ROOT/'runtime'/rel for key,(rel,_) in RENDERER_NATIVE.items()},
+                       lifecycle=ROOT/'ds3-runtime',**targets)
+    if policy is not None and policy.get('schema',0)>=5:targets['nativeApproval']=HOME/'AIDev/state/ds3-native-launch-approval.json'
+    if policy is not None and policy.get('schema') in (6,7,8,9):targets.update(dxgiRuntime=ROOT/'runtime'/DXGI_REL,dxgiPrefix=PREFIX/DXGI_PREFIX)
+    if policy is not None and policy.get('schema')==8:targets=dict(renderer_launch_targets(),**targets)
+    return targets
+
+def renderer_transaction(commit,native=False,admission=False,launch=False,d3d=False):
+    need(type(commit) is str and re.fullmatch('[0-9a-f]{40}',commit) is not None,'renderer_commit')
+    return ROOT/(('.d3d-renderer-' if d3d else '.launch-renderer-' if launch else '.admitted-renderer-' if admission else '.native-renderer-' if native else '.renderer-')+commit)
+
+def renderer_policy_validate(p):
+    fields={'schema','id','owner','previousRendererSha256','candidateFiles','diagnosticCapable'}
+    need(type(p) is dict and type(p.get('schema')) is int and p['schema'] in (1,2,3,4,5,6,7,8,9)
+         and set(p)-({'previousDxgiSha256'} if p['schema'] in (6,7,8,9) else set())-({'launchAdmission'} if p['schema']==8 else set())==(fields|{'nativeBorderlessCapable','traceProtocolVersion','previousNativeRuntimeHashes','nativeIdentityHashes','nativeAdmissionBase','previousManifestSha256','previousEffectiveLifecycleSha256'} if p['schema']>=4 else fields|{'nativeBorderlessCapable','traceProtocolVersion','previousNativeRuntimeHashes','nativeIdentityHashes'} if p['schema']==3 else fields|{'nativeBorderlessCapable','traceProtocolVersion'} if p['schema']==2 else fields)
+         and (p['schema']==1 or type(p['nativeBorderlessCapable']) is bool)
+         and (p['schema']==1 or type(p['traceProtocolVersion']) is int and p['traceProtocolVersion']==2)
+         and p['id']=='ds3-renderer-update' and p['owner']=='control-ds3-marshal-fix'
+         and pinned(p['previousRendererSha256']) and type(p['diagnosticCapable']) is bool
+         and type(p['candidateFiles']) is dict and set(p['candidateFiles'])==((RENDERER_NATIVE_FILES|{'dxgi.dll'}|set(RENDERER_LAUNCH_FILES.values())) if p['schema']==8 else (RENDERER_NATIVE_FILES|{'dxgi.dll'}) if p['schema'] in (6,7,9) else RENDERER_NATIVE_FILES if p['schema']>=3 else RENDERER_FILES)
+         and all(pinned(x) for x in p['candidateFiles'].values()),'renderer_policy_schema')
+    if p['schema']>=3:
+        need(type(p['previousNativeRuntimeHashes']) is dict and set(p['previousNativeRuntimeHashes'])=={rel for rel,_ in RENDERER_NATIVE.values()}
+             and all(pinned(v) for v in p['previousNativeRuntimeHashes'].values())
+             and type(p['nativeIdentityHashes']) is dict and set(p['nativeIdentityHashes'])==RENDERER_PE_IDENTITIES
+             and all(pinned(v) for v in p['nativeIdentityHashes'].values()),'renderer_native_policy_schema')
+    if p['schema']>=4:
+        base=renderer_admission_base_policy(p['nativeAdmissionBase'])
+        need(pinned(p['previousManifestSha256']) and pinned(p['previousEffectiveLifecycleSha256']),'renderer_admission_policy_schema')
+        ntdll='engine/lib/wine/x86_64-unix/ntdll.so'
+        if p['schema']==4:
+            need(p['candidateFiles']['ntdll.so']==p['previousNativeRuntimeHashes'][ntdll]==base['intent']['preserveRuntimeHashes'][ntdll],'renderer_admission_ntdll_delta_unsupported')
+        elif p['schema'] in (5,6):
+            need(p['candidateFiles']['d3d11.dll']==p['previousRendererSha256']
+                 and all(p['candidateFiles'][name]==p['previousNativeRuntimeHashes'][rel] for rel,name in RENDERER_NATIVE.values() if name!='ntdll.so'),'renderer_ntdll_only_scope')
+    if p['schema']==7:
+        need(pinned(p.get('previousDxgiSha256')) and p['candidateFiles']['dxgi.dll']==p['previousDxgiSha256']
+             and p['candidateFiles']['d3d11.dll']==p['previousRendererSha256']
+             and all(p['candidateFiles'][name]==p['previousNativeRuntimeHashes'][rel] for rel,name in RENDERER_NATIVE.values() if name!='winemac.so'),'renderer_winemac_only_scope')
+    if p['schema']==6:
+        need(pinned(p.get('previousDxgiSha256')) and p['candidateFiles']['d3d11.dll']==p['previousRendererSha256']
+             and all(p['candidateFiles'][name]==p['previousNativeRuntimeHashes'][rel] for rel,name in RENDERER_NATIVE.values()),'renderer_dxgi_only_scope')
+    if p['schema']==9:
+        need(pinned(p.get('previousDxgiSha256')) and p['candidateFiles']['dxgi.dll']==p['previousDxgiSha256']
+             and all(p['candidateFiles'][name]==p['previousNativeRuntimeHashes'][rel] for rel,name in RENDERER_NATIVE.values()),'renderer_d3d_only_scope')
+    if p['schema']==8:
+        need(type(p.get('launchAdmission')) is dict and set(p['launchAdmission'])==set(RENDERER_LAUNCH_FILES)
+             and all(pinned(pin) for pin in p['launchAdmission'].values())
+             and pinned(p.get('previousDxgiSha256')) and p['candidateFiles']['dxgi.dll']==p['previousDxgiSha256']
+             and p['candidateFiles']['d3d11.dll']==p['previousRendererSha256']
+             and all(p['candidateFiles'][name]==p['previousNativeRuntimeHashes'][rel] for rel,name in RENDERER_NATIVE.values()),'renderer_launch_only_scope')
+    return p
+
+def renderer_policy():
+    return renderer_policy_validate(load(CONTROL/RENDERER_POLICY))
+
+def renderer_candidate(candidate,p):
+    renderer_policy_validate(p);safe_directory(candidate); files={}
+    for name in p['candidateFiles']:
+        path=candidate/name;safe_file(path);need(path.stat().st_size<=renderer_file_limit(name),'renderer_candidate_limit')
+        files[name]=path.read_bytes();need(digest_bytes(files[name])==p['candidateFiles'][name],'renderer_candidate_pin')
+    provenance=json.loads(files['provenance.json'])
+    need(type(provenance) is dict and provenance.get('d3d11Sha256')==p['candidateFiles']['d3d11.dll']
+         and provenance.get('sourceArchiveSha256')==p['candidateFiles']['source.tar.gz']
+         and provenance.get('nativeBridgeModified') is (p['schema']>=3) and provenance.get('diagnosticCapable')==p['diagnosticCapable'],'renderer_provenance')
+    if p['schema']>=2:need(provenance.get('nativeBorderlessCapable') is p['nativeBorderlessCapable'],'renderer_borderless_provenance')
+    if p['schema']>=2:need(type(provenance.get('traceProtocolVersion')) is int and provenance['traceProtocolVersion']==p['traceProtocolVersion'],'renderer_trace_protocol_provenance')
+    if p['schema']>=3:
+        need(provenance.get('nativeRuntimeHashes')=={rel:p['candidateFiles'][name] for rel,name in RENDERER_NATIVE.values()}
+             and provenance.get('nativeIdentityHashes')==p['nativeIdentityHashes']
+             and provenance.get('lifecycleSha256')==p['candidateFiles']['ds3-runtime'],'renderer_native_provenance')
+    if p['schema'] in (6,7,8,9):need(provenance.get('dxgiSha256')==p['candidateFiles']['dxgi.dll'],'renderer_dxgi_provenance')
+    if p['schema']==8:need(provenance.get('launchAdmissionFiles')=={name:p['candidateFiles'][name] for name in RENDERER_LAUNCH_FILES.values()},'renderer_launch_provenance')
+    return files
+
+def renderer_after(before,modes,files,p,commit,tree_rows):
+    old=json.loads(before['manifest']);br=json.loads(before['borderless']);receipt=json.loads(before['receipt']);brr=json.loads(before['borderlessReceipt'])
+    need(old['schema']==4 and renderer_hash(old)==p['previousRendererSha256'],'renderer_predecessor')
+    if p['schema']>=4:
+        renderer_admission_base_policy(p['nativeAdmissionBase'])
+        need(receipt.get('runtimeTreeSha256')==digest_bytes(json.dumps(tree_rows,separators=(',',':')).encode()),'renderer_admission_before_tree')
+        need(receipt.get('manifestSha256')==brr.get('baseManifestSha256')==digest_bytes(before['manifest'])
+             and receipt.get('lifecycleSha256')==digest_bytes(before['lifecycle'])
+             and brr.get('manifestSha256')==digest_bytes(before['borderless'])
+             and brr.get('baseRuntimeTreeSha256')==receipt['runtimeTreeSha256'],'renderer_admission_before_metadata')
+        need(old.get('launchAdmissionOverride')==p['nativeAdmissionBase']['descriptor']
+             and digest_bytes(before['manifest'])==p['previousManifestSha256']
+             and digest_bytes(before['lifecycle'])==p['previousEffectiveLifecycleSha256'],'renderer_admission_predecessor')
+    else:need('launchAdmissionOverride' not in old,'native_admission_successor_blocks_renderer_upgrade')
+    if renderer_native_hashes(old):
+        need(p['schema']>=3,'renderer_native_scope_downgrade')
+    need(digest_bytes(before['runtime'])==digest_bytes(before['prefix'])==p['previousRendererSha256'],'renderer_pair_drift')
+    need(modes['runtime']==0o755 and modes['prefix']==0o644,'renderer_pair_modes')
+    new=dict(old,rendererOverride={'d3d11Sha256':p['candidateFiles']['d3d11.dll'],'provenanceSha256':p['candidateFiles']['provenance.json'],
+                                'policySha256':digest_bytes(json_bytes(p)),'transactionCommit':commit,'diagnosticCapable':p['diagnosticCapable']})
+    if p['schema']>=2:new['rendererOverride'].update(nativeBorderlessCapable=p['nativeBorderlessCapable'],traceProtocolVersion=p['traceProtocolVersion'])
+    after={'runtime':files['d3d11.dll'],'prefix':files['d3d11.dll'],'manifest':json_bytes(new),
+           'borderless':json_bytes(dict(br,nativeBinding=dict(br['nativeBinding'],d3d11Sha256=p['candidateFiles']['d3d11.dll'])))}
+    need(p['schema'] in (6,7,8,9) or 'dxgiSha256' not in (renderer_fields(old) or {}),'renderer_dxgi_successor_required')
+    replacements={RENDERER_REL:('runtime',p['previousRendererSha256'],p['candidateFiles']['d3d11.dll'],0o755)}
+    if p['schema']>=3:
+        native={rel:p['candidateFiles'][name] for rel,name in RENDERER_NATIVE.values()}
+        new['rendererOverride'].update(nativeRuntimeHashes=native,lifecycleSha256=p['candidateFiles']['ds3-runtime'])
+        after['lifecycle']=files['ds3-runtime'];after['manifest']=json_bytes(new)
+        after['borderless']=json_bytes(dict(br,nativeBinding=dict(br['nativeBinding'],d3d11Sha256=p['candidateFiles']['d3d11.dll'],winemetalSha256=native[METAL])))
+        need(modes['lifecycle']==0o700,'renderer_lifecycle_mode')
+        for key,(rel,name) in RENDERER_NATIVE.items():
+            previous=p['previousNativeRuntimeHashes'][rel]
+            need(digest_bytes(before[key])==previous and modes[key]==RENDERER_NATIVE_MODES[key],'renderer_native_predecessor')
+            after[key]=files[name];replacements[rel]=(key,previous,native[rel],modes[key])
+        for rel,expected in p['nativeIdentityHashes'].items():
+            matches=[r for r in tree_rows if r[0]==rel]
+            need(len(matches)==1 and matches[0][2]==expected and type(matches[0][1]) is int,'renderer_native_identity')
+    if p['schema']>=5:
+        need(modes['nativeApproval']==0o600,'renderer_approval_mode')
+        need(before['nativeApproval']==renderer_ntdll_approval(p['nativeAdmissionBase'],p['previousNativeRuntimeHashes']['engine/lib/wine/x86_64-unix/ntdll.so']),'renderer_approval_predecessor')
+        after['nativeApproval']=renderer_ntdll_approval(p['nativeAdmissionBase'],p['candidateFiles']['ntdll.so'])
+    if p['schema'] in (6,7,8,9):
+        need(renderer_dxgi_hash(old)==p['previousDxgiSha256']
+             and digest_bytes(before['dxgiRuntime'])==digest_bytes(before['dxgiPrefix'])==p['previousDxgiSha256']
+             and modes['dxgiRuntime']==modes['dxgiPrefix']==0o644,'renderer_dxgi_predecessor')
+        new['rendererOverride']['dxgiSha256']=p['candidateFiles']['dxgi.dll'];after['manifest']=json_bytes(new)
+        after['dxgiRuntime']=after['dxgiPrefix']=files['dxgi.dll']
+        replacements[DXGI_REL]=('dxgiRuntime',p['previousDxgiSha256'],p['candidateFiles']['dxgi.dll'],0o644)
+    rows=[list(row) for row in tree_rows];matches=[r for r in rows if r[0]==RENDERER_REL]
+    need(len(matches)==1 and matches[0][1]==0o755 and matches[0][2]==p['previousRendererSha256'],'renderer_tree_preimage')
+    for rel,(key,previous,desired,mode) in replacements.items():
+        found=[r for r in rows if r[0]==rel]
+        need(len(found)==1 and found[0][1]==mode and found[0][2]==previous,'renderer_tree_preimage')
+        found[0][2]=desired
+    tree=digest_bytes(json.dumps(rows,separators=(',',':')).encode())
+    updated=dict(receipt,manifestSha256=digest_bytes(after['manifest']),runtimeTreeSha256=tree)
+    if p['schema']>=3:updated['lifecycleSha256']=p['candidateFiles']['ds3-runtime']
+    after['receipt']=json_bytes(updated)
+    after['borderlessReceipt']=json_bytes(dict(brr,manifestSha256=digest_bytes(after['borderless']),baseManifestSha256=digest_bytes(after['manifest']),baseRuntimeTreeSha256=tree))
+    if p['schema']==8:
+        for key,name in RENDERER_LAUNCH_FILES.items():
+            need(modes[key]==RENDERER_LAUNCH_MODES[key] and digest_bytes(before[key])==p['launchAdmission'][key],'renderer_launch_preimage')
+            after[key]=files[name]
+        hub=json.loads(before['launchHubReceipt']);cs2=json.loads(before['launchCs2Receipt'])
+        need(modes['launchHubReceipt']==modes['launchCs2Receipt']==0o600
+             and hub.get('owner')=='control-games-hub' and hub.get('launcherSha256')==digest_bytes(before['launchHub'])
+             and hub.get('launchAdmissionSha256')==digest_bytes(before['launchHelper'])
+             and cs2.get('owner')=='control-cs2-standalone' and cs2.get('launcherSha256')==digest_bytes(before['launchCs2']),'renderer_launch_receipt_preimage')
+        canonical=lambda value:(json.dumps(value,sort_keys=True,indent=2)+'\n').encode()
+        after['launchHubReceipt']=canonical(dict(hub,launcherSha256=digest_bytes(after['launchHub']),launchAdmissionSha256=digest_bytes(after['launchHelper']),launchReliabilityCommit=commit))
+        after['launchCs2Receipt']=canonical(dict(cs2,launcherSha256=digest_bytes(after['launchCs2']),launcherCommit=commit))
+    return after
+
+def renderer_rows():
+    rows=[]
+    for path in (ROOT/'runtime').rglob('*'):
+        rel=str(path.relative_to(ROOT/'runtime'));s=path.lstat()
+        if stat.S_ISLNK(s.st_mode):rows.append([rel,'link',os.readlink(path)])
+        elif stat.S_ISREG(s.st_mode):rows.append([rel,s.st_mode&0o777,sha(path,rel==NATIVE_LOADER)])
+        else:need(stat.S_ISDIR(s.st_mode),'renderer_tree_kind')
+    return sorted(rows,key=lambda x:x[0])
+
+def renderer_read(transaction):
+    safe_directory(transaction);safe_file(transaction/'record.json');record_raw=(transaction/'record.json').read_bytes();need(len(record_raw)<=32*1024*1024,'renderer_record_limit');r=json.loads(record_raw)
+    need(type(r) is dict and set(r)=={'schema','commit','policy','images','treeRows','phase','direction','intent'} and type(r['schema']) is int and r['schema']==1
+         and transaction==renderer_transaction(r['commit'],native=r['policy'].get('schema',0)>=3,admission=r['policy'].get('schema',0)>=4,launch=r['policy'].get('schema')==8,d3d=r['policy'].get('schema')==9) and r['phase'] in ('prepared','running','complete')
+         and r['direction'] in ('after','before') and r['intent'] in (None,*renderer_targets(r['policy'])),'renderer_record_schema')
+    need(type(r['images']) is dict and set(r['images'])==set(renderer_targets(r['policy'])),'renderer_target_scope')
+    captured={side:{} for side in ('before','after')};modes={}
+    for name,row in r['images'].items():
+        need(type(row) is dict and set(row)=={'before','after','mode'} and type(row['mode']) is int and 0<=row['mode']<=0o777 and not row['mode']&0o022,'renderer_image_schema')
+        modes[name]=row['mode']
+        for side in captured:
+            path=transaction/(name+'.'+side);safe_file(path);need(path.stat().st_size<=64*1024*1024 and sha(path)==row[side],'renderer_backup_drift');captured[side][name]=path.read_bytes()
+    files=renderer_candidate(transaction/'source',r['policy'])
+    need(renderer_after(captured['before'],modes,files,r['policy'],r['commit'],r['treeRows'])==captured['after'],'renderer_derived_images')
+    r['_recordSha']=digest_bytes(record_raw)
+    return r,captured
+
+def renderer_save(transaction,record,guard=None):
+    path=transaction/'record.json';old=record['_recordSha'];payload={k:v for k,v in record.items() if k!='_recordSha'}
+    raw=json_bytes(payload);renderer_replace(path,raw,0o600,old,guard=guard);record['_recordSha']=digest_bytes(raw)
+
+def renderer_checkpoint(label):
+    """Test-only fault injection seam; no environment-controlled production input."""
+
+def renderer_pending_guard(allow=None):
+    for t in (*ROOT.glob('.renderer-*'),*ROOT.glob('.native-renderer-*'),*ROOT.glob('.admitted-renderer-*'),*ROOT.glob('.launch-renderer-*'),*ROOT.glob('.d3d-renderer-*')):
+        r,_=renderer_read(t)
+        need(t==allow or (r['phase']=='complete' and r['intent'] is None),'renderer_recovery_required')
+
+def renderer_verify_binding(m):
+    override=renderer_fields(m)
+    if override:
+        t=renderer_binding_transaction(m);r,_=renderer_read(t)
+        need(r['phase']=='complete' and r['direction']=='after' and r['intent'] is None,'renderer_recovery_required')
+        need(override['policySha256']==digest_bytes(json_bytes(r['policy'])) and override['provenanceSha256']==r['policy']['candidateFiles']['provenance.json']
+             and override['d3d11Sha256']==r['policy']['candidateFiles']['d3d11.dll'] and override['diagnosticCapable']==r['policy']['diagnosticCapable'],'renderer_installed_binding')
+        need(('nativeBorderlessCapable' in override)==(r['policy']['schema']>=2)
+             and override.get('nativeBorderlessCapable')==r['policy'].get('nativeBorderlessCapable'),'renderer_borderless_binding')
+        need(override.get('traceProtocolVersion')==r['policy'].get('traceProtocolVersion'),'renderer_trace_protocol_binding')
+        if r['policy']['schema']>=3:
+            need(override.get('nativeRuntimeHashes')=={rel:r['policy']['candidateFiles'][name] for rel,name in RENDERER_NATIVE.values()}
+                 and override.get('lifecycleSha256')==r['policy']['candidateFiles']['ds3-runtime'],'renderer_native_binding')
+            need(sha(ROOT/'ds3-runtime')==(native_admission_lifecycle(m) if m.get('launchAdmissionOverride') is not None else override['lifecycleSha256']),'renderer_lifecycle_drift')
+            for rel,expected in override['nativeRuntimeHashes'].items():need(sha(ROOT/'runtime'/rel)==expected,'renderer_native_drift')
+        if r['policy']['schema'] in (6,7,8,9):
+            need(override.get('dxgiSha256')==r['policy']['candidateFiles']['dxgi.dll'] and sha(ROOT/'runtime'/DXGI_REL)==sha(PREFIX/DXGI_PREFIX)==override['dxgiSha256']
+                 and (ROOT/'runtime'/DXGI_REL).stat().st_mode&0o777==(PREFIX/DXGI_PREFIX).stat().st_mode&0o777==0o644,'renderer_dxgi_drift')
+        else:need('dxgiSha256' not in override,'renderer_dxgi_binding')
+        need(sha(PREFIX/RENDERER_PREFIX)==override['d3d11Sha256'] and (PREFIX/RENDERER_PREFIX).stat().st_mode&0o777==0o644,'renderer_prefix_drift')
+
+def renderer_admission_guard(policy,source_guard):
+    # Validate immutable bytes once, then hold their complete file facts across
+    # the ten-target operation. Own target publication cannot change this set.
+    base=policy['nativeAdmissionBase'];b=native_admission_bridge()
+    paths={HOME/'AIDev/bin/game-launch-admission',HOME/'Library/Application Support/Adapted Games/games-play',
+           HOME/'Library/Application Support/Adapted Games/receipt.json',HOME/'Library/Application Support/CS2 Standalone/cs2-play',
+           HOME/'Library/Application Support/CS2 Standalone/runtime/.owner.json',ADMISSION_BRIDGE_PATH,
+           HOME/'AIDev/lib/game-launch-admission-v2/receipt.json',ROOT/'native/receipt.json',
+           HOME/'AIDev/state/ds3-native-launch-approval.json',PREFIX/'native-applications.routes'}
+    if policy['schema']==8:paths.difference_update(renderer_launch_targets().values())
+    for pattern in ('.native-admission-*','.native-launch-admission-*'):
+        for directory in ROOT.glob(pattern):paths.update(directory.iterdir())
+    paths.update(HOME/'AIDev/lib/game-launch-admission-v2'/relative for relative in base['intent']['companions'])
+    route=base['intent']['nativeRoute'];app=ROOT/'native/Dark Souls III Native.app'
+    paths.update(app/rel for rel in route['bundleFiles'])
+    paths.update((PREFIX/'drive_c/Program Files (x86)/Steam/steamapps/common/DARK SOULS III/Game/DarkSoulsIII.exe',
+                  ROOT/'runtime/engine/lib/wine/x86_64-unix/ntdll.so',ROOT/'runtime/engine/bin/wineserver'))
+    directories={parent for path in paths for parent in path.parents}
+    def facts():
+        result={}
+        for path in paths:
+            safe_file(path);st=path.lstat()
+            result[path]=tuple(getattr(st,key) for key in ('st_dev','st_ino','st_mode','st_uid','st_nlink','st_size','st_mtime_ns','st_ctime_ns'))
+        for path in directories:
+            st=path.lstat();need(stat.S_ISDIR(st.st_mode) and st.st_uid in (0,os.getuid()) and not st.st_mode&0o022,'renderer_admission_directory')
+            result[path]=(st.st_dev,st.st_ino,st.st_mode,st.st_uid)
+        return result
+    pins=None
+    if policy['schema']>=5:
+        paths.discard(HOME/'AIDev/state/ds3-native-launch-approval.json')
+        paths.discard(ROOT/'runtime/engine/lib/wine/x86_64-unix/ntdll.so')
+        pins=(policy['previousNativeRuntimeHashes']['engine/lib/wine/x86_64-unix/ntdll.so'],policy['candidateFiles']['ntdll.so'])
+    frozen=facts();renderer_admission_base_check(base,pins)
+    need(facts()==frozen,'renderer_admission_static_drift')
+    def guard():
+        if policy['schema']==8 and _RENDERER_CS2_GUARD is not None:_RENDERER_CS2_GUARD()
+        source_guard()
+        pending=HOME/'AIDev/state/game-launch-pending.json'
+        need(not pending.exists() and not pending.is_symlink(),'pending_launch_requires_recovery')
+        inactive(ROOT/'runtime',PREFIX)
+        need(facts()==frozen,'renderer_admission_static_drift')
+    return guard
+
+def renderer_run(transaction,direction,recover=False,guard=None):
+    record,_=renderer_read(transaction)
+    with renderer_launch_scope(record['policy']):return renderer_run_scoped(transaction,direction,recover,guard)
+
+def renderer_run_scoped(transaction,direction,recover=False,guard=None):
+    native_admission_pending_guard()
+    r,images=renderer_read(transaction);targets=renderer_targets(r['policy'])
+    renderer_pending_guard(allow=transaction)
+    if r['policy']['schema']<4:need('launchAdmissionOverride' not in load(ROOT/'manifest.json'),'rollback_native_admission_first')
+    local=guard or (lambda:None)
+    if r['policy']['schema']>=4:
+        renderer_admission_ancestry(r,images,sides=('before','after'))
+        local=renderer_admission_guard(r['policy'],local)
+    local()
+    if recover:need(r['direction']==direction,'renderer_recovery_direction')
+    else:need(r['phase'] in ('prepared','complete') and r['intent'] is None,'renderer_recovery_required')
+    current_rows=renderer_rows();expected_rows=[list(row) for row in r['treeRows']]
+    runtime_keys={RENDERER_REL:'runtime'}
+    if r['policy']['schema']>=3:runtime_keys.update({rel:key for key,(rel,_) in RENDERER_NATIVE.items()})
+    if r['policy']['schema'] in (6,7,8,9):runtime_keys[DXGI_REL]='dxgiRuntime'
+    for row in current_rows:
+        if row[0] in runtime_keys:
+            entry=r['images'][runtime_keys[row[0]]]
+            need(row[2] in (entry['before'],entry['after']),'renderer_runtime_drift')
+            row[2]=entry['before']
+    need(current_rows==expected_rows,'renderer_other_runtime_drift')
+    # Whole closure validation before changing any target. Every third state is retained.
+    for name,target in targets.items():
+        safe_file(target);need(target.stat().st_mode&0o777==r['images'][name]['mode'] and sha(target) in (r['images'][name]['before'],r['images'][name]['after']),'renderer_target_drift')
+    if r['phase']=='complete' and r['direction']==direction:
+        need(all(sha(t)==r['images'][n][direction] for n,t in targets.items()),'renderer_noop_drift');return False
+    if not recover and r['phase']=='complete':
+        need(all(sha(t)==r['images'][n][r['direction']] for n,t in targets.items()),'renderer_rollback_preimage')
+    r.update(phase='running',direction=direction,intent=None);renderer_save(transaction,r,local)
+    order=list(targets) if direction=='after' else list(reversed(targets))
+    for name in order:
+        if sha(targets[name])==r['images'][name][direction]:continue
+        r['intent']=name;renderer_save(transaction,r,local);renderer_checkpoint('intent:'+name)
+        renderer_replace(targets[name],images[direction][name],r['images'][name]['mode'],r['images'][name]['before' if direction=='after' else 'after'],guard=local);renderer_checkpoint('published:'+name)
+        r['intent']=None;renderer_save(transaction,r,local)
+    need(all(sha(t)==r['images'][n][direction] for n,t in targets.items()),'renderer_postimage')
+    r.update(phase='complete',intent=None);renderer_save(transaction,r,local);return True
+
+def renderer_rollback_head(commit,apply_commit):
+    """Rollback an exact installed winemac generation using current admitted source."""
+    exact=source_gate(commit,action='renderer-rollback')
+    window_repair_pending_guard();inactive(ROOT/'runtime',PREFIX)
+    transaction=renderer_transaction(apply_commit,native=True,admission=True)
+    record,images=renderer_read(transaction)
+    policy=record['policy']
+    need(policy['schema']==7,'renderer_rollback_scope')
+    # Historical intent is immutable Git ancestry, not the current candidate policy.
+    run(['/usr/bin/git','-c','core.hooksPath=/dev/null','-C',CONTROL,'merge-base','--is-ancestor',apply_commit,commit])
+    historical=run(['/usr/bin/git','-c','core.hooksPath=/dev/null','-C',CONTROL,'show',apply_commit+':manifests/ds3-renderer-update.json'])
+    need(json.loads(historical)==policy,'renderer_rollback_historical_policy')
+    current=(ROOT/'manifest.json').read_bytes()
+    recovering=record['phase']=='running' and record['direction']=='before'
+    if recovering:
+        need(current in (images['before']['manifest'],images['after']['manifest']),'renderer_rollback_head')
+    else:
+        need(record['phase']=='complete' and record['direction']=='after' and record['intent'] is None
+             and current==images['after']['manifest']
+             and renderer_fields(json.loads(current))['transactionCommit']==apply_commit,'renderer_rollback_head')
+        verify_installed();verify_borderless()
+    # Preserve all existing publication, recovery, source, inactivity and native
+    # admission guards. renderer_run validates the complete target closure first.
+    def held():
+        if exact is not None:exact()
+        safe_file(transaction/'record.json')
+        raw=(transaction/'record.json').read_bytes();need(len(raw)<=32*1024*1024,'renderer_record_limit')
+        live=json.loads(raw)
+        need(all(live.get(key)==record[key] for key in ('schema','commit','policy','images','treeRows')),'renderer_rollback_record_drift')
+    held()
+    with renderer_launch_scope(policy):
+        changed=renderer_run(transaction,'before',recover=recovering,guard=held)
+    verify_installed();verify_borderless()
+    return {'state':'DS3_RENDERER_RESTORED','changed':changed,'gameStarted':False,'gameplayVerified':False}
+
+def renderer_operation(commit,operation,candidate=None):
+    with renderer_launch_scope(renderer_policy()):return renderer_operation_scoped(commit,operation,candidate)
+
+def renderer_operation_scoped(commit,operation,candidate=None):
+    need(operation in ('upgrade','recover','rollback','return'),'renderer_operation')
+    exact=source_gate(commit,action='renderer-'+operation);window_repair_pending_guard();inactive(ROOT/'runtime',PREFIX)
+    p=renderer_policy();transaction=renderer_transaction(commit,native=p['schema']>=3,admission=p['schema']>=4,launch=p['schema']==8,d3d=p['schema']==9)
+    if p['schema']==8 and HERE==CONTROL:need(_RENDERER_CS2_GUARD is not None,'renderer_launch_lock_required')
+    publication_guard=renderer_admission_guard(p,exact or (lambda:None)) if p['schema']>=4 else exact
+    if publication_guard is not None:publication_guard()
+    if operation=='upgrade' and not transaction.exists():
+        renderer_pending_guard();old,_=verify_installed();verify_borderless();p=renderer_policy();files=renderer_candidate(candidate,p)
+        if renderer_native_hashes(old):renderer_overlay_lifecycle(old,max_generations=RENDERER_MAX_GENERATIONS-1)
+        targets=renderer_targets(p);before={};modes={}
+        for name,path in targets.items():
+            safe_file(path);need(path.stat().st_size<=64*1024*1024,'renderer_target_limit');before[name]=path.read_bytes();modes[name]=path.stat().st_mode&0o777
+        if p['schema']>=3:need(files['ds3-runtime']==(CONTROL/'bin/ds3-runtime').read_bytes(),'renderer_lifecycle_source')
+        if p['schema']==8:
+            for name in RENDERER_LAUNCH_FILES.values():need(files[name]==(CONTROL/'bin'/name).read_bytes(),'renderer_launch_source')
+        rows=renderer_rows();after=renderer_after(before,modes,files,p,commit,rows)
+        record={'schema':1,'commit':commit,'policy':p,'images':{n:{'before':digest_bytes(before[n]),'after':digest_bytes(after[n]),'mode':modes[n]} for n in targets},
+                'treeRows':rows,'phase':'prepared','direction':'after','intent':None}
+        stage=Path(tempfile.mkdtemp(prefix='.ds3-renderer-stage-',dir=ROOT));stage.chmod(0o700)
+        parent=lifecycle_parent_fd(transaction);directory=os.open(stage.name,os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW,dir_fd=parent);source_fd=None
+        try:
+            identity=os.fstat(directory);os.mkdir('source',mode=0o700,dir_fd=directory)
+            source_fd=os.open('source',os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW,dir_fd=directory)
+            source_identity=os.fstat(source_fd)
+            writes=[(source_fd,name,data) for name,data in files.items()]
+            writes += [(directory,name+'.'+side,data) for side,images in (('before',before),('after',after)) for name,data in images.items()]
+            writes.append((directory,'record.json',json_bytes(record)))
+            for owner,name,data in writes:
+                fd=os.open(name,os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW,0o600,dir_fd=owner)
+                try:
+                    with os.fdopen(os.dup(fd),'wb') as f:f.write(data);f.flush()
+                    os.fchmod(fd,0o600);os.fsync(fd)
+                finally:os.close(fd)
+            for owner,name,data in writes:
+                fd=os.open(name,os.O_RDONLY|os.O_NOFOLLOW,dir_fd=owner)
+                try:
+                    st=os.fstat(fd);need(stat.S_ISREG(st.st_mode) and st.st_nlink==1 and st.st_uid==os.getuid() and st.st_mode&0o777==0o600,'renderer_stage_mode')
+                    with os.fdopen(os.dup(fd),'rb') as f:need(f.read()==data,'renderer_stage_bytes')
+                finally:os.close(fd)
+            os.fsync(source_fd);os.fsync(directory)
+            st=os.stat(stage.name,dir_fd=parent,follow_symlinks=False);ss=os.stat('source',dir_fd=directory,follow_symlinks=False)
+            need((st.st_dev,st.st_ino)==(identity.st_dev,identity.st_ino) and (ss.st_dev,ss.st_ino)==(source_identity.st_dev,source_identity.st_ino),'renderer_stage_identity')
+            if publication_guard is not None:publication_guard()
+            lifecycle_rename(stage.name,transaction.name,parent,parent);os.fsync(parent)
+        finally:
+            if source_fd is not None:os.close(source_fd)
+            os.close(directory);os.close(parent)
+    r,_=renderer_read(transaction)
+    need(r['policy']==renderer_policy(),'renderer_policy_changed')
+    direction=r['direction'] if operation=='recover' else 'before' if operation=='rollback' else 'after'
+    changed=renderer_run(transaction,direction,recover=operation=='recover',guard=publication_guard)
+    verify_installed();verify_borderless()
+    return {'state':'DS3_RENDERER_'+('INSTALLED' if direction=='after' else 'RESTORED'),'changed':changed,'gameStarted':False,'gameplayVerified':False}
+
+def renderer_replace(target,data,mode,expected,guard=None):
+    need((target in renderer_targets({'schema':8}).values() or (target.name=='record.json' and target.parent.parent==ROOT and re.fullmatch(r'\.(?:renderer|native-renderer|admitted-renderer|launch-renderer|d3d-renderer)-[0-9a-f]{40}',target.parent.name)))
+         and type(data) is bytes and len(data)<=64*1024*1024 and pinned(expected),'renderer_replace_scope')
+    parent=lifecycle_parent_fd(target);stage_parent=lifecycle_parent_fd(ROOT/'unused');temp='.ds3-renderer-write-'+digest_bytes(data);fd=None
+    def facts(st):return tuple(getattr(st,k) for k in ('st_dev','st_ino','st_mode','st_uid','st_nlink','st_size','st_mtime_ns','st_ctime_ns'))
+    try:
+        held=os.open(target.name,os.O_RDONLY|os.O_NOFOLLOW|os.O_NONBLOCK,dir_fd=parent)
+        try:
+            before=os.fstat(held);need(stat.S_ISREG(before.st_mode) and before.st_nlink==1 and before.st_uid==os.getuid() and before.st_mode&0o777==mode and before.st_size<=64*1024*1024,'renderer_target_mode')
+            with os.fdopen(os.dup(held),'rb') as f:need(digest_bytes(f.read())==expected,'renderer_target_changed')
+            fd=os.open(temp,os.O_RDWR|os.O_CREAT|os.O_NOFOLLOW|os.O_NONBLOCK,0o600,dir_fd=stage_parent)
+            st=os.fstat(fd);need(stat.S_ISREG(st.st_mode) and st.st_nlink==1 and st.st_uid==os.getuid() and st.st_mode&0o777 in (0o600,mode) and st.st_size<=len(data),'renderer_stage_drift')
+            with os.fdopen(os.dup(fd),'rb') as f:need(data.startswith(f.read()),'renderer_stage_drift')
+            os.lseek(fd,0,os.SEEK_SET)
+            with os.fdopen(os.dup(fd),'wb') as f:f.write(data);f.flush()
+            os.ftruncate(fd,len(data));os.fchmod(fd,mode);os.fsync(fd);staged=facts(os.fstat(fd));renderer_checkpoint('replace:staged')
+            if guard is not None:guard()
+            need(facts(os.stat(target.name,dir_fd=parent,follow_symlinks=False))==facts(before) and facts(os.fstat(held))==facts(before),'renderer_target_changed')
+            need(facts(os.stat(temp,dir_fd=stage_parent,follow_symlinks=False))==staged and facts(os.fstat(fd))==staged,'renderer_stage_changed')
+            # Both directories are descriptor-held; scratch lives outside runtime tree.
+            parent_st=os.fstat(parent);named_parent=target.parent.lstat();root_st=os.fstat(stage_parent);named_root=ROOT.lstat()
+            need(stat.S_ISDIR(named_parent.st_mode) and stat.S_ISDIR(named_root.st_mode) and (parent_st.st_dev,parent_st.st_ino)==(named_parent.st_dev,named_parent.st_ino) and (root_st.st_dev,root_st.st_ino)==(named_root.st_dev,named_root.st_ino),'renderer_parent_changed')
+            os.replace(temp,target.name,src_dir_fd=stage_parent,dst_dir_fd=parent);os.fsync(parent);os.fsync(stage_parent)
+        finally:os.close(held)
+    finally:
+        if fd is not None:os.close(fd)
+        os.close(parent);os.close(stage_parent)
+
+
+def renderer_trace_session(base,graphics):
+    need(renderer_fields(base) and base['rendererOverride']['diagnosticCapable'],'trace_renderer_required')
+    safe_directory(ROOT/'logs');capture=ROOT/'logs'/('dxmt-trace-session-'+os.urandom(16).hex());capture.mkdir(mode=0o700)
+    marker=capture/'.cs2trace-session'
+    protocol=renderer_fields(base).get('traceProtocolVersion',1)
+    with marker.open('xb') as f:f.write(('CS2TRACE_SESSION_V'+str(protocol)+'\n').encode());f.flush();os.fchmod(f.fileno(),0o600);os.fsync(f.fileno())
+    (capture/'capture.json').write_bytes(json_bytes({'schema':1,'rendererSha256':renderer_hash(base),'traceProtocolVersion':protocol,'graphics':graphics,'armed':False}))
+    (capture/'capture.json').chmod(0o600);lifecycle_sync(capture/'capture.json');lifecycle_sync(capture)
+    return capture
+
 def no_foreign_steam():
     need(not admission(HOME,'ds3').summary()['foreignSteam'], 'foreign_steam_active')
 
-def play(measure=False, preset=None):
-    need(type(measure) is bool, 'invalid_measure_mode')
+def play(measure=False, preset=None, trace=False, quit_trace=False):
+    need(type(measure) is bool and type(trace) is bool and type(quit_trace) is bool, 'invalid_measure_mode')
+    need(not quit_trace or not (measure or trace or preset is not None),'quit_trace_exclusive')
     base,_ = verify_installed(); graphics = verify_window_config(); borderless,receipt = verify_borderless()
+    # The admitted virtual-display policy must survive the game's WINDOW
+    # preference, so an in-game fullscreen toggle can reach real DXGI modeset.
+    # Missing policy keeps the existing geometric-borderless fallback.
+    virtual_fullscreen = graphics['windowMode'] == 'FULLSCREEN' or virtual_fullscreen_registry_enabled()
+    native_borderless = (renderer_fields(base) or {}).get('nativeBorderlessCapable',False) and not virtual_fullscreen
+    need(not virtual_fullscreen or base.get('aspectFit') is True,'virtual_fullscreen_requires_aspect')
+    need(not native_borderless or base.get('aspectFit') is True,'native_borderless_requires_aspect')
     request=admission(HOME,'ds3');request.reconcile()
     session=request.allow_client()
+    if quit_trace:need(not session['clientActive'] and not session['targetActive'],'quit_trace_requires_stopped_client_target')
     if session['targetActive']:
         return {'state':'DS3_ALREADY_RUNNING','gameplayVerified':False,'borderlessVerified':False}
     # A client in another prefix can reroute -applaunch to its old session.
@@ -1571,17 +2698,23 @@ def play(measure=False, preset=None):
         m = manifest(ROOT/'manifest.json')
         need(sha(SOURCE/'runtime/engine/bin/wineserver',allow_source_hardlinks=True) == m['sourceCriticalHashes']['engine/bin/wineserver'], 'source_server_drift')
         inactive(SOURCE/'runtime', SOURCE/'profiles/prince')
+    if trace: need(not session['clientActive'] and renderer_fields(base) and base['rendererOverride']['diagnosticCapable'], 'trace_requires_stopped_diagnostic_client')
     if not session['clientActive']: inactive(ROOT/'runtime',PREFIX)
+    virtual_policy = verify_virtual_fullscreen_live(request) if virtual_fullscreen and session['clientActive'] else {'state':'COLD_PREFIX_VERIFIED'} if virtual_fullscreen else None
     if preset is not None:
         need(base.get('aspectFit') is True, 'resolution_preset_requires_aspect')
         select_resolution(preset); graphics = verify_window_config()
     exe = PREFIX/'drive_c/Program Files (x86)/Steam/steam.exe'; safe_file(exe)
-    logpath = ROOT/'logs/launch-ds3.log'
-    fd = os.open(logpath,os.O_WRONLY|os.O_APPEND|os.O_CREAT|os.O_NOFOLLOW,0o600)
+    logpath = ROOT/'logs'/('steam-quit-trace-'+str(time.time_ns())+'.log' if quit_trace else 'launch-ds3.log')
+    fd = os.open(logpath,os.O_WRONLY|os.O_APPEND|os.O_CREAT|os.O_NOFOLLOW|(os.O_EXCL if quit_trace else 0),0o600)
     s = os.fstat(fd); need(stat.S_ISREG(s.st_mode) and s.st_uid == os.getuid() and s.st_nlink == 1 and not s.st_mode & 0o077, 'unsafe_launch_log')
     env = wine_env(ROOT/'runtime',PREFIX,True)
+    if quit_trace:env['WINEDEBUG']='-all,steam.exe:trace+macdrv,steam.exe:warn+macdrv,steam.exe:err+macdrv'
+    if native_borderless: env['DXMT_DS3_BORDERLESS'] = '1'
     if base.get('aspectFit') is True: env['DXMT_DS3_ASPECT_FIT'] = '1'
     if measure: env['MTL_HUD_ENABLED'] = '1'
+    capture=renderer_trace_session(base,graphics) if trace else None
+    if capture: env['DXMT_CS2_TRACE_DIR']='Z:'+str(capture).replace('/','\\')
     helper_log = ROOT/'logs/borderless-latest.log'
     if helper_log.exists() or helper_log.is_symlink(): safe_file(helper_log)
     helper_fd = os.open(helper_log,os.O_WRONLY|os.O_CREAT|os.O_NOFOLLOW,0o600)
@@ -1590,15 +2723,18 @@ def play(measure=False, preset=None):
     helper_env = wine_env(ROOT/'runtime',PREFIX,False); helper_env['DXMT_DS3_MARSHAL_FIX'] = '0'
     request.begin()
     with os.fdopen(fd,'ab') as log,os.fdopen(helper_fd,'ab') as hlog:
-        helper = subprocess.Popen([str(ROOT/'runtime/engine/bin/wine'),str(ROOT/'borderless/helper.exe')]+borderless['argv'],
-                                  env=helper_env,cwd=ROOT/'borderless',stdin=subprocess.DEVNULL,stdout=hlog,stderr=hlog,start_new_session=True)
+        helper = None
+        if not native_borderless and not virtual_fullscreen:
+            helper = subprocess.Popen([str(ROOT/'runtime/engine/bin/wine'),str(ROOT/'borderless/helper.exe')]+borderless['argv'],
+                                      env=helper_env,cwd=ROOT/'borderless',stdin=subprocess.DEVNULL,stdout=hlog,stderr=hlog,start_new_session=True)
         try:
             steam=subprocess.Popen([str(ROOT/'runtime/engine/bin/wine'),str(exe),'-cef-disable-gpu','-applaunch','374320'],
                              env=env,cwd=exe.parent,stdin=subprocess.DEVNULL,stdout=log,stderr=log,start_new_session=True)
         except Exception:
-            helper.terminate(); raise RuntimeError('steam_launch_failed_borderless_cancel_requested')
-        request.dispatched([helper,steam])
-    return dict({'state':'DS3_LAUNCH_REQUESTED','gameplayVerified':False,'diagnosticHud':measure,'borderlessRequested':True,'borderlessVerified':False},**graphics)
+            if helper is not None: helper.terminate()
+            raise RuntimeError('steam_launch_failed_borderless_cancel_requested')
+        request.dispatched([helper,steam] if helper is not None else [steam])
+    return dict({'state':'DS3_LAUNCH_REQUESTED','gameplayVerified':False,'diagnosticHud':measure,'traceDirectory':str(capture) if capture else None,'rendererSha256':renderer_hash(base),'borderlessRequested':not virtual_fullscreen,'borderlessRoute':('virtual-fullscreen' if graphics['windowMode']=='FULLSCREEN' else 'virtual-fullscreen-capable') if virtual_fullscreen else 'native-owner-thread' if native_borderless else 'external-helper','borderlessVerified':False},**graphics,**({'virtualFullscreenPolicy':virtual_policy} if virtual_fullscreen else {}),**({'quitTraceLog':str(logpath),'quitTraceScope':'steam.exe:macdrv'} if quit_trace else {}))
 
 def stop_attestation():
     # Emergency stop must not scan mutable profiles, full trees or shortcuts.
@@ -1705,24 +2841,45 @@ def lifecycle_retire(j,complete=False):
     return {'state':'RETIRED_DATA_RETAINED','profileDeleted':False,'changed':True}
 
 def main():
+    if len(sys.argv)>1 and sys.argv[1] in ('upgrade-renderer','recover-renderer','rollback-renderer','return-renderer') and renderer_policy()['schema']==8:
+        # CS2's launcher takes its local lock before the shared lock below.
+        with renderer_cs2_locked():return main_locked()
+    return main_locked()
+
+def main_locked():
+    global _RENDERER_CS2_GUARD
     os.umask(0o077); args = sys.argv[1:]
-    need(args, 'usage: ds3-runtime prepare CANDIDATE | install COMMIT CANDIDATE | recover COMMIT | refresh COMMIT | install-borderless COMMIT CANDIDATE | large-window COMMIT | overlay-off COMMIT | resolution-1080 COMMIT | upgrade-aspect COMMIT CANDIDATE | rollback-aspect COMMIT APPLY_COMMIT | upgrade-follow COMMIT CANDIDATE | rollback-follow COMMIT APPLY_COMMIT | repair-window COMMIT | rollback-window COMMIT APPLY_COMMIT | status | play | play-1080 | measure | stop | retire COMMIT')
+    need(args, 'usage: ds3-runtime prepare CANDIDATE | install COMMIT CANDIDATE | recover COMMIT | refresh COMMIT | install-borderless COMMIT CANDIDATE | large-window COMMIT | overlay-off COMMIT | resolution-1080 COMMIT | upgrade-aspect COMMIT CANDIDATE | rollback-aspect COMMIT APPLY_COMMIT | upgrade-follow COMMIT CANDIDATE | rollback-follow COMMIT APPLY_COMMIT | repair-window COMMIT | rollback-window COMMIT APPLY_COMMIT | virtual-fullscreen COMMIT [1080|1440] | rollback-virtual-fullscreen COMMIT APPLY_COMMIT | status | play | play-1080 | measure | quit-trace | stop | retire COMMIT')
     lockdir = HOME/'AIDev/state'; safe_directory(lockdir)
     fd = os.open(lockdir/'games-hub.lock',os.O_CREAT|os.O_RDWR|os.O_NOFOLLOW,0o600)
     s = os.fstat(fd); need(stat.S_ISREG(s.st_mode) and s.st_uid == os.getuid() and s.st_nlink == 1 and not s.st_mode & 0o022,'unsafe_lock')
     with os.fdopen(fd,'w') as f:
         try: fcntl.flock(f,fcntl.LOCK_EX|fcntl.LOCK_NB)
         except BlockingIOError: raise RuntimeError('launcher_busy') from None
+        if _RENDERER_CS2_GUARD is not None:
+            cs2_guard=_RENDERER_CS2_GUARD
+            def both_locks():
+                cs2_guard();named=(lockdir/'games-hub.lock').lstat();opened=os.fstat(f.fileno())
+                need(stat.S_ISREG(named.st_mode) and (named.st_dev,named.st_ino,named.st_mode,named.st_uid)==(s.st_dev,s.st_ino,s.st_mode,s.st_uid)
+                     and (opened.st_dev,opened.st_ino)==(s.st_dev,s.st_ino),'renderer_shared_lock_changed')
+            _RENDERER_CS2_GUARD=both_locks
         if args[0] == 'prepare' and len(args) == 2: result = prepare(Path(args[1]))
         elif args[0] == 'install' and len(args) == 3: result = install(args[1],Path(args[2]))
         elif args[0] == 'install-borderless' and len(args) == 3: result = install_borderless(args[1],Path(args[2]))
         elif args[0] == 'retire' and len(args) == 2: result = retire(args[1])
         elif args[0] == 'recover' and len(args) == 2: result = recover(args[1])
+        elif args[0] == 'upgrade-renderer' and len(args)==3: result=renderer_operation(args[1],'upgrade',Path(args[2]))
+        elif args[0]=='rollback-renderer' and len(args)==3: result=renderer_rollback_head(args[1],args[2])
+        elif args[0] in ('recover-renderer','rollback-renderer','return-renderer') and len(args)==2: result=renderer_operation(args[1],args[0].split('-')[0])
         elif args[0] == 'upgrade-aspect' and len(args) == 3: result = upgrade_aspect(args[1],Path(args[2]))
         elif args[0] == 'rollback-aspect' and len(args) == 3: result = rollback_aspect(args[1],args[2])
         elif args[0] == 'upgrade-follow' and len(args) == 3: result = upgrade_follow(args[1],Path(args[2]))
         elif args[0] == 'rollback-follow' and len(args) == 3: result = rollback_follow(args[1],args[2])
+        elif args[0] == 'measure-trace' and len(args)==1: result=play(trace=True)
+        elif args[0] == 'quit-trace' and len(args)==1: result=play(quit_trace=True)
         elif args[0] == 'play-1080' and len(args) == 1: result = play(preset='1080')
+        elif args[0] == 'virtual-fullscreen' and len(args) in (2,3): result = virtual_fullscreen(args[1],args[2] if len(args)==3 else None)
+        elif args[0] == 'rollback-virtual-fullscreen' and len(args)==3: result = rollback_virtual_fullscreen(args[1],args[2])
         elif args[0] == 'repair-window' and len(args) == 2: result = repair_window(args[1])
         elif args[0] == 'rollback-window' and len(args) == 3: result = rollback_window(args[1],args[2])
         elif args[0] == 'refresh' and len(args) == 2: result = refresh(args[1])

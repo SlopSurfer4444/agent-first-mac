@@ -253,7 +253,10 @@ class CheckpointTests(unittest.TestCase):
         for path, ident, content in (
             (S.VENDOR_FIXTURE_CUSTODY_REPAIR_PATH, 'vendor-fixture-custody-repair', b'custody repair'),
             (S.SCHEDULER_DESCRIPTOR_REPAIR_PATH, 'scheduler-descriptor-repair', b'scheduler repair'),
-            (S.PRODUCT_SURFACE_PATH, 'product-surface', b'product documentation and navigation')):
+            (S.PRODUCT_SURFACE_PATH, 'product-surface', b'product documentation and navigation'),
+            (S.WINE_ARCHIVE_CHAIN_PATH, 'wine-archive-chain', b'bounded archive chain recovery'),
+            (S.CUSTODY_NAMESPACE_PATH, 'custody-namespace', b'durable custody namespace'),
+            (S.SCOPED_READINESS_PATH, 'scoped-readiness', b'affected operation readiness')):
             prior, prior_tree = self.previous, self.git._tree(self.previous)
             self.updates[path] = {'previous_commit': prior, 'paths': {'lib/engine.py'}, 'after': self.rules}
             reviewed = self.accept(ident, {'lib/engine.py': content}, kind='policy')

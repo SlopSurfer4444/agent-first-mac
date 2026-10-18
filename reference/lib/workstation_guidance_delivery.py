@@ -21,10 +21,16 @@ PREIMAGE = "0c7da6b0f97d96d15d9c982440cfd56a415c38329f4d2d5b3dc431d6a16cd8e5"
 POSTIMAGE = "0ce75fb90e30b2e7fc75be98756f29671e7054c46d0667dfb413a7a8c661d59c"
 RECORDS = {"prestate.json", "before", "after", "intent.json", "rollback.json"}
 ACTIONS = ("plan", "status", "apply", "recover", "rollback")
+SUCCESSOR = "scoped-readiness-v1"
+SUCCESSOR_HASH = "98044ec691a325711121cc307900e4c43c997ed33ee96984f9d93e0300e9f0c2"
+LEGACY_PAYLOAD = "skills/manage-workstation/recovery/owner-first-v1.md"
 
 
-def source():
-    manifest = H.parse((ROOT / "manifests/workstation-guidance-delivery.json").read_bytes())
+def source(operation=OPERATION):
+    H.require(operation in (OPERATION, SUCCESSOR), "fixed_operation")
+    successor = operation == SUCCESSOR
+    manifest_path = "manifests/workstation-guidance-successor.json" if successor else "manifests/workstation-guidance-delivery.json"
+    manifest = H.parse((ROOT / manifest_path).read_bytes())
     expected = {"schema": 1, "owner": "control", "scope": "owner-first-manage-workstation-guidance",
         "source": "skills/manage-workstation/SKILL.md", "target": "$HOME/.codex/skills/manage-workstation/SKILL.md",
         "preimageSha256": PREIMAGE, "postimageSha256": POSTIMAGE, "mode": "0600",
@@ -32,9 +38,16 @@ def source():
         "readiness": "fresh-full-current-doctor-PASS-then-held-source",
         "operation": "one-fixed-guidance-file-atomic-exchange",
         "recovery": "Exact recorded inodes and images only; retain unknown state without inverse."}
+    if successor:
+        expected.update(scope="scoped-readiness-manage-workstation-guidance",
+            preimageSha256=POSTIMAGE, postimageSha256=SUCCESSOR_HASH,
+            recoverySuffix="/".join(STATE + (SUCCESSOR,)),
+            readiness="held-accepted-source-and-exact-target-recovery")
     H.require(H.wire(manifest) == H.wire(expected), "guidance_manifest")
-    raw = (ROOT / expected["source"]).read_bytes()
-    H.require(0 < len(raw) <= H.LIMIT and H.digest(raw) == POSTIMAGE, "guidance_source")
+    # Keep the immutable v1 manifest and recovery route usable after the
+    # active skill advances. This is a fixed hash-bound payload, not an override.
+    raw = (ROOT / (expected["source"] if successor else LEGACY_PAYLOAD)).read_bytes()
+    H.require(0 < len(raw) <= H.LIMIT and H.digest(raw) == expected["postimageSha256"], "guidance_source")
     return manifest, raw
 
 
@@ -53,9 +66,12 @@ def stamp(value):
     H.require(type(value) is list and len(value) == 8 and all(type(v) is int for v in value), "record_identity")
 
 
-def execute(home, action, *, admission, source_guard=lambda: True, checkpoint=lambda _: None):
+def execute(home, action, *, admission, source_guard=lambda: True, checkpoint=lambda _: None, operation=OPERATION):
     H.require(action in ACTIONS, "action")
-    manifest, after = source()
+    H.require(operation in (OPERATION, SUCCESSOR), "fixed_operation")
+    stage = STAGE if operation == OPERATION else ".workstation-guidance-scoped-readiness-v1"
+    load_source = source if operation == OPERATION else lambda: source(operation)
+    manifest, after = load_source()
     dirs = []
     try:
         target = H.Directory(home, TARGET); dirs.append(target)
@@ -82,7 +98,7 @@ def execute(home, action, *, admission, source_guard=lambda: True, checkpoint=la
         H.require(stat.S_IMODE(os.fstat(custody.fd).st_mode) == 0o700, "private_state_mode")
         fcntl.flock(custody.fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
         try:
-            recovery = H.Directory(home, STATE + (OPERATION,), create=action == "apply" and observed == "PREDECESSOR")
+            recovery = H.Directory(home, STATE + (operation,), create=action == "apply" and observed == "PREDECESSOR")
         except FileNotFoundError:
             if action == "status": return report(observed)
             raise H.OfframpError("missing_recovery") from None
@@ -91,7 +107,7 @@ def execute(home, action, *, admission, source_guard=lambda: True, checkpoint=la
 
         def guard():
             for d in dirs: d.verify()
-            H.require(source_guard() is True and source() == (manifest, after), "source_drift")
+            H.require(source_guard() is True and load_source() == (manifest, after), "source_drift")
             H.require(set(os.listdir(recovery.fd)) <= RECORDS, "unknown_recovery_material")
             return True
 
@@ -109,7 +125,7 @@ def execute(home, action, *, admission, source_guard=lambda: True, checkpoint=la
             value = record(recovery, "intent.json")
             H.require(type(value) is dict and set(value) == {"schema", "before", "after", "stage"}
                 and type(value["schema"]) is int and value["schema"] == 1
-                and value["before"] == prestate["before"] and value["stage"] == STAGE, "intent_record")
+                and value["before"] == prestate["before"] and value["stage"] == stage, "intent_record")
             stamp(value["before"]); stamp(value["after"])
             old = read(recovery, "before")[0]
             H.require(H.digest(old) == manifest["preimageSha256"]
@@ -117,7 +133,7 @@ def execute(home, action, *, admission, source_guard=lambda: True, checkpoint=la
             return value, old
 
         def position(intent, old):
-            current = read(target, NAME); staged = read(target, STAGE)
+            current = read(target, NAME); staged = read(target, stage)
             if (current, staged) == ((old, intent["before"]), (after, intent["after"])): return 0
             if (current, staged) == ((after, intent["after"]), (old, intent["before"])): return 1
             raise H.OfframpError("unknown_target_or_displaced")
@@ -144,7 +160,7 @@ def execute(home, action, *, admission, source_guard=lambda: True, checkpoint=la
                 H.require(action == "apply" and not os.listdir(recovery.fd), "unknown_preparation")
                 H.require(read(target, NAME) == (before, before_id)
                     and digest == manifest["preimageSha256"], "unknown_predecessor")
-                H.require(not H.has_file(target, STAGE), "unknown_stage")
+                H.require(not H.has_file(target, stage), "unknown_stage")
                 H.write_record(recovery, "prestate.json", H.wire({"schema": 1, "before": before_id,
                     "preimageSha256": manifest["preimageSha256"], "postimageSha256": manifest["postimageSha256"]}))
                 checkpoint("prestate-recorded")
@@ -161,12 +177,12 @@ def execute(home, action, *, admission, source_guard=lambda: True, checkpoint=la
                 guard()
                 # Without the published intent an existing stage has no bound
                 # inode identity. Even matching bytes cannot establish custody.
-                H.require(not H.has_file(target, STAGE), "unbound_stage_retained")
-                H.write_new(target, STAGE, after, 0o600)
-                staged, stage_id = read(target, STAGE)
+                H.require(not H.has_file(target, stage), "unbound_stage_retained")
+                H.write_new(target, stage, after, 0o600)
+                staged, stage_id = read(target, stage)
                 H.require(staged == after and read(target, NAME) == (current, ident), "stage_or_target_drift")
                 checkpoint("staged")
-                H.write_record(recovery, "intent.json", H.wire({"schema": 1, "before": ident, "after": stage_id, "stage": STAGE}))
+                H.write_record(recovery, "intent.json", H.wire({"schema": 1, "before": ident, "after": stage_id, "stage": stage}))
                 checkpoint("prepared")
             intent, old = validate_intent()
             pos = position(intent, old)
@@ -181,7 +197,7 @@ def execute(home, action, *, admission, source_guard=lambda: True, checkpoint=la
             guard(); pos = position(intent, old)
             changed = pos != desired
             if changed:
-                H.swap(target, STAGE, NAME)
+                H.swap(target, stage, NAME)
             # A prior exchange/record can be visible after its fsync failed.
             # Known-state recovery re-establishes durability even on a no-op.
             os.fsync(target.fd)
@@ -197,18 +213,19 @@ def execute(home, action, *, admission, source_guard=lambda: True, checkpoint=la
         for d in reversed(dirs): d.close()
 
 
-def main(arguments=None):
+def main(arguments=None, *, operation=OPERATION):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("action", choices=ACTIONS)
     args = parser.parse_args(arguments)
     try:
+        H.require(operation in (OPERATION, SUCCESSOR), "fixed_operation")
+        execution_options = {} if operation == OPERATION else {"operation": SUCCESSOR}
         home = Path(pwd.getpwuid(os.getuid()).pw_dir)
         H.require(os.getuid() > 0 and ROOT == home / "AIDev/control" and Path.cwd() == ROOT, "canonical_source_required")
         from lib.workstation_maintenance_delivery import admitted_source
         if args.action in ("plan", "status"):
-            result = execute(home, args.action, admission=None)
+            result = execute(home, args.action, admission=None, **execution_options)
         else:
-            admitted_source(ROOT, full=True)
             results = []
             def run(head, *, source_guard):
                 H.require(source_guard() is True, "source_drift")
@@ -217,7 +234,7 @@ def main(arguments=None):
                     value = work()
                     H.require(source_guard() is True and guard(), "source_drift")
                     return value
-                results.append(execute(home, args.action, admission=admission, source_guard=source_guard))
+                results.append(execute(home, args.action, admission=admission, source_guard=source_guard, **execution_options))
                 H.require(source_guard() is True, "source_drift")
                 return True
             admitted_source(ROOT, full=False, operation_check=run)

@@ -29,7 +29,7 @@ class DS3Tests(unittest.TestCase):
         r={'owner':'control-games-hub','manifestSha256':h.sha(hp),'runtimeTreeSha256':h.code_tree(self.source/'runtime')};(self.source/'receipt.json').write_text(json.dumps(r))
         sp=self.source/'profiles/prince';sp.mkdir(parents=True)
         old=('Z:'+str(self.source/'runtime/engine/share/wine/fonts').replace('/','\\')).replace('\\','\\\\')
-        for n in ('user.reg','userdef.reg','system.reg'):(sp/n).write_text('opaque auth preserved\n'+old+'\n'+old)
+        for n in ('user.reg','userdef.reg','system.reg'):(sp/n).write_text('WINE REGISTRY Version 2\n;; opaque auth preserved\n'+old+'\n'+old)
         self.graphics=('<?xml version="1.0" encoding="UTF-16"?>\r\n<config><ScreenMode>FULLSCREEN</ScreenMode><Resolution-FullScreenWidth>1710</Resolution-FullScreenWidth><Resolution-FullScreenHeight>1068</Resolution-FullScreenHeight><Resolution-WindowScreenWidth>1680</Resolution-WindowScreenWidth><Resolution-WindowScreenHeight>945</Resolution-WindowScreenHeight><TextureQuality>HIGH</TextureQuality><AutoDetect>OFF</AutoDetect></config>').encode('utf-16-le')
         gp=sp/h.CONFIG_REL;gp.parent.mkdir(parents=True);gp.write_bytes(self.graphics)
         steam=sp/'drive_c/Program Files (x86)/Steam/steam.exe';steam.parent.mkdir(parents=True);steam.write_bytes(b'fake client')
@@ -173,7 +173,7 @@ class DS3Tests(unittest.TestCase):
         self.assertEqual(launch.call_args.kwargs['env']['MTL_HUD_ENABLED'],'0');self.assertEqual(p.read_bytes(),raw)
     def test_invalid_duplicate_malformed_window_configuration_rejected(self):
         self.installed();p=self.prefix/h.CONFIG_REL;good=p.read_bytes().decode('utf-16-le')
-        bad=[good.replace('WINDOW','FULLSCREEN'),good.replace('<config>','<junk>').replace('</config>','</junk>'),good.replace('<config>','<config><nested>').replace('</config>','</nested></config>'),good.replace('</config>','<ScreenMode>WINDOW</ScreenMode></config>'),good.replace('</config>','<Resolution-WindowScreenWidth>1680</Resolution-WindowScreenWidth></config>'),good.replace('</Resolution-WindowScreenWidth>',''),good.replace('<Resolution-WindowScreenHeight>1068</Resolution-WindowScreenHeight>',''),good.replace('<config>','<!DOCTYPE config [<!ENTITY test "x">]><config>')]
+        bad=[good.replace('WINDOW','UNSUPPORTED'),good.replace('<config>','<junk>').replace('</config>','</junk>'),good.replace('<config>','<config><nested>').replace('</config>','</nested></config>'),good.replace('</config>','<ScreenMode>WINDOW</ScreenMode></config>'),good.replace('</config>','<Resolution-WindowScreenWidth>1680</Resolution-WindowScreenWidth></config>'),good.replace('</Resolution-WindowScreenWidth>',''),good.replace('<Resolution-WindowScreenHeight>1068</Resolution-WindowScreenHeight>',''),good.replace('<config>','<!DOCTYPE config [<!ENTITY test "x">]><config>')]
         for value in ('0','-1','1680.0','NaN','7681','123456','000640','639'):
             bad.append(good.replace('<Resolution-WindowScreenWidth>1710</Resolution-WindowScreenWidth>','<Resolution-WindowScreenWidth>'+value+'</Resolution-WindowScreenWidth>'))
         for value in ('0','359','4321'):
@@ -538,7 +538,7 @@ class DS3Tests(unittest.TestCase):
     def test_aspect_preset_malformed_rejected(self):
         raw=self.graphics.replace('FULLSCREEN'.encode('utf-16-le'),'WINDOW'.encode('utf-16-le'))
         text=raw.decode('utf-16-le')
-        for invalid in (text.replace('<config>','<!DOCTYPE config><config>'),text.replace('</config>','<ScreenMode>WINDOW</ScreenMode></config>'),text.replace('1680','99999'),text.replace('WINDOW','FULLSCREEN')):
+        for invalid in (text.replace('<config>','<!DOCTYPE config><config>'),text.replace('</config>','<ScreenMode>WINDOW</ScreenMode></config>'),text.replace('1680','99999'),text.replace('WINDOW','UNSUPPORTED')):
             with self.assertRaises(RuntimeError):h.resolution_plan(invalid.encode('utf-16-le'),'1440')
     def test_aspect_registry_other_bytes_preserved(self):
         raw=b'[Software\\\\Wine\\\\Mac Driver] 1\n"RetinaMode"="N"\n"Other"="N"\n[Other]\n"RetinaMode"="N"\n'

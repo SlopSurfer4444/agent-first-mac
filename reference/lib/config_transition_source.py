@@ -412,6 +412,146 @@ PRODUCT_SURFACE_PATHS = frozenset((
     "docs/product-surface-admission.md",
 ))
 
+# Exact aggregate successor: the ordinary Wave5 pins precede a protected
+# regression-test update. Admission preserves all prior protections and receipts.
+WINE_ARCHIVE_CHAIN_PREVIOUS = "db9629b187e0dbfd2ae0e0deb341249283965717"
+WINE_ARCHIVE_CHAIN_PATH = "evidence/config-transitions/wine-archive-chain/acceptance.json"
+WINE_ARCHIVE_CHAIN_PATHS = frozenset((
+    "bin/game-launch-reliability-update", "tests/test_game_delivery_order.py",
+    "manifests/games-hub.json", "manifests/wine-runtime-overlay.json", "manifests/wine-runtime-update.json",
+    "lib/config_transition_source.py", "tests/test_config_transition_source.py",
+    "tests/test_current_source_checkpoint.py", "docs/wine-archive-chain-admission.md",
+))
+
+# Durable namespace identity: aggregate the unchanged routine Wine prefix,
+# then admit only the separately reviewed custody and admission source delta.
+CUSTODY_NAMESPACE_PREVIOUS = "f96b6a78f68a58635f018dbca8271ca8981d47a1"
+CUSTODY_NAMESPACE_PATH = "evidence/config-transitions/custody-namespace/acceptance.json"
+CUSTODY_NAMESPACE_PATHS = frozenset((
+    "lib/vendor_fixture_custody.py", "tests/test_custody_namespace.py",
+    "docs/custody-namespace.md", "docs/custody-namespace-admission.md",
+    "lib/config_transition_source.py", "tests/test_config_transition_source.py",
+    "tests/test_current_source_checkpoint.py",
+    "bin/ds3-runtime", "bin/game-launch-reliability-update", "bin/games-runtime-update",
+    "bin/wine-runtime-overlay", "docs/wine-runtime-overlay.md",
+    "manifests/ds3-renderer-update.json", "manifests/game-launch-reliability.json",
+    "manifests/games-hub.json", "manifests/wine-runtime-overlay.json",
+    "manifests/wine-runtime-update.json", "tests/test_ds3_native_borderless_launch.py",
+    "tests/test_ds3_renderer.py", "tests/test_game_archive_renderer.py",
+    "tests/test_game_archive_schema4.py", "tests/test_renderer_launch_bridge.py",
+))
+
+SCOPED_READINESS_PREVIOUS = "ab3763f701974c2262a8fb2e579ed426f5bce0dd"
+SCOPED_READINESS_PATH = "evidence/config-transitions/scoped-readiness/acceptance.json"
+SCOPED_READINESS_PATHS = frozenset((
+    "docs/games-hub.md", "docs/game-launch-reliability-update.md",
+    "docs/wine-runtime-overlay.md", "docs/windows-host-ssh-client.md",
+    "AGENTS.md",
+    "ARCHITECTURE.md",
+    "bin/workstation-guidance-successor",
+    "docs/harness-operations.md",
+    "docs/maintenance.md",
+    "docs/operation-readiness.md",
+    "docs/owner-first-delivery-recovery.md",
+    "docs/quarantine-delivery.md",
+    "docs/root-runtime-delivery.md",
+    "docs/scoped-readiness-admission.md",
+    "docs/shell-nofile.md",
+    "docs/wave-games.md",
+    "docs/wave-offramp.md",
+    "docs/wave-ssh.md",
+    "docs/workstation-guidance-delivery.md",
+    "lib/config_transition_source.py",
+    "lib/quarantine_delivery.py",
+    "lib/root_delivery.py",
+    "lib/workstation_guidance_delivery.py",
+    "lib/workstation_maintenance_delivery.py",
+    "manifests/harness-hook-retirement.json",
+    "manifests/workstation-guidance-successor.json",
+    "skills/manage-workstation/SKILL.md",
+    "skills/manage-workstation/recovery/owner-first-v1.md",
+    "tests/test_config_transition_source.py",
+    "tests/test_current_source_checkpoint.py",
+    "tests/test_operation_readiness.py",
+    "tests/test_quarantine_delivery.py",
+    "tests/test_root_delivery.py",
+    "tests/test_workstation_guidance_delivery.py",
+    "tests/test_workstation_maintenance_delivery.py",
+))
+
+# Exact native launch source admission; namespace protection is unchanged.
+# Includes every actual post-checkpoint edge, retaining the already admitted
+# RustDesk/renderer prefix rather than pretending 64fdb5d was a checkpoint.
+NATIVE_LAUNCH_PREVIOUS = "a0bd1e9af3d1bf2ba5426762ede54b4bee3e4445"
+NATIVE_LAUNCH_PATH = "evidence/config-transitions/native-launch-admission/acceptance.json"
+NATIVE_LAUNCH_PATHS = frozenset((
+    'bin/cs2-play',
+    'bin/ds3-runtime',
+    'bin/game-launch-admission',
+    'bin/game-native-admission-plan',
+    'bin/game-native-admission-update',
+    'bin/games-play',
+    'bin/rustdesk-ssh-tunnel',
+    'docs/ds3-native-renderer.md',
+    'docs/game-native-launch-admission.md',
+    'docs/native-launch-source-admission.md',
+    'docs/rustdesk-ssh-tunnel.md',
+    'lib/config_transition_source.py',
+    'lib/game_launch_native/BUILD.md',
+    'lib/game_launch_native/README.md',
+    'lib/game_launch_native/binding/native_launch_binding.py',
+    'lib/game_launch_native/native-identity/native_identity.py',
+    'lib/game_launch_native/native-identity/prefix_identity.py',
+    'lib/game_launch_native/native-identity/prefix_probe.c',
+    'lib/game_launch_native/native-identity/probe.c',
+    'lib/game_native_admission_assets.py',
+    'lib/game_native_admission_bridge.py',
+    'lib/game_native_admission_capability.py',
+    'lib/game_native_admission_transaction.py',
+    'manifests/ds3-renderer-update.json',
+    'manifests/game-native-launch-admission.json',
+    'manifests/rustdesk-ssh-tunnel.json',
+    'manifests/wine-runtime-update.json',
+    'tests/test_config_transition_source.py',
+    'tests/test_ds3_native_renderer.py',
+    'tests/test_ds3_virtual_fullscreen.py',
+    'tests/test_game_native_admission_assets.py',
+    'tests/test_game_native_admission_bridge.py',
+    'tests/test_game_native_admission_capability.py',
+    'tests/test_game_native_admission_transaction.py',
+    'tests/test_game_native_admission_update.py',
+    'tests/test_native_admission.py',
+    'tests/test_native_admission_layout.py',
+    'tests/test_native_admission_plan.py',
+    'tests/test_rustdesk_ssh_tunnel.py',
+))
+
+NATIVE_SERVER_ALIAS_PREVIOUS = "46e3a690096b6f89f2ca09a23e8c9e668fb6bbc0"
+NATIVE_SERVER_ALIAS_PATH = "evidence/config-transitions/native-server-alias/acceptance.json"
+NATIVE_SERVER_ALIAS_PATHS = frozenset((
+    'bin/cs2-play',
+    'bin/ds3-runtime',
+    'bin/game-launch-admission',
+    'bin/game-native-admission-plan',
+    'bin/game-native-admission-update',
+    'bin/games-play',
+    'docs/game-native-launch-admission.md',
+    'lib/config_transition_source.py',
+    'lib/game_launch_native/binding/native_launch_binding.py',
+    'lib/game_native_admission_assets.py',
+    'lib/game_native_admission_bridge.py',
+    'lib/game_native_admission_transaction.py',
+    'manifests/game-native-launch-admission.json',
+    'manifests/wine-runtime-update.json',
+    'tests/test_config_transition_source.py',
+    'tests/test_game_native_admission_assets.py',
+    'tests/test_game_native_admission_bridge.py',
+    'tests/test_game_native_admission_update.py',
+    'tests/test_native_admission.py',
+    'tests/test_native_admission_layout.py',
+    'tests/test_native_admission_plan.py',
+))
+
 # Payload doctors report the current reviewed manifest; they are not source
 # admission, broker or trust authorities. Their July versions are history,
 # not a permanent constraint on future reviewed app versions/preferences.
@@ -485,7 +625,22 @@ def policy_updates(anchor):
                 "paths": SCHEDULER_DESCRIPTOR_REPAIR_PATHS, "after": owner_first_wave_policy(anchor)},
             PRODUCT_SURFACE_PATH: {
                 "previous_commit": PRODUCT_SURFACE_PREVIOUS,
-                "paths": PRODUCT_SURFACE_PATHS, "after": owner_first_wave_policy(anchor)}}
+                "paths": PRODUCT_SURFACE_PATHS, "after": owner_first_wave_policy(anchor)},
+            WINE_ARCHIVE_CHAIN_PATH: {
+                "previous_commit": WINE_ARCHIVE_CHAIN_PREVIOUS,
+                "paths": WINE_ARCHIVE_CHAIN_PATHS, "after": owner_first_wave_policy(anchor)},
+            CUSTODY_NAMESPACE_PATH: {
+                "previous_commit": CUSTODY_NAMESPACE_PREVIOUS,
+                "paths": CUSTODY_NAMESPACE_PATHS, "after": owner_first_wave_policy(anchor)},
+            SCOPED_READINESS_PATH: {
+                "previous_commit": SCOPED_READINESS_PREVIOUS,
+                "paths": SCOPED_READINESS_PATHS, "after": owner_first_wave_policy(anchor)},
+            NATIVE_LAUNCH_PATH: {
+                "previous_commit": NATIVE_LAUNCH_PREVIOUS,
+                "paths": NATIVE_LAUNCH_PATHS, "after": owner_first_wave_policy(anchor)},
+            NATIVE_SERVER_ALIAS_PATH: {
+                "previous_commit": NATIVE_SERVER_ALIAS_PREVIOUS,
+                "paths": NATIVE_SERVER_ALIAS_PATHS, "after": owner_first_wave_policy(anchor)}}
 
 
 def import_scope(before, after):

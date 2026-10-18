@@ -77,6 +77,14 @@ def operation_ready(commit,operation,checks,target_guard):
     module=importlib.util.module_from_spec(importlib.util.spec_from_loader(loader.name,loader));loader.exec_module(module)
     return module.ready(CONTROL,commit,operation,checks=checks,target_guard=target_guard)
 
+def renderer_archive_view(root,commit,old_commit):
+    # Reuse the exact renderer proof owned by the launch archive adapter.
+    path=Path(__file__).absolute().parent/'game-launch-reliability-update'
+    loader=importlib.machinery.SourceFileLoader('renderer_archive_successor',str(path))
+    module=importlib.util.module_from_spec(importlib.util.spec_from_loader(loader.name,loader));loader.exec_module(module)
+    return module.renderer_successor(root,commit,old_commit)
+
+
 def source_gate(commit,engine=None,root=None,action='apply'):
     source_check(commit);need(engine is not None and root is not None,'operation_targets_required')
     definition=engine.decode(root.read('payload/update-policy.json')[0])
@@ -117,7 +125,9 @@ def source_gate(commit,engine=None,root=None,action='apply'):
             root.validate_namespace()
             if root.exists('state/transaction/journal.json'):
                 tx=transaction()
-                for key,rel in tx.targets.items():need(root.read(rel) in tuple(tx.images[key].values()),'target_unknown_drift')
+                endpoint_root=root
+                if action=='archive-applied':endpoint_root,_=renderer_archive_view(root,commit,tx.plan['acceptedCommit'])
+                for key,rel in tx.targets.items():need(endpoint_root.read(rel) in tuple(tx.images[key].values()),'target_unknown_drift')
         return True
     checks={'payload-owner':owner,'recovery':recovery}
     if not recovery_action:
@@ -166,13 +176,14 @@ def build_delivery(engine,root,commit,definition,policy,publish=False):
     if definition['schema']==3:
         dm=engine.decode(root.read('ds3/manifest.json')[0])
         old=engine.decode(root.read('ds3/policy-source/overlay-policy.json')[0])
-        if dm.get('schema')==3 and old.get('lifecycleSha256')!=digest(root.read('ds3/ds3-runtime')[0]):
+        if dm.get('schema') in (3,4) and old.get('lifecycleSha256')!=digest(root.read('ds3/ds3-runtime')[0]):
             # Launch deployment changes the helper before the overlay. Bind
             # its complete settled transition instead of erasing old ancestry.
             with launch_bridge(root,commit,'settled') as proof:
                 proof.revalidate()
                 need(proof.installed_lifecycle==root.read('ds3/ds3-runtime')[0],'launch_bridge_lifecycle_drift')
                 kwargs['predecessor_lifecycle']=proof.before_lifecycle
+                if dm.get('schema')==4:kwargs['launch_proof']=proof
                 result=build()
                 proof.revalidate()
                 return result
@@ -498,6 +509,7 @@ def archive_prepared(engine,root,current_commit,old_commit,expected_plan,termina
         source_gate(current_commit,engine,root,'archive-applied' if terminal_applied else 'archive-rolled-back' if terminal_rolled_back else 'archive-prepared')
         fresh=lambda _: local_gate(engine,root,current_commit)
         fresh(current_commit)
+        endpoint_root=root
         if terminal:
             need(pin(old_commit,40) and old_commit != current_commit,'distinct_old_source_commit_required')
             git=['/usr/bin/git','-c','core.hooksPath=/dev/null','-C',CONTROL]
@@ -512,8 +524,8 @@ def archive_prepared(engine,root,current_commit,old_commit,expected_plan,termina
                 def read(self,rel,**kwargs):
                     if rel == 'payload/policy.json':return historical_policy,root.read(rel)[1]
                     if rel == 'payload/source-hub-v1.json':return historical_source,root.read(rel)[1]
-                    return root.read(rel,**kwargs)
-                def __getattr__(self,name):return getattr(root,name)
+                    return endpoint_root.read(rel,**kwargs)
+                def __getattr__(self,name):return getattr(endpoint_root,name)
             transaction_root=HistoricalRoot()
         else:
             archive_source_ancestry(engine,root,old_commit,current_commit)
@@ -535,6 +547,9 @@ def archive_prepared(engine,root,current_commit,old_commit,expected_plan,termina
                 need(set(os.listdir(fd)) == expected,'archive_requires_no_stages')
                 check()
         def exact_prepared():
+            nonlocal endpoint_root
+            renderer_proof=None
+            if terminal_applied:endpoint_root,renderer_proof=renderer_archive_view(root,current_commit,old_commit)
             root.validate_namespace()
             raw,mode=root.read('state/transaction/plan.json')
             need((0 if terminal else engine.MAX_METADATA_BYTES) < len(raw) <= engine.MAX_PLAN_BYTES and mode == 0o600,'archive_not_large_plan_repair')
@@ -544,11 +559,14 @@ def archive_prepared(engine,root,current_commit,old_commit,expected_plan,termina
             tx.preflight(mixed=False)
             need(tx.side(exact_side),'archive_requires_complete_after' if terminal_applied else 'archive_requires_complete_before')
             for name in ('hub','ds3'):
-                need(engine.tree_rows(root,name+'/runtime') == tx.plan['runtimeRows'][name][exact_side],
+                need(engine.tree_rows(endpoint_root,name+'/runtime') == tx.plan['runtimeRows'][name][exact_side],
                      'archive_runtime_not_before')
             # Fresh gates are observations, not a lease on journal/inventory.
             # Re-read the exact records after the gate, before claiming prepared.
             prepared_records(tx)
+            if terminal_applied:
+                _,after_proof=renderer_archive_view(root,current_commit,old_commit)
+                need(after_proof==renderer_proof,'renderer_archive_proof_drift')
             return tx
         exact_prepared()
         # Capture the bound source directory identity before creating archive
@@ -578,10 +596,10 @@ def archive_prepared(engine,root,current_commit,old_commit,expected_plan,termina
                 if terminal:
                     # The final local gate can expose drift. Recheck the entire
                     # old installed closure after it, not just the journal.
-                    tx.preflight(mixed=False)
+                    tx=exact_prepared()
                     need(tx.side(exact_side),'archive_requires_complete_after' if terminal_applied else 'archive_requires_complete_before')
                     for name in ('hub','ds3'):
-                        need(engine.tree_rows(root,name+'/runtime') == tx.plan['runtimeRows'][name][exact_side],
+                        need(engine.tree_rows(endpoint_root,name+'/runtime') == tx.plan['runtimeRows'][name][exact_side],
                              'archive_runtime_not_after' if terminal_applied else 'archive_runtime_not_before')
                     prepared_records(tx)
                     source_check();destination_check()

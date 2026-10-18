@@ -1,0 +1,106 @@
+#!/usr/bin/python3
+"""Private read-only native admission preparation. No apply, launch or approval publication."""
+import sys
+sys.dont_write_bytecode=True
+import argparse,hashlib,importlib.util,json,os,pwd,re,stat
+from pathlib import Path
+HERE=Path(__file__).resolve().parent.parent
+if str(HERE) not in sys.path:sys.path.insert(0,str(HERE))
+HOME=Path(pwd.getpwuid(os.getuid()).pw_dir)
+DS3=HOME/'Library/Application Support/Adapted Games DS3'
+HUB=HOME/'Library/Application Support/Adapted Games'
+CS2=HOME/'Library/Application Support/CS2 Standalone'
+TARGETS={'admission.helper':HOME/'AIDev/bin/game-launch-admission',
+         'hub.launcher':HUB/'games-play','cs2.launcher':CS2/'cs2-play',
+         'ds3.lifecycle':DS3/'ds3-runtime','hub.receipt':HUB/'receipt.json',
+         'cs2.receipt':CS2/'runtime/.owner.json','ds3.manifest':DS3/'manifest.json',
+         'ds3.receipt':DS3/'receipt.json','ds3.borderlessReceipt':DS3/'borderless/receipt.json'}
+SOURCES={'admission.helper':'bin/game-launch-admission','hub.launcher':'bin/games-play',
+         'cs2.launcher':'bin/cs2-play','ds3.lifecycle':'bin/ds3-runtime'}
+
+def sha(raw):return hashlib.sha256(raw).hexdigest()
+def enc(value):return (json.dumps(value,sort_keys=True,indent=2)+'\n').encode()
+def need(ok,reason):
+ if not ok:raise RuntimeError(reason)
+
+def bridge():
+ path=HERE/'lib/game_native_admission_bridge.py';spec=importlib.util.spec_from_file_location('native_bridge_planning',path);module=importlib.util.module_from_spec(spec);spec.loader.exec_module(module);return module
+
+def read(path,max_size=64*1024*1024):
+ path=Path(path);need(path.is_absolute() and '..' not in path.parts,'canonical_input_path')
+ for parent in (*reversed(path.parents),path.parent):
+  s=parent.lstat();need(stat.S_ISDIR(s.st_mode) and s.st_uid in (0,os.getuid()) and not s.st_mode&0o022,'unsafe_input_directory')
+ fd=os.open(path,os.O_RDONLY|os.O_NOFOLLOW|os.O_NONBLOCK)
+ try:
+  before=os.fstat(fd);need(stat.S_ISREG(before.st_mode) and before.st_uid==os.getuid() and before.st_nlink==1 and not before.st_mode&0o022 and before.st_size<=max_size,'unsafe_input_file')
+  with os.fdopen(os.dup(fd),'rb') as f:raw=f.read()
+  facts=lambda s:(s.st_dev,s.st_ino,s.st_mode,s.st_uid,s.st_nlink,s.st_size,s.st_mtime_ns,s.st_ctime_ns)
+  need(facts(before)==facts(os.fstat(fd))==facts(path.lstat()),'input_changed')
+  return raw,stat.S_IMODE(before.st_mode)
+ finally:os.close(fd)
+
+def prepare(commit):
+ need(type(commit) is str and re.fullmatch('[0-9a-f]{40}',commit),'commit_required')
+ b=bridge();intent=json.loads((HERE/'manifests/game-native-launch-admission.json').read_bytes())
+ for rel,expected in intent['sourceFiles'].items():need(sha(read(HERE/rel)[0])==expected,'source_binding_changed')
+ before={name:read(path) for name,path in TARGETS.items()}
+ old_manifest=json.loads(before['ds3.manifest'][0]);override=old_manifest.get('rendererOverride',{})
+ need(override.get('policySha256')==intent['preserveRendererPolicySha256'],'renderer_package_changed')
+ need(sha(before['ds3.lifecycle'][0])==intent['previousLifecycleSha256'],'lifecycle_predecessor_changed')
+ after={name:(read(HERE/rel)[0],before[name][1]) for name,rel in SOURCES.items()}
+ ds_before={name:before['ds3.'+{'lifecycle':'lifecycle','manifest':'manifest','receipt':'receipt','borderlessReceipt':'borderlessReceipt'}[name]][0] for name in b.TARGETS}
+ policy={'schema':1,'id':'ds3-native-admission-bridge','owner':b.OWNER,'previousLifecycleSha256':sha(ds_before['lifecycle']),
+         'lifecycleSha256':sha(after['ds3.lifecycle'][0]),'admissionSha256':sha(after['admission.helper'][0]),'sourceManifestSha256':sha(ds_before['manifest'])}
+ if intent.get('companionGeneration')==2:
+  need(sha(ds_before['manifest'])==intent['previousManifestSha256']
+       and old_manifest.get('launchAdmissionOverride')==intent['previousAdmissionOverride'],'admission_predecessor_changed')
+  need(sha(before['admission.helper'][0])==intent['previousAdmissionOverride']['admissionSha256'],
+       'admission_predecessor_helper')
+  need(b.verify(DS3,old_manifest)==intent['previousLifecycleSha256'],'admission_predecessor_proof')
+  policy.update(schema=2,previousAdmission=intent['previousAdmissionOverride'])
+ ds_after=b.derive(ds_before,policy,commit,after['ds3.lifecycle'][0])
+ for name,raw in ds_after.items():after['ds3.'+name]=(raw,b.MODES[name])
+ hub=json.loads(before['hub.receipt'][0]);cs2=json.loads(before['cs2.receipt'][0])
+ need(hub.get('owner')=='control-games-hub' and hub.get('launcherSha256')==sha(before['hub.launcher'][0]),'hub_receipt_preimage')
+ need(cs2.get('owner')=='control-cs2-standalone' and cs2.get('launcherSha256')==sha(before['cs2.launcher'][0]),'cs2_receipt_preimage')
+ after['hub.receipt']=(enc(dict(hub,launcherSha256=sha(after['hub.launcher'][0]),launchAdmissionSha256=sha(after['admission.helper'][0]),launchReliabilityCommit=commit)),before['hub.receipt'][1])
+ after['cs2.receipt']=(enc(dict(cs2,launcherSha256=sha(after['cs2.launcher'][0]),launcherCommit=commit)),before['cs2.receipt'][1])
+ for rel,expected in intent['preserveRuntimeHashes'].items():need(sha(read(DS3/'runtime'/rel)[0])==expected,'renderer_runtime_drift')
+ target=DS3/'profiles/ds3/drive_c/Program Files (x86)/Steam/steamapps/common/DARK SOULS III/Game/DarkSoulsIII.exe'
+ need(sha(read(target,256*1024*1024)[0])==intent['nativeRoute']['targetSha256'],'native_target_changed')
+ from lib import game_native_admission_capability as capability
+ capability_after=capability.derive(intent,_test_home=HOME)
+ approval=capability.b.decode(capability_after['approval']);routes=capability_after['routes']
+ capability_before={key:capability.optional(path) for key,path in capability.layout(HOME)[2].items()}
+ need(all(read(TARGETS[name])==before[name] for name in TARGETS),'prestate_changed_while_planning')
+ report={'schema':1,'state':intent['state'],'blocker':intent['blocker'],'sourceOnly':True,
+         'provisionalCommit':commit,'mustRegenerateForAcceptedSource':True,'policySha256':sha(enc(intent)),
+         'ds3BridgePolicySha256':sha(b.json_bytes(policy)),
+         'targets':{name:{'beforeSha256':sha(before[name][0]),'afterSha256':sha(after[name][0]),'mode':after[name][1]} for name in TARGETS},
+         'capabilityBeforeSha256':{key:None if raw is None else sha(raw) for key,raw in capability_before.items()},
+         'approvalCandidateSha256':sha(capability_after['approval']),'routeCandidateSha256':sha(routes),
+         'rendererTreeSha256':json.loads(ds_before['receipt'])['runtimeTreeSha256'],
+         'rendererPackageUnchanged':True,'nativeApprovalPublished':False,'liveAcceptance':False,'publicationAdapterImplemented':intent.get('publicationAdapterImplemented',False)}
+ return report,before,after,policy,approval,routes
+
+def private_output(path):
+ output=Path(path).absolute()
+ need('..' not in output.parts and not output.exists() and not output.is_symlink(),'fresh_private_output_required')
+ for managed in (HERE,HOME/'AIDev',DS3,HUB,CS2):need(output!=managed and managed not in output.parents,'managed_output_forbidden')
+ for parent in reversed(output.parents):
+  facts=parent.lstat();need(stat.S_ISDIR(facts.st_mode) and facts.st_uid in (0,os.getuid()) and not facts.st_mode&0o022,'unsafe_output_directory')
+ return output
+
+def main():
+ p=argparse.ArgumentParser(description=__doc__);p.add_argument('--commit',default='0'*40);p.add_argument('--output',required=True,type=Path);args=p.parse_args()
+ report,before,after,policy,approval,routes=prepare(args.commit)
+ output=private_output(args.output);output.mkdir(mode=0o700)
+ def save(name,raw):
+  path=output/name;fd=os.open(path,os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW,0o600)
+  with os.fdopen(fd,'wb') as f:f.write(raw);f.flush();os.fsync(f.fileno())
+ for side,images in (('before',before),('after',after)):
+  for name,(raw,mode) in images.items():save(name+'.'+side,raw)
+ save('plan.json',enc(report));save('ds3-bridge-policy.json',bridge().json_bytes(policy));save('approval-candidate.json',bridge().json_bytes(approval));save('native-applications.routes.candidate',routes)
+ print(json.dumps({'output':str(output),'state':report['state'],'planSha256':sha(enc(report)),'publishedToManagedState':False},indent=2))
+
+if __name__=='__main__':main()

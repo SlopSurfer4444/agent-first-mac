@@ -320,11 +320,10 @@ def native(operation, install_bundle=None, emergency_bundle=None):
         verify_bundles(release, install_bundle, emergency_bundle, uid)
         return {'status': 'BUNDLES_VERIFIED', 'releaseID': RELEASE_ID, 'installed': False,
             'sourceAdmissionClaimed': False}
-    if operation in ('stage', 'handoff'):
-        # current-doctor executes operation_check before its vendor sentinel.
-        # Complete full readiness first, then hold a fresh Git-only source guard
-        # around staging, as the existing maintenance delivery adapter does.
-        admitted_source(full=True)
+    # Staging/handoff consume sealed bundle and root-contract observations,
+    # not vendor CLI schema capability. Held source admission below spans the
+    # work; native_health and the owner-authenticated typed installer remain
+    # independent requirements and are never replaced by source admission.
     results = []
     def operation_check(head, *, source_guard):
         need(source_guard() is True, 'source_drift')

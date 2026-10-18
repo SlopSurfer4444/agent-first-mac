@@ -1,0 +1,180 @@
+#!/usr/bin/python3
+"""Fixed DS3 native Admission successor; never launches or stops a game."""
+import sys
+sys.dont_write_bytecode=True
+import argparse,contextlib,fcntl,hashlib,importlib.machinery,json,os,pwd,stat,subprocess
+from pathlib import Path
+HERE=Path(__file__).absolute().parent.parent
+if str(HERE) not in sys.path:sys.path.insert(0,str(HERE))
+from lib import game_native_admission_bridge as b
+from lib import game_native_admission_capability as cap
+HOME=Path(pwd.getpwuid(os.getuid()).pw_dir);CONTROL=HOME/'AIDev/control'
+DS3=HOME/'Library/Application Support/Adapted Games DS3';CS2=HOME/'Library/Application Support/CS2 Standalone';HUB=HOME/'Library/Application Support/Adapted Games'
+STATE=HOME/'AIDev/state';POLICY='manifests/game-native-launch-admission.json'
+
+def command(argv,timeout=30,env=None):
+ result=subprocess.run([str(x) for x in argv],capture_output=True,timeout=timeout,env=env)
+ b.need(result.returncode==0 and len(result.stdout)+len(result.stderr)<=2*1024*1024,'native_delivery_command_failed');return result.stdout
+
+def source_check(commit):
+ b.need(HERE==CONTROL and Path(__file__).absolute()==CONTROL/'bin/game-native-admission-update' and b.pinned(commit,40),'canonical_source_required')
+ git=['/usr/bin/git','-c','core.hooksPath=/dev/null','-C',CONTROL]
+ b.need(command(git+['rev-parse','HEAD']).decode().strip()==commit and command(git+['branch','--show-current']).decode().strip()=='main' and command(git+['status','--porcelain'])==b'','clean_exact_main_required')
+ intent=b.decode(b._read(CONTROL/POLICY))
+ b.need(intent.get('publicationAdapterImplemented') is True and intent.get('state')=='SOURCE_CANDIDATE','native_source_not_prepared')
+ for rel,pin in intent['sourceFiles'].items():
+  b.need(type(rel) is str and '..' not in Path(rel).parts and not Path(rel).is_absolute() and b.sha(b._read(CONTROL/rel,limit=b.MAX_IMAGE))==pin,'native_source_pin_changed')
+ return intent
+
+@contextlib.contextmanager
+def locks():
+ held=[];identities=[]
+ try:
+  # Matches the existing CS2 launcher and shared game delivery adapter.
+  for path in (CS2/'.launcher.lock',STATE/'games-hub.lock'):
+   parent=b._directory(path.parent)
+   try:fd=os.open(path.name,os.O_RDONLY|os.O_NOFOLLOW,dir_fd=parent)
+   except BaseException:os.close(parent);raise
+   held.append((fd,parent));facts=os.fstat(fd)
+   b.need(stat.S_ISREG(facts.st_mode) and facts.st_uid==os.getuid() and facts.st_nlink==1 and not facts.st_mode&0o077,'native_delivery_lock')
+   try:fcntl.flock(fd,fcntl.LOCK_EX|fcntl.LOCK_NB)
+   except BlockingIOError:raise RuntimeError('launcher_busy') from None
+   identities.append((path,facts.st_dev,facts.st_ino))
+  def bound():
+   for path,dev,ino in identities:
+    facts=path.lstat();b.need(stat.S_ISREG(facts.st_mode) and (facts.st_dev,facts.st_ino)==(dev,ino),'native_delivery_lock_changed')
+   return True
+  yield bound;bound()
+ finally:
+  for fd,parent in reversed(held):os.close(fd);os.close(parent)
+
+def no_request():
+ path=STATE/'game-launch-pending.json'
+ b.need(not path.exists() and not path.is_symlink(),'native_launch_reservation_pending');return True
+
+def runtime(intent):
+ for rel,pin in intent['preserveRuntimeHashes'].items():b.need(b.sha(b._read(DS3/'runtime'/rel,limit=b.MAX_IMAGE))==pin,'native_runtime_changed')
+ b.need(b.sha(b._read(DS3/'runtime/engine/bin/wineserver',limit=b.MAX_IMAGE))==intent['preserveServerSha256'],'native_server_changed')
+ target=DS3/'profiles/ds3/drive_c/Program Files (x86)/Steam/steamapps/common/DARK SOULS III/Game/DarkSoulsIII.exe'
+ b.need(b.sha(b._read(target,limit=256*1024*1024))==intent['nativeRoute']['targetSha256'],'native_target_changed');return True
+
+def inactive(intent,verify_runtime=True):
+ if verify_runtime:runtime(intent)
+ no_request();server=DS3/'runtime/engine/bin/wineserver'
+ env={'HOME':str(HOME),'PATH':'/usr/bin:/bin:/usr/sbin:/sbin','WINEPREFIX':str(DS3/'profiles/ds3'),'WINESERVER':str(server),'DYLD_FALLBACK_LIBRARY_PATH':str(DS3/'runtime/Frameworks')+':/usr/lib'}
+ try:command([server,'-w'],timeout=3,env=env)
+ except subprocess.TimeoutExpired:raise RuntimeError('ds3_prefix_active') from None
+ return True
+
+def owner():
+ for path,wanted in ((HUB/'receipt.json','control-games-hub'),(DS3/'receipt.json','control-ds3-marshal-fix'),(CS2/'runtime/.owner.json','control-cs2-standalone')):b.need(b.decode(b._read(path)).get('owner')==wanted,'native_payload_owner')
+ return True
+
+def planner():return importlib.machinery.SourceFileLoader('native_admission_fixed_planner',str(CONTROL/'bin/game-native-admission-plan')).load_module()
+
+# Publication is connected below after the fixed transaction module is loaded.
+def operate(operation,commit,expected=None,payload=None):
+ from lib import game_native_admission_assets as assets
+ from lib import game_native_admission_transaction as transaction
+ intent=source_check(commit)
+ from lib import game_operation_readiness as ready
+ immutable=[DS3/'runtime'/rel for rel in intent['preserveRuntimeHashes']] + [DS3/'runtime/engine/bin/wineserver',DS3/'profiles/ds3/drive_c/Program Files (x86)/Steam/steamapps/common/DARK SOULS III/Game/DarkSoulsIII.exe']
+ immutable_guard=ready.bound(lambda:ready.metadata(immutable))
+ with locks() as lock_guard:
+  def local():
+   lock_guard();b.need(source_check(commit)==intent,'native_policy_changed');b.need(immutable_guard() is True,'native_runtime_drift');inactive(intent,verify_runtime=False);return True
+  def recovery():
+   no_request()
+   for namespace in STATE.glob('.game-native-admission-*'):
+    if namespace.name=='.game-native-admission-'+commit:continue
+    journal=b.decode(b._read(namespace/'journal.json'))
+    b.need(journal.get('owner')==b.OWNER and journal.get('phase')=='complete','other_native_recovery_required')
+   own=STATE/('.game-native-admission-'+commit)
+   if own.exists():
+    b.need(b.pinned(expected) and b.sha(b._read(own/'reviewed-plan.json'))==expected,'native_recovery_plan_required')
+   return True
+  nodes=[*transaction.target_paths().values(),*cap.layout()[2].values()]
+  target_guard=ready.bound(lambda:ready.metadata(nodes))
+  checks={'payload-owner':owner,'recovery':recovery}
+  if operation in ('plan','apply','return'):checks['wine-target']=lambda:inactive(intent)
+  else:inactive(intent)
+  observation=ready.ready(CONTROL,commit,'wine-recovery' if operation in ('rollback','recover') else 'wine-install',checks=checks,target_guard=target_guard)
+  b.need(observation.get('scopedCandidateReady') is True,'native_scoped_readiness_required');local()
+  # The adapter accepts one reviewed exact plan; no general path or target list.
+  return _publish(operation,commit,expected,payload,intent,local,assets,transaction)
+
+def _publish(operation,commit,expected,payload,intent,local,assets,transaction):
+ state=STATE/('.game-native-admission-'+commit)
+ current_policy=b.sha(planner().enc(intent))
+ def required_assets():
+  local();assets.verify_assets(intent);return True
+ if not state.exists() and not state.is_symlink():
+  report,before,after,bridge_policy,_,_=planner().prepare(commit)
+  raw=planner().enc(report);pin=b.sha(raw)
+  if operation=='plan':return {'state':'PLANNED_READ_ONLY','planSha256':pin,'changed':False,'launchPerformed':False}
+  b.need(operation in ('apply','recover') and expected==pin,'reviewed_native_plan_required')
+  b.need(payload is not None,'native_asset_payload_required')
+  assets.publish(intent,payload,commit,local,lambda _:None)
+  tx=transaction.prepare(commit,before,after,bridge_policy,reviewed_plan=raw,expected_plan_sha256=expected,guard=required_assets)
+ else:
+  b.need(b.pinned(expected),'reviewed_native_plan_required')
+  # A fully prepared global image set can precede proof publication after an interruption.
+  internal=b.decode(b._read(state/'plan.json'))
+  proof=b.proof_directory(DS3,commit,internal['bridgePolicy']['schema'])
+  if not proof.exists() and not proof.is_symlink():
+   b.need(operation!='plan','native_recovery_required')
+   raw=b._read(state/'reviewed-plan.json');b.need(b.sha(raw)==expected,'native_reviewed_plan_changed')
+   before={key:(b._read(state/(key+'.before'),0o600,b.MAX_IMAGE),transaction.MODES[key]) for key in transaction.KEYS}
+   after={key:(b._read(state/(key+'.after'),0o600,b.MAX_IMAGE),transaction.MODES[key]) for key in transaction.KEYS}
+   tx=transaction.prepare(commit,before,after,internal['bridgePolicy'],reviewed_plan=raw,expected_plan_sha256=expected,guard=required_assets)
+  else:tx=transaction.load(commit,expected,guard=required_assets)
+  report=tx.plan
+  b.need(report['policySha256']==current_policy,'native_source_policy_changed')
+  if operation=='plan':return {'state':'PLANNED_RETAINED_TRANSACTION','planSha256':expected,'changed':False,'launchPerformed':False}
+ report=tx.plan
+ b.need(report['policySha256']==current_policy,'native_source_policy_changed')
+ for key,rel in planner().SOURCES.items():b.need(tx.after[key][0]==b._read(CONTROL/rel,limit=b.MAX_IMAGE),'native_after_source_changed')
+ capability=cap.Transaction(commit,intent,required_assets)
+ wanted=capability.after
+ b.need(b.sha(wanted['approval'])==report['approvalCandidateSha256'] and b.sha(wanted['routes'])==report['routeCandidateSha256'],'native_capability_plan_changed')
+ if not capability.directory.exists() and not capability.directory.is_symlink():capability.prepare(report['capabilityBeforeSha256'])
+ cap_record,cap_files=capability.read()
+ b.need({key:None if raw is None else b.sha(raw) for key,raw in cap_files['before'].items()}==report['capabilityBeforeSha256'],'native_capability_before_changed')
+ # Every parent component validates the same held prerequisites. No external path is recorded or executed.
+ def held():
+  required_assets();_,images=capability.read()
+  b.need(all(cap.optional(path) in (images['before'][key],images['after'][key]) for key,path in capability.targets.items()),'native_capability_third_state')
+  return True
+ tx.guard=held;capability.guard=required_assets
+ journal=tx.verify();direction='before' if operation=='rollback' else 'after'
+ if operation=='recover':
+  if cap_record['phase']=='running':
+   direction=cap_record['direction']
+   b.need(journal['phase']!='running' or cap_record['direction']=='after' and journal['direction']=='after','native_cross_component_recovery')
+  elif journal['phase']=='running':direction=journal['direction']
+  elif cap_record['phase']=='complete' and cap_record['direction']=='before':direction='before'
+  else:direction=journal['direction']
+ elif journal['phase']=='running' or cap_record['phase']=='running':raise RuntimeError('native_recover_required')
+ changed=False
+ if direction=='before':
+  changed=capability.run('before',recover=cap_record['phase']=='running' or operation=='recover' and cap_record['direction']==direction) or changed
+  journal=tx.verify();changed=tx.run('before',recover=journal['phase']=='running' or operation=='recover' and journal['direction']==direction)['changed'] or changed
+ else:
+  # Arm the shared forward direction before core publication, without enabling a route.
+  if cap_record['phase']!='running' and not (cap_record['phase']=='complete' and cap_record['direction']=='after' and journal['phase']=='complete' and journal['direction']=='after'):capability.arm_after()
+  # Approval/route can become active only after all nine source/metadata images are coherent.
+  journal=tx.verify();changed=tx.run('after',recover=journal['phase']=='running' or operation=='recover' and journal['direction']==direction)['changed'] or changed
+  b.need(tx.side('after'),'native_code_not_coherent')
+  cap_record,_=capability.read();changed=capability.run('after',recover=cap_record['phase']=='running' or operation=='recover' and cap_record['direction']==direction) or changed
+ b.need(tx.side(direction),'native_code_postimage');cap_record,images=capability.read()
+ b.need(cap_record['phase']=='complete' and cap_record['direction']==direction and all(cap.optional(path)==images[direction][key] for key,path in capability.targets.items()),'native_capability_postimage')
+ return {'state':'NATIVE_ADMISSION_INSTALLED' if direction=='after' else 'NATIVE_ADMISSION_ROLLED_BACK','planSha256':expected,'changed':changed,'launchPerformed':False,'installedAcceptanceClaimed':False,'liveNativeAcceptanceClaimed':False}
+
+
+def main():
+ os.umask(0o077);p=argparse.ArgumentParser(description=__doc__);p.add_argument('operation',choices=('plan','apply','recover','rollback','return'));p.add_argument('commit');p.add_argument('--plan-sha256');p.add_argument('--payload',type=Path);args=p.parse_args()
+ print(json.dumps(operate(args.operation,args.commit,args.plan_sha256,args.payload),sort_keys=True))
+if __name__=='__main__':
+ try:main()
+ except (OSError,RuntimeError,subprocess.SubprocessError) as error:
+  print(json.dumps({'state':'BLOCKED','reason':str(error) if isinstance(error,RuntimeError) else type(error).__name__,'installedAcceptanceClaimed':False,'launchPerformed':False,'automaticRetryAllowed':False}));sys.exit(1)

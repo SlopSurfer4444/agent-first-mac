@@ -141,7 +141,86 @@ class ConfigTransitionSourceTests(unittest.TestCase):
                 "paths": S.SCHEDULER_DESCRIPTOR_REPAIR_PATHS, "after": S.owner_first_wave_policy(anchor)},
             S.PRODUCT_SURFACE_PATH: {
                 "previous_commit": S.PRODUCT_SURFACE_PREVIOUS,
-                "paths": S.PRODUCT_SURFACE_PATHS, "after": S.owner_first_wave_policy(anchor)}})
+                "paths": S.PRODUCT_SURFACE_PATHS, "after": S.owner_first_wave_policy(anchor)},
+            S.WINE_ARCHIVE_CHAIN_PATH: {
+                "previous_commit": S.WINE_ARCHIVE_CHAIN_PREVIOUS,
+                "paths": S.WINE_ARCHIVE_CHAIN_PATHS, "after": S.owner_first_wave_policy(anchor)},
+            S.CUSTODY_NAMESPACE_PATH: {
+                "previous_commit": S.CUSTODY_NAMESPACE_PREVIOUS,
+                "paths": S.CUSTODY_NAMESPACE_PATHS, "after": S.owner_first_wave_policy(anchor)},
+            S.SCOPED_READINESS_PATH: {
+                "previous_commit": S.SCOPED_READINESS_PREVIOUS,
+                "paths": S.SCOPED_READINESS_PATHS, "after": S.owner_first_wave_policy(anchor)},
+            S.NATIVE_LAUNCH_PATH: {
+                "previous_commit": S.NATIVE_LAUNCH_PREVIOUS,
+                "paths": S.NATIVE_LAUNCH_PATHS, "after": S.owner_first_wave_policy(anchor)},
+            S.NATIVE_SERVER_ALIAS_PATH: {
+                "previous_commit": S.NATIVE_SERVER_ALIAS_PREVIOUS,
+                "paths": S.NATIVE_SERVER_ALIAS_PATHS, "after": S.owner_first_wave_policy(anchor)}})
+
+    def test_scoped_readiness_scope_preserves_game_closure_and_authority(self):
+        self.assertEqual(S.SCOPED_READINESS_PREVIOUS, 'ab3763f701974c2262a8fb2e579ed426f5bce0dd')
+        self.assertEqual(S.SCOPED_READINESS_PATH, 'evidence/config-transitions/scoped-readiness/acceptance.json')
+        rules = S.owner_first_wave_policy({})
+        self.assertEqual(S.policy_updates({})[S.SCOPED_READINESS_PATH]['after'], rules)
+        before = {p: blob(p) for p in rules['protected_paths']}
+        before[S.CUSTODY_NAMESPACE_PATH] = blob('immutable custody acceptance')
+        candidate = dict(before, **{p: blob('scoped ' + p) for p in S.SCOPED_READINESS_PATHS})
+        scope = dict(rules, bootstrap_paths=S.SCOPED_READINESS_PATHS)
+        F.validate_candidate(before, candidate, 'policy', **scope)
+        for path in ('lib/current_source_checkpoint.py', 'lib/operation_readiness.py',
+                     'bin/current-doctor', 'manifests/games-hub.json', 'manifests/trusted-repos.json',
+                     'manifests/workstation-guidance-delivery.json'):
+            with self.subTest(path=path), self.assertRaisesRegex(F.TransitionError, 'unsupported_bootstrap_surface'):
+                F.validate_candidate(before, dict(candidate, **{path: blob('extra')}), 'policy', **scope)
+        with self.assertRaisesRegex(F.TransitionError, 'historical_evidence_changed'):
+            F.validate_candidate(before, dict(candidate, **{S.CUSTODY_NAMESPACE_PATH: blob('changed')}),
+                                 'policy', **scope)
+
+    def test_custody_namespace_scope_preserves_authority_and_prior_evidence(self):
+        self.assertEqual(S.CUSTODY_NAMESPACE_PREVIOUS, "f96b6a78f68a58635f018dbca8271ca8981d47a1")
+        self.assertEqual(S.CUSTODY_NAMESPACE_PATH, "evidence/config-transitions/custody-namespace/acceptance.json")
+        rules = S.owner_first_wave_policy({})
+        self.assertEqual(S.policy_updates({})[S.CUSTODY_NAMESPACE_PATH]['after'], rules)
+        before = {p: blob(p) for p in rules['protected_paths']}
+        before[S.WINE_ARCHIVE_CHAIN_PATH] = blob('immutable wine acceptance')
+        candidate = dict(before, **{p: blob('namespace ' + p) for p in S.CUSTODY_NAMESPACE_PATHS})
+        scope = dict(rules, bootstrap_paths=S.CUSTODY_NAMESPACE_PATHS)
+        F.validate_candidate(before, candidate, 'policy', **scope)
+        for path in ('lib/current_source_checkpoint.py', 'lib/operation_readiness.py',
+                     'bin/current-doctor', 'ARCHITECTURE.md', 'manifests/trusted-repos.json'):
+            with self.subTest(path=path), self.assertRaisesRegex(F.TransitionError, 'unsupported_bootstrap_surface'):
+                F.validate_candidate(before, dict(candidate, **{path: blob('extra')}), 'policy', **scope)
+        with self.assertRaisesRegex(F.TransitionError, 'historical_evidence_changed'):
+            F.validate_candidate(before, dict(candidate, **{S.WINE_ARCHIVE_CHAIN_PATH: blob('changed')}),
+                                 'policy', **scope)
+
+    def test_wine_archive_chain_scope_preserves_protected_contract_and_receipts(self):
+        self.assertEqual(S.WINE_ARCHIVE_CHAIN_PREVIOUS, "db9629b187e0dbfd2ae0e0deb341249283965717")
+        self.assertEqual(S.WINE_ARCHIVE_CHAIN_PATH, "evidence/config-transitions/wine-archive-chain/acceptance.json")
+        expected = {"bin/game-launch-reliability-update", "tests/test_game_delivery_order.py",
+                    "manifests/games-hub.json", "manifests/wine-runtime-overlay.json", "manifests/wine-runtime-update.json",
+                    "lib/config_transition_source.py", "tests/test_config_transition_source.py",
+                    "tests/test_current_source_checkpoint.py", "docs/wine-archive-chain-admission.md"}
+        self.assertEqual(S.WINE_ARCHIVE_CHAIN_PATHS, expected)
+        rules = S.owner_first_wave_policy({})
+        self.assertEqual(S.policy_updates({})[S.WINE_ARCHIVE_CHAIN_PATH]['after'], rules)
+        self.assertIn('tests/test_game_delivery_order.py', rules['protected_paths'])
+        before = {p: blob(p) for p in rules['protected_paths']}
+        before[S.PRODUCT_SURFACE_PATH] = blob('immutable prior acceptance')
+        candidate = dict(before, **{p: blob('wine chain ' + p) for p in expected})
+        scope = dict(rules, bootstrap_paths=expected)
+        F.validate_candidate(before, candidate, 'policy', **scope)
+        with self.assertRaisesRegex(F.TransitionError, 'protected_policy_changed'):
+            F.validate_candidate(before, dict(before, **{'tests/test_game_delivery_order.py': blob('changed')}),
+                                 'configuration', **rules)
+        for path in ('lib/current_source_checkpoint.py', 'lib/game_delivery_bridge.py', 'bin/current-doctor',
+                     'bin/ds3-runtime', 'bin/games-runtime-update', 'manifests/game-launch-reliability.json'):
+            with self.subTest(path=path), self.assertRaisesRegex(F.TransitionError, 'unsupported_bootstrap_surface'):
+                F.validate_candidate(before, dict(candidate, **{path: blob('extra')}), 'policy', **scope)
+        with self.assertRaisesRegex(F.TransitionError, 'historical_evidence_changed'):
+            F.validate_candidate(before, dict(candidate, **{S.PRODUCT_SURFACE_PATH: blob('changed')}),
+                                 'policy', **scope)
 
     def test_product_surface_scope_preserves_runtime_and_previous_acceptance(self):
         self.assertEqual(S.PRODUCT_SURFACE_PREVIOUS, "fac9dd5d7925695c7d0a8b5a3f8af536ef71c3dd")
@@ -1091,6 +1170,144 @@ class OwnerFirstWaveSourceTests(unittest.TestCase):
             route(chain, updates=wrong, rules=before)
         with self.assertRaisesRegex(F.TransitionError, "unregistered_policy_transition"):
             route(chain, rules=before)
+
+
+
+class NativeLaunchAdmissionScope(unittest.TestCase):
+    def test_actual_post_checkpoint_edges_match_the_exact_registration(self):
+        import subprocess
+        root = Path(__file__).resolve().parents[1]
+        def git(*args):
+            return subprocess.check_output(['git', '-C', str(root), *args])
+        def tree(commit):
+            result = {}
+            for row in git('ls-tree', '-rz', commit).split(b'\0'):
+                if row:
+                    meta, name = row.split(b'\t', 1)
+                    mode, kind, identity = meta.decode().split(' ')
+                    self.assertEqual(kind, 'blob')
+                    result[name.decode()] = (mode, identity)
+            return result
+        tip = '96db584aa8a6f90630941e09e1a033883cfcafae'
+        before = tree(S.NATIVE_LAUNCH_PREVIOUS)
+        rules = S.owner_first_wave_policy(before)
+        paths = set()
+        rows = git('rev-list', '--reverse', '--parents', S.NATIVE_LAUNCH_PREVIOUS + '..' + tip).decode().splitlines()
+        self.assertEqual(len(rows), 7)
+        for row in rows:
+            commit, parent = row.split()
+            old, new = tree(parent), tree(commit)
+            paths.update(F.delta(old, new))
+            F.validate_candidate(old, new, 'policy', **dict(rules, bootstrap_paths=S.NATIVE_LAUNCH_PATHS))
+            S.import_scope(old, new)
+        self.assertEqual(paths | {'lib/config_transition_source.py', 'tests/test_config_transition_source.py',
+                                 'docs/native-launch-source-admission.md', 'tests/test_ds3_virtual_fullscreen.py'}, S.NATIVE_LAUNCH_PATHS)
+        with self.assertRaisesRegex(F.TransitionError, 'protected_policy_changed'):
+            F.validate_candidate(tree('64fdb5d1fc98b4d97ff1943c49650ff977f586b8'), tree(tip), 'configuration', **rules)
+
+    def test_exact_registered_transition_preserves_all_successor_rules(self):
+        expected = {
+            'bin/cs2-play',
+            'bin/ds3-runtime',
+            'bin/game-launch-admission',
+            'bin/game-native-admission-plan',
+            'bin/game-native-admission-update',
+            'bin/games-play',
+            'bin/rustdesk-ssh-tunnel',
+            'docs/ds3-native-renderer.md',
+            'docs/game-native-launch-admission.md',
+            'docs/native-launch-source-admission.md',
+            'docs/rustdesk-ssh-tunnel.md',
+            'lib/config_transition_source.py',
+            'lib/game_launch_native/BUILD.md',
+            'lib/game_launch_native/README.md',
+            'lib/game_launch_native/binding/native_launch_binding.py',
+            'lib/game_launch_native/native-identity/native_identity.py',
+            'lib/game_launch_native/native-identity/prefix_identity.py',
+            'lib/game_launch_native/native-identity/prefix_probe.c',
+            'lib/game_launch_native/native-identity/probe.c',
+            'lib/game_native_admission_assets.py',
+            'lib/game_native_admission_bridge.py',
+            'lib/game_native_admission_capability.py',
+            'lib/game_native_admission_transaction.py',
+            'manifests/ds3-renderer-update.json',
+            'manifests/game-native-launch-admission.json',
+            'manifests/rustdesk-ssh-tunnel.json',
+            'manifests/wine-runtime-update.json',
+            'tests/test_config_transition_source.py',
+            'tests/test_ds3_native_renderer.py',
+            'tests/test_ds3_virtual_fullscreen.py',
+            'tests/test_game_native_admission_assets.py',
+            'tests/test_game_native_admission_bridge.py',
+            'tests/test_game_native_admission_capability.py',
+            'tests/test_game_native_admission_transaction.py',
+            'tests/test_game_native_admission_update.py',
+            'tests/test_native_admission.py',
+            'tests/test_native_admission_layout.py',
+            'tests/test_native_admission_plan.py',
+            'tests/test_rustdesk_ssh_tunnel.py',
+}
+        self.assertEqual(S.NATIVE_LAUNCH_PREVIOUS, "a0bd1e9af3d1bf2ba5426762ede54b4bee3e4445")
+        self.assertEqual(S.NATIVE_LAUNCH_PATH, "evidence/config-transitions/native-launch-admission/acceptance.json")
+        self.assertEqual(S.NATIVE_LAUNCH_PATHS, expected)
+        rules = S.owner_first_wave_policy({})
+        registration = S.policy_updates({})[S.NATIVE_LAUNCH_PATH]
+        self.assertEqual(registration, {'previous_commit': S.NATIVE_LAUNCH_PREVIOUS, 'paths': expected, 'after': rules})
+        before = {p: blob(p) for p in rules['protected_paths']}
+        candidate = dict(before, **{p: blob('native source ' + p) for p in expected})
+        F.validate_candidate(before, candidate, 'policy', **dict(rules, bootstrap_paths=expected))
+        with self.assertRaisesRegex(F.TransitionError, 'protected_policy_changed'):
+            F.validate_candidate(before, candidate, 'configuration', **rules)
+        for path in ('lib/operation_readiness.py', 'bin/current-doctor', 'lib/current_source_checkpoint.py', 'policy/root.json', 'skills/unrelated/SKILL.md'):
+            with self.subTest(path=path), self.assertRaisesRegex(F.TransitionError, 'unsupported_bootstrap_surface'):
+                F.validate_candidate(before, dict(candidate, **{path: blob('unrelated')}), 'policy', **dict(rules, bootstrap_paths=expected))
+        for path in ('lib/game_native_admission_transaction.py', 'lib/game_launch_native/binding/native_launch_binding.py'):
+            with self.subTest(future_path=path), self.assertRaisesRegex(F.TransitionError, 'protected_policy_changed'):
+                F.validate_candidate(candidate, dict(candidate, **{path: blob('later ordinary edit')}), 'configuration', **rules)
+
+
+class NativeServerAliasScope(unittest.TestCase):
+    def test_exact_transition_keeps_successor_protection(self):
+        expected = {
+            'bin/cs2-play',
+            'bin/ds3-runtime',
+            'bin/game-launch-admission',
+            'bin/game-native-admission-plan',
+            'bin/game-native-admission-update',
+            'bin/games-play',
+            'docs/game-native-launch-admission.md',
+            'lib/config_transition_source.py',
+            'lib/game_launch_native/binding/native_launch_binding.py',
+            'lib/game_native_admission_assets.py',
+            'lib/game_native_admission_bridge.py',
+            'lib/game_native_admission_transaction.py',
+            'manifests/game-native-launch-admission.json',
+            'manifests/wine-runtime-update.json',
+            'tests/test_config_transition_source.py',
+            'tests/test_game_native_admission_assets.py',
+            'tests/test_game_native_admission_bridge.py',
+            'tests/test_game_native_admission_update.py',
+            'tests/test_native_admission.py',
+            'tests/test_native_admission_layout.py',
+            'tests/test_native_admission_plan.py',
+        }
+        self.assertEqual(len(expected), 21)
+        self.assertEqual(S.NATIVE_SERVER_ALIAS_PREVIOUS, '46e3a690096b6f89f2ca09a23e8c9e668fb6bbc0')
+        self.assertEqual(S.NATIVE_SERVER_ALIAS_PATH, 'evidence/config-transitions/native-server-alias/acceptance.json')
+        self.assertEqual(S.NATIVE_SERVER_ALIAS_PATHS, expected)
+        rules = S.owner_first_wave_policy({})
+        self.assertEqual(S.policy_updates({})[S.NATIVE_SERVER_ALIAS_PATH],
+                         {'previous_commit': S.NATIVE_SERVER_ALIAS_PREVIOUS, 'paths': expected, 'after': rules})
+        before = {p: blob(p) for p in rules['protected_paths']}
+        after = dict(before, **{p: blob('successor ' + p) for p in expected})
+        F.validate_candidate(before, after, 'policy', **dict(rules, bootstrap_paths=expected))
+        with self.assertRaisesRegex(F.TransitionError, 'protected_policy_changed'):
+            F.validate_candidate(before, after, 'configuration', **rules)
+        for path in ('lib/operation_readiness.py', 'lib/current_source_checkpoint.py', 'bin/current-doctor', 'policy/root.json'):
+            with self.subTest(path=path), self.assertRaisesRegex(F.TransitionError, 'unsupported_bootstrap_surface'):
+                F.validate_candidate(before, dict(after, **{path: blob('unrelated')}), 'policy', **dict(rules, bootstrap_paths=expected))
+        with self.assertRaisesRegex(F.TransitionError, 'protected_policy_changed'):
+            F.validate_candidate(after, dict(after, **{'lib/game_native_admission_bridge.py': blob('later edit')}), 'configuration', **rules)
 
 
 if __name__ == "__main__":

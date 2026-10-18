@@ -60,6 +60,8 @@ class DeliveryOrder(LaunchFixture):
                 self.definition['sourceFiles'][rel] = u.digest(raw)
                 self.definition['desiredFiles'][key] = self.image('candidate/' + u.CANDIDATE_FILES[key])
             self.definition['previousNativePolicySha256'] = u.digest(self.native_raw)
+        if hasattr(self, 'intermediate_overlay'):
+            old_policy = self.intermediate_overlay(f, old_policy)
         # Fixture engine uses its own isolated transaction namespace first.
         self.old_commit = 'b' * 40
         self.old_overlay_pin = w.build(f.root, self.old_commit, f.pins[w.PE32], f.pins[w.PE],
@@ -340,8 +342,115 @@ class DownstreamOrder(DeliveryOrder):
         self.assert_archive_refused()
 
 
+class ArchivedChainOrder(DownstreamOrder):
+    middle_commit = 'd' * 40
+
+    def intermediate_overlay(self, f, extended_policy):
+        hm=w.decode(f.root.read('hub/manifest.json')[0]);dm=w.decode(f.root.read('ds3/manifest.json')[0])
+        lifecycle=f.root.read('ds3/ds3-runtime')[0]
+        originals={name:f.root.read('payload/'+name) for name in ('winemac-i386.drv','winemac-x86_64.drv','ds3-runtime','policy.json')}
+        desired={w.PE32:w.digest(b'middle pe32'),w.PE:w.digest(b'middle pe64')}
+        policy=dict(extended_policy,schema=1,desiredPEHashes=desired,lifecycleSha256=w.digest(lifecycle))
+        del policy['desiredRuntimeHashes']
+        f.put('payload/policy.json',w.encode(policy));f.put('payload/ds3-runtime',lifecycle,0o700)
+        f.put('payload/winemac-i386.drv',b'middle pe32');f.put('payload/winemac-x86_64.drv',b'middle pe64')
+        self.middle_history={'manifests/wine-runtime-overlay.json':w.encode(policy),
+                             'manifests/ds3-source-hub-v1.json':f.root.read('payload/source-hub-v1.json')[0],
+                             'bin/ds3-runtime':lifecycle}
+        self.middle_pin=w.build(f.root,self.middle_commit,desired[w.PE32],desired[w.PE],w.digest(w.encode(policy)),source_only=False)['planSha256']
+        w.Transaction(f.root,self.middle_pin,source_only=False,gate=lambda _: {'sourceAccepted':True,'doctorReady':True,'prefixesInactive':True}).run('after')
+        self.middle_dir=self.mapping['state']/a.ARCHIVES/(self.middle_commit+'-'+self.middle_pin)
+        self.put('state/'+a.ARCHIVES+'/owner.json',a.ARCHIVE_OWNER_BYTES)
+        self.middle_dir.mkdir(mode=0o700)
+        (self.middle_dir/'owner.json').write_bytes(a.OWNER_BYTES);(self.middle_dir/'owner.json').chmod(0o600)
+        shutil.copytree(f.path/'state/transaction',self.middle_dir/'transaction',copy_function=shutil.copy2)
+        shutil.rmtree(f.path/'state/transaction')
+        for name,(raw,mode) in originals.items():f.put('payload/'+name,raw,mode)
+        hm=w.decode(f.root.read('hub/manifest.json')[0]);dm=w.decode(f.root.read('ds3/manifest.json')[0])
+        policy=dict(extended_policy,previousHubManifestSha256=w.digest(w.encode(hm)),
+                    previousDS3ManifestSha256=w.digest(w.encode(dm)),previousHubCriticalHashes=hm['criticalHashes'])
+        f.put('payload/policy.json',w.encode(policy));f.policy_sha=w.digest(w.encode(policy))
+        return policy
+
+    def command(self,argv,**kwargs):
+        if argv[0]=='/usr/bin/git':
+            if 'cat-file' in argv and argv[-1]==self.middle_commit:return SimpleNamespace(returncode=0,stdout=b'commit\n')
+            if argv[-2]=='show' and argv[-1].startswith(self.middle_commit+':'):
+                return SimpleNamespace(returncode=0,stdout=self.middle_history[argv[-1].split(':',1)[1]])
+            if 'merge-base' in argv:
+                ranks={self.old_launch_commit:0,self.middle_commit:1,self.old_commit:2,COMMIT:3}
+                good=argv[-2] in ranks and argv[-1] in ranks and ranks[argv[-2]]<=ranks[argv[-1]]
+                return SimpleNamespace(returncode=0 if good else 1,stdout=b'')
+        return super().command(argv,**kwargs)
+
+    def test_chain_complete(self):
+        self.assertTrue(self.archive_launch()['changed'])
+
+    def test_chain_gap(self):
+        shutil.rmtree(self.middle_dir)
+        self.assert_archive_refused()
+
+    def test_chain_prepared_cannot_supply_link(self):
+        p=self.middle_dir/'transaction/journal.json';j=w.decode(p.read_bytes());j['phase']='prepared';p.write_bytes(w.encode(j))
+        self.assert_archive_refused()
+
+    def test_chain_backup_tamper(self):
+        (self.middle_dir/'transaction/hub.pe32.after').write_bytes(b'tamper')
+        self.assert_archive_refused()
+
+    def test_chain_backup_mode_tamper(self):
+        (self.middle_dir/'transaction/hub.pe32.after').chmod(0o700)
+        self.assert_archive_refused()
+
+    def test_chain_mutation_before_rename(self):
+        def mutate(event):
+            if event=='before-archive':(self.middle_dir/'transaction/hub.pe32.after').write_bytes(b'tamper')
+        with self.assertRaises(RuntimeError):
+            u.operate('archive-settled',COMMIT,self.old_launch_pin,mutate,old_commit=self.old_launch_commit)
+        self.assertTrue((self.mapping['state']/u.NAMESPACE/'transaction').is_dir())
+
+    def rebind_middle(self, plan):
+        raw=w.encode(plan);(self.middle_dir/'transaction/plan.json').write_bytes(raw)
+        p=self.middle_dir/'transaction/journal.json';j=w.decode(p.read_bytes());j['planSha256']=w.digest(raw);p.write_bytes(w.encode(j))
+        renamed=self.middle_dir.parent/(self.middle_commit+'-'+w.digest(raw));self.middle_dir.rename(renamed);self.middle_dir=renamed
+
+    def test_chain_other_overlap_tamper(self):
+        p=self.middle_dir/'transaction/hub.pe32.after';p.write_bytes(b'forged but rebound')
+        plan=w.decode((self.middle_dir/'transaction/plan.json').read_bytes())
+        plan['targets']['hub.pe32']['after']['sha256']=w.digest(p.read_bytes());self.rebind_middle(plan)
+        self.assert_archive_refused()
+
+    def test_chain_runtime_rows_tamper(self):
+        plan=w.decode((self.middle_dir/'transaction/plan.json').read_bytes())
+        plan['runtimeRows']['hub']['after'][0][2]='0'*64;self.rebind_middle(plan)
+        self.assert_archive_refused()
+
+    def test_chain_ambiguous(self):
+        neighbor=self.middle_dir.parent/('e'*40+'-'+'f'*64);shutil.copytree(self.middle_dir,neighbor)
+        self.assert_archive_refused()
+
+    def test_chain_malformed_archive(self):
+        (self.middle_dir/'transaction/plan.json').write_bytes(b'[]')
+        with self.assertRaisesRegex(u.Blocked,'downstream_archive_schema'):self.archive_launch()
+
+    def test_chain_wrong_ancestry(self):
+        original=self.command
+        def command(argv,**kwargs):
+            if 'merge-base' in argv and self.middle_commit in argv:
+                return SimpleNamespace(returncode=1,stdout=b'')
+            return original(argv,**kwargs)
+        with patch.object(u.subprocess,'run',side_effect=command):self.assert_archive_refused()
+
+    def test_chain_prepared_neighbor_not_used(self):
+        neighbor=self.middle_dir.parent/('e'*40+'-'+'f'*64)
+        shutil.copytree(self.middle_dir,neighbor)
+        p=neighbor/'transaction/journal.json';j=w.decode(p.read_bytes());j['phase']='prepared';p.write_bytes(w.encode(j))
+        self.assertTrue(self.archive_launch()['changed'])
+
 def load_tests(loader, tests, pattern):
     return unittest.TestSuite([DeliveryOrder(name) for name in loader.getTestCaseNames(DeliveryOrder)
                               if name.startswith('test_order_')] +
                              [DownstreamOrder(name) for name in loader.getTestCaseNames(DownstreamOrder)
-                              if name.startswith('test_downstream_')])
+                              if name.startswith('test_downstream_')] +
+                             [ArchivedChainOrder(name) for name in loader.getTestCaseNames(ArchivedChainOrder)
+                              if name.startswith('test_chain_')])

@@ -33,6 +33,33 @@ app does not become a prerequisite for editing a project or fixing another
 component. Scheduler installation and an actual scheduled cycle are separate
 from source availability and unit tests.
 
+## Review the boundaries, not only the happy path
+
+The 2026-10-18 source snapshot includes the scoped guidance successor and
+delivery consumers for scheduler, quarantine file delivery and root bundle
+staging. Their affected-source and exact-target checks must not be confused
+with the explicit full vendor-compatibility diagnostic. Quarantine file
+delivery is not permission to execute unknown code; staging a root bundle is
+not installation or a privilege grant. Inspect the actual callers as well as
+the shared readiness API: an unused scoped API cannot remove a blocking caller.
+
+Custody records now include reboot/namespace handling. Retaining unknown
+material rather than adopting or deleting it is intentional; unnecessary global
+blocking, unrecoverable retained state and routine manual intervention remain
+valid review questions. Distinguish cooperative same-user recovery from a
+security boundary against a hostile process with the same user identity.
+
+The optional RustDesk tunnel is a fixed loopback SSH adapter. Its source and
+mocked tests are included; its private host declaration and actual authentication
+state are not. Socket/listener checks do not prove screen or input usability.
+
+This public tree omits the installed operational skill, host manifests and
+private acceptance history. The example skill is illustrative, not a copy of
+the installed skill. Findings about source control flow can be grounded here;
+claims about the owner's current live policy or installation require separate
+evidence. Missing excluded inputs are publication limitations, not by themselves
+proof that the installed harness is broken.
+
 ## Changes and recovery
 
 Bind a change to one target, one primary owner and a bounded recovery path. Reuse
