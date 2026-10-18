@@ -2,6 +2,7 @@
 """Stable independent game entry points; no automatic Ubisoft Steam login."""
 import sys
 sys.dont_write_bytecode = True
+sys.pycache_prefix = "/dev/null"
 import contextlib, fcntl, hashlib, json, os, pwd, re, socket, stat, subprocess
 from pathlib import Path
 HOME = Path(pwd.getpwuid(os.getuid()).pw_dir)

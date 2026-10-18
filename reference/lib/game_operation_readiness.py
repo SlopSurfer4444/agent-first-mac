@@ -17,7 +17,7 @@ def ready(control, commit, operation, *, checks, target_guard):
     control = Path(control)
     if str(control) not in sys.path:
         sys.path.insert(0, str(control))
-    from lib.operation_readiness import require_scoped_operation_ready
+    from lib.user_operation_readiness import require_scoped_operation_ready
     return require_scoped_operation_ready(control, operation, commit,
                                          checks=checks, target_guard=target_guard)
 

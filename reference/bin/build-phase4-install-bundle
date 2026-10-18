@@ -30,6 +30,7 @@ SOURCE_FILES = (
     "Sources/AidAdminBootstrap/main.swift",
     "Sources/AidAdminBootstrapCore/AidAdminBootstrapCore.swift",
     "Sources/AidAdminCore/AidAdminCore.swift",
+    "Sources/AidAdminCore/GitObservation.swift",
     "Sources/AidAdminCore/OperationJournal.swift",
     "Sources/AidAdminCore/ResumeLaunchd.swift",
     "Sources/AidAdminCore/ResumeHomeManager.swift",

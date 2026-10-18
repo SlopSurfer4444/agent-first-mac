@@ -2,6 +2,7 @@
 """Offline, fixture-only Wine overlay transaction candidate. No live route."""
 import sys
 sys.dont_write_bytecode = True
+sys.pycache_prefix = "/dev/null"
 import argparse
 import contextlib
 import copy

@@ -2,6 +2,7 @@
 """Build and migrate four fixed Finder apps; no command starts a game."""
 import sys
 sys.dont_write_bytecode = True
+sys.pycache_prefix = "/dev/null"
 import fcntl, hashlib, importlib.machinery, importlib.util, json, os, plistlib, pwd, re, shutil, stat, subprocess, tempfile
 from pathlib import Path
 HOME = Path(pwd.getpwuid(os.getuid()).pw_dir)
@@ -132,8 +133,9 @@ def source_gate(commit,action='apply',recovery_check=None):
     need(HERE == CONTROL and Path(__file__).absolute() == CONTROL/'bin/game-app-launchers','canonical_source_required')
     need(type(commit) is str and re.fullmatch('[0-9a-f]{40}',commit),'invalid_commit')
     def exact():
-        git=['/usr/bin/git','-c','core.hooksPath=/dev/null','-C',CONTROL]
-        need(run(git+['rev-parse','HEAD']).decode().strip() == commit and run(git+['branch','--show-current']).decode().strip() == 'main' and not run(git+['status','--porcelain']),'clean_exact_main_required')
+        sys.path.insert(0,str(CONTROL))
+        from lib.scoped_source_admission import check
+        check(CONTROL,commit,entrypoints=('bin/game-app-launchers',))
     exact()
     bridge=module_bridge()
     nodes=[HUB,DS3,HOME/'Games',HOME/'AIDev/state']

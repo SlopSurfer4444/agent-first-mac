@@ -38,6 +38,10 @@ def main():
         "HZF9JMC8YN",
         "hdiutil attach -readonly -nobrowse -noverify",
         "/usr/bin/ditto",
+        'default = "preserve";',
+        'lib.types.enum [ "preserve" "install" "remove" ]',
+        'if test "$action" = preserve; then',
+        '${if action == "install" then rustDeskDmg else ""}',
     ):
         require(needle in module, "module_" + needle)
     for forbidden in ("tccutil", "defaults write", "--password", "--config", "$HOME"):

@@ -244,6 +244,7 @@ public final class BootstrapInstaller {
     public static let disabledSudoersPath = "/etc/sudoers.d/agent-first-mac-aid-admin.disabled"
     private static let bootstrapRoot = "/var/db/agent-first-mac/bootstrap"
     private static let journalPath = bootstrapRoot + "/active.json"
+    private static let retainedPreparations = bootstrapRoot + "/retained-preparations"
     private static let token = "@@AGENT_OWNER@@"
     private static let cleanEnvironment = [
         "HOME": "/var/empty", "LANG": "C", "LC_ALL": "C",
@@ -285,7 +286,16 @@ public final class BootstrapInstaller {
                                          options: .regularExpression) != nil, "transaction_identifier")
             transaction.staging = Self.bootstrapRoot + "/transaction-" + identifier
             try require(!exists(transaction.staging), "transaction_already_exists_UNKNOWN")
+            // Preparation has no target writes. Publish intent before allocation
+            // so even interrupted copies can be preserved without blocking a
+            // later authenticated attempt or adopting partial executable bytes.
+            transaction.phase = "preparing"
+            try saveJournal(transaction)
+            try hooks.afterMutation(step: "preparation-intent")
             try ensureDirectory(transaction.staging, mode: 0o700, state: &transaction)
+            try hooks.afterMutation(step: "preparation-directory-created")
+            try saveJournal(transaction)
+            try hooks.afterMutation(step: "preparation-directory-recorded")
 
             let stagedInputs = transaction.staging + "/install-inputs.json"
             try copyReviewedSource(request.inputsPath, to: stagedInputs,
@@ -351,6 +361,7 @@ public final class BootstrapInstaller {
                 transaction.post[target] = try trustedFileSnapshot(publication, mode: mode)
             }
             transaction.mutationStarted = true
+            transaction.phase = "prepared"
             for target in transaction.files.keys {
                 var parent = URL(fileURLWithPath: target).deletingLastPathComponent().path
                 while parent != "/" {
@@ -422,7 +433,9 @@ public final class BootstrapInstaller {
                     throw BootstrapFailure.rejected(original + "_rollback_failed")
                 }
             }
-            try? cleanupStaging(state: &transaction, success: false)
+            // Preparation bytes may be partial or foreign. Preserve them under
+            // the recorded private namespace; never recursively delete them.
+            if exists(Self.journalPath) { _ = try? reconcileLocked() }
             throw error
         }
     }
@@ -524,7 +537,25 @@ public final class BootstrapInstaller {
                     "bootstrap_emergency_revocation_UNKNOWN")
         guard exists(Self.journalPath) else {
             let entries = try FileManager.default.contentsOfDirectory(atPath: physical(Self.bootstrapRoot))
-            try require(entries.isEmpty, "bootstrap_orphan_UNKNOWN")
+            try require(entries.allSatisfy { ["retained-preparations", "active.json.next"].contains($0) },
+                        "bootstrap_orphan_UNKNOWN")
+            if entries.contains("active.json.next") {
+                // No directory allocation or live mutation can precede the
+                // first published journal. Preserve even partial candidate bytes
+                // as data, never interpret them as a recovery command.
+                _ = try readTrustedFile(Self.journalPath + ".next", mode: 0o400, maximum: 128 * 1024)
+                var retention = TransactionState()
+                try ensureDirectory(Self.retainedPreparations, mode: 0o700, state: &retention)
+                let destination = Self.retainedPreparations + "/unpublished-" + UUID().uuidString.lowercased() + ".json"
+                try require(renameatx_np(AT_FDCWD, physical(Self.journalPath + ".next"), AT_FDCWD,
+                                        physical(destination), UInt32(RENAME_EXCL)) == 0,
+                            "preparation_unpublished_retention_UNKNOWN")
+                try syncParent(Self.journalPath)
+                try syncParent(destination)
+            }
+            if entries.contains("retained-preparations") {
+                try validateDirectory(Self.retainedPreparations, mode: 0o700)
+            }
             return "NO_INTERRUPTED_INSTALL"
         }
         do {
@@ -532,6 +563,9 @@ public final class BootstrapInstaller {
             var state = try JSONDecoder().decode(TransactionState.self, from: bytes)
             let encoder = JSONEncoder(); encoder.outputFormatting = [.sortedKeys]
             try require(try encoder.encode(state) == bytes, "journal_noncanonical_UNKNOWN")
+            if state.phase == "preparing" {
+                return try retainInterruptedPreparation(state)
+            }
             let targets = Set([Self.binaryPath, Self.policyPath, Self.attestationPath, Self.sudoersPath])
             try require(state.schema == 1 && state.mutationStarted &&
                         ["prepared", "committed", "rolled-back"].contains(state.phase) &&
@@ -575,6 +609,58 @@ public final class BootstrapInstaller {
         } catch {
             throw BootstrapFailure.rejected("bootstrap_recovery_UNKNOWN_" + String(describing: error))
         }
+    }
+
+    /// No preparation content is executed, adopted or deleted. The durable
+    /// intent owns only this UUID namespace; exact directory identity is held
+    /// once available. A crash between mkdir and identity publication can retain
+    /// an empty private directory but cannot infer ownership of populated state.
+    private func retainInterruptedPreparation(_ state: TransactionState) throws -> String {
+        try require(state.schema == 1 && !state.mutationStarted && state.files.isEmpty &&
+                    state.post.isEmpty && state.stagedFiles.isEmpty &&
+                    state.directoryStaging.isEmpty && state.boundDirectories.isEmpty &&
+                    state.staging.range(of: "^" + Self.bootstrapRoot + "/transaction-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", options: .regularExpression) != nil &&
+                    Set(state.createdDirectories).isSubset(of: [state.staging]) &&
+                    Set(state.directoryIdentities.keys).isSubset(of: [state.staging]),
+                    "preparation_intent_UNKNOWN")
+        var retention = TransactionState()
+        try ensureDirectory(Self.retainedPreparations, mode: 0o700, state: &retention)
+        let name = URL(fileURLWithPath: state.staging).lastPathComponent
+        let retained = Self.retainedPreparations + "/" + name
+        let retainedJournal = retained + ".json"
+        try require(!exists(retainedJournal), "preparation_retention_collision_UNKNOWN")
+        if exists(state.staging) {
+            try require(!exists(retained), "preparation_retention_collision_UNKNOWN")
+            try validateDirectory(state.staging, mode: 0o700)
+            if state.directoryIdentities[state.staging] != nil {
+                try validateDirectoryIdentity(state.staging, state: state)
+            } else {
+                try require(try FileManager.default.contentsOfDirectory(atPath: physical(state.staging)).isEmpty,
+                            "preparation_unrecorded_contents_UNKNOWN")
+            }
+            try require(renameatx_np(AT_FDCWD, physical(state.staging), AT_FDCWD,
+                                    physical(retained), UInt32(RENAME_EXCL)) == 0,
+                        "preparation_retention_move_UNKNOWN")
+            try syncParent(state.staging)
+            try syncParent(retained)
+            try hooks.afterMutation(step: "preparation-retained")
+        } else if exists(retained) {
+            try validateDirectory(retained, mode: 0o700)
+            if state.directoryIdentities[state.staging] != nil {
+                try validateDirectoryIdentity(retained, state: state, expectedPath: state.staging)
+            } else {
+                try require(try FileManager.default.contentsOfDirectory(atPath: physical(retained)).isEmpty,
+                            "preparation_unrecorded_contents_UNKNOWN")
+            }
+        } else {
+            try require(state.directoryIdentities.isEmpty, "preparation_directory_missing_UNKNOWN")
+        }
+        try require(renameatx_np(AT_FDCWD, physical(Self.journalPath), AT_FDCWD,
+                                physical(retainedJournal), UInt32(RENAME_EXCL)) == 0,
+                    "preparation_intent_retention_UNKNOWN")
+        try syncParent(Self.journalPath)
+        try syncParent(retainedJournal)
+        return "INTERRUPTED_PREPARATION_RETAINED"
     }
 
     private func matches(_ path: String, _ snapshot: FileSnapshot) throws -> Bool {
@@ -816,16 +902,22 @@ public final class BootstrapInstaller {
         defer { Darwin.close(fd) }
         try require(fchown(fd, context.trustedUID, context.trustedGID) == 0 &&
                     fchmod(fd, mode) == 0, "exclusive_write_owner_mode")
+        let preparationFile = logical.hasPrefix(Self.bootstrapRoot + "/transaction-") ||
+            logical == Self.journalPath + ".next"
+        let name = URL(fileURLWithPath: logical).lastPathComponent
+        if preparationFile { try hooks.afterMutation(step: "preparation-file-created-" + name) }
         var offset = 0
         while offset < data.count {
             let count = data.withUnsafeBytes { raw -> Int in
                 guard let base = raw.baseAddress else { return -1 }
-                return Darwin.write(fd, base.advanced(by: offset), raw.count - offset)
+                return Darwin.write(fd, base.advanced(by: offset), min(raw.count - offset, 64 * 1024))
             }
             try require(count > 0, "exclusive_write")
             offset += count
+            if preparationFile { try hooks.afterMutation(step: "preparation-file-written-" + name) }
         }
         try require(fsync(fd) == 0, "exclusive_write_sync")
+        if preparationFile { try hooks.afterMutation(step: "preparation-file-synced-" + name) }
     }
 
     private func trustedFileSnapshotIfPresent(_ logical: String, mode: mode_t) throws -> FileSnapshot {
@@ -946,7 +1038,7 @@ public final class BootstrapInstaller {
                 try require(rmdir(physical(state.staging)) == 0, "staging_directory_retire")
                 try syncParent(state.staging)
             } else {
-                try FileManager.default.removeItem(atPath: physical(state.staging))
+                throw BootstrapFailure.rejected("preparation_requires_retention")
             }
         }
         let keepOnSuccess = Set(["/etc/sudoers.d", "/etc/agent-first-mac",

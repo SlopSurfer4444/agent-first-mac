@@ -311,13 +311,13 @@ class Directory:
             os.close(self.entries.pop()[0])
 
 
-def read_at(directory, name, private=False):
+def read_at(directory, name, private=False, *, allow_empty=False):
     directory.verify()
     fd = os.open(name, FILE_FLAGS, dir_fd=directory.fd)
     try:
         facts = os.fstat(fd)
         require(stat.S_ISREG(facts.st_mode) and facts.st_uid == os.getuid()
-                and facts.st_nlink == 1 and 0 < facts.st_size <= LIMIT
+                and facts.st_nlink == 1 and (0 if allow_empty else 1) <= facts.st_size <= LIMIT
                 and stat.S_IMODE(facts.st_mode) in ((0o600,) if private else (0o600, 0o644)),
                 "file_metadata")
         raw = os.read(fd, LIMIT + 1)
@@ -329,6 +329,18 @@ def read_at(directory, name, private=False):
         return raw, identity(facts)
     finally:
         os.close(fd)
+
+
+def native_snapshot(directory):
+    """Observe optional native configuration without creating or parsing it.
+
+    Absent and empty files are valid owner states, not missing permission.
+    Unsafe objects and changes during a read remain refusals.
+    """
+    if not has_file(directory, "config.toml"):
+        directory.verify()
+        return None
+    return read_at(directory, "config.toml", allow_empty=True)
 
 
 def write_new(directory, name, raw, mode=0o600):
@@ -642,6 +654,33 @@ def _sources():
             (ROOT / "manifests/sessionstart-exposure.json").read_bytes())
 
 
+def default_cycle(home, owner, action):
+    """Select a default cycle without skipping an unfinished operation.
+
+    Explicit caller IDs never enter this route. Completed journals remain
+    immutable; a new disable gets the next numbered directory after restore.
+    """
+    operation = "hooks"
+    for number in range(2, 10002):
+        if not has_file(owner, operation):
+            return operation
+        prior = Directory(home, RECOVERY + (operation,))
+        try:
+            if not has_file(prior, "restored.json"):
+                return operation
+            raw, _ = read_at(prior, "restored.json", True)
+            require(wire(parse(raw)) == wire({"schema": 1, "status": "RESTORED"}), "recovery_record")
+            require(has_file(prior, "active.json"),
+                    "recovery_record_incomplete")
+        finally:
+            prior.close()
+        following = "hooks-" + str(number)
+        if not has_file(owner, following) and action == "restore":
+            return operation
+        operation = following
+    raise OfframpError("recovery_cycle_limit")
+
+
 def execute(home, action, *, admission, operation="hooks", link_witness=None,
             plan_action="remove", before_publish=None, after_publish=None):
     """Actual scoped file adapter. Admission is an owning operation observer,
@@ -650,7 +689,7 @@ def execute(home, action, *, admission, operation="hooks", link_witness=None,
     """
     require(action in ACTIONS + ("restore", "status", "plan"), "action_refused")
     require(plan_action in ACTIONS, "action_refused")
-    require(type(operation) is str and re.fullmatch(r"[a-z][a-z0-9-]{0,47}", operation) is not None,
+    require(operation is None or type(operation) is str and re.fullmatch(r"[a-z][a-z0-9-]{0,47}", operation) is not None,
             "operation_id")
     require(callable(admission), "admission_required")
     manifest, historical = _sources()
@@ -667,7 +706,7 @@ def execute(home, action, *, admission, operation="hooks", link_witness=None,
             report["sourceAdmissionChecked"] = False
             report["machineMutationAuthorized"] = False
             if scope == "remove":
-                rows = passive_preflight(home, manifest, link_witness=link_witness, operation=operation)
+                rows = passive_preflight(home, manifest, link_witness=link_witness, operation=operation or "hooks")
                 report["passiveTargets"] = [{"id": row["id"], "status": row["status"]} for row in rows]
                 report["globalGuidance"] = "RETAINED_EXTERNAL_GUIDE"
                 report["harnessRemovalComplete"] = False
@@ -695,6 +734,10 @@ def execute(home, action, *, admission, operation="hooks", link_witness=None,
             except Exception:
                 return False
         require(custody_guard(), "custody_drift")
+        if operation is None:
+            operation = default_cycle(home, recovery_owner, action)
+        def reported(report):
+            return dict(report, operationId=operation)
         recovery = Directory(home, RECOVERY + (operation,), create=True)
         require(stat.S_IMODE(os.fstat(recovery.fd).st_mode) == 0o700, "recovery_not_private")
         before, stamp = read_at(target, "hooks.json")
@@ -703,9 +746,9 @@ def execute(home, action, *, admission, operation="hooks", link_witness=None,
                 require(not any(has_file(recovery, name) for name in (
                     "publication.json", "applied.json", "restoration-publication.json")),
                     "recovery_record_incomplete")
-                return {"schema": 1, "status": "PREPARATION_ABORTED_NO_MUTATION",
+                return reported({"schema": 1, "status": "PREPARATION_ABORTED_NO_MUTATION",
                         "targetChanged": False, "recoveryRetained": True,
-                        "newOperationRequired": True, "nativeTrustChanged": False}
+                        "newOperationRequired": True, "nativeTrustChanged": False})
             journal, _ = read_at(recovery, "active.json", True)
             record = parse(journal)
             require(type(record) is dict and set(record) == {
@@ -726,27 +769,32 @@ def execute(home, action, *, admission, operation="hooks", link_witness=None,
                     and plan.removed == record["removed"], "recovery_corrupt")
             outcome = interrupted_publication(target, recovery, plan)
             if outcome == "PUBLICATION_NOT_APPLIED":
-                return {"schema": 1, "status": outcome, "targetChanged": False,
+                return reported({"schema": 1, "status": outcome, "targetChanged": False,
                         "recoveryRetained": True, "newOperationRequired": True,
-                        "nativeTrustChanged": False}
+                        "nativeTrustChanged": False})
             restoration_outcome = interrupted_restoration(target, recovery)
             if restoration_outcome == "RESTORATION_NOT_APPLIED":
-                return {"schema": 1, "status": restoration_outcome, "targetChanged": False,
+                return reported({"schema": 1, "status": restoration_outcome, "targetChanged": False,
                         "recoveryRetained": True, "targetedRecoveryRequired": True,
-                        "nativeTrustChanged": False}
+                        "nativeTrustChanged": False})
             after = restore_plan(before, plan)
         else:
             plan = build_plan(before, manifest, historical, action)
             if plan.removed == 0 and action != "remove":
-                return plan.public_report()
+                return reported(plan.public_report())
             after = plan.after
         passive = passive_preflight(home, manifest, recovery, restore=action == "restore",
                                     link_witness=link_witness) if (
             action == "remove" or action == "restore" and plan.action == "remove") else []
-        if action == "restore" and after == before and not any(r["status"] == "OWNED" for r in passive):
+        already_restored = action == "restore" and after == before and not any(
+            r["status"] == "OWNED" for r in passive)
+        if already_restored and has_file(recovery, "restored.json"):
+            marker, _ = read_at(recovery, "restored.json", True)
+            require(wire(parse(marker)) == wire({"schema": 1, "status": "RESTORED"}),
+                    "recovery_record")
             report = plan.public_report()
             report["status"] = "ALREADY_RESTORED"
-            return report
+            return reported(report)
         def guard():
             try:
                 current, current_stamp = read_at(target, "hooks.json")
@@ -782,11 +830,19 @@ def execute(home, action, *, admission, operation="hooks", link_witness=None,
                 return False
         admission(guard, recovery_guard)
         require(guard() and recovery_guard(), "preimage_drift")
+        if already_restored:
+            # Publication can have completed before its completion marker.
+            # Reconcile exact restored bytes and retained recovery under the
+            # ordinary guards; do not leave the default cycle permanently busy.
+            write_record(recovery, "restored.json", wire({"schema": 1, "status": "RESTORED"}))
+            report = plan.public_report()
+            report["status"] = "ALREADY_RESTORED"
+            return reported(report)
         if after != before:
             publish(target, before, stamp, after, recovery, restoring=action == "restore", before_publish=before_publish,
                     after_publish=after_publish, mutation_guard=lambda: custody_guard() and recovery_guard())
         passive_reports = passive_apply(home, passive, recovery, restore=action == "restore")
-        write_new(recovery, "restored.json" if action == "restore" else "applied.json",
+        write_record(recovery, "restored.json" if action == "restore" else "applied.json",
                   wire({"schema": 1, "status": "RESTORED" if action == "restore" else "APPLIED"}))
         report = plan.public_report()
         report["status"] = "RESTORED" if action == "restore" else "APPLIED"
@@ -798,7 +854,7 @@ def execute(home, action, *, admission, operation="hooks", link_witness=None,
         report["globalGuidance"] = "RETAINED_EXTERNAL_GUIDE"
         report["retainedScope"] = list(RETAINED_SCOPE)
         report["residualScope"] = list(RESIDUAL_SCOPE)
-        return report
+        return reported(report)
     finally:
         if lock is not None:
             os.close(lock)
@@ -832,16 +888,15 @@ def execute_live(action, commit, operation="hooks", plan_action="remove"):
     After that accepted live-source cutover, an unrelated vendor compatibility
     failure does not block this scoped exit. Nothing edits native consent.
     """
-    from lib.operation_readiness import require_scoped_operation_ready
+    from lib.user_operation_readiness import require_scoped_operation_ready
     home = Path.home()
     require(ROOT == home / "AIDev/control" and Path.cwd() == ROOT, "canonical_source")
     native = Directory(home, (".codex",))
     try:
-        native_before, native_stamp = read_at(native, "config.toml")
+        native_before = native_snapshot(native)
         def native_unchanged():
             try:
-                raw, stamp = read_at(native, "config.toml")
-                return raw == native_before and stamp == native_stamp
+                return native_snapshot(native) == native_before
             except Exception:
                 return False
         def admission(guard, recovery_guard):
@@ -869,7 +924,7 @@ def main(arguments=None, emit=print):
         group = parser.add_mutually_exclusive_group(required=True)
         group.add_argument("--fixture-home", type=Path)
         group.add_argument("--live-commit")
-        parser.add_argument("--operation", default="hooks")
+        parser.add_argument("--operation", default=None)
         parser.add_argument("--scope", choices=ACTIONS, default="remove")
         args = parser.parse_args(arguments)
         report = execute_fixture(args.fixture_home, args.action, operation=args.operation,

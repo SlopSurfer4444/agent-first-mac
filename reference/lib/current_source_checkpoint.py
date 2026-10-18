@@ -227,6 +227,27 @@ def admit(observation, head, current, binding, rules, updates):
         # this final tree may stage policy deltas. They MUST close at that receipt.
         registered = [(p, u) for p, u in updates.items()
                       if u["previous_commit"] == previous and p in current and p not in trees[previous]]
+        # Schema-2 policy reviews use the same exact aggregate/bundle proof as
+        # root-target review. The immutable legacy registry remains for old
+        # schema-1 decisions; future policy repairs need no named code entry.
+        # A record only opens candidate staging here, NEVER routine admission.
+        # Its exact delta, observed review/recovery bundle and sole child are
+        # still independently verified below before advancing the checkpoint.
+        generic = []
+        for future in rows:
+            future_receipt = future["receipt"]
+            if future_receipt is None or future_receipt["path"] in updates:
+                continue
+            decision = parse_receipt(future_receipt["raw"], future_receipt["path"])
+            if (decision["schema"] == 2 and decision["kind"] == "policy"
+                    and decision["previous_commit"] == previous):
+                changed = set(decision["changes"])
+                F.require(any(p in active_rules["protected_paths"]
+                    or p.startswith(active_rules["protected_prefixes"]) for p in changed),
+                    "policy_review_requires_protected_delta")
+                generic.append((future_receipt["path"], {
+                    "previous_commit": previous, "paths": changed, "after": active_rules}))
+        registered += generic
         F.require(len(registered) <= 1, "ambiguous_checkpoint_policy")
         kind = "policy" if registered else "configuration"
         scope = dict(active_rules, bootstrap_paths=registered[0][1]["paths"]) if registered else active_rules

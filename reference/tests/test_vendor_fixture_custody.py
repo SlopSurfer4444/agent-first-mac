@@ -40,7 +40,7 @@ class CustodyTests(unittest.TestCase):
                 slot, root, consumed = self.generated(custody)
                 self.assertEqual(custody.census(), (634, 326))
                 custody.seal_output(slot, consumed)
-                self.assertEqual(custody.records()[slot]['schema'], 2)
+                self.assertEqual(custody.records()[slot]['schema'], 3)
                 self.assertEqual(len(custody.records()[slot]['output']), 326)
                 custody.retire(slot)
                 self.assertFalse(root.exists())
@@ -71,7 +71,8 @@ class CustodyTests(unittest.TestCase):
                     with patch.object(C, 'MAX_OUTPUT_ENTRIES', 10 if case == 'entries' else 1024), \
                             patch.object(C, 'MAX_OUTPUT_BYTES', 1 if case == 'bytes' else 16 * 1024 * 1024):
                         with self.assertRaises(C.CustodyError): custody.seal_output(slot, consumed)
-                    self.assertEqual(custody.records()[slot]['schema'], 1)
+                    self.assertEqual(custody.records()[slot]['schema'], 3)
+                    self.assertIsNone(custody.records()[slot]['output'])
                     self.assertTrue(target.exists())
 
     def test_generated_retained_schema1_is_never_adopted_after_restart(self):
@@ -158,7 +159,9 @@ class CustodyTests(unittest.TestCase):
                     elif case == 'mode': value['schema/v2/Type0.json'][2] |= 0o4000
                     elif case == 'parent': value['schema/v2'] = []
                     else: value.pop('schema/' + C.SCHEMAS[0])
-                    custody.update(slot, output=value)
+                    record = custody.records()[slot]
+                    record['output'] = value
+                    (Path(d)/C.NAMESPACE/(str(slot)+'.json')).write_text(json.dumps(record))
                     with self.assertRaises(C.CustodyError): custody.retire(slot)
                     self.assertTrue((root/'schema/v2/Type0.json').exists())
 
@@ -284,7 +287,7 @@ raise SystemExit(C.main(sys.argv[2:]))
                         else:
                             with self.assertRaises(C.CustodyError):
                                 custody.reserve()
-                            self.assertTrue((Path(d)/C.NAMESPACE/'0.json.pending').exists())
+                            self.assertEqual(len(list((Path(d)/C.NAMESPACE).glob('.prepare-*.payload'))), 1)
 
     def test_uncertain_record_descriptor_close_retains_owner_without_retry(self):
         with tempfile.TemporaryDirectory(dir="/private/tmp") as d:
@@ -392,8 +395,9 @@ raise SystemExit(C.main(sys.argv[2:]))
                 self.assertFalse(any(p.name.startswith("vendor-sentinel-") and p.name != C.NAMESPACE
                                      for p in Path(d).iterdir()))
                 if point == "record-written":
-                    with self.assertRaises(C.CustodyError):
-                        C.Custody(d, d, os.getuid(), envelope=EMPTY)
+                    with C.Custody(d, d, os.getuid(), envelope=EMPTY) as custody:
+                        self.assertEqual(custody.status()['outstanding'], 0)
+                        self.assertEqual(len(list((Path(d)/C.NAMESPACE).glob('.prepare-*.payload'))), 1)
                 else:
                     with C.Custody(d, d, os.getuid(), envelope=EMPTY) as custody:
                         self.assertEqual(custody.status()["outstanding"], 1)

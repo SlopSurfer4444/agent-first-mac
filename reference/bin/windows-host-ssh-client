@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import ctypes
 import hashlib
 import hmac
 import json
@@ -19,6 +20,7 @@ import pwd
 import re
 import secrets
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -251,7 +253,13 @@ def atomic_write(path: Path, data: bytes, mode: int) -> None:
             handle.write(data)
             handle.flush()
             os.fsync(handle.fileno())
-        os.replace(staged_path, path)
+        # link(2) publishes complete bytes only if the target is still absent.
+        # A preflight exists() check followed by replace() clobbers a concurrent
+        # owner file (including a symlink) created while we stage the payload.
+        try:
+            os.link(staged_path, path, follow_symlinks=False)
+        except FileExistsError:
+            fail("managed_target_collision")
     finally:
         if staged_path.exists():
             staged_path.unlink()
@@ -312,7 +320,6 @@ def apply_profile(fingerprint: str, user: str) -> bool:
     host, key_type, public_body, observed = prepare(fingerprint, user)
     paths["config_dir"].mkdir(mode=0o700)
     paths["state"].mkdir(parents=True, mode=0o700, exist_ok=False)
-    created: list[Path] = []
     try:
         main = render_main_config()
         alias = render_alias_config(host, user)
@@ -320,7 +327,6 @@ def apply_profile(fingerprint: str, user: str) -> bool:
         for path, data in ((paths["main"], main), (paths["alias"], alias),
                            (paths["known"], known)):
             atomic_write(path, data, 0o600)
-            created.append(path)
         receipt = {
             "schema": 1,
             "status": "applied",
@@ -341,13 +347,9 @@ def apply_profile(fingerprint: str, user: str) -> bool:
         atomic_write(paths["receipt"],
                      (json.dumps(receipt, sort_keys=True) + "\n").encode(), 0o600)
     except Exception:
-        for path in reversed(created):
-            if path.exists() and not path.is_symlink():
-                path.unlink()
-        if paths["config_dir"].is_dir() and not any(paths["config_dir"].iterdir()):
-            paths["config_dir"].rmdir()
-        if paths["state"].is_dir() and not any(paths["state"].iterdir()):
-            paths["state"].rmdir()
+        # Retain partial publication for scoped recovery. Even a successful
+        # inode/byte comparison followed by unlink has an owner-edit race.
+        # Never delete a potentially replaced file to make failure look clean.
         raise
     return True
 
@@ -362,10 +364,12 @@ def load_receipt(paths: dict[str, Path]) -> dict:
     return data
 
 
-def exact_managed(paths: dict[str, Path], receipt: dict) -> bool:
+def exact_managed(paths: dict[str, Path], receipt: dict, *, include_main: bool = True) -> bool:
     expected = receipt["managed"]
     checks = (("main", "config"), ("alias", "alias"), ("known", "knownHosts"))
     for path_name, hash_name in checks:
+        if path_name == "main" and not include_main:
+            continue
         path = paths[path_name]
         if not path.is_file() or path.is_symlink() or (path.stat().st_mode & 0o777) != 0o600:
             return False
@@ -447,20 +451,68 @@ def doctor() -> None:
         fail("strict_key_only_smoke_failed")
 
 
+def rename_exclusive(source: Path, destination: Path) -> None:
+    """Move the actual directory entry without replacing any destination."""
+    libc = ctypes.CDLL(None, use_errno=True)
+    try:
+        rename = libc.renamex_np
+    except AttributeError:
+        fail("exclusive_rename_unavailable")
+    rename.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_uint]
+    rename.restype = ctypes.c_int
+    if rename(os.fsencode(source), os.fsencode(destination), 4) != 0:
+        raise OSError(ctypes.get_errno(), "exclusive rename refused")
+
+
 def rollback() -> None:
     home = canonical_home()
     paths = layout(home)
     receipt = load_receipt(paths)
-    if not exact_managed(paths, receipt):
+    if not exact_managed(paths, receipt, include_main=False):
         fail("rollback_refuses_managed_drift")
-    for name in ("known", "alias", "main"):
-        paths[name].unlink()
-    if paths["config_dir"].is_dir() and not any(paths["config_dir"].iterdir()):
-        paths["config_dir"].rmdir()
-    receipt["status"] = "rolled_back"
-    staged = (json.dumps(receipt, sort_keys=True) + "\n").encode()
-    paths["receipt"].unlink()
-    atomic_write(paths["receipt"], staged, 0o600)
+    # The top-level Include is shared infrastructure, not an exclusive alias
+    # payload. Retain it even when currently empty: a new profile may appear
+    # immediately after an emptiness check. Owner edits to it are also retained.
+    names = ("known", "alias", "receipt")
+    hashes = {"known": receipt["managed"]["knownHosts"],
+              "alias": receipt["managed"]["alias"]}
+    raw_receipt = paths["receipt"].read_bytes()
+    if json.loads(raw_receipt) != receipt:
+        fail("rollback_refuses_managed_drift")
+    hashes["receipt"] = sha256_bytes(raw_receipt)
+    identities = {name: paths[name].lstat() for name in names}
+    if paths["state"].is_symlink() or not paths["state"].is_dir():
+        fail("unsafe_managed_parent")
+    recovery = Path(tempfile.mkdtemp(prefix="rollback-", dir=paths["state"]))
+    captured = []
+    try:
+        for name in names:
+            held = recovery / name
+            rename_exclusive(paths[name], held)
+            captured.append(name)
+            actual, expected = held.lstat(), identities[name]
+            if (not stat.S_ISREG(actual.st_mode) or actual.st_mode & 0o777 != 0o600
+                    or (actual.st_dev, actual.st_ino) != (expected.st_dev, expected.st_ino)
+                    or sha256_bytes(held.read_bytes()) != hashes[name]):
+                fail("rollback_capture_drift")
+        if any(paths[name].exists() or paths[name].is_symlink() for name in names):
+            fail("rollback_target_reappeared")
+        receipt["status"] = "rolled_back"
+        receipt["rollbackRecovery"] = recovery.name
+        atomic_write(paths["receipt"],
+                     (json.dumps(receipt, sort_keys=True) + "\n").encode(), 0o600)
+        if any(paths[name].exists() or paths[name].is_symlink() for name in ("known", "alias")):
+            fail("rollback_target_reappeared")
+    except Exception as exc:
+        # Restore the actual captured entries only into absent slots. A racing
+        # replacement stays in place; its predecessor remains in private
+        # recovery. Renames preserve symlinks/directories without following them.
+        for name in reversed(captured):
+            try:
+                rename_exclusive(recovery / name, paths[name])
+            except OSError:
+                pass
+        raise ProfileError("rollback_interrupted_recovery_retained") from exc
 
 
 def parser() -> argparse.ArgumentParser:

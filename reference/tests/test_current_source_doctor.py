@@ -58,6 +58,36 @@ class CurrentDoctorTests(unittest.TestCase):
             C.run(git=self.git, source_factory=self.source, budget=Budget(), canonical_main=False,
                   sentinel_check=self.sentinel)
 
+    def test_source_failure_has_closed_reason_scope_and_next_action(self):
+        self.state['clean'] = False
+        with self.assertRaises(C.DoctorError) as caught:
+            self.run_doctor(git_only=True)
+        value = caught.exception.outcome.public
+        self.assertEqual(value['reasonCodes'], ['source_checkout_dirty'])
+        self.assertEqual(value['affectedScope'], 'control-source')
+        self.assertEqual(value['nextAction'], 'inspect-source-reason-preserve-owner-work')
+        self.assertEqual(value['verdict'], 'NEEDS_REVIEW')
+        C.public_report(value, git_only=True)
+
+    def test_transition_reason_allowlist_and_unknown_private_error_redaction(self):
+        for error, expected in (
+            (C.current_sources.F.TransitionError('protected_policy_changed'), 'protected_policy_changed'),
+            (C.current_sources.F.TransitionError('/Users/private/secret'), 'source_admission_failed'),
+            (RuntimeError('/Users/private/secret'), 'source_admission_failed')):
+            with patch.object(C.current_sources, 'admit', side_effect=error):
+                with self.assertRaises(C.DoctorError) as caught:
+                    self.run_doctor(git_only=True)
+            value = caught.exception.outcome.public
+            self.assertEqual(value['reasonCodes'], [expected])
+            self.assertNotIn('private', str(value))
+            C.public_report(value)
+
+    def test_failure_guidance_cannot_be_forged(self):
+        value = C.report(stage='source', reasons=['source_admission_failed'])
+        value['nextAction'] = 'disable-all-checks'
+        with self.assertRaises(Exception):
+            C.public_report(value)
+
     def test_source_drift_blocks_callback_and_final_result(self):
         def mutate(budget, *, source_guard):
             self.sources[0][1].data += b'drift'

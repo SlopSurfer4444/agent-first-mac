@@ -489,6 +489,67 @@ private struct BootstrapTests {
         }
     }
 
+    func testPreparationCrashPreservesAndUnblocks() throws {
+        let steps = ["preparation-intent", "preparation-directory-created",
+                     "preparation-directory-recorded"] +
+            ["active.json.next", "install-inputs.json", "aid-admin", "sudoers-rendered"].flatMap {
+                ["preparation-file-created-" + $0, "preparation-file-written-" + $0,
+                 "preparation-file-synced-" + $0]
+            }
+        for step in steps {
+            let fixture = try Fixture()
+            if step == "preparation-file-written-aid-admin" {
+                try FileManager.default.setAttributes([.posixPermissions: 0o644], ofItemAtPath: fixture.broker.path)
+                try Data(repeating: 65, count: 128 * 1024).write(to: fixture.broker)
+                try FileManager.default.setAttributes([.posixPermissions: 0o555], ofItemAtPath: fixture.broker.path)
+                try fixture.refreshInputs()
+            }
+            try expect(try fixture.subprocess("--crash", step: step) == 77, "preparation_crash_" + step)
+            try expect(fixture.expectedPathsAbsent(), "preparation_changed_live_state")
+            try expect(try fixture.subprocess("--reconcile") == 0, "preparation_reconcile_" + step)
+            try expect(fixture.expectedPathsAbsent(), "preparation_reconcile_changed_live_state")
+            let retained = fixture.physical("/var/db/agent-first-mac/bootstrap/retained-preparations")
+            try expect(retained.exists, "preparation_evidence_lost")
+            if step == "preparation-file-written-aid-admin" {
+                let partial = retained.appendingPathComponent("transaction-11111111-2222-3333-4444-555555555555/aid-admin")
+                try expect(try Data(contentsOf: partial) == Data(repeating: 65, count: 64 * 1024),
+                           "partial_write_not_preserved")
+            }
+            try expect(try fixture.installer().install(fixture.request()) == "INSTALL_TRANSACTION_COMMITTED",
+                       "preparation_still_blocks_new_install")
+        }
+        let fixture = try Fixture()
+        try expect(try fixture.subprocess("--crash", step: "preparation-directory-recorded") == 77)
+        let stage = fixture.physical("/var/db/agent-first-mac/bootstrap/transaction-11111111-2222-3333-4444-555555555555")
+        let foreign = stage.appendingPathComponent("unknown-owner-material")
+        try Data("preserve-even-unknown".utf8).write(to: foreign)
+        try expect(try fixture.subprocess("--reconcile") == 0)
+        let retained = fixture.physical("/var/db/agent-first-mac/bootstrap/retained-preparations/transaction-11111111-2222-3333-4444-555555555555/unknown-owner-material")
+        try expect(try Data(contentsOf: retained) == Data("preserve-even-unknown".utf8), "unknown_preparation_deleted")
+
+        let interruptedRetention = try Fixture()
+        try expect(try interruptedRetention.subprocess("--crash", step: "preparation-directory-recorded") == 77)
+        try expect(try interruptedRetention.subprocess("--rollback-crash", step: "preparation-retained") == 77)
+        try expect(try interruptedRetention.subprocess("--reconcile") == 0, "retention_cannot_restart")
+
+        let replaced = try Fixture()
+        try expect(try replaced.subprocess("--crash", step: "preparation-directory-recorded") == 77)
+        let recorded = replaced.physical("/var/db/agent-first-mac/bootstrap/transaction-11111111-2222-3333-4444-555555555555")
+        try FileManager.default.moveItem(at: recorded, to: recorded.appendingPathExtension("foreign-retained"))
+        try FileManager.default.createDirectory(at: recorded, withIntermediateDirectories: false,
+                                              attributes: [.posixPermissions: 0o700])
+        try expect(try replaced.subprocess("--reconcile") == 78, "replacement_directory_adopted")
+        try expect(recorded.exists && replaced.expectedPathsAbsent(), "foreign_preparation_changed")
+
+        let unrecorded = try Fixture()
+        try expect(try unrecorded.subprocess("--crash", step: "preparation-directory-created") == 77)
+        let unrecordedDirectory = unrecorded.physical("/var/db/agent-first-mac/bootstrap/transaction-11111111-2222-3333-4444-555555555555")
+        let unknown = unrecordedDirectory.appendingPathComponent("unknown")
+        try Data("foreign".utf8).write(to: unknown)
+        try expect(try unrecorded.subprocess("--reconcile") == 78, "unrecorded_nonempty_directory_adopted")
+        try expect(try Data(contentsOf: unknown) == Data("foreign".utf8), "unknown_directory_erased")
+    }
+
     func testCommittedCrashDoesNotUndoInstall() throws {
         let fixture = try Fixture()
         try expect(try fixture.subprocess("--crash", step: "journal-committed") == 77)
@@ -649,6 +710,7 @@ private struct TestMain {
             ("sudoers_drift_direct_backend", suite.testRenderedSudoersAndDirectBackendRejections),
             ("bootstrap_self_attestation", suite.testBootstrapSelfAttestationFailsClosed),
             ("crash_restart_matrix", suite.testCrashRestartMatrix),
+            ("preparation_crash_retention", suite.testPreparationCrashPreservesAndUnblocks),
             ("committed_crash", suite.testCommittedCrashDoesNotUndoInstall),
             ("foreign_recovery", suite.testForeignAndUntrustedRecoveryStayUnknown),
             ("restart_before_admission", suite.testInstallReconcilesBeforeNewAdmission),

@@ -2,6 +2,7 @@
 """Reviewed DS3-only adoption; preparation and installation never start a game."""
 import sys
 sys.dont_write_bytecode = True
+sys.pycache_prefix = "/dev/null"
 import contextlib, ctypes, fcntl, hashlib, importlib.machinery, importlib.util, json, os, pwd, re, shutil, stat, subprocess, tempfile, time
 import xml.etree.ElementTree as ET
 from pathlib import Path
@@ -123,7 +124,9 @@ def manifest(p):
                 info = path.lstat()
                 need(info.st_uid == os.getuid() and stat.S_IMODE(info.st_mode) == 0o600, 'installed_policy_mode')
             lifecycle_path = ROOT/'ds3-runtime'
-            hub_path = SOURCE/'manifest.json'
+            # The cloned runtime has an installed policy closure. The donor
+            # Hub is provenance, not a live dependency of launch or stop.
+            hub_path = None
         else:
             need(HERE == CONTROL and p == CONTROL/MANIFEST, 'schema4_manifest_scope')
     if HERE == CONTROL or m['schema'] >= 2:
@@ -151,10 +154,11 @@ def manifest(p):
         else:
             need(pinned(policy.get('lifecycleSha256')) and policy['lifecycleSha256'] == sha(lifecycle_path), 'overlay_lifecycle_pin')
         need(policy.get('desiredRuntimeHashes' if m['schema'] >= 3 else 'desiredPEHashes') == overrides and policy.get('sourceHubManifestSha256') == m['sourceHubManifestSha256'] and policy.get('sourceCriticalHashes') == m['sourceCriticalHashes'], 'overlay_source_binding')
-        current_hub = load(hub_path)
-        need(type(current_hub) is dict and type(current_hub.get('criticalHashes')) is dict, 'current_hub_schema')
-        need(current_hub.get('runtimeOverlayPolicySha256') == m['runtimeOverlayPolicySha256'] and all(current_hub.get('criticalHashes',{}).get(rel) == value for rel,value in overrides.items()), 'overlay_hub_binding')
-        if m['schema'] == 4:
+        if hub_path is not None:
+            current_hub = load(hub_path)
+            need(type(current_hub) is dict and type(current_hub.get('criticalHashes')) is dict, 'current_hub_schema')
+            need(current_hub.get('runtimeOverlayPolicySha256') == m['runtimeOverlayPolicySha256'] and all(current_hub.get('criticalHashes',{}).get(rel) == value for rel,value in overrides.items()), 'overlay_hub_binding')
+        if m['schema'] == 4 and hub_path is not None:
             need(current_hub.get('id') == 'games-hub' and current_hub.get('owner') == 'control-games-hub'
                  and type(policy.get('previousHubCriticalHashes')) is dict
                  and current_hub['criticalHashes'] == dict(policy['previousHubCriticalHashes'],**overrides), 'installed_policy_hub_binding')
@@ -235,9 +239,10 @@ def readiness_bridge():
 def source_gate(commit,action='apply',candidate=None,apply_commit=None):
     need(HERE == CONTROL and Path(__file__).absolute() == CONTROL/'bin/ds3-runtime', 'canonical_source_required')
     need(type(commit) is str and re.fullmatch('[0-9a-f]{40}',commit), 'invalid_commit')
-    def git(*a): return run(['/usr/bin/git','-c','core.hooksPath=/dev/null','-C',CONTROL,*a]).decode().strip()
     def exact():
-        need(git('rev-parse','HEAD') == commit and git('branch','--show-current') == 'main' and not git('status','--porcelain'), 'clean_exact_main_required')
+        sys.path.insert(0,str(CONTROL))
+        from lib.scoped_source_admission import check
+        check(CONTROL,commit,entrypoints=('bin/ds3-runtime',))
     exact()
     bridge=readiness_bridge();namespace=lifecycle_directory();bootstrap=lifecycle_bootstrap_path()
     nodes=[ROOT,ROOT.parent,HOME/'AIDev/bin',HOME/'Games',HOME/'AIDev/state']
@@ -1973,7 +1978,7 @@ RENDERER_REL = 'engine/lib/wine/x86_64-windows/d3d11.dll'
 RENDERER_PREFIX = 'drive_c/windows/system32/d3d11.dll'
 DXGI_REL = 'engine/lib/wine/x86_64-windows/dxgi.dll'
 DXGI_PREFIX = 'drive_c/windows/system32/dxgi.dll'
-RENDERER_POLICY = 'manifests/ds3-renderer-update.json'
+RENDERER_POLICY: "source-data-only" = 'manifests/ds3-renderer-update.json'
 RENDERER_FILES = {'d3d11.dll','provenance.json','source.tar.gz'}
 RENDERER_NATIVE = {'nativeWinemac':('engine/lib/wine/x86_64-unix/winemac.so','winemac.so'),
                    'nativeMetal':(METAL,'winemetal.so'),
@@ -2691,13 +2696,8 @@ def play(measure=False, preset=None, trace=False, quit_trace=False):
     if quit_trace:need(not session['clientActive'] and not session['targetActive'],'quit_trace_requires_stopped_client_target')
     if session['targetActive']:
         return {'state':'DS3_ALREADY_RUNNING','gameplayVerified':False,'borderlessVerified':False}
-    # A client in another prefix can reroute -applaunch to its old session.
-    if SOURCE.exists() or SOURCE.is_symlink():
-        safe_directory(SOURCE); safe_directory(SOURCE/'profiles/prince')
-        # Foreign source is not a launch dependency, but never execute a drifted server.
-        m = manifest(ROOT/'manifest.json')
-        need(sha(SOURCE/'runtime/engine/bin/wineserver',allow_source_hardlinks=True) == m['sourceCriticalHashes']['engine/bin/wineserver'], 'source_server_drift')
-        inactive(SOURCE/'runtime', SOURCE/'profiles/prince')
+    # allow_client observed actual processes and rejects foreign Steam. Do not
+    # execute the donor server merely because an unrelated Hub still exists.
     if trace: need(not session['clientActive'] and renderer_fields(base) and base['rendererOverride']['diagnosticCapable'], 'trace_requires_stopped_diagnostic_client')
     if not session['clientActive']: inactive(ROOT/'runtime',PREFIX)
     virtual_policy = verify_virtual_fullscreen_live(request) if virtual_fullscreen and session['clientActive'] else {'state':'COLD_PREFIX_VERIFIED'} if virtual_fullscreen else None

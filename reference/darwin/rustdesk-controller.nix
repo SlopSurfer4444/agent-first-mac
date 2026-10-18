@@ -1,7 +1,8 @@
-{ lib, pkgs, ... }:
+{ config, lib, pkgs, ... }:
 
 let
-  rustDeskControllerEnabled = true;
+  action = config.agentFirst.rustDeskController.action;
+  rustDeskControllerEnabled = action == "install";
 
   rustDeskDmg = pkgs.fetchurl {
     name = "rustdesk-1.4.6-aarch64.dmg";
@@ -14,16 +15,34 @@ let
   '';
 in
 {
-  system.activationScripts.extraActivation.text = lib.mkAfter ''
+  options.agentFirst.rustDeskController.action = lib.mkOption {
+    type = lib.types.enum [ "preserve" "install" "remove" ];
+    default = "preserve";
+    description = ''
+      Explicit RustDesk lifecycle action for this reviewed activation target.
+      Normal system activation preserves the app and marker, including absence
+      and owner-installed versions. Install/remove require a separately reviewed
+      target; return to preserve after the bounded action is complete.
+    '';
+  };
+
+  config.system.activationScripts.extraActivation.text = lib.mkAfter ''
+    (
     # aid-admin-resume-rustdesk-marker-guards-v1
+    # Keep this optional lifecycle out of unrelated system activations. This
+    # subshell exit must not terminate the rest of nix-darwin activation.
+    action='${action}'
+    if test "$action" = preserve; then
+      exit 0
+    fi
     echo "reconciling the owner-authorized RustDesk controller lifecycle..." >&2
 
     app=/Applications/RustDesk.app
     marker_dir=/var/db/agent-first-mac/rustdesk-controller
     marker=$marker_dir/managed-source
     expected_marker='1.4.6|0cd498e3f99c878bfa3c54996089b9671fdd15aee5d1ac160444841f95ea01bc'
-    dmg='${rustDeskDmg}'
-    marker_source='${managedMarker}'
+    dmg='${if action == "install" then rustDeskDmg else ""}'
+    marker_source='${if action != "preserve" then managedMarker else ""}'
 
     fail() {
       echo "RustDesk controller lifecycle failure: $1" >&2
@@ -153,5 +172,6 @@ in
         fail unmanaged_or_drifted_removal_state
       fi
     fi
+    ) || exit 1
   '';
 }

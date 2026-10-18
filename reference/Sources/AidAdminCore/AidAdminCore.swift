@@ -232,16 +232,42 @@ public struct CommandResult: Equatable {
 
 public protocol CommandRunning {
     func run(executable: String, arguments: [String], environment: [String: String]) throws -> CommandResult
+    func observeGit(helperExecutable: String, userID: uid_t, repository: String,
+                    command: [String]) throws -> CommandResult
+}
+
+public extension CommandRunning {
+    func observeGit(helperExecutable: String, userID: uid_t, repository: String,
+                    command: [String]) throws -> CommandResult {
+        throw BrokerFailure.rejected("git_observer_not_supported")
+    }
+}
+
+public struct ProcessCommandFailure: Error, CustomStringConvertible {
+    public let outcome: BoundedProcessOutcome
+    public let settled: Bool
+    public init(outcome: BoundedProcessOutcome, settled: Bool) {
+        self.outcome = outcome; self.settled = settled
+    }
+    public var description: String { "process_" + outcome.rawValue + "_needs_reconcile" }
 }
 
 public final class ProcessCommandRunner: CommandRunning {
     public init() {}
     public func run(executable: String, arguments: [String], environment: [String: String]) throws -> CommandResult {
         let result = try BoundedProcess.run(executable: executable, arguments: arguments, environment: environment)
-        try require(result.settled && result.outcome == .exited,
-                    "process_" + result.outcome.rawValue + "_needs_reconcile")
+        guard result.settled && result.outcome == .exited else {
+            throw ProcessCommandFailure(outcome: result.outcome, settled: result.settled)
+        }
         return CommandResult(status: result.status,
                              output: String((result.stdout + result.stderr).prefix(8192)))
+    }
+
+    public func observeGit(helperExecutable: String, userID: uid_t, repository: String,
+                           command: [String]) throws -> CommandResult {
+        let arguments = try GitObservation.helperArguments(userID: userID, repository: repository, command: command)
+        return try run(executable: helperExecutable, arguments: arguments,
+                       environment: fixedGitEnvironment(base: BrokerPolicy.cleanEnvironment))
     }
 }
 
@@ -552,6 +578,19 @@ public final class AidAdminBroker {
         self.bootGeneration = bootGeneration
     }
 
+    /// Internal observer entry is reachable through the executable-level sudo
+    /// grant too. Bind its target to root-owned owner identity before any drop;
+    /// never trust a requested UID or SUDO_UID as cross-account authority.
+    public func validateGitObservationOwner() throws {
+        try validateDirectory("/etc/agent-first-mac", exactMode: 0o755)
+        let raw = try readTrustedFile("/etc/agent-first-mac/aid-admin-install.json",
+                                      exactMode: 0o400, maximumBytes: 4096)
+        let attestation = try InstallAttestation.decodeStrict(raw)
+        try require(context.realUID != 0 && attestation.agentOwnerUID == context.realUID &&
+                    attestation.agentOwnerIdentity == context.callerIdentity,
+                    "git_observer_not_installed_owner")
+    }
+
     public func doctorRoot() -> DoctorReport {
         var checks: [String: Bool] = [:]
         var problems: [String] = []
@@ -767,7 +806,8 @@ public final class AidAdminBroker {
             operation?.sourceDrift = try validateRepository(repository, commit: commit, policy: policy) != controlTree
         } catch {
             operation?.sourceDrift = true
-            if String(describing: error).contains("process_") {
+            if String(describing: error).contains("process_") &&
+                (error as? ProcessCommandFailure)?.settled != true {
                 try? persistOperation("unknown")
                 throw BrokerFailure.rejected("applied_source_observation_process_unknown_no_rollback")
             }
@@ -1304,12 +1344,13 @@ public final class AidAdminBroker {
         try require(lstat(repository, &before) == 0 && (before.st_mode & S_IFMT) == S_IFDIR &&
                     before.st_uid == context.realUID && (before.st_mode & 0o022) == 0,
                     "control_repository_mutable")
-        let gitEnvironment = fixedGitEnvironment(base: policy.environment)
-        let gitExecutable = try physicalResolvedExecutable(policy.executables.git, policy: policy)
+        _ = try physicalResolvedExecutable(policy.executables.git, policy: policy)
+        // The installed broker was hash/owner/mode-attested before this route,
+        // including emergency resume. Never execute argv[0] or a user wrapper.
+        let observer = try canonicalPhysical(policy.installedPaths.binary, allowSymlink: false)
         func git(_ arguments: [String], expectedOutput: String? = nil) throws -> String {
-            let result = try runner.run(executable: gitExecutable,
-                                        arguments: fixedGitArguments(repository: repository, command: arguments),
-                                        environment: gitEnvironment)
+            let result = try runner.observeGit(helperExecutable: observer, userID: context.realUID,
+                                               repository: repository, command: arguments)
             try require(result.status == 0, "control_git_\(arguments.first ?? "command")")
             let output = result.output.trimmingCharacters(in: .whitespacesAndNewlines)
             if let expectedOutput { try require(output == expectedOutput, "control_git_output") }

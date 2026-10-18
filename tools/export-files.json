@@ -1,4 +1,12 @@
 [
+  "Sources/AidAdminCore/GitObservation.swift",
+  "lib/operation_checks.py",
+  "lib/scoped_source_admission.py",
+  "lib/user_operation_readiness.py",
+  "tests/test_custody_durable_records.py",
+  "tests/test_custody_transactions.py",
+  "tests/test_game_harness_successor.py",
+  "tests/test_scoped_source_admission.py",
   "bin/game-native-admission-plan",
   "bin/game-native-admission-update",
   "bin/rustdesk-ssh-tunnel",

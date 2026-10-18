@@ -2,6 +2,7 @@
 """Deterministic metadata cycle and exact schedule adapter; no model or repair."""
 import sys
 sys.dont_write_bytecode = True
+sys.pycache_prefix = "/dev/null"
 
 import importlib.machinery
 import json

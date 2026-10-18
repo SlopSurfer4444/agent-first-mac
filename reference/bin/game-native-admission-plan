@@ -2,6 +2,7 @@
 """Private read-only native admission preparation. No apply, launch or approval publication."""
 import sys
 sys.dont_write_bytecode=True
+sys.pycache_prefix = "/dev/null"
 import argparse,hashlib,importlib.util,json,os,pwd,re,stat
 from pathlib import Path
 HERE=Path(__file__).resolve().parent.parent

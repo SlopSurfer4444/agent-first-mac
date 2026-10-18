@@ -5,8 +5,9 @@ This file governs the public reference release, not any installed workstation.
 The implementation separates desired configuration, observations, authorization,
 and mutation. The `aid` facade routes work; doctors inspect state; reviewed
 configuration transitions bind changes to source; typed Swift administrator
-operations limit privileged actions. Unknown projects enter quarantine rather
-than inheriting workstation trust. Skills and context hooks guide agents but
+operations limit privileged actions. Unknown code receives bounded inspection
+and isolation before execution; ordinary project editing does not require a
+custom trust registry, workstation doctor or harness adoption. Skills and context hooks guide agents but
 are not a security boundary by themselves.
 
 The intended live layout separates `~/AIDev/control` (desired-state source) from

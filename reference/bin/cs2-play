@@ -2,6 +2,7 @@
 """Launch the control-owned CS2 runtime and its separate Steam prefix."""
 import sys
 sys.dont_write_bytecode = True
+sys.pycache_prefix = "/dev/null"
 
 import argparse
 import contextlib

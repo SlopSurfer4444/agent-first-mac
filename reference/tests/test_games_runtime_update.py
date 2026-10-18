@@ -22,6 +22,24 @@ loader.exec_module(a)
 
 
 class Tests(unittest.TestCase):
+    def test_successor_recovery_after_unrelated_commit(self):
+        before=self.images();pin=self.once('plan')['planSha256']
+        self.once('apply',pin=pin);after=self.images();self.head='d'*40
+        self.once('rollback',self.head,pin);self.assertEqual(self.images(),before)
+        self.once('return',self.head,pin);self.assertEqual(self.images(),after)
+        with self.assertRaisesRegex(RuntimeError,'transaction_source_commit_drift'):
+            self.once('apply',self.head,pin)
+
+    def test_successor_recovery_rejects_changed_scope_and_foreign_ancestry(self):
+        pin=self.once('plan')['planSha256'];self.once('apply',pin=pin)
+        self.head='d'*40;before=self.images();self.ancestor=False
+        with self.assertRaisesRegex(RuntimeError,'old_source_not_ancestor'):
+            self.once('rollback',self.head,pin)
+        self.ancestor=True;self.source_blobs[a.POLICY]=b'other policy'
+        with self.assertRaisesRegex(RuntimeError,'archive_source_scope_changed'):
+            self.once('rollback',self.head,pin)
+        self.assertEqual(self.images(),before)
+
     def setUp(self):
         self.f=Fixture();self.addCleanup(self.f.close)
         home=self.f.path

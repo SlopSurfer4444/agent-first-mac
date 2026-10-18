@@ -2,6 +2,7 @@
 """Private, reviewed adoption of the owner's working game environment."""
 import sys
 sys.dont_write_bytecode = True
+sys.pycache_prefix = "/dev/null"
 import fcntl, hashlib, importlib.machinery, importlib.util, json, os, pwd, shutil, stat, subprocess
 from pathlib import Path
 HOME = Path(pwd.getpwuid(os.getuid()).pw_dir)
@@ -66,9 +67,10 @@ def snapshot(p):
 
 def source_gate(commit):
     need(HERE==CONTROL and Path(__file__).absolute()==CONTROL/'bin/games-hub','canonical_source_required')
-    def git(*a): return run(['/usr/bin/git','-c','core.hooksPath=/dev/null','-C',CONTROL,*a]).decode().strip()
+    sys.path.insert(0,str(CONTROL))
+    from lib.scoped_source_admission import check
     need(len(commit)==40 and all(c in '0123456789abcdef' for c in commit),'invalid_commit')
-    need(git('rev-parse','HEAD')==commit and git('branch','--show-current')=='main' and not git('status','--porcelain'),'clean_exact_main_required')
+    check(CONTROL,commit,entrypoints=('bin/games-hub',))
     loader=importlib.machinery.SourceFileLoader('game_scoped_ready',str(CONTROL/'lib/game_operation_readiness.py'))
     bridge=importlib.util.module_from_spec(importlib.util.spec_from_loader(loader.name,loader));loader.exec_module(bridge)
     nodes=[ROOT,ROOT.parent,HOME/'AIDev/bin',HOME/'AIDev/state']
@@ -86,7 +88,7 @@ def source_gate(commit):
         return True
     d=bridge.ready(CONTROL,commit,'wine-install',checks={'payload-owner':owner,'wine-target':target,'recovery':recovery},target_guard=bridge.bound(lambda:bridge.metadata(nodes)))
     need(d.get('scopedCandidateReady') is True,'scoped_operation_readiness_required')
-    need(git('rev-parse','HEAD')==commit and not git('status','--porcelain'),'source_changed')
+    check(CONTROL,commit,entrypoints=('bin/games-hub',))
 
 def inactive():
     env={'HOME':str(HOME),'PATH':'/usr/bin:/bin','WINEPREFIX':str(DONOR/'prefix'),'WINESERVER':str(DONOR/ENGINE/'bin/wineserver')}

@@ -336,19 +336,17 @@ class DeliveryTests(unittest.TestCase):
         self.assertEqual(self.cycle(guard=lambda: False)["status"], "UNAVAILABLE")
         self.assertEqual(self.notify_calls, [])
 
-    def test_actual_source_gate_wrapper_uses_git_only_and_held_callback(self):
-        from lib import current_doctor_native
+    def test_actual_source_gate_wrapper_uses_affected_source_and_held_callback(self):
+        from lib import scoped_source_admission
         calls = []
-        doctor = type("Doctor", (), {"public_report": staticmethod(lambda value, git_only: value)})()
-        def native(loaded, git_only, **options):
-            calls.append(git_only)
-            self.assertIs(loaded, doctor)
-            self.assertTrue(options["operation_check"]("f" * 40, source_guard=lambda: True))
-            return {"integratedMain": True, "verdict": "GIT_ONLY_VALID"}
+        def scoped(root, callback, **options):
+            calls.append(root)
+            self.assertTrue(callback("f" * 40, source_guard=lambda: True))
+            return True
         owner = type("Owner", (), {"pw_dir": str(self.home)})()
-        with patch.object(M.pwd, "getpwuid", return_value=owner), patch.object(M.importlib.machinery.SourceFileLoader, "load_module", return_value=doctor), patch.object(current_doctor_native, "native", side_effect=native):
-            self.assertEqual(M.admitted_source(self.root, full=False)["verdict"], "GIT_ONLY_VALID")
-        self.assertEqual(calls, [True])
+        with patch.object(M.pwd, "getpwuid", return_value=owner), patch.object(scoped_source_admission, "run", side_effect=scoped):
+            self.assertEqual(M.admitted_source(self.root, full=False)["verdict"], "SOURCE_VALID")
+        self.assertEqual(calls, [self.root])
 
     def test_new_actionable_event_one_attempt_not_delivery_and_reserved_unknown_no_retry(self):
         self.schedule("install"); self.cycle(); self.collected = "changed"
@@ -360,19 +358,41 @@ class DeliveryTests(unittest.TestCase):
         self.assertEqual(len(self.notify_calls), 1)
         self.collected = "changed-again"
         self.cycle(notifier=lambda: "reserved_unknown")
-        self.collected = "new-event-after-unknown"
+        unknown_record = json.loads((self.home / "AIDev/state/maintenance" / M.CYCLE).read_bytes())
+        unknown_id = unknown_record["eventId"]
         self.cycle()
         self.assertEqual(len(self.notify_calls), 1)
+        self.collected = "new-event-after-unknown"
+        self.cycle()
+        self.assertEqual(len(self.notify_calls), 2)
+        record = json.loads((self.home / "AIDev/state/maintenance" / M.CYCLE).read_bytes())
+        self.assertIn(unknown_id, record["attemptedEvents"])
 
     def test_crash_after_notification_reservation_is_not_replayed(self):
         self.schedule("install"); self.cycle(); self.collected = "changed"
         def crash(): raise Crash()
         with self.assertRaises(Crash): self.cycle(notifier=crash)
-        self.collected = "next-change"
         result = self.cycle()
         self.assertEqual(self.notify_calls, [])
         self.assertEqual(result["notificationOutcome"], "reserved_unknown")
         self.assertFalse(result["notificationDelivered"])
+        self.collected = "next-change"
+        self.assertEqual(self.cycle()["notificationOutcome"], "command_accepted_unverified")
+        self.assertEqual(len(self.notify_calls), 1)
+
+    def test_unknown_a_accepted_b_recurring_a_does_not_claim_a_accepted(self):
+        self.schedule("install"); self.cycle()
+        self.observation = lambda: (_ for _ in ()).throw(D.Fault("scan_unavailable"))
+        first = self.cycle(notifier=lambda: "reserved_unknown")
+        self.observation = lambda: (_ for _ in ()).throw(D.Fault("scan_limit"))
+        second = self.cycle()
+        self.observation = lambda: (_ for _ in ()).throw(D.Fault("scan_unavailable"))
+        repeated = self.cycle()
+        self.assertEqual(repeated["event"]["id"], first["event"]["id"])
+        self.assertEqual(repeated["notificationOutcome"], "not_attempted")
+        self.assertEqual(repeated["notificationEventId"], second["event"]["id"])
+        self.assertEqual(len(self.notify_calls), 1)
+        self.assertFalse(repeated["notificationDelivered"])
 
     def test_native_presence_parser_exact_argv_and_error_vs_not_found(self):
         path = str(self.home / "Library/LaunchAgents" / M.PLIST)
@@ -400,7 +420,7 @@ class DeliveryTests(unittest.TestCase):
                 self.assertEqual(json.loads(output[0])["operation"], operation)
         self.assertEqual(seen, ["plan", "install", "remove", "recover", "status"])
 
-    def test_alternating_stable_events_are_not_replayed_and_capacity_never_evicts(self):
+    def test_alternating_events_deduplicate_and_full_legacy_window_rotates(self):
         self.schedule("install"); self.cycle()
         normal = self.observation
         for reason in ("scan_unavailable", "scan_limit", "scan_unavailable"):
@@ -412,13 +432,14 @@ class DeliveryTests(unittest.TestCase):
         record = json.loads(path.read_bytes())
         self.assertEqual(len(record["attemptedEvents"]), 2)
         record["attemptedEvents"] += [M.sha(("synthetic-attempt-" + str(index)).encode()) for index in range(126)]
+        record["notification"] = "capacity_exhausted"  # Legacy terminal state.
         path.write_bytes(M.encoded(record))
         attempted = list(record["attemptedEvents"])
         self.assertEqual(len(attempted), M.MAX_EVENTS)
         self.observation = lambda: (_ for _ in ()).throw(D.Fault("scan_changed"))
         result = self.cycle()
         self.assertTrue(result["runSourceAccepted"])
-        self.assertEqual(result["notificationOutcome"], "capacity_exhausted")
+        self.assertEqual(result["notificationOutcome"], "command_accepted_unverified")
         self.assertEqual(result["observation"]["sequence"], 5)
         self.observation = normal
         self.collected = "129th-actionable-metadata-fixture"
@@ -426,11 +447,18 @@ class DeliveryTests(unittest.TestCase):
         self.assertTrue(result["observation"]["completeObservation"])
         self.assertTrue(result["freshObservation"])
         self.assertTrue(result["actionable"])
-        self.assertEqual(result["notificationOutcome"], "capacity_exhausted")
+        self.assertEqual(result["notificationOutcome"], "command_accepted_unverified")
         record = json.loads(path.read_bytes())
-        self.assertEqual(record["attemptedEvents"], attempted)
+        self.assertEqual(len(record["attemptedEvents"]), M.MAX_EVENTS)
+        self.assertEqual(record["attemptedEvents"][:-2], attempted[2:])
         self.assertEqual(record["latest"]["observation"]["sequence"], 6)
-        self.assertEqual(len(self.notify_calls), 2)
+        self.assertEqual(len(self.notify_calls), 4)
+        # Eviction is explicit bounded-window semantics, not lifetime silence.
+        self.observation = lambda: (_ for _ in ()).throw(D.Fault("scan_unavailable"))
+        self.cycle()
+        self.assertEqual(len(self.notify_calls), 5)
+        self.cycle()
+        self.assertEqual(len(self.notify_calls), 5)
 
     def test_native_descendant_closed_pipes_is_stopped_before_custody_released(self):
         calls, original = [], os.killpg
@@ -518,6 +546,8 @@ class DeliveryTests(unittest.TestCase):
                 patch.object(M, 'runner', self.native), \
                 patch.object(M.importlib.machinery.SourceFileLoader, 'load_module', load), \
                 patch.object(N, 'native', side_effect=native), \
+                patch('lib.scoped_source_admission.run', side_effect=lambda root, callback, **kwargs:
+                      native(doctor, True, operation_check=callback)), \
                 patch.object(N.probe, 'observe', side_effect=AssertionError('vendor launch forbidden')):
             result = M.native_schedule('install')
         self.assertEqual(result['status'], 'INSTALLED')

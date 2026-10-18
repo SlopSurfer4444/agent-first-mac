@@ -197,7 +197,7 @@ class AdapterTests(unittest.TestCase):
             return {"scopedCandidateReady": True, "machineMutationAuthorized": False}
         with patch.object(h, "ROOT", control), patch.object(Path, "home", return_value=self.home), \
                 patch.object(Path, "cwd", return_value=control), patch.object(h, "_sources", return_value=(MANIFEST, HISTORICAL)), \
-                patch("lib.operation_readiness.require_scoped_operation_ready", side_effect=observe), \
+                patch("lib.user_operation_readiness.require_scoped_operation_ready", side_effect=observe), \
                 patch("lib.operation_readiness.require_operation_ready", side_effect=AssertionError("no full doctor")):
             result = h.execute_live("disable", "a" * 40)
         self.assertEqual(result["status"], "APPLIED")
@@ -208,10 +208,125 @@ class AdapterTests(unittest.TestCase):
         control = self.home / "AIDev/control"
         with patch.object(h, "ROOT", control), patch.object(Path, "home", return_value=self.home), \
                 patch.object(Path, "cwd", return_value=control), patch.object(h, "_sources", return_value=(MANIFEST, HISTORICAL)), \
-                patch("lib.operation_readiness.require_scoped_operation_ready", side_effect=RuntimeError("unaccepted")):
+                patch("lib.user_operation_readiness.require_scoped_operation_ready", side_effect=RuntimeError("unaccepted")):
             with self.assertRaises(RuntimeError):
                 h.execute_live("disable", "a" * 40)
         self.assertEqual(self.target.read_bytes(), self.before)
+
+    def test_live_disable_accepts_absent_or_empty_native_config_without_creating_it(self):
+        control = self.home / "AIDev/control"
+        for content in (None, b""):
+            with self.subTest(content=content):
+                if content is None:
+                    self.config.unlink()
+                else:
+                    self.config.write_bytes(content)
+                self.target.write_bytes(self.before)
+                def observe(*args, **kwargs):
+                    self.assertTrue(all(check() for check in kwargs["checks"].values()))
+                with patch.object(h, "ROOT", control), patch.object(Path, "home", return_value=self.home), \
+                        patch.object(Path, "cwd", return_value=control), \
+                        patch.object(h, "_sources", return_value=(MANIFEST, HISTORICAL)), \
+                        patch("lib.user_operation_readiness.require_scoped_operation_ready", side_effect=observe):
+                    result = h.execute_live("disable", "a" * 40,
+                                            operation="absent" if content is None else "empty")
+                self.assertEqual(result["status"], "APPLIED")
+                self.assertEqual(self.config.read_bytes() if self.config.exists() else None, content)
+
+    def test_live_absent_native_config_appearing_during_admission_refuses(self):
+        self.config.unlink()
+        control = self.home / "AIDev/control"
+        def change(*args, **kwargs):
+            self.config.write_bytes(b"owner-new-state")
+        with patch.object(h, "ROOT", control), patch.object(Path, "home", return_value=self.home), \
+                patch.object(Path, "cwd", return_value=control), patch.object(h, "_sources", return_value=(MANIFEST, HISTORICAL)), \
+                patch("lib.user_operation_readiness.require_scoped_operation_ready", side_effect=change):
+            with self.assertRaisesRegex(h.OfframpError, "native_state_drift"):
+                h.execute_live("disable", "a" * 40)
+        self.assertEqual(self.target.read_bytes(), self.before)
+        self.assertEqual(self.config.read_bytes(), b"owner-new-state")
+
+    def test_native_snapshot_does_not_follow_dangling_symlink(self):
+        self.config.unlink()
+        self.config.symlink_to(self.home / "absent")
+        directory = h.Directory(self.home, (".codex",))
+        try:
+            with self.assertRaises(OSError):
+                h.native_snapshot(directory)
+        finally:
+            directory.close()
+
+    def test_cli_default_cycles_keep_history_and_restore_latest(self):
+        reports = []
+        first_images = None
+        for expected_id in ("hooks", "hooks-2", "hooks-3"):
+            for action, status in (("disable", "APPLIED"), ("disable", "NOOP"),
+                                   ("restore", "RESTORED"), ("restore", "ALREADY_RESTORED")):
+                self.assertEqual(h.main([action, "--fixture-home", str(self.home)], emit=reports.append), 0)
+                report = json.loads(reports[-1])
+                self.assertEqual(report["status"], status)
+                self.assertEqual(report["operationId"], expected_id)
+            first = self.home.joinpath(*h.RECOVERY, "hooks")
+            images = {p.name: p.read_bytes() for p in first.iterdir()}
+            if first_images is None:
+                first_images = images
+            self.assertEqual(images, first_images)
+        self.assertEqual(self.target.read_bytes(), self.before)
+
+    def test_default_cycle_does_not_skip_interrupted_preparation(self):
+        original = h.write_new
+        def interrupt(directory, name, raw, *args):
+            if name == "after.json":
+                raise KeyboardInterrupt()
+            return original(directory, name, raw, *args)
+        with patch.object(h, "write_new", side_effect=interrupt):
+            with self.assertRaises(KeyboardInterrupt):
+                self.run_action("disable", operation=None)
+        with self.assertRaises(FileExistsError):
+            self.run_action("disable", operation=None)
+        self.assertFalse(self.home.joinpath(*h.RECOVERY, "hooks-2").exists())
+        self.assertEqual(self.target.read_bytes(), self.before)
+
+    def test_completed_restore_without_marker_reconciles_and_advances_default_cycle(self):
+        self.run_action("disable", operation=None)
+        original = h.write_record
+        def interrupt(directory, name, raw):
+            if name == "restored.json":
+                raise KeyboardInterrupt()
+            return original(directory, name, raw)
+        with patch.object(h, "write_record", side_effect=interrupt):
+            with self.assertRaises(KeyboardInterrupt):
+                self.run_action("restore", operation=None)
+        self.assertEqual(self.target.read_bytes(), self.before)
+        recovery = self.home.joinpath(*h.RECOVERY, "hooks")
+        self.assertFalse((recovery / "restored.json").exists())
+        result = self.run_action("restore", operation=None)
+        self.assertEqual(result["status"], "ALREADY_RESTORED")
+        self.assertEqual(h.parse((recovery / "restored.json").read_bytes()),
+                         {"schema": 1, "status": "RESTORED"})
+        result = self.run_action("disable", operation=None)
+        self.assertEqual(result["status"], "APPLIED")
+        self.assertEqual(result["operationId"], "hooks-2")
+
+    def test_restore_marker_reconciliation_requires_admission(self):
+        self.run_action("disable")
+        self.run_action("restore")
+        marker = self.home.joinpath(*h.RECOVERY, "hooks", "restored.json")
+        marker.unlink()
+        def refuse(*args):
+            raise h.OfframpError("admission_refused")
+        with self.assertRaisesRegex(h.OfframpError, "admission_refused"):
+            h.execute(self.home, "restore", admission=refuse)
+        self.assertFalse(marker.exists())
+        self.assertEqual(self.target.read_bytes(), self.before)
+
+    def test_default_cycle_rejects_unknown_completion_marker(self):
+        self.run_action("disable")
+        self.home.joinpath(*h.RECOVERY, "hooks", "restored.json").write_bytes(b'{"status":"UNKNOWN"}')
+        self.home.joinpath(*h.RECOVERY, "hooks", "restored.json").chmod(0o600)
+        with self.assertRaisesRegex(h.OfframpError, "recovery_record"):
+            self.run_action("disable", operation=None)
+        self.assertFalse(self.home.joinpath(*h.RECOVERY, "hooks-2").exists())
 
     def test_native_live_adapter_native_drift_during_admission_preserves_hooks(self):
         control = self.home / "AIDev/control"
@@ -219,7 +334,7 @@ class AdapterTests(unittest.TestCase):
             self.config.write_text('native-trust = "third-choice"\n')
         with patch.object(h, "ROOT", control), patch.object(Path, "home", return_value=self.home), \
                 patch.object(Path, "cwd", return_value=control), patch.object(h, "_sources", return_value=(MANIFEST, HISTORICAL)), \
-                patch("lib.operation_readiness.require_scoped_operation_ready", side_effect=change):
+                patch("lib.user_operation_readiness.require_scoped_operation_ready", side_effect=change):
             with self.assertRaisesRegex(h.OfframpError, "native_state_drift"):
                 h.execute_live("disable", "a" * 40)
         self.assertEqual(self.target.read_bytes(), self.before)

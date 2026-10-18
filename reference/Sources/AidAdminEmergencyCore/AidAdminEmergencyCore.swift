@@ -118,8 +118,8 @@ public struct EmergencyArtifactExpectations: Equatable, Sendable {
     }
 
     public static let production = EmergencyArtifactExpectations(
-        binarySHA256: "ccf7c87823476892f35d25ae5b65e614fbd9e2fc1ae6e8c409644e800e291b54",
-        binarySize: 813_680,
+        binarySHA256: "447fb83a10f2d66239b3a226a245de247559e1f900434eb80882f500fc659024",
+        binarySize: 847_376,
         policySHA256: "2555b3f0ed1f75cd26bc41af6512ecc30d444ba1b0113458f72efcfccc304225",
         policySize: 1_617,
         sudoersSHA256: "b51a2c60bae3652decef1df7ffe2fd66931ee317305fbf1bc5c50e491f5c3ee6",
@@ -316,13 +316,11 @@ public final class EmergencyOwnerOrchestrator {
 
     private func finishDisable() throws -> [String] {
         try clearTimestampOrReject("disable_timestamp_clear_failed_state_retained")
-        let doctor = try doctorResult()
-        guard doctor.status != 0 else {
-            throw EmergencyFailure.rejected("disable_verification_failed_state_retained")
-        }
+        // The authenticated transaction verified exact grant absence. A broken
+        // broker's exit status cannot prove sudo denial and must not be run here.
         return [
             "EMERGENCY_DISABLE_VERIFIED",
-            "sudo_n_doctor_denied=true",
+            "exact_managed_grant_absent=true",
             "sudo_timestamp_cleared=true",
             "recovery_requires_fresh_standard_sudo=true",
             "in_flight_apply_state=UNKNOWN",
@@ -448,10 +446,11 @@ private struct TrustedEmergencyParents {
     let canonicalEtc: TrustedEmergencyDirectory
     let canonicalSudoers: TrustedEmergencyDirectory
     let agentConfiguration: TrustedEmergencyDirectory
-    let libexec: TrustedEmergencyDirectory
-    let audit: TrustedEmergencyDirectory
+    let libexec: TrustedEmergencyDirectory?
+    let audit: TrustedEmergencyDirectory?
     let staging: TrustedEmergencyDirectory
     let operationRoot: TrustedEmergencyDirectory
+    let revocationOnly: Bool
 }
 
 private struct EmergencyFileIdentity: Equatable {
@@ -516,51 +515,30 @@ public final class EmergencyTransaction {
 
     public func disable() throws -> String {
         try validateContext()
-        let parents = try openTrustedParents()
+        let parents = try openTrustedParents(revocationOnly: true)
         let lease = try acquireLease(".emergency.lock", parents)
         defer { withExtendedLifetime(lease) {} }
         if try reconcileInterrupted(parents) {
             return "EMERGENCY_DISABLE_TRANSACTION_COMMITTED"
         }
         try validateEnabledState(parents)
-        try validateSudoers(Self.sudoersPath, parents)
-        try validateFullSudoers(parents)
         try beginJournal(action: "disable", sudoers: Self.sudoersPath, parents)
-        var mutationStarted = false
-        var committedMarker: EmergencyFileIdentity?
         do {
             try renameNoReplace(Self.sudoersPath, Self.disabledSudoersPath,
                                 parents: parents, step: "disable-sudoers-move",
                                 failure: "disable_sudoers_move")
-            mutationStarted = true
             try hooks.afterMutation(step: "sudoers-moved")
             _ = try readExpectedSudoers(Self.disabledSudoersPath, parents)
 
-            committedMarker = try createMarker(parents)
+            _ = try createMarker(parents)
             try hooks.afterMutation(step: "marker-created")
-            try validateSudoers(Self.disabledSudoersPath, parents)
-            try hooks.afterMutation(step: "disabled-visudo")
-            try validateFullSudoers(parents)
-            try hooks.afterMutation(step: "full-visudo-disabled")
             try validateDisabledState(parents)
             try hooks.afterMutation(step: "disabled-final-verification")
             try clearJournal(parents)
             return "EMERGENCY_DISABLE_TRANSACTION_COMMITTED"
         } catch {
-            let original = String(describing: error)
-            if original.hasPrefix("emergency_process_") { throw error }
-            if mutationStarted {
-                do {
-                    try hooks.beforeRollback()
-                    try rollbackDisable(parents, committedMarker: committedMarker)
-                    try clearJournal(parents)
-                    throw EmergencyFailure.rejected(original + "_rolled_back")
-                } catch let failure as EmergencyFailure where failure.description.hasSuffix("_rolled_back") {
-                    throw failure
-                } catch {
-                    throw EmergencyFailure.rejected(original + "_rollback_failed")
-                }
-            }
+            // Retain the write-ahead record and exact moved grant. Never restore
+            // authority merely because marker/audit publication was interrupted.
             throw error
         }
     }
@@ -832,8 +810,10 @@ public final class EmergencyTransaction {
         } else if !marker {
             _ = try createMarker(parents)
         }
-        try validateSudoers(Self.disabledSudoersPath, parents)
-        try validateFullSudoers(parents)
+        if !parents.revocationOnly {
+            try validateSudoers(Self.disabledSudoersPath, parents)
+            try validateFullSudoers(parents)
+        }
         try validateDisabledState(parents)
         try clearJournal(parents)
         return true
@@ -879,6 +859,13 @@ public final class EmergencyTransaction {
     private func validateStaticArtifacts(
         sudoers: String, parents: TrustedEmergencyParents
     ) throws {
+        if parents.revocationOnly {
+            let bytes = try readExpectedSudoers(sudoers, parents)
+            let expected = "Cmnd_Alias AGENT_FIRST_MAC_AID_ADMIN = /usr/local/libexec/aid-admin\n" +
+                context.invokingOwner.name + " ALL=(root) NOPASSWD: AGENT_FIRST_MAC_AID_ADMIN\n"
+            try require(bytes == Data(expected.utf8), "revocation_grant_owner_binding")
+            return
+        }
         let binary = try readTrustedFile(Self.binaryPath, mode: 0o555,
                                          maximum: 32 * 1024 * 1024, parents: parents)
         try require(binary.count == context.expectations.binarySize &&
@@ -909,7 +896,8 @@ public final class EmergencyTransaction {
                     "attestation_hash_binding")
         try require(emergencySHA256(sudoersData) == value.sudoersSHA256,
                     "attestation_sudoers_binding")
-        try revalidateDirectory(parents.audit)
+        guard let audit = parents.audit else { throw EmergencyFailure.rejected("recovery_audit_missing") }
+        try revalidateDirectory(audit)
         try revalidateDirectory(parents.staging)
     }
 
@@ -962,30 +950,6 @@ public final class EmergencyTransaction {
         }
         if value.contains("permission denied") { return "access" }
         return "rejected"
-    }
-
-    private func rollbackDisable(
-        _ parents: TrustedEmergencyParents, committedMarker: EmergencyFileIdentity?
-    ) throws {
-        let temporaryMarkerExists = try exists(Self.markerTemporaryPath, parents)
-        try require(!temporaryMarkerExists, "rollback_disable_marker_temporary")
-        if let committedMarker {
-            try removeExactFile(Self.markerPath, expected: committedMarker, parents: parents,
-                                failure: "rollback_disable_marker")
-        } else {
-            let markerExists = try exists(Self.markerPath, parents)
-            try require(!markerExists, "rollback_disable_marker_unowned")
-        }
-        let enabledSudoersExists = try exists(Self.sudoersPath, parents)
-        let disabledSudoersExists = try exists(Self.disabledSudoersPath, parents)
-        try require(!enabledSudoersExists && disabledSudoersExists,
-                    "rollback_disable_sudoers_state")
-        try renameNoReplace(Self.disabledSudoersPath, Self.sudoersPath,
-                            parents: parents, step: "rollback-disable-sudoers-restore",
-                            failure: "rollback_disable_sudoers_restore")
-        try validateSudoers(Self.sudoersPath, parents)
-        try validateFullSudoers(parents)
-        try validateEnabledState(parents)
     }
 
     private func rollbackRecovery(_ parents: TrustedEmergencyParents) throws {
@@ -1121,7 +1085,7 @@ public final class EmergencyTransaction {
         return data
     }
 
-    private func openTrustedParents() throws -> TrustedEmergencyParents {
+    private func openTrustedParents(revocationOnly: Bool = false) throws -> TrustedEmergencyParents {
         let sudoers = try openTrustedDirectory("/etc/sudoers.d", mode: 0o755)
         let canonicalEtc = try openTrustedDirectory("/private/etc", mode: 0o755)
         let canonicalSudoers = try openTrustedDirectory("/private/etc/sudoers.d", mode: 0o755)
@@ -1133,10 +1097,11 @@ public final class EmergencyTransaction {
             canonicalEtc: canonicalEtc,
             canonicalSudoers: canonicalSudoers,
             agentConfiguration: try openTrustedDirectory("/etc/agent-first-mac", mode: 0o755),
-            libexec: try openTrustedDirectory("/usr/local/libexec", mode: 0o755),
-            audit: try openTrustedDirectory(Self.auditPath, mode: 0o700),
+            libexec: revocationOnly ? nil : try openTrustedDirectory("/usr/local/libexec", mode: 0o755),
+            audit: revocationOnly ? nil : try openTrustedDirectory(Self.auditPath, mode: 0o700),
             staging: try openTrustedDirectory(Self.stagingPath, mode: 0o700),
-            operationRoot: try openTrustedDirectory(Self.operationRootPath, mode: 0o755))
+            operationRoot: try openTrustedDirectory(Self.operationRootPath, mode: 0o755),
+            revocationOnly: revocationOnly)
     }
 
     private func openTrustedDirectory(
@@ -1191,7 +1156,8 @@ public final class EmergencyTransaction {
         case Self.mainSudoersPath:
             return (parents.canonicalEtc, "sudoers")
         case Self.binaryPath:
-            return (parents.libexec, "aid-admin")
+            guard let libexec = parents.libexec else { throw EmergencyFailure.rejected("recovery_libexec_missing") }
+            return (libexec, "aid-admin")
         case Self.policyPath:
             return (parents.agentConfiguration, "aid-admin-policy.json")
         case Self.attestationPath:

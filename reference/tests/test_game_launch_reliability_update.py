@@ -7,6 +7,32 @@ from lib import operation_readiness as readiness
 P=Path(__file__).resolve().parents[1];COMMIT='a'*40
 loader=importlib.machinery.SourceFileLoader('launch_update',str(P/'bin/game-launch-reliability-update'));spec=importlib.util.spec_from_loader(loader.name,loader);u=importlib.util.module_from_spec(spec);loader.exec_module(u)
 class Tests(unittest.TestCase):
+    def test_successor_recover_finishes_original_interrupted_direction(self):
+        def interrupt(event):
+            if event=='replaced:'+u.TARGETS['helper']:raise KeyboardInterrupt()
+        with self.assertRaises(KeyboardInterrupt):self.apply(interrupt)
+        self.head='d'*40
+        self.assertTrue(u.operate('recover',self.head,self.pin)['changed'])
+        u.operate('rollback',self.head,self.pin)
+        self.assertEqual(self.images(),self.before)
+
+    def test_recovery_after_unrelated_commit_keeps_original_receipts(self):
+        self.apply();after=self.images();self.head='d'*40
+        result=u.operate('rollback',self.head,self.pin)
+        self.assertTrue(result['changed']);self.assertEqual(self.images(),self.before)
+        u.operate('return',self.head,self.pin)
+        self.assertEqual(self.images(),after)
+        with self.assertRaisesRegex(RuntimeError,'previous_settled_transaction_archive_required'):
+            u.operate('apply',self.head,self.pin)
+
+    def test_successor_recovery_preserves_unknown_target(self):
+        self.apply();self.head='d'*40
+        self.put(u.TARGETS['hub.launcher'],b'owner change',0o755)
+        before=self.images()
+        with self.assertRaisesRegex(RuntimeError,'target_unknown_drift'):
+            u.operate('rollback',self.head,self.pin)
+        self.assertEqual(self.images(),before)
+
     def setUp(self):
         self.tmp=tempfile.TemporaryDirectory();self.addCleanup(self.tmp.cleanup);self.home=Path(self.tmp.name).resolve()
         self.mapping={name:self.home/name for name in ('hub','ds3','cs2','games','source','state','candidate','aid-bin')}
@@ -330,7 +356,13 @@ class Tests(unittest.TestCase):
             shutil.copytree(self.mapping['games']/name,native_only/name)
             shutil.copyfile(self.path('candidate/'+name+'/Contents/MacOS/launcher'),native_only/name/'Contents/MacOS/launcher')
         (native_only/'build.json').write_bytes(u.encode({'schema':1,'sourceSha256':self.source_files['bin/game-app-launcher.m'],'apps':self.new_native['builtApps']}))
-        with patch.object(h,'HOME',self.home),patch.object(h,'HUB',self.mapping['hub']),patch.object(h,'DS3',self.mapping['ds3']),patch.object(h,'HERE',self.source),patch.object(h,'source_gate',side_effect=lambda commit,*_:u.source_check(commit)),patch.object(h,'status'):
+        def source_gate(commit,*_):
+            u.source_check(commit)
+            def held():
+                u.source_check(commit)
+                return True
+            return held
+        with patch.object(h,'HOME',self.home),patch.object(h,'HUB',self.mapping['hub']),patch.object(h,'DS3',self.mapping['ds3']),patch.object(h,'HERE',self.source),patch.object(old,'source_gate',side_effect=source_gate),patch.object(old,'source_check',side_effect=u.source_check),patch.object(old,'status'):
             old.update(COMMIT,native_only)
             before=self.images()
             with self.assertRaisesRegex(u.Blocked,'predecessor_drift'):self.apply()

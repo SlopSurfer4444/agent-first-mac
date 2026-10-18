@@ -32,9 +32,8 @@ class Fixture:
             **{p: {"uid": 0, "gid": 0, "mode": 0o700, "kind": "directory"} for p in health.DIRECTORIES},
             **{p: True for p in health.ABSENCES},
         }
-        checks = {key: True for key in ("emergency_disable_absent", "installed_artifact_attestation", "installed_contract", "policy_hash")}
-        if selected == "successor":
-            checks["operation_settled"] = True
+        checks = {key: True for key in ("emergency_disable_absent", "installed_artifact_attestation",
+                                       "installed_contract", "operation_settled", "policy_hash")}
         self.response = {"checks": checks, "command": "doctor-root", "problems": [], "readOnly": True,
             "schema": 1, "systemMutationsPerformed": False, "verdict": "ROOT_CONTRACT_READY"}
         self.commands = []
@@ -74,7 +73,41 @@ class RootRuntimeHealthTests(unittest.TestCase):
         self.assertEqual(f.commands, [])
         report = f.inspect(allow_predecessor=True)
         self.assertEqual(report["verdict"], "PREDECESSOR_READY")
-        self.assertIs(report["operationJournalSettled"], False)
+        self.assertIs(report["operationJournalSettled"], True)
+
+    def test_predecessor_requires_real_boolean_settlement_and_all_five_checks(self):
+        for key in Fixture("predecessor").response["checks"]:
+            for invalid in (False, 1, None, "true"):
+                f = Fixture("predecessor")
+                f.response["checks"][key] = invalid
+                with self.subTest(key=key, invalid=invalid), self.assertRaisesRegex(
+                        health.HealthError, "root_doctor_contract"):
+                    f.inspect(allow_predecessor=True)
+                self.assertEqual(f.commands, [health.COMMAND])
+
+    def test_current_release_predecessor_is_the_journal_aware_broker(self):
+        release = health.delivery.load_release(Path(__file__).resolve().parents[1])
+        self.assertEqual(release["installedContracts"]["predecessor"]["broker"], {
+            "sha256": "ccf7c87823476892f35d25ae5b65e614fbd9e2fc1ae6e8c409644e800e291b54",
+            "size": 813680,
+        })
+
+    def test_handoff_health_adapter_observes_predecessor_settlement(self):
+        f = Fixture("predecessor")
+        observer = mock.Mock(observe=f.observe)
+        release = object()
+        uid = health.os.getuid()
+        home = health.pwd.getpwuid(uid).pw_dir
+        with mock.patch.object(health, "NativeObservation", return_value=observer), \
+             mock.patch.object(health.delivery, "health_contract", return_value=f.contract), \
+             mock.patch.object(health.delivery, "verify_durable", return_value={}) as pair, \
+             mock.patch.object(health, "bounded", side_effect=lambda argv, **kw: f.run(tuple(argv))):
+            report = health.native_health(release, home, uid, f.source, allow_predecessor=True)
+        self.assertEqual(report["verdict"], "PREDECESSOR_READY")
+        self.assertIs(report["operationJournalSettled"], True)
+        self.assertEqual(f.commands, [health.COMMAND])
+        self.assertEqual(pair.call_count, 3)
+        observer.close.assert_called_once_with()
 
     def test_unknown_or_corrupt_broker_never_executes(self):
         for raw in (b"unknown", b"suCcessor", b"", b"successor\x00"):
@@ -137,12 +170,16 @@ class RootRuntimeHealthTests(unittest.TestCase):
 
     def test_additional_or_missing_check_cannot_masquerade_as_current_contract(self):
         for selected in ("successor", "predecessor"):
+            for missing in Fixture(selected).response["checks"]:
+                f = Fixture(selected)
+                del f.response["checks"][missing]
+                with self.subTest(selected=selected, missing=missing), self.assertRaisesRegex(
+                        health.HealthError, "root_doctor_contract"):
+                    f.inspect(allow_predecessor=True)
             f = Fixture(selected)
-            if selected == "successor":
-                del f.response["checks"]["operation_settled"]
-            else:
-                f.response["checks"]["operation_settled"] = True
-            with self.subTest(selected=selected), self.assertRaises(health.HealthError):
+            f.response["checks"]["unexpected_check"] = True
+            with self.subTest(selected=selected, extra=True), self.assertRaisesRegex(
+                    health.HealthError, "root_doctor_contract"):
                 f.inspect(allow_predecessor=True)
 
     def test_post_command_drift_rejects_every_observation(self):

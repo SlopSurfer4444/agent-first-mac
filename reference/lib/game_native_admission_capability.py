@@ -60,15 +60,18 @@ class Transaction:
   self.gate();b.need(type(expected_before) is dict and set(expected_before)==set(NAMES),'capability_before_schema')
   before={key:optional(path) for key,path in self.targets.items()}
   b.need({key:None if raw is None else b.sha(raw) for key,raw in before.items()}==expected_before,'capability_prestate_changed')
-  b.need(not self.directory.exists() and not self.directory.is_symlink(),'capability_transaction_exists')
-  parent=b._directory(self.directory.parent);os.mkdir(self.directory.name,0o700,dir_fd=parent);os.fsync(parent);os.close(parent)
   images={key:{'before':None if before[key] is None else b.sha(before[key]),'after':b.sha(self.after[key])} for key in NAMES}
   record={'schema':1,'owner':b.OWNER,'commit':self.commit,'policySha256':b.sha(b.json_bytes(self.intent)),'phase':'prepared','direction':'after','intent':None,'images':images}
   # No managed target changes until this complete immutable image inventory exists.
-  for side,files in (('before',before),('after',self.after)):
-   for key,raw in files.items():
-    if raw is not None:self.new(self.directory/(key+'.'+side),raw)
-  self.new(self.directory/'record.json',b.json_bytes(record));self.read();return record
+  from lib import game_native_admission_transaction as transaction
+  images_to_write={key+'.'+side:raw for side,files in (('before',before),('after',self.after)) for key,raw in files.items() if raw is not None}
+  images_to_write['record.json']=b.json_bytes(record)
+  if self.directory.exists() or self.directory.is_symlink():
+   # Repair legacy preparation interrupted before its record was published.
+   # Every retained byte must match the freshly bound prepared inventory.
+   transaction._complete_namespace(self.directory,images_to_write)
+  else:transaction._new_namespace(self.directory,images_to_write)
+  self.read();return record
  def new(self,path,raw):
   parent=b._directory(path.parent,private=True);fd=None
   try:

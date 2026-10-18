@@ -2,6 +2,7 @@
 """Exact-source user-shell soft open-file limit lifecycle; no root changes."""
 import sys
 sys.dont_write_bytecode = True
+sys.pycache_prefix = "/dev/null"
 import argparse, fcntl, hashlib, json, os, pwd, re, stat
 from pathlib import Path
 HERE = Path(__file__).resolve().parent.parent
@@ -25,7 +26,7 @@ def gate(commit, fd, operation):
     need(HERE == CONTROL and Path(__file__).absolute() == CONTROL/'bin/shell-nofile', 'canonical_source_required')
     need(re.fullmatch('[0-9a-f]{40}', commit), 'invalid_commit')
     if str(HERE) not in sys.path: sys.path.insert(0, str(HERE))
-    from lib.operation_readiness import require_scoped_operation_ready
+    from lib.user_operation_readiness import require_scoped_operation_ready
     def capture():
         home = os.stat(HOME, follow_symlinks=False); held = os.fstat(fd)
         need((home.st_dev, home.st_ino) == (held.st_dev, held.st_ino), 'home_drift')
@@ -54,6 +55,243 @@ JOURNAL = '.aid-shell-nofile-operation.json'
 PENDING_TARGET = '.aid-shell-nofile-target.pending'
 PENDING_RECEIPT = '.aid-shell-nofile-receipt.pending'
 PENDING_LEGACY = '.aid-shell-nofile-legacy-receipt.pending'
+BLOCK_START = b'# >>> aid shell-nofile >>>'
+BLOCK_END = b'# <<< aid shell-nofile <<<'
+BLOCK = b'\n' + BLOCK_START + b'\n' + PAYLOAD.split(b'\n', 1)[1] + BLOCK_END + b'\n'
+
+def startup_snapshot(fd, name=TARGET):
+    try: leaf = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=fd)
+    except FileNotFoundError: return None
+    try:
+        s = os.fstat(leaf)
+        need(stat.S_ISREG(s.st_mode) and s.st_uid == os.getuid() and s.st_nlink == 1 and not s.st_mode & 0o022 and not getattr(s, 'st_flags', 0) and s.st_size <= 1024*1024, 'unsafe_startup_file')
+        with os.fdopen(os.dup(leaf), 'rb') as stream: data = stream.read(1024*1024+1)
+        last = os.fstat(leaf)
+        need(len(data) == s.st_size and (last.st_dev, last.st_ino, last.st_mode, last.st_uid, last.st_gid, last.st_size, last.st_mtime_ns, last.st_ctime_ns) ==
+             (s.st_dev, s.st_ino, s.st_mode, s.st_uid, s.st_gid, s.st_size, s.st_mtime_ns, s.st_ctime_ns), 'startup_file_drift')
+        return data, (s.st_dev, s.st_ino, s.st_mode, s.st_uid, s.st_gid, s.st_size, s.st_mtime_ns, s.st_ctime_ns)
+    finally: os.close(leaf)
+
+def integration_plan(fd, operation):
+    need(operation in ('integrate', 'unintegrate'), 'invalid_operation')
+    need(all(snapshot_at(fd, name) is None for name in (RECEIPT, JOURNAL, PENDING_TARGET, PENDING_RECEIPT, PENDING_LEGACY)), 'legacy_installation_requires_existing_lifecycle')
+    before = startup_snapshot(fd)
+    data = b'' if before is None else before[0]
+    count = data.count(BLOCK)
+    need(count <= 1 and data.count(BLOCK_START) == count and data.count(BLOCK_END) == count, 'managed_block_drift')
+    if operation == 'integrate': after = data if count else data + BLOCK
+    elif count:
+        prefix, suffix = data.split(BLOCK, 1)
+        # Preserve the separator if owner text was later appended after our
+        # block; removing it must not concatenate two shell commands.
+        separator = b'\n' if prefix and not prefix.endswith(b'\n') and suffix else b''
+        after = prefix + separator + suffix
+    else: after = data
+    return before, after
+
+def exchange_startup(fd, pending):
+    import ctypes
+    need(sys.platform == 'darwin', 'atomic_exchange_requires_macos')
+    exchange = ctypes.CDLL('/usr/lib/libSystem.B.dylib', use_errno=True).renameatx_np
+    exchange.argtypes = (ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_uint)
+    exchange.restype = ctypes.c_int
+    # stdio.h: RENAME_SWAP (0x00000002), both names must exist.
+    need(exchange(fd, os.fsencode(pending), fd, os.fsencode(TARGET), 2) == 0, 'startup_exchange_failed')
+
+def retain_preimage(fd, pending):
+    recovery = pending.replace('.aid-shell-block-', '.aid-shell-recovery-', 1)
+    rename_exclusive(fd, pending, recovery)
+    return recovery
+
+def rename_exclusive(fd, source, destination):
+    import ctypes
+    rename = ctypes.CDLL('/usr/lib/libSystem.B.dylib', use_errno=True).renameatx_np
+    rename.argtypes = (ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_uint)
+    rename.restype = ctypes.c_int
+    need(rename(fd, os.fsencode(source), fd, os.fsencode(destination), 4) == 0,
+         'startup_preimage_retention_required:' + source)
+    os.fsync(fd)
+
+def copy_startup_metadata(fd, pending, before):
+    leaf = os.open(pending, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=fd)
+    try:
+        if before is None: os.fchmod(leaf, 0o600)
+        else:
+            original = os.open(TARGET, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=fd)
+            try:
+                s = os.fstat(original)
+                need((s.st_dev, s.st_ino, s.st_mode, s.st_uid, s.st_gid, s.st_size, s.st_mtime_ns, s.st_ctime_ns) == before[1], 'startup_file_drift')
+                if sys.platform == 'darwin':
+                    # copyfile.h: COPYFILE_METADATA = ACL | STAT | XATTR.
+                    import ctypes
+                    copy = ctypes.CDLL('/usr/lib/libSystem.B.dylib', use_errno=True).fcopyfile
+                    copy.argtypes = (ctypes.c_int, ctypes.c_int, ctypes.c_void_p, ctypes.c_uint32)
+                    copy.restype = ctypes.c_int
+                    need(copy(original, leaf, None, 7) == 0, 'startup_metadata_copy_failed')
+                else:
+                    os.fchown(leaf, s.st_uid, s.st_gid)
+                    os.fchmod(leaf, stat.S_IMODE(s.st_mode))
+                    if hasattr(os, 'listxattr'):
+                        for name in os.listxattr(original): os.setxattr(leaf, name, os.getxattr(original, name))
+            finally: os.close(original)
+        os.fsync(leaf)
+    finally: os.close(leaf)
+
+def integrate(fd, operation, source_guard=lambda: None):
+    # A single atomic replacement needs no multi-object journal. Exact marker
+    # removal preserves owner edits outside this block. Never adopt legacy state.
+    retained = sorted(name for name in os.listdir(fd) if name.startswith('.aid-shell-block-'))
+    need(not retained, 'startup_stage_inspection_required:' + ','.join(retained))
+    before, after = integration_plan(fd, operation)
+    data = b'' if before is None else before[0]
+    if after == data: return 'UNCHANGED'
+    import secrets
+    pending = '.aid-shell-block-' + secrets.token_hex(12)
+    create_at(fd, pending, after)
+    remove_stage = True
+    try:
+        copy_startup_metadata(fd, pending, before)
+        source_guard()
+        need(integration_plan(fd, operation) == (before, after), 'startup_file_drift')
+        if before is None:
+            os.link(pending, TARGET, src_dir_fd=fd, dst_dir_fd=fd, follow_symlinks=False)
+            os.unlink(pending, dir_fd=fd)
+        else:
+            # The swap retains whatever was actually displaced, including a
+            # concurrent owner edit after the last check. Never discard it on
+            # mismatch or process interruption.
+            remove_stage = False
+            exchange_startup(fd, pending)
+            os.fsync(fd)
+            try: displaced = startup_snapshot(fd, pending)
+            except (OSError, RuntimeError):
+                raise RuntimeError('startup_concurrent_edit_preserved:' + pending)
+            # Renaming may change ctime; bind bytes, inode and stable metadata.
+            need(displaced is not None and displaced[0] == before[0] and displaced[1][:-1] == before[1][:-1],
+                 'startup_concurrent_edit_preserved:' + pending)
+        os.fsync(fd)
+        need(startup_snapshot(fd)[0] == after, 'startup_readback_failed')
+        if before is not None:
+            # An editor can still hold the displaced inode open. Keep that
+            # inode, even after successful verification, so late writes survive.
+            retain_preimage(fd, pending)
+        remove_stage = True
+        return 'INTEGRATED' if operation == 'integrate' else 'UNINTEGRATED'
+    finally:
+        # Only our unpredictable staging name, never owner files or wildcards.
+        if remove_stage:
+            try: os.unlink(pending, dir_fd=fd)
+            except FileNotFoundError: pass
+
+def integration_gate(commit, fd, operation):
+    need(HERE == CONTROL and Path(__file__).absolute() == CONTROL/'bin/shell-nofile', 'canonical_source_required')
+    need(re.fullmatch('[0-9a-f]{40}', commit), 'invalid_commit')
+    if str(HERE) not in sys.path: sys.path.insert(0, str(HERE))
+    from lib.user_operation_readiness import require_scoped_operation_ready
+    before = integration_plan(fd, operation)
+    def unchanged():
+        home = os.stat(HOME, follow_symlinks=False); held = os.fstat(fd)
+        return (home.st_dev, home.st_ino) == (held.st_dev, held.st_ino) and integration_plan(fd, operation) == before
+    return require_scoped_operation_ready(CONTROL, 'shell-apply' if operation == 'integrate' else 'shell-recovery', commit,
+        checks={'payload-owner': unchanged, 'recovery': unchanged}, target_guard=unchanged)
+
+def block_migration_plan(fd):
+    need(snapshot_at(fd, JOURNAL) is None and all(snapshot_at(fd, name) is None for name in
+         (PENDING_TARGET, PENDING_RECEIPT, PENDING_LEGACY)), 'explicit_recovery_required')
+    before = startup_snapshot(fd); receipt = snapshot_at(fd, RECEIPT)
+    need(before is not None and receipt is not None, 'legacy_pair_required')
+    r = receipt_valid(receipt[0]); data, ident = before
+    need(data.count(PAYLOAD) == 1 and BLOCK_START not in data and BLOCK_END not in data, 'legacy_fragment_ambiguous')
+    if r['schema'] == 1:
+        need(data == PAYLOAD, 'legacy_schema1_edited_target_unbound')
+    else:
+        recorded = r['targetIdentity']
+        need((recorded['device'], recorded['inode'], recorded['uid'], recorded['mode']) ==
+             (ident[0], ident[1], ident[3], stat.S_IMODE(ident[2])), 'legacy_target_identity_drift')
+    return before, receipt, data.replace(PAYLOAD, BLOCK, 1)
+
+def block_migration_phase(fd, j):
+    keys = {'schema', 'operation', 'commit', 'stage', 'beforeIdentity', 'afterIdentity',
+            'beforeSha256', 'afterSha256', 'receiptIdentity', 'receiptSha256'}
+    need(type(j) is dict and set(j) == keys and type(j['schema']) is int and j['schema'] == 1 and j['operation'] == 'migrate-block'
+         and type(j['commit']) is str and re.fullmatch('[0-9a-f]{40}', j['commit'])
+         and type(j['stage']) is str and re.fullmatch(r'\.aid-shell-block-[0-9a-f]{24}', j['stage']), 'journal_drift')
+    for key in ('beforeIdentity', 'afterIdentity'):
+        need(type(j[key]) is list and len(j[key]) == 8 and all(type(n) is int and n >= 0 for n in j[key]), 'journal_identity_drift')
+    identity_valid(j['receiptIdentity'])
+    need(all(snapshot_at(fd, name) is None for name in (PENDING_TARGET, PENDING_RECEIPT, PENDING_LEGACY)), 'unexpected_pending_file')
+    for key in ('beforeSha256', 'afterSha256', 'receiptSha256'):
+        need(type(j[key]) is str and re.fullmatch('[0-9a-f]{64}', j[key]), 'journal_drift')
+    recovery = j['stage'].replace('.aid-shell-block-', '.aid-shell-recovery-', 1)
+    current = startup_snapshot(fd); stage = startup_snapshot(fd, j['stage']); saved = startup_snapshot(fd, recovery)
+    def matches(value, side):
+        return value is not None and list(value[1][:-1]) == j[side+'Identity'][:-1] and hashlib.sha256(value[0]).hexdigest() == j[side+'Sha256']
+    live_receipt = snapshot_at(fd, RECEIPT); saved_receipt = snapshot_at(fd, recovery+'.receipt')
+    def receipt_matches(value):
+        return value is not None and value[1] == j['receiptIdentity'] and hashlib.sha256(value[0]).hexdigest() == j['receiptSha256']
+    need((receipt_matches(live_receipt) and saved_receipt is None) or
+         (live_receipt is None and receipt_matches(saved_receipt)), 'migration_receipt_drift')
+    if matches(current, 'before') and matches(stage, 'after') and saved is None and saved_receipt is None: return 'before'
+    if matches(current, 'after') and matches(stage, 'before') and saved is None and saved_receipt is None: return 'swapped'
+    if matches(current, 'after') and stage is None and matches(saved, 'before'):
+        return 'retained' if live_receipt is not None else 'settled'
+    raise RuntimeError('migration_target_drift_preserved:' + j['stage'])
+
+def recover_block_migration(fd, j, journal_snapshot):
+    phase = block_migration_phase(fd, j)
+    if phase == 'before':
+        exchange_startup(fd, j['stage']); os.fsync(fd)
+        phase = block_migration_phase(fd, j)
+    if phase == 'swapped':
+        retain_preimage(fd, j['stage'])
+        phase = block_migration_phase(fd, j)
+    if phase == 'retained':
+        recovery = j['stage'].replace('.aid-shell-block-', '.aid-shell-recovery-', 1)
+        rename_exclusive(fd, RECEIPT, recovery+'.receipt')
+        phase = block_migration_phase(fd, j)
+    need(phase == 'settled', 'migration_incomplete')
+    unlink_owned(fd, JOURNAL, journal_snapshot[1], hashlib.sha256(journal_snapshot[0]).hexdigest())
+    return 'BLOCK_MIGRATED'
+
+def migrate_block(fd, commit, source_guard=lambda: None):
+    need(type(commit) is str and re.fullmatch('[0-9a-f]{40}', commit), 'invalid_commit')
+    journal = snapshot_at(fd, JOURNAL)
+    if journal is not None:
+        j = parse_json(journal[0]); block_migration_phase(fd, j)
+        source_guard()
+        return recover_block_migration(fd, j, journal)
+    need(not any(name.startswith('.aid-shell-block-') for name in os.listdir(fd)), 'startup_stage_inspection_required')
+    if snapshot_at(fd, RECEIPT) is None:
+        current, after = integration_plan(fd, 'integrate')
+        if current is not None and current[0] == after: return 'UNCHANGED'
+    before, receipt, after = block_migration_plan(fd)
+    import secrets
+    stage = '.aid-shell-block-' + secrets.token_hex(12)
+    create_at(fd, stage, after)
+    copy_startup_metadata(fd, stage, before)
+    source_guard()
+    need(block_migration_plan(fd) == (before, receipt, after), 'migration_prestate_drift')
+    j = {'schema': 1, 'operation': 'migrate-block', 'commit': commit, 'stage': stage,
+         'beforeIdentity': list(before[1]), 'afterIdentity': list(startup_snapshot(fd, stage)[1]),
+         'beforeSha256': hashlib.sha256(before[0]).hexdigest(), 'afterSha256': hashlib.sha256(after).hexdigest(),
+         'receiptIdentity': receipt[1], 'receiptSha256': hashlib.sha256(receipt[0]).hexdigest()}
+    create_at(fd, JOURNAL, json.dumps(j, sort_keys=True).encode()+b'\n')
+    return recover_block_migration(fd, j, snapshot_at(fd, JOURNAL))
+
+def block_migration_gate(commit, fd):
+    need(HERE == CONTROL and Path(__file__).absolute() == CONTROL/'bin/shell-nofile', 'canonical_source_required')
+    need(re.fullmatch('[0-9a-f]{40}', commit), 'invalid_commit')
+    if str(HERE) not in sys.path: sys.path.insert(0, str(HERE))
+    from lib.user_operation_readiness import require_scoped_operation_ready
+    def capture():
+        journal = snapshot_at(fd, JOURNAL)
+        return (journal, block_migration_phase(fd, parse_json(journal[0]))) if journal else block_migration_plan(fd)
+    before = capture()
+    def unchanged():
+        home = os.stat(HOME, follow_symlinks=False); held = os.fstat(fd)
+        return (home.st_dev, home.st_ino) == (held.st_dev, held.st_ino) and capture() == before
+    return require_scoped_operation_ready(CONTROL, 'shell-recovery', commit,
+        checks={'payload-owner': unchanged, 'recovery': unchanged}, target_guard=unchanged)
 
 def snapshot_at(fd, name, links=1):
     try: leaf = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=fd)
@@ -112,6 +350,9 @@ def unlink_owned(fd, name, expected, digest):
 
 def journal_state(fd, recorded):
     j = parse_json(recorded)
+    if type(j) is dict and j.get('operation') == 'migrate-block':
+        block_migration_phase(fd, j)
+        return j
     need(type(j) is dict and j.get('operation') in ('apply', 'rollback', 'migrate-receipt'), 'journal_drift')
     keys = {'schema', 'operation', 'commit', 'targetIdentity', 'receiptIdentity', 'receiptSha256'}
     if j['operation'] == 'migrate-receipt': keys |= {'legacyReceiptIdentity', 'legacyReceiptSha256'}
@@ -157,6 +398,7 @@ def journal_state(fd, recorded):
     return j
 
 def recover(fd, j, journal_snapshot):
+    if j['operation'] == 'migrate-block': return recover_block_migration(fd, j, journal_snapshot)
     if j['operation'] in ('apply', 'migrate-receipt'):
         if j['operation'] == 'migrate-receipt':
             observed = snapshot_at(fd, RECEIPT, links=2)
@@ -240,17 +482,46 @@ def transaction(fd, operation, commit):
 
 def main():
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument('operation', choices=('apply', 'status', 'rollback', 'recover', 'migrate-receipt'))
+    p.add_argument('operation', choices=('apply', 'status', 'rollback', 'recover', 'migrate-receipt', 'migrate-block', 'print-snippet'),
+                   help='print-snippet emits owner-managed zsh code without inspecting or changing HOME')
     p.add_argument('--commit')
     a = p.parse_args()
-    need(not os.environ.get('ZDOTDIR') or Path(os.environ['ZDOTDIR']) == HOME, 'alternate_zdotdir')
     m = json.loads((HERE/MANIFEST).read_text())
     need(m['payloadSha256'] == hashlib.sha256(PAYLOAD).hexdigest(), 'manifest_drift')
+    if a.operation == 'print-snippet':
+        # Export is not adoption or installation. The owner can place this in
+        # their actual zsh startup configuration, including a custom ZDOTDIR,
+        # without granting this adapter ownership of the containing file.
+        sys.stdout.write('# Owner-managed shell-nofile snippet. Remove this block to undo.\n'
+                         + PAYLOAD.decode().split('\n', 1)[1])
+        return
+    need(not os.environ.get('ZDOTDIR') or Path(os.environ['ZDOTDIR']) == HOME, 'alternate_zdotdir')
     fd = os.open(HOME, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
     try:
         s = os.fstat(fd)
         need(s.st_uid == os.getuid() and not s.st_mode & 0o022, 'unsafe_home')
         fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        journal = snapshot_at(fd, JOURNAL)
+        parsed_journal = parse_json(journal[0]) if journal is not None else None
+        block_recovery = type(parsed_journal) is dict and parsed_journal.get('operation') == 'migrate-block'
+        if a.operation == 'migrate-block' or block_recovery and a.operation == 'recover':
+            verdict = migrate_block(fd, a.commit or '', lambda: block_migration_gate(a.commit or '', fd))
+            print(json.dumps({'schema': 1, 'verdict': verdict, 'existingSessionsChanged': False}))
+            return
+        legacy = any(snapshot_at(fd, name) is not None for name in (RECEIPT, JOURNAL, PENDING_TARGET, PENDING_RECEIPT, PENDING_LEGACY))
+        if not legacy and a.operation in ('apply', 'rollback', 'status'):
+            operation = 'integrate' if a.operation == 'apply' else 'unintegrate'
+            if a.operation == 'status':
+                retained = sorted(name for name in os.listdir(fd) if name.startswith('.aid-shell-block-'))
+                if retained:
+                    print(json.dumps({'schema': 1, 'verdict': 'INSPECTION_REQUIRED', 'retainedStages': retained, 'existingSessionsChanged': False}))
+                    return
+                before, after = integration_plan(fd, operation)
+                verdict = 'ABSENT' if before is None or after == before[0] else 'INSTALLED'
+            else:
+                verdict = integrate(fd, operation, lambda: integration_gate(a.commit or '', fd, operation))
+            print(json.dumps({'schema': 1, 'verdict': verdict, 'existingSessionsChanged': False}))
+            return
         if a.operation != 'status': gate(a.commit or '', fd, a.operation)
         verdict = transaction(fd, a.operation, a.commit)
         report = {'schema': 1, 'verdict': verdict, 'softLimitFloor': 4096, 'existingSessionsChanged': False}

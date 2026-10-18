@@ -51,6 +51,9 @@ class AidTests(unittest.TestCase):
             self.assertEqual(A.main(args, adapter_factory=lambda: self.fail("unexpected IO"), emit=output.append), 0)
             self.assertIn("read-only", output[0])
             self.assertIn("unsupported", output[0])
+            self.assertIn("bin/aid-harness-offramp --help", output[0])
+            self.assertIn("docs/wave-offramp.md", output[0])
+            self.assertIn("does not execute", output[0])
 
     def test_closed_grammar_unknown_or_mutation_arguments_fail_before_any_io(self):
         arguments = [[name] for name in ("install", "adopt", "upgrade", "remove", "rollback", "apply", "unknown")]

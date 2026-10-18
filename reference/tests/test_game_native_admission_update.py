@@ -16,6 +16,7 @@ class Integration(unittest.TestCase):
   self.intent={'preserveServerSha256':'c'*64,'preserveRuntimeHashes':{'engine/lib/wine/x86_64-unix/ntdll.so':'d'*64},'nativeRoute':{'image':r'C:\Program Files (x86)\Steam\steamapps\common\DARK SOULS III\Game\DarkSoulsIII.exe','machine':0x8664,'bundleIdentifier':'local.exact','targetSha256':'e'*64,'bundleFiles':{'Contents/MacOS/wine':{'sha256':'a'*64},'Contents/Info.plist':{'sha256':'b'*64}}}}
   self.source=f.home/'control';self.sources={'admission.helper':'bin/game-launch-admission','hub.launcher':'bin/games-play','cs2.launcher':'bin/cs2-play','ds3.lifecycle':'bin/ds3-runtime'}
   for key,rel in self.sources.items():f.fixture.put(self.source/rel,f.after[key][0],f.after[key][1])
+  for rel in m.RECOVERY_SOURCE:f.fixture.put(self.source/rel,(ROOT/rel).read_bytes())
   for module,key,value in [(m,'HOME',f.home),(m,'STATE',f.home/'AIDev/state'),(m,'DS3',f.root),(m,'CONTROL',self.source),(tx,'HOME',f.home),(cap,'HOME',f.home)]:
    p=patch.object(module,key,value);p.start();self.addCleanup(p.stop)
   after=cap.derive(self.intent);self.report=dict(f.reviewed,policySha256=b.sha(self.enc(self.intent)),capabilityBeforeSha256={'approval':None,'routes':None},approvalCandidateSha256=b.sha(after['approval']),routeCandidateSha256=b.sha(after['routes']))
@@ -42,6 +43,39 @@ class Integration(unittest.TestCase):
   self.assertEqual(self.f.images(),self.f.before)
   with self.assertRaisesRegex(RuntimeError,'recovery_required'):self.run_operation('plan')
   self.assertFalse(self.f.proof.exists());self.run_operation('recover');self.side('after')
+ def test_legacy_capability_preparation_without_record_recovers(self):
+  c=cap.Transaction(self.commit,self.intent,lambda:True)
+  c.directory.mkdir(mode=0o700)
+  self.f.fixture.put(c.directory/'approval.after',c.after['approval'][:11])
+  self.run_operation('recover');self.side('after')
+  self.assertFalse(self.run_operation('apply')['changed'])
+ def test_recovery_source_allows_current_engine_not_changed_policy(self):
+  import subprocess,tempfile
+  with tempfile.TemporaryDirectory() as directory:
+   root=Path(directory)
+   def git(*args):return subprocess.check_output(['git','-c','core.hooksPath=/dev/null','-c','commit.gpgsign=false','-C',str(root),*args],stderr=subprocess.DEVNULL,timeout=15).decode().strip()
+   git('init','-q');git('config','user.email','fixture@example.invalid');git('config','user.name','Fixture')
+   path=root/m.RECOVERY_SOURCE[0];path.parent.mkdir();path.write_text('engine')
+   git('add',m.RECOVERY_SOURCE[0]);git('commit','-qm','engine');original=git('rev-parse','HEAD')
+   (root/'note').write_text('unrelated');git('add','note');git('commit','-qm','note');current=git('rev-parse','HEAD')
+   with patch.object(m,'CONTROL',root),patch.object(m,'HERE',root):
+    self.assertEqual(m.recovery_source('recover',original),current)
+    path.write_text('different engine');git('add',m.RECOVERY_SOURCE[0]);git('commit','-qm','engine changed')
+    self.assertEqual(m.recovery_source('recover',original),git('rev-parse','HEAD'))
+    policy=root/m.POLICY;policy.parent.mkdir();policy.write_text('changed policy');git('add',m.POLICY);git('commit','-qm','policy changed')
+    with self.assertRaisesRegex(RuntimeError,'command_failed'):m.recovery_source('recover',original)
+ def test_connected_guard_admits_once_then_rechecks_exact_source_bytes(self):
+  from lib import game_operation_readiness as ready
+  @contextlib.contextmanager
+  def locks():yield lambda:True
+  def publish(operation,commit,expected,payload,intent,local,*components):
+   for _ in range(4):self.assertTrue(local())
+   (self.source/m.POLICY).write_bytes(b'changed')
+   with self.assertRaisesRegex(RuntimeError,'native_policy_changed'):local()
+   return {'checked':True}
+  with patch.object(m,'source_check',return_value=self.intent) as source,patch.object(m,'locks',locks),patch.object(m,'inactive',return_value=True),patch.object(m,'_publish',side_effect=publish),patch.object(ready,'bound',return_value=lambda:True),patch.object(ready,'ready',return_value={'scopedCandidateReady':True}):
+   self.assertEqual(m.operate('apply',self.commit,self.pin),{'checked':True})
+   self.assertEqual(source.call_count,1)
  def test_nine_file_publication_interruption_recovers_before_capability(self):
   original=tx.prepare;fired=[]
   def prepare(*args,**kwargs):

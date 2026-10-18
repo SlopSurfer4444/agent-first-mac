@@ -74,7 +74,8 @@ class _Proof:
                 check()
             raw, mode = root.read('state/transaction/plan.json')
             need(mode == 0o600, 'bridge_plan_mode')
-            tx = m.Transaction(root, m.digest(raw), self.commit, value, native, policy_sha)
+            original = m.retained_commit(root, self.commit, 'bridge')
+            tx = m.Transaction(root, m.digest(raw), original, value, native, policy_sha)
             journal = tx.journal()
             need(journal['phase'] == 'applied' and journal['intent'] is None,
                  'bridge_launch_not_settled')

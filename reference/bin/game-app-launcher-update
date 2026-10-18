@@ -2,6 +2,7 @@
 """Exact native executable/receipt update; never launches or stops a client."""
 import sys
 sys.dont_write_bytecode=True
+sys.pycache_prefix = "/dev/null"
 import fcntl,importlib.machinery,importlib.util,os,re,stat,tempfile
 from pathlib import Path
 loader=importlib.machinery.SourceFileLoader('game_apps',str(Path(__file__).resolve().with_name('game-app-launchers')))
@@ -11,6 +12,48 @@ def targets():
     result={str(i):h.HOME/'Games'/name/'Contents/MacOS/launcher' for i,name in enumerate(h.NAMES)}
     result.update(hub=h.HUB/'receipt.json',ds3=h.DS3/'receipt.json')
     return result
+
+def source_check(commit):
+    h.need(h.HERE == h.CONTROL and Path(__file__).absolute() == h.CONTROL/'bin/game-app-launcher-update','canonical_source_required')
+    h.need(type(commit) is str and re.fullmatch('[0-9a-f]{40}',commit),'invalid_commit')
+    sys.path.insert(0,str(h.CONTROL))
+    from lib.scoped_source_admission import check
+    check(h.CONTROL,commit,entrypoints=('bin/game-app-launcher-update',))
+
+def status():
+    """Only the four launcher bundles and the two owned receipt fields.
+
+    Updating Finder executables neither executes Wine nor changes a prefix,
+    runtime, lifecycle helper or migration README. Their health is unrelated.
+    """
+    receipts={key:h.load(path) for key,path in targets().items() if key in ('hub','ds3')}
+    m=h.policy_for_digest(receipts['ds3'].get('appPolicySha256'))
+    h.need(h.bundle_inventory(h.HOME/'Games')==m['builtApps'],'installed_app_drift')
+    for key,receipt in receipts.items():
+        names=[n for n in h.NAMES if (n=='Dark Souls III.app')==(key=='ds3')]
+        h.need(receipt.get('appPolicySha256')==h.policy_digest(m) and receipt.get('appLaunchers')=={n:m['builtApps'][n] for n in names},'app_receipt_drift')
+    return True
+
+def source_gate(commit,recovery_check=None):
+    source_check(commit);bridge=h.module_bridge()
+    def owner():
+        for key,expected in (('hub','control-games-hub'),('ds3','control-ds3-marshal-fix')):
+            h.need(h.load(targets()[key]).get('owner')==expected,'operation_payload_owner')
+        return True
+    def recovery():
+        if recovery_check is not None:recovery_check()
+        else:
+            transaction=h.HUB/('.game-app-errors-'+commit)
+            if transaction.exists() or transaction.is_symlink():check(transaction,commit)
+        return True
+    snapshot=lambda:({str(p):h.image(p) for p in targets().values()},h.bundle_inventory(h.HOME/'Games'))
+    held=bridge.bound(snapshot)
+    checks={'payload-owner':owner,'recovery':recovery}
+    if recovery_check is None:checks['wine-target']=status
+    report=bridge.ready(h.CONTROL,commit,'wine-recovery' if recovery_check else 'wine-install',checks=checks,target_guard=held)
+    h.need(report.get('scopedCandidateReady') is True,'scoped_operation_readiness_required')
+    source_check(commit)
+    return held
 
 def policies():
     old=h.policy(h.MANIFEST);new=h.policy(h.ERROR_POLICY)
@@ -50,7 +93,7 @@ def restore(transaction,commit):
     check(transaction,commit,'before')
 
 def update(commit,candidate):
-    h.source_gate(commit);old,new=policies();h.candidate_check(candidate,new);h.status()
+    held=source_gate(commit);old,new=policies();h.candidate_check(candidate,new);status()
     current=h.load(h.DS3/'receipt.json')
     if current.get('appPolicySha256') == h.policy_digest(new):return {'state':'GAME_APP_ERRORS_INSTALLED','changed':False,'gameStarted':False}
     h.need(current.get('appPolicySha256') == h.policy_digest(old),'update_previous_policy')
@@ -64,18 +107,20 @@ def update(commit,candidate):
         for key in ('hub','ds3'):h.write_image(pending/(key+'.after'),h.jb(receipt_after(h.load(pending/(key+'.before')),new,commit,key)))
         for key in mapped:j[key]['after']=h.image(pending/(key+'.after'))
         h.write_image(pending/'journal.json',h.jb(j));check(pending,commit,'before');os.rename(pending,transaction)
-    h.source_gate(commit);check(transaction,commit,'before')
+    # Recheck the exact source and staged target preimages at publication,
+    # without rerunning the complete diagnostic or unrelated game validators.
+    source_check(commit);h.need(held() is True,'launcher_target_drift');check(transaction,commit,'before')
     try:
         for key,target in mapped.items():h.replace_image(transaction/(key+'.after'),target,j[key]['before'])
-        check(transaction,commit,'after');h.status()
+        check(transaction,commit,'after');status()
     except Exception:
         restore(transaction,commit);raise
     return {'state':'GAME_APP_ERRORS_INSTALLED','changed':True,'gameStarted':False}
 
 def rollback(commit,apply_commit):
     h.need(type(apply_commit) is str and re.fullmatch('[0-9a-f]{40}',apply_commit),'invalid_apply_commit')
-    h.source_gate(commit,'rollback',lambda:check(h.HUB/('.game-app-errors-'+apply_commit),apply_commit))
-    restore(h.HUB/('.game-app-errors-'+apply_commit),apply_commit);h.status()
+    source_gate(commit,lambda:check(h.HUB/('.game-app-errors-'+apply_commit),apply_commit))
+    restore(h.HUB/('.game-app-errors-'+apply_commit),apply_commit);status()
     return {'state':'GAME_APP_ERRORS_ROLLED_BACK','gameStarted':False}
 
 def main():
@@ -86,7 +131,9 @@ def main():
         fcntl.flock(lock,fcntl.LOCK_EX|fcntl.LOCK_NB)
         if len(args)==3 and args[0]=='install':result=update(args[1],Path(args[2]))
         elif len(args)==3 and args[0]=='rollback':result=rollback(args[1],args[2])
-        else:raise RuntimeError('usage: game-app-launcher-update install COMMIT CANDIDATE | rollback COMMIT APPLY_COMMIT')
+        elif args==['status']:
+            status();result={'state':'GAME_APP_LAUNCHERS_VALID','sourcePolicyCurrent':h.load(h.DS3/'receipt.json')['appPolicySha256']==h.policy_digest(h.policy()),'gameStarted':False}
+        else:raise RuntimeError('usage: game-app-launcher-update install COMMIT CANDIDATE | rollback COMMIT APPLY_COMMIT | status')
     print(h.jb(result).decode())
 if __name__=='__main__':
     try:main()

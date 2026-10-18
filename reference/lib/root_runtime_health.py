@@ -100,9 +100,11 @@ def inspect_installed(contract, *, observe, runner, paired_guard, source_guard,
             "root_doctor_process_unsettled")
     code, stdout, stderr, _ = result
     require(type(code) is int and code == 0 and type(stderr) is bytes and stderr == b"", "root_doctor_failed")
-    checks = {key: True for key in ("emergency_disable_absent", "installed_artifact_attestation", "installed_contract", "policy_hash")}
-    if selected == "successor":
-        checks["operation_settled"] = True
+    # Both exact broker pins in this release implement the journal-aware
+    # five-check protocol. The older four-check predecessor belonged to the
+    # preceding release; accepting it here would omit settlement evidence.
+    checks = {key: True for key in ("emergency_disable_absent", "installed_artifact_attestation",
+                                   "installed_contract", "operation_settled", "policy_hash")}
     expected = {"checks": checks, "command": "doctor-root", "problems": [], "readOnly": True,
                 "schema": 1, "systemMutationsPerformed": False, "verdict": "ROOT_CONTRACT_READY"}
     value = strict_json(stdout)
@@ -115,7 +117,7 @@ def inspect_installed(contract, *, observe, runner, paired_guard, source_guard,
             "releaseObserved": selected, "pairedEmergencyRetained": True,
             "rootPrivateConsistencyAttestedByTypedDoctor": True,
             "expectedPrivatePolicyHashVerified": False, "rootOwnedStateTrustAssumed": True,
-            "operationJournalSettled": selected == "successor",
+            "operationJournalSettled": value["checks"]["operation_settled"],
             "nativeAuthenticationExercised": False, "emergencyActionsExecuted": False,
             "wholeMachineHealth": False, "installationAuthorized": False,
             "readOnly": True, "systemMutationsPerformed": False, "childSettled": True}

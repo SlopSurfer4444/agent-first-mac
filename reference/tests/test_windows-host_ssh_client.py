@@ -2,6 +2,7 @@ import base64
 import hashlib
 import importlib.machinery
 import json
+import os
 from pathlib import Path
 import subprocess
 import tempfile
@@ -18,6 +19,177 @@ module = loader.load_module()
 
 
 class WindowsHostSSHClientTests(unittest.TestCase):
+    def test_atomic_publication_preserves_racing_owner_file_and_symlink(self):
+        for symlink in (False, True):
+            with self.subTest(symlink=symlink), tempfile.TemporaryDirectory() as directory:
+                target = Path(directory) / "config"
+                owner = Path(directory) / "owner"
+                owner.write_bytes(b"owner bytes")
+                real_link = os.link
+
+                def race(source, destination, **kwargs):
+                    if symlink:
+                        target.symlink_to(owner)
+                    else:
+                        target.write_bytes(b"owner bytes")
+                    return real_link(source, destination, **kwargs)
+
+                with patch.object(module.os, "link", side_effect=race):
+                    with self.assertRaisesRegex(module.ProfileError, "managed_target_collision"):
+                        module.atomic_write(target, b"managed bytes", 0o600)
+                self.assertEqual(target.read_bytes(), b"owner bytes")
+                self.assertEqual(target.is_symlink(), symlink)
+                self.assertEqual(list(Path(directory).glob(".windows-host.*")), [])
+
+    def test_failed_enrollment_preserves_owner_replacement_and_shared_include(self):
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory)
+            paths = module.layout(home)
+            paths["ssh"].mkdir(mode=0o700)
+            original_write = module.atomic_write
+            owner_config = paths["config_dir"] / "owner.conf"
+
+            def fail_later(path, data, mode):
+                if path == paths["known"]:
+                    paths["alias"].unlink()
+                    paths["alias"].write_bytes(b"owner replacement")
+                    owner_config.write_bytes(b"Host owner\n")
+                    raise module.ProfileError("injected_failure")
+                return original_write(path, data, mode)
+
+            body = base64.b64encode(b"fixture").decode()
+            with patch.object(module, "canonical_home", return_value=home), \
+                 patch.object(module, "prepare", return_value=("100.64.0.1", "ssh-ed25519", body, "fixture")), \
+                 patch.object(module, "atomic_write", side_effect=fail_later):
+                with self.assertRaisesRegex(module.ProfileError, "injected_failure"):
+                    module.apply_profile("fixture", "fixture")
+            self.assertEqual(paths["alias"].read_bytes(), b"owner replacement")
+            self.assertEqual(owner_config.read_bytes(), b"Host owner\n")
+            self.assertEqual(paths["main"].read_bytes(), module.render_main_config())
+
+    def test_rollback_keeps_shared_include_and_other_profiles(self):
+        for edited in (False, True):
+            with self.subTest(edited=edited), tempfile.TemporaryDirectory() as directory:
+                home, paths = self.fixture(directory)
+                owner = paths["config_dir"] / "owner.conf"
+                owner.write_bytes(b"Host owner\n  HostName localhost\n")
+                main = module.render_main_config() + (b"# owner setting\n" if edited else b"")
+                paths["main"].write_bytes(main)
+                with patch.object(module, "canonical_home", return_value=home):
+                    module.rollback()
+                self.assertEqual(paths["main"].read_bytes(), main)
+                self.assertTrue(owner.is_file())
+                self.assertFalse(paths["alias"].exists())
+                self.assertFalse(paths["known"].exists())
+                self.assertEqual(json.loads(paths["receipt"].read_text())["status"], "rolled_back")
+
+    def test_failed_enrollment_never_unlinks_published_files(self):
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory)
+            paths = module.layout(home)
+            paths["ssh"].mkdir(mode=0o700)
+            original_write, original_unlink = module.atomic_write, Path.unlink
+
+            def fail_later(path, data, mode):
+                if path == paths["known"]:
+                    raise module.ProfileError("injected_failure")
+                return original_write(path, data, mode)
+
+            def no_cleanup(path, *args, **kwargs):
+                if path in (paths["main"], paths["alias"]):
+                    path.write_bytes(b"owner edit at cleanup boundary")
+                    raise AssertionError("published file cleanup attempted")
+                return original_unlink(path, *args, **kwargs)
+
+            body = base64.b64encode(b"fixture").decode()
+            with patch.object(module, "canonical_home", return_value=home), \
+                 patch.object(module, "prepare", return_value=("100.64.0.1", "ssh-ed25519", body, "fixture")), \
+                 patch.object(module, "atomic_write", side_effect=fail_later), \
+                 patch.object(Path, "unlink", no_cleanup):
+                with self.assertRaisesRegex(module.ProfileError, "injected_failure"):
+                    module.apply_profile("fixture", "fixture")
+            self.assertEqual(paths["main"].read_bytes(), module.render_main_config())
+            self.assertTrue(paths["alias"].is_file())
+
+    def test_rollback_race_before_capture_restores_actual_owner_entry(self):
+        for symlink in (False, True):
+            with self.subTest(symlink=symlink), tempfile.TemporaryDirectory() as directory:
+                home, paths = self.fixture(directory)
+                owner = home / "owner-file"
+                owner.write_bytes(b"owner content")
+                rename = module.rename_exclusive
+                raced = False
+
+                def race(source, destination):
+                    nonlocal raced
+                    if source == paths["known"] and not raced:
+                        raced = True
+                        source.unlink()
+                        if symlink:
+                            source.symlink_to(owner)
+                        else:
+                            source.write_bytes(b"owner content")
+                            source.chmod(0o600)
+                    return rename(source, destination)
+
+                with patch.object(module, "canonical_home", return_value=home), \
+                     patch.object(module, "rename_exclusive", side_effect=race):
+                    with self.assertRaisesRegex(module.ProfileError, "rollback_interrupted_recovery_retained"):
+                        module.rollback()
+                self.assertEqual(paths["known"].read_bytes(), b"owner content")
+                self.assertEqual(paths["known"].is_symlink(), symlink)
+                self.assertTrue(paths["alias"].exists())
+                self.assertEqual(json.loads(paths["receipt"].read_text())["status"], "applied")
+
+    def test_rollback_race_after_capture_retains_both_versions(self):
+        with tempfile.TemporaryDirectory() as directory:
+            home, paths = self.fixture(directory)
+            old = paths["known"].read_bytes()
+            rename = module.rename_exclusive
+
+            def race(source, destination):
+                result = rename(source, destination)
+                if source == paths["known"]:
+                    paths["known"].write_bytes(b"new owner content")
+                return result
+
+            with patch.object(module, "canonical_home", return_value=home), \
+                 patch.object(module, "rename_exclusive", side_effect=race):
+                with self.assertRaisesRegex(module.ProfileError, "rollback_interrupted_recovery_retained"):
+                    module.rollback()
+            self.assertEqual(paths["known"].read_bytes(), b"new owner content")
+            recovered = list(paths["state"].glob("rollback-*/known"))
+            self.assertEqual(len(recovered), 1)
+            self.assertEqual(recovered[0].read_bytes(), old)
+            self.assertTrue(paths["alias"].exists())
+            self.assertEqual(json.loads(paths["receipt"].read_text())["status"], "applied")
+
+    def test_rollback_receipt_publication_failure_preserves_owner_and_recovery(self):
+        for collision in (False, True):
+            with self.subTest(collision=collision), tempfile.TemporaryDirectory() as directory:
+                home, paths = self.fixture(directory)
+                old = {name: paths[name].read_bytes() for name in ("known", "alias", "receipt")}
+
+                def fail_write(path, data, mode):
+                    self.assertEqual(path, paths["receipt"])
+                    if collision:
+                        path.write_bytes(b"owner receipt replacement")
+                    raise module.ProfileError("injected_receipt_failure")
+
+                with patch.object(module, "canonical_home", return_value=home), \
+                     patch.object(module, "atomic_write", side_effect=fail_write):
+                    with self.assertRaisesRegex(module.ProfileError, "rollback_interrupted_recovery_retained"):
+                        module.rollback()
+                for name in ("known", "alias"):
+                    self.assertEqual(paths[name].read_bytes(), old[name])
+                if collision:
+                    self.assertEqual(paths["receipt"].read_bytes(), b"owner receipt replacement")
+                    recovered = list(paths["state"].glob("rollback-*/receipt"))
+                    self.assertEqual(len(recovered), 1)
+                    self.assertEqual(recovered[0].read_bytes(), old["receipt"])
+                else:
+                    self.assertEqual(paths["receipt"].read_bytes(), old["receipt"])
+
     def test_public_blob_fingerprint(self):
         blob = b"synthetic-ed25519-host-key-fixture"
         body = base64.b64encode(blob).decode("ascii")

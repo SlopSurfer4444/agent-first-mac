@@ -61,12 +61,25 @@ private final class FakeRunner: CommandRunning {
     var afterActivation: (() throws -> Void)?
     var postValidationUnknown = false
     var activationUnknown = false
+    var finalGitFailure: Error?
+    var gitObserverUIDs: [uid_t] = []
     private var activationAttempted = false
     var rollbackVerificationFailure = false
     var driftNixStoreAfterFirstInvocation = false
     var root: URL?
     var invocations: [(String, [String], [String: String])] = []
     private var nixStoreInvocations = 0
+
+    func observeGit(helperExecutable: String, userID: uid_t, repository: String,
+                    command: [String]) throws -> CommandResult {
+        gitObserverUIDs.append(userID)
+        try expect(helperExecutable == physical("/usr/local/libexec/aid-admin").path,
+                   "observer_not_installed_binary")
+        if activationAttempted, let failure = finalGitFailure { throw failure }
+        return try run(executable: physical("/usr/bin/git").path,
+                       arguments: fixedGitArguments(repository: repository, command: command),
+                       environment: fixedGitEnvironment(base: BrokerPolicy.cleanEnvironment))
+    }
 
     func run(executable: String, arguments: [String], environment: [String: String]) throws -> CommandResult {
         invocations.append((executable, arguments, environment))
@@ -720,6 +733,8 @@ struct AidAdminCoreTests {
         let repository = fixture.physical("/home/agentowner/AIDev/control").path
         let gitCalls = fixture.runner.invocations.filter { $0.0.hasSuffix("/usr/bin/git") }
         try expect(!gitCalls.isEmpty)
+        try expect(fixture.runner.gitObserverUIDs.count == gitCalls.count &&
+                   fixture.runner.gitObserverUIDs.allSatisfy { $0 == fixture.uid })
         for call in gitCalls {
             try expect(call.1.starts(with: fixedGitArguments(repository: repository, command: [])))
             try expect(call.2 == fixedGitEnvironment(base: BrokerPolicy.cleanEnvironment))
@@ -751,6 +766,121 @@ struct AidAdminCoreTests {
         try expect(safe.status == 0, safe.output)
         try expect(!marker.isFileURL || !FileManager.default.fileExists(atPath: marker.path),
                    "fsmonitor_executed")
+
+        // AFM-01: fsmonitor suppression never disabled a clean filter. Safely
+        // reproduce only as the unprivileged test owner, then exercise the real
+        // fresh-process observer and inspect the filter's actual UID/GID.
+        try expect(getuid() != 0 && geteuid() != 0, "filter_fixture_requires_nonroot")
+        let filter = realRoot.appendingPathComponent("filter")
+        let identity = realRoot.appendingPathComponent("filter-identity")
+        try Data("#!/bin/sh\n/usr/bin/id -u > '\(identity.path)'\n/usr/bin/id -g >> '\(identity.path)'\n/bin/cat\n".utf8).write(to: filter)
+        try FileManager.default.setAttributes([.posixPermissions: NSNumber(value: 0o755)], ofItemAtPath: filter.path)
+        try Data("tracked filter=identity\n".utf8).write(to: realRoot.appendingPathComponent(".gitattributes"))
+        try expect(try runProcess("/usr/bin/git", ["-C", realRoot.path, "config", "filter.identity.clean", filter.path]).status == 0)
+        // Same byte length defeats the stat-size shortcut and requires Git to
+        // compare the filtered content against the index.
+        try Data("other\n".utf8).write(to: tracked)
+        _ = try runProcess("/usr/bin/git", fixedGitArguments(repository: realRoot.path,
+            command: ["status", "--porcelain", "--untracked-files=normal"]),
+            environment: fixedGitEnvironment(base: BrokerPolicy.cleanEnvironment))
+        try expect(FileManager.default.fileExists(atPath: identity.path), "clean_filter_not_reproduced")
+        try FileManager.default.removeItem(at: identity)
+        let parentUID = getuid(), parentGID = getgid()
+        let observed = try ProcessCommandRunner().observeGit(
+            helperExecutable: URL(fileURLWithPath: CommandLine.arguments[0]).standardizedFileURL.path,
+            userID: getuid(), repository: realRoot.path,
+            command: ["status", "--porcelain", "--untracked-files=normal"])
+        try expect(observed.status == 0, "observer_failed")
+        try expect(try String(contentsOf: identity, encoding: .utf8) == "\(parentUID)\n\(parentGID)\n",
+                   "filter_ran_with_wrong_credentials")
+        try expect(getuid() == parentUID && getgid() == parentGID, "parent_credentials_changed")
+        _ = try expectThrows { _ = try GitObservation.helperArguments(userID: 0, repository: realRoot.path, command: ["status"]) }
+        for command in [["config", "--get", "filter.identity.clean"], ["-c", "x=y", "status"], ["rev-parse", "--git-dir"]] {
+            _ = try expectThrows { _ = try GitObservation.helperArguments(userID: getuid(), repository: realRoot.path, command: command) }
+        }
+    }
+
+    func testGitCredentialDropContract() throws {
+        let fixture = try Fixture()
+        try fixture.broker().validateGitObservationOwner()
+        let otherContext = RuntimeContext(rootPrefix: fixture.root.path, trustedUID: fixture.uid,
+            realUID: fixture.uid + 1, effectiveUID: 0, callerHome: "/var/empty",
+            callerIdentity: ownerIdentity, currentExecutablePath: "")
+        let reason = try expectThrows { try fixture.broker(context: otherContext).validateGitObservationOwner() }
+        try expect(reason == "git_observer_not_installed_owner")
+        let otherName = RuntimeContext(rootPrefix: fixture.root.path, trustedUID: fixture.uid,
+            realUID: fixture.uid, effectiveUID: 0, callerHome: "/var/empty",
+            callerIdentity: "otherowner", currentExecutablePath: "")
+        _ = try expectThrows { try fixture.broker(context: otherName).validateGitObservationOwner() }
+        for fault in ["missing", "malformed", "mode", "uid", "symlink"] {
+            let broken = try Fixture()
+            let path = broken.physical("/etc/agent-first-mac/aid-admin-install.json")
+            if fault == "missing" {
+                try FileManager.default.removeItem(at: path)
+            } else if fault == "symlink" {
+                let other = path.deletingLastPathComponent().appendingPathComponent("other-attestation.json")
+                try FileManager.default.moveItem(at: path, to: other)
+                try FileManager.default.createSymbolicLink(at: path, withDestinationURL: other)
+            } else {
+                try FileManager.default.setAttributes([.posixPermissions: NSNumber(value: 0o600)], ofItemAtPath: path.path)
+                if fault == "malformed" { try Data("{}\n".utf8).write(to: path) }
+                if fault == "uid" {
+                    var record = try JSONSerialization.jsonObject(with: Data(contentsOf: path)) as! [String: Any]
+                    record["agentOwnerUID"] = broken.uid + 1
+                    try JSONSerialization.data(withJSONObject: record).write(to: path)
+                }
+                if fault != "mode" {
+                    try FileManager.default.setAttributes([.posixPermissions: NSNumber(value: 0o400)], ofItemAtPath: path.path)
+                }
+            }
+            _ = try expectThrows { try broken.broker().validateGitObservationOwner() }
+        }
+        final class Credentials: GitCredentials {
+            var realUID: uid_t = 0, effectiveUID: uid_t = 0
+            var realGID: gid_t = 0, effectiveGID: gid_t = 0
+            var steps: [String] = [], fail: String? = nil
+            func primaryGID(userID: uid_t) throws -> gid_t { steps.append("lookup"); return 20 }
+            func clearGroups() -> Bool { steps.append("groups"); return fail != "groups" }
+            func setGroup(_ gid: gid_t) -> Bool {
+                steps.append("gid"); if fail == "gid" { return false }
+                realGID = gid; effectiveGID = gid; return true
+            }
+            func setUser(_ uid: uid_t) -> Bool {
+                steps.append("uid"); if fail == "uid" { return false }
+                realUID = uid; effectiveUID = uid; return true
+            }
+            func regainRoot() -> Bool { steps.append("regain"); return fail == "regain" }
+        }
+        let success = Credentials()
+        try dropGitObservationPrivileges(userID: 501, credentials: success)
+        try expect(success.steps == ["lookup", "groups", "gid", "uid", "regain"])
+        for failure in ["groups", "gid", "uid", "regain"] {
+            let broken = Credentials(); broken.fail = failure
+            _ = try expectThrows { try dropGitObservationPrivileges(userID: 501, credentials: broken) }
+            try expect(broken.steps.last == failure, "continued_after_drop_failure")
+        }
+        let forbidden = Credentials()
+        _ = try expectThrows { try dropGitObservationPrivileges(userID: 0, credentials: forbidden) }
+        try expect(forbidden.steps.isEmpty)
+    }
+
+    func testSettledFinalGitFailureDoesNotDemoteApply() throws {
+        for outcome in [ProcessCommandFailure(outcome: .timedOut, settled: true),
+                        ProcessCommandFailure(outcome: .outputLimit, settled: true),
+                        ProcessCommandFailure(outcome: .descendantPipeHold, settled: true)] {
+            let fixture = try Fixture(); fixture.runner.finalGitFailure = outcome
+            try expect(try fixture.broker().applySystem(commit: commit) == 0)
+            let data = try Data(contentsOf: fixture.physical("/var/db/agent-first-mac/staging/operation.json"))
+            let journal = try JSONSerialization.jsonObject(with: data) as! [String: Any]
+            try expect(journal["phase"] as? String == "complete" && journal["sourceDrift"] as? Bool == true)
+            try expect(fixture.runner.invocations.filter { $0.0.hasSuffix("/darwin-rebuild") }.count == 1)
+        }
+        let unknown = try Fixture()
+        unknown.runner.finalGitFailure = ProcessCommandFailure(outcome: .unknown, settled: false)
+        let reason = try expectThrows { _ = try unknown.broker().applySystem(commit: commit) }
+        try expect(reason == "applied_source_observation_process_unknown_no_rollback")
+        try expect(try unknown.broker().inspectOperation()["state"] == "unknown")
+        try expect(unknown.runner.invocations.filter { $0.0.hasSuffix("/darwin-rebuild") }.count == 1)
     }
 
     func testGitProvenanceAndReceiptBoundariesFailClosed() throws {
@@ -1216,6 +1346,7 @@ struct AidAdminCoreTests {
 @main
 struct TestMain {
     static func main() throws {
+        GitObservation.handleHelperIfRequested(Array(CommandLine.arguments.dropFirst()))
         if CommandLine.arguments.count == 5 && CommandLine.arguments[1] == "--fixture-child" {
             let root = CommandLine.arguments[2]
             let mode = CommandLine.arguments[3]
@@ -1251,6 +1382,8 @@ struct TestMain {
             ("closure_revision_binding", suite.testClosureRevisionIsAuthoritativeAndStrict),
             ("stable_redacted_output", suite.testAuditAndDoctorAreStableRedacted),
             ("safe_git_boundary", suite.testGitBoundaryUsesFixedArgumentsAndEnvironment),
+            ("git_credential_drop", suite.testGitCredentialDropContract),
+            ("settled_final_git", suite.testSettledFinalGitFailureDoesNotDemoteApply),
             ("git_and_receipt_rejections", suite.testGitProvenanceAndReceiptBoundariesFailClosed),
             ("owner_mode_attestation_target", suite.testOwnerModePolicyAttestationAndTargetFailuresCloseGate),
             ("preaudit_and_gate", suite.testPreAuditAndPreparationGateNeverMutateProfile),

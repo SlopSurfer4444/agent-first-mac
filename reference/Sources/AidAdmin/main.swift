@@ -35,6 +35,7 @@ private func fail(_ reason: String, code: Int32 = 64) -> Never {
 }
 
 let arguments = Array(CommandLine.arguments.dropFirst())
+GitObservation.handleHelperIfRequested(arguments)
 guard let command = arguments.first else { fail("missing_command") }
 let real = invokingUID()
 let context = RuntimeContext(realUID: real, effectiveUID: geteuid(),

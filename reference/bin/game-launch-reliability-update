@@ -2,6 +2,7 @@
 """Fixed-path reviewed game launch deployment; never dispatches or stops games."""
 import sys
 sys.dont_write_bytecode=True
+sys.pycache_prefix = "/dev/null"
 import argparse,contextlib,fcntl,hashlib,importlib.machinery,importlib.util,json,os,pwd,re,stat,subprocess
 from pathlib import Path
 HOME=Path(pwd.getpwuid(os.getuid()).pw_dir)
@@ -12,7 +13,7 @@ DS3=HOME/'Library/Application Support/Adapted Games DS3'
 CS2=HOME/'Library/Application Support/CS2 Standalone'
 GAMES=HOME/'Games';BIN=HOME/'AIDev/bin';STATE=HOME/'AIDev/state'
 CANDIDATE=STATE/'game-launch-reliability-candidate'
-POLICY='manifests/game-launch-reliability.json'
+POLICY: "source-data-only" = 'manifests/game-launch-reliability.json'
 NATIVE_POLICY='manifests/game-app-launcher-errors.json'
 NAMESPACE='game-launch-reliability'
 ARCHIVES='game-launch-reliability-archives'
@@ -24,7 +25,7 @@ TARGETS.update({'native-'+str(i):'games/'+name+'/Contents/MacOS/launcher' for i,
 TARGETS.update({'hub.receipt':'hub/receipt.json','ds3.receipt':'ds3/receipt.json','cs2.receipt':'cs2/runtime/.owner.json'})
 ORDER=tuple(TARGETS)
 SOURCES={'helper':'bin/game-launch-admission','hub.launcher':'bin/games-play','cs2.launcher':'bin/cs2-play','ds3.lifecycle':'bin/ds3-runtime'}
-LIBRARY_SOURCES={'lib/game_operation_readiness.py','lib/operation_readiness.py'}
+LIBRARY_SOURCES: "source-data-only" = {'lib/game_operation_readiness.py','lib/operation_readiness.py'}
 CANDIDATE_FILES={'helper':'game-launch-admission','hub.launcher':'games-play','cs2.launcher':'cs2-play','ds3.lifecycle':'ds3-runtime'}
 CANDIDATE_FILES.update({'native-'+str(i):name+'/Contents/MacOS/launcher' for i,name in enumerate(APPS)})
 GUARDS={'hub/manifest.json','ds3/manifest.json','cs2/runtime/.manifest.json','ds3/ds3-play',
@@ -54,14 +55,27 @@ def command(argv,timeout=120,env=None):
 def source_check(commit):
     need(os.getuid()>0 and os.getuid()==os.geteuid(),'owner_required')
     need(SOURCE_PATH==CONTROL/'bin/game-launch-reliability-update','canonical_source_required');need(pin(commit,40),'invalid_commit')
-    git=['/usr/bin/git','-c','core.hooksPath=/dev/null','-C',CONTROL]
-    need(command(git+['rev-parse','HEAD']).decode().strip()==commit and command(git+['branch','--show-current']).decode().strip()=='main'
-         and command(git+['status','--porcelain']).decode().strip()=='','clean_exact_main_required')
+    sys.path.insert(0,str(CONTROL))
+    from lib.scoped_source_admission import check
+    check(CONTROL,commit,entrypoints=('bin/game-launch-reliability-update',))
 
 def operation_ready(commit,operation,checks,target_guard):
     loader=importlib.machinery.SourceFileLoader('game_scoped_ready',str(CONTROL/'lib/game_operation_readiness.py'))
     module=importlib.util.module_from_spec(importlib.util.spec_from_loader(loader.name,loader));loader.exec_module(module)
     return module.ready(CONTROL,commit,operation,checks=checks,target_guard=target_guard)
+
+def retained_commit(root,commit,action):
+    """Keep current execution admission separate from immutable transaction identity."""
+    if action not in ('rollback','recover','return','bridge'):
+        return commit
+    old=decode(root.read('state/transaction/plan.json')[0]).get('acceptedCommit')
+    need(pin(old,40),'transaction_commit_invalid')
+    if old!=commit:
+        command(['/usr/bin/git','-c','core.hooksPath=/dev/null','-C',CONTROL,
+                 'merge-base','--is-ancestor',old,commit])
+    # Transaction still validates current policy, candidate bytes, exact backups,
+    # receipts and targets. Historical Git content is never executed.
+    return old
 
 def source_gate(commit,root=None,value=None,action='apply'):
     source_check(commit);need(root is not None and value is not None,'operation_targets_required')
@@ -89,8 +103,9 @@ def source_gate(commit,root=None,value=None,action='apply'):
                     need(action=='apply' and prepared.startswith(raw),'staging_unknown_drift');predecessor(root,value,{key:before[rel] for key,rel in TARGETS.items()})
                 else:
                     old_plan=decode(plan_raw)
-                    need(old_plan.get('acceptedCommit')==commit,'previous_settled_transaction_archive_required')
-                    _,native,policy_sha=policy(root);tx=Transaction(root,plan_sha,commit,value,native,policy_sha)
+                    original=retained_commit(root,commit,action)
+                    need(old_plan.get('acceptedCommit')==original,'previous_settled_transaction_archive_required')
+                    _,native,policy_sha=policy(root);tx=Transaction(root,plan_sha,original,value,native,policy_sha)
                     for key,rel in TARGETS.items():need(read(root,rel) in tuple(tx.images[key].values()),'target_unknown_drift')
         return True
     checks={'payload-owner':owner,'recovery':recovery}
@@ -817,7 +832,8 @@ def operate(operation,commit,expected=None,event=lambda _:None,old_commit=None):
             if operation=='apply' and not journal_exists:
                 p,before,after=plan(root,commit,value,native,policy_sha);need(digest(encode(p))==expected,'prestate_changed_since_plan')
                 stage(root,p,before,after)
-            tx=OperationTransaction(root,expected,commit,value,native,policy_sha,event)
+            original=retained_commit(root,commit,operation)
+            tx=OperationTransaction(root,expected,original,value,native,policy_sha,event)
             return tx.run('before' if operation=='rollback' else 'after',recover=operation=='recover')
     finally:root.close()
 

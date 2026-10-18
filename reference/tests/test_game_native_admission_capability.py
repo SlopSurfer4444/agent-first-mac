@@ -12,6 +12,19 @@ class Capability(unittest.TestCase):
   self.tx=c.Transaction('a'*40,self.intent,lambda:True,_test_home=self.f.home)
   self.before={key:None for key in c.NAMES}
  def prepare(self):self.tx.prepare(self.before)
+ def test_legacy_partial_preparation_resumes_exact_prefixes(self):
+  self.tx.directory.mkdir(mode=0o700)
+  self.f.put(self.tx.directory/'approval.after',self.tx.after['approval'][:17])
+  self.prepare();self.prepare();self.tx.read()
+  self.assertTrue(all(c.optional(path) is None for path in self.tx.targets.values()))
+  self.assertTrue(self.tx.run('after'));self.assertFalse(self.tx.run('after'))
+ def test_legacy_unknown_preparation_is_preserved(self):
+  self.tx.directory.mkdir(mode=0o700)
+  self.f.put(self.tx.directory/'approval.after',b'unknown')
+  with self.assertRaisesRegex(RuntimeError,'stage_drift'):self.prepare()
+  self.assertEqual((self.tx.directory/'approval.after').read_bytes(),b'unknown')
+  self.assertFalse((self.tx.directory/'record.json').exists())
+  self.assertTrue(all(c.optional(path) is None for path in self.tx.targets.values()))
  def assert_side(self,side):
   _,files=self.tx.read();self.assertEqual({key:c.optional(path) for key,path in self.tx.targets.items()},files[side])
  def test_narrow_five_file_approval_and_exact_single_route(self):

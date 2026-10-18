@@ -63,6 +63,11 @@ class NamespaceTests(unittest.TestCase):
             self.write(d, old)
             before = self.marker(d).read_bytes()
             slot = self.marker(d).with_name('0.json')
+            legacy = json.loads(slot.read_bytes())
+            legacy['schema'] = 1
+            legacy.pop('output')
+            legacy.pop('provenance')
+            slot.write_text(json.dumps(legacy))
             slot_before = slot.read_bytes()
             with self.assertRaises(C.CustodyError):
                 self.open(d, 'b' * 64)
@@ -196,9 +201,11 @@ class NamespaceTests(unittest.TestCase):
             with self.assertRaises(RuntimeError):
                 self.open(d, 'b' * 64, checkpoint=stop)
             self.assertEqual(self.marker(d).read_bytes(), before)
-            self.assertTrue(self.marker(d).with_name('namespace.json.pending').is_file())
-            with self.assertRaises(C.CustodyError):
-                self.open(d, 'b' * 64)
+            pending, = self.marker(d).parent.glob('.prepare-*.payload')
+            preserved = pending.read_bytes()
+            with self.open(d, 'b' * 64):
+                pass
+            self.assertEqual(pending.read_bytes(), preserved)
 
     def test_native_stable_volume_provider_reads_held_directory_and_lock(self):
         with tempfile.TemporaryDirectory(dir='/private/tmp') as d:
@@ -230,10 +237,115 @@ class NamespaceTests(unittest.TestCase):
             with patch.object(N.pwd, 'getpwuid', return_value=NS(pw_dir=home)), \
                     patch.object(N.probe, 'require_fixture_envelope', lambda *args: None), \
                     patch.object(C, 'namespace_boot', return_value='b' * 64):
-                with self.assertRaisesRegex(C.CustodyError, 'fixture_namespace_refresh_required'):
-                    N.custody_cli(doctor)
+                report = N.custody_cli(doctor)
+                self.assertEqual(report['outstanding'], 0)
+                self.assertEqual(report['capacityReason'], 'fixture_namespace_refresh_required')
             self.assertEqual(self.marker(root).read_bytes(), before)
             self.assertEqual(set(p.name for p in self.marker(root).parent.iterdir()), {'lock', 'namespace.json'})
+
+    def test_readonly_retained_crossboot_status_preserves_records_and_blocks_mutation(self):
+        with tempfile.TemporaryDirectory(dir='/private/tmp') as d:
+            old = self.seed(d, slot=True)
+            self.stale_device(old)
+            self.write(d, old)
+            before = {p.name: p.read_bytes() for p in self.marker(d).parent.iterdir()}
+            with self.open(d, 'b' * 64, create=False) as custody:
+                report = custody.status()
+                self.assertEqual(report['outstanding'], 1)
+                self.assertTrue(report['namespaceRefreshRequired'])
+                for action in (lambda: custody.reserve(), lambda: custody.retire(0),
+                               lambda: custody.update(0, state='retiring'),
+                               lambda: custody.release_absent(0)):
+                    with self.assertRaisesRegex(C.CustodyError, 'fixture_namespace_refresh_required'):
+                        action()
+            self.assertEqual(before, {p.name: p.read_bytes() for p in self.marker(d).parent.iterdir()})
+
+    def test_same_device_crossboot_retained_record_can_refresh_or_retire_exact_absence(self):
+        for create in (False, True):
+            with self.subTest(create=create), tempfile.TemporaryDirectory(dir='/private/tmp') as d:
+                self.seed(d, slot=True)
+                before = self.marker(d).read_bytes()
+                slot_before = self.marker(d).with_name('0.json').read_bytes()
+                with self.open(d, 'b' * 64, create=create) as custody:
+                    self.assertEqual(self.marker(d).with_name('0.json').read_bytes(), slot_before)
+                    if not create:
+                        self.assertEqual(self.marker(d).read_bytes(), before)
+                        with self.assertRaisesRegex(C.CustodyError, 'fixture_namespace_refresh_required'):
+                            custody.reserve()
+                    self.assertTrue(custody.retire(0)['retired'])
+                with self.open(d, 'b' * 64) as custody:
+                    self.assertEqual(custody.reserve(), 0)
+
+    def test_retained_record_changed_during_namespace_refresh_is_not_rebound(self):
+        with tempfile.TemporaryDirectory(dir='/private/tmp') as d:
+            self.seed(d, slot=True)
+            before = self.marker(d).read_bytes()
+            def race(point):
+                if point == 'record-written':
+                    slot = self.marker(d).with_name('0.json')
+                    value = json.loads(slot.read_bytes())
+                    value['settled'] = False
+                    slot.write_text(json.dumps(value))
+            with self.assertRaises(C.CustodyError):
+                self.open(d, 'b' * 64, checkpoint=race)
+            self.assertEqual(self.marker(d).read_bytes(), before)
+            self.assertFalse(json.loads(self.marker(d).with_name('0.json').read_bytes())['settled'])
+
+    def test_known_settled_tree_retires_crossboot_but_unsettled_tree_never_does(self):
+        for settled in (True, False):
+            with self.subTest(settled=settled), tempfile.TemporaryDirectory(dir='/private/tmp') as d:
+                with self.open(d) as custody:
+                    slot = custody.reserve()
+                    root = Path(d) / custody.leaf(custody.records()[slot])
+                    root.mkdir(mode=0o700)
+                    child = root / 'home'
+                    child.mkdir(mode=0o700)
+                    custody.update(slot, root=C.identity(root.stat()),
+                                   children={'home': C.identity(child.stat())},
+                                   state='retained', settled=settled)
+                with self.open(d, 'b' * 64, create=False) as custody:
+                    self.assertEqual(custody.status()['slots'][0]['settled'], settled)
+                    if settled:
+                        self.assertTrue(custody.retire(slot)['retired'])
+                        self.assertFalse(root.exists())
+                    else:
+                        with self.assertRaisesRegex(C.CustodyError, 'fixture_settlement_required'):
+                            custody.retire(slot)
+                        self.assertTrue(child.is_dir())
+
+    def test_pending_metadata_is_observable_but_never_interpreted_as_authority(self):
+        for leaf in ('namespace.json.pending', '0.json.pending'):
+            with self.subTest(leaf=leaf), tempfile.TemporaryDirectory(dir='/private/tmp') as d:
+                self.seed(d, slot=True)
+                pending = self.marker(d).with_name(leaf)
+                pending.write_bytes(b'unknown incomplete write')
+                before = {p.name: p.read_bytes() for p in pending.parent.iterdir()}
+                with self.open(d, create=False) as custody:
+                    report = custody.status()
+                    self.assertEqual(report['pendingMetadataCount'], 1)
+                    self.assertEqual(report['capacityReason'], 'fixture_metadata_pending')
+                    with self.assertRaisesRegex(C.CustodyError, 'fixture_metadata_pending'):
+                        custody.retire(0)
+                with self.assertRaises(C.CustodyError):
+                    self.open(d)
+                self.assertEqual(before, {p.name: p.read_bytes() for p in pending.parent.iterdir()})
+
+    def test_each_reservation_publication_interruption_keeps_status_available(self):
+        for point in ('record-written', 'record-published', 'record-durable', 'reservation-durable'):
+            with self.subTest(point=point), tempfile.TemporaryDirectory(dir='/private/tmp') as d:
+                with self.open(d) as custody:
+                    def stop(current):
+                        if current == point:
+                            raise RuntimeError('publication interrupted')
+                    custody.checkpoint = stop
+                    with self.assertRaisesRegex(RuntimeError, 'publication interrupted'):
+                        custody.reserve()
+                before = {p.name: p.read_bytes() for p in self.marker(d).parent.iterdir()}
+                with self.open(d, create=False) as custody:
+                    report = custody.status()
+                    self.assertEqual(report['outstanding'], int(point != 'record-written'))
+                    self.assertEqual(report['pendingMetadataCount'], int(point in ('record-published', 'record-durable')))
+                self.assertEqual(before, {p.name: p.read_bytes() for p in self.marker(d).parent.iterdir()})
 
 
 if __name__ == '__main__':

@@ -754,9 +754,9 @@ def validate_static():
                      "/usr/sbin/visudo", "openat", "fstatat", "renameatx_np",
                      "mainSudoersPath", "classifyFullVisudoFailure",
                      "RENAME_EXCL", "sudoers-moved", "marker-created",
-                     "rollbackDisable", "rollbackRecovery",
+                     "revocationOnly", "rollbackRecovery",
                      "runInteractive", "posix_spawn", "isatty", "tcgetpgrp", "getpgid",
-                     "disable_verification_failed_state_retained",
+                     "exact_managed_grant_absent=true",
                      "recovery_verification_failed", "ROOT_CONTRACT_READY",
                      "EmergencyArtifactExpectations.production"):
         require(required in swift, f"emergency_semantic_{required}")
@@ -784,7 +784,7 @@ def validate_static():
                      "fixture_echo_disabled=true", "pty_process_stopped_or_timed_out",
                      "recovery_verification_failed_rolled_back",
                      "recovery_verification_failed_rollback_failed",
-                     "disable_verification_failed_state_retained",
+                     "disable_timestamp_clear_failed_state_retained", "revokeWithBrokenRuntime",
                      "noRecursiveOrUnrelatedMutation"):
         require(required in tests, f"emergency_test_semantic_{required}")
     tracked = sorted(IMPLEMENTATION_SCOPE | FINALIZATION_SCOPE)

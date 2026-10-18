@@ -2,6 +2,7 @@
 """Fixed DS3 native Admission successor; never launches or stops a game."""
 import sys
 sys.dont_write_bytecode=True
+sys.pycache_prefix = "/dev/null"
 import argparse,contextlib,fcntl,hashlib,importlib.machinery,json,os,pwd,stat,subprocess
 from pathlib import Path
 HERE=Path(__file__).absolute().parent.parent
@@ -11,6 +12,10 @@ from lib import game_native_admission_capability as cap
 HOME=Path(pwd.getpwuid(os.getuid()).pw_dir);CONTROL=HOME/'AIDev/control'
 DS3=HOME/'Library/Application Support/Adapted Games DS3';CS2=HOME/'Library/Application Support/CS2 Standalone';HUB=HOME/'Library/Application Support/Adapted Games'
 STATE=HOME/'AIDev/state';POLICY='manifests/game-native-launch-admission.json'
+RECOVERY_SOURCE=('bin/game-native-admission-update','bin/game-native-admission-plan',
+ 'lib/game_native_admission_bridge.py','lib/game_native_admission_transaction.py',
+ 'lib/game_native_admission_capability.py','lib/game_native_admission_assets.py',
+ 'lib/game_operation_readiness.py',POLICY)
 
 def command(argv,timeout=30,env=None):
  result=subprocess.run([str(x) for x in argv],capture_output=True,timeout=timeout,env=env)
@@ -18,8 +23,9 @@ def command(argv,timeout=30,env=None):
 
 def source_check(commit):
  b.need(HERE==CONTROL and Path(__file__).absolute()==CONTROL/'bin/game-native-admission-update' and b.pinned(commit,40),'canonical_source_required')
- git=['/usr/bin/git','-c','core.hooksPath=/dev/null','-C',CONTROL]
- b.need(command(git+['rev-parse','HEAD']).decode().strip()==commit and command(git+['branch','--show-current']).decode().strip()=='main' and command(git+['status','--porcelain'])==b'','clean_exact_main_required')
+ sys.path.insert(0,str(CONTROL))
+ from lib.scoped_source_admission import check
+ check(CONTROL,commit,entrypoints=('bin/game-native-admission-update',))
  intent=b.decode(b._read(CONTROL/POLICY))
  b.need(intent.get('publicationAdapterImplemented') is True and intent.get('state')=='SOURCE_CANDIDATE','native_source_not_prepared')
  for rel,pin in intent['sourceFiles'].items():
@@ -72,17 +78,35 @@ def owner():
 
 def planner():return importlib.machinery.SourceFileLoader('native_admission_fixed_planner',str(CONTROL/'bin/game-native-admission-plan')).load_module()
 
+def recovery_source(operation,commit):
+ if operation not in ('rollback','recover'):return commit
+ b.need(HERE==CONTROL and b.pinned(commit,40),'canonical_source_required')
+ git=['/usr/bin/git','-c','core.hooksPath=/dev/null','-C',CONTROL]
+ current=command(git+['rev-parse','HEAD']).decode().strip()
+ b.need(b.pinned(current,40),'canonical_source_required')
+ if current!=commit:
+  command(git+['merge-base','--is-ancestor',commit,current])
+  # Current independently admitted code interprets the retained schema and
+  # validates exact policy/images below; never execute historical source.
+  command(git+['diff','--quiet','--no-ext-diff','--no-textconv',commit,current,'--',POLICY])
+ return current
+
 # Publication is connected below after the fixed transaction module is loaded.
 def operate(operation,commit,expected=None,payload=None):
  from lib import game_native_admission_assets as assets
  from lib import game_native_admission_transaction as transaction
- intent=source_check(commit)
+ admitted_commit=recovery_source(operation,commit)
+ intent=source_check(admitted_commit)
  from lib import game_operation_readiness as ready
+ source_paths={CONTROL/rel for rel in (*RECOVERY_SOURCE,*intent.get('sourceFiles',{}))}
+ # The admitted inputs, not unrelated Git history, are the publication guard.
+ # Exact bytes are re-read; this is neither a TTL nor a cached PASS/stat test.
+ source_images={path:b._read(path,limit=b.MAX_IMAGE) for path in source_paths}
  immutable=[DS3/'runtime'/rel for rel in intent['preserveRuntimeHashes']] + [DS3/'runtime/engine/bin/wineserver',DS3/'profiles/ds3/drive_c/Program Files (x86)/Steam/steamapps/common/DARK SOULS III/Game/DarkSoulsIII.exe']
  immutable_guard=ready.bound(lambda:ready.metadata(immutable))
  with locks() as lock_guard:
   def local():
-   lock_guard();b.need(source_check(commit)==intent,'native_policy_changed');b.need(immutable_guard() is True,'native_runtime_drift');inactive(intent,verify_runtime=False);return True
+   lock_guard();b.need(all(b._read(path,limit=b.MAX_IMAGE)==raw for path,raw in source_images.items()),'native_policy_changed');b.need(immutable_guard() is True,'native_runtime_drift');inactive(intent,verify_runtime=False);return True
   def recovery():
    no_request()
    for namespace in STATE.glob('.game-native-admission-*'):
@@ -98,7 +122,7 @@ def operate(operation,commit,expected=None,payload=None):
   checks={'payload-owner':owner,'recovery':recovery}
   if operation in ('plan','apply','return'):checks['wine-target']=lambda:inactive(intent)
   else:inactive(intent)
-  observation=ready.ready(CONTROL,commit,'wine-recovery' if operation in ('rollback','recover') else 'wine-install',checks=checks,target_guard=target_guard)
+  observation=ready.ready(CONTROL,admitted_commit,'wine-recovery' if operation in ('rollback','recover') else 'wine-install',checks=checks,target_guard=target_guard)
   b.need(observation.get('scopedCandidateReady') is True,'native_scoped_readiness_required');local()
   # The adapter accepts one reviewed exact plan; no general path or target list.
   return _publish(operation,commit,expected,payload,intent,local,assets,transaction)
@@ -137,8 +161,12 @@ def _publish(operation,commit,expected,payload,intent,local,assets,transaction):
  capability=cap.Transaction(commit,intent,required_assets)
  wanted=capability.after
  b.need(b.sha(wanted['approval'])==report['approvalCandidateSha256'] and b.sha(wanted['routes'])==report['routeCandidateSha256'],'native_capability_plan_changed')
- if not capability.directory.exists() and not capability.directory.is_symlink():capability.prepare(report['capabilityBeforeSha256'])
- cap_record,cap_files=capability.read()
+ try:cap_record,cap_files=capability.read()
+ except (OSError,RuntimeError,ValueError):
+  # Preparation has no target effects. Resume only the exact reviewed prestate
+  # and byte-prefix inventory; unknown or progressed evidence is preserved.
+  capability.prepare(report['capabilityBeforeSha256'])
+  cap_record,cap_files=capability.read()
  b.need({key:None if raw is None else b.sha(raw) for key,raw in cap_files['before'].items()}==report['capabilityBeforeSha256'],'native_capability_before_changed')
  # Every parent component validates the same held prerequisites. No external path is recorded or executed.
  def held():

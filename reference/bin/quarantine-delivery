@@ -1,6 +1,7 @@
 #!/usr/bin/python3
 import sys
 sys.dont_write_bytecode = True
+sys.pycache_prefix = "/dev/null"
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from lib.quarantine_delivery import main

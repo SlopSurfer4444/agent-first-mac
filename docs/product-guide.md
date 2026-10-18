@@ -35,19 +35,33 @@ from source availability and unit tests.
 
 ## Review the boundaries, not only the happy path
 
-The 2026-10-18 source snapshot includes the scoped guidance successor and
-delivery consumers for scheduler, quarantine file delivery and root bundle
-staging. Their affected-source and exact-target checks must not be confused
-with the explicit full vendor-compatibility diagnostic. Quarantine file
+The second 2026-10-18 source snapshot includes affected-source admission for
+owner-authorized user helpers. Static imports, deferred imports, literal helper
+and data references, and declared dynamic inputs form a conservative closure.
+Unrelated notes or commits should not invalidate an operation; changed affected
+inputs, import shadowing and replaced targets must still be rejected. A source
+check is not owner authorization, root admission or native consent.
+
+Delivery consumers include scheduler, quarantine file delivery, guidance and
+root bundle staging. Their affected-source and exact-target checks must not be
+confused with the explicit full vendor-compatibility diagnostic. Quarantine file
 delivery is not permission to execute unknown code; staging a root bundle is
 not installation or a privilege grant. Inspect the actual callers as well as
 the shared readiness API: an unused scoped API cannot remove a blocking caller.
 
-Custody records now include reboot/namespace handling. Retaining unknown
-material rather than adopting or deleting it is intentional; unnecessary global
+Custody records include durable transaction and reboot/namespace handling.
+Settled retained records with matching provenance can survive device renumbering;
+unknown provenance and ambiguous interrupted writes are not silently adopted.
+Retaining unknown material rather than adopting or deleting it is intentional; unnecessary global
 blocking, unrecoverable retained state and routine manual intervention remain
 valid review questions. Distinguish cooperative same-user recovery from a
 security boundary against a hostile process with the same user identity.
+
+The typed administrator's Git observer drops to the bound user's identity
+before Git interprets repository configuration. Review this separately from
+user-helper source closure and from the root operation's target/receipt checks;
+none is a substitute for the others. The selected Python suite does not execute
+or certify the Swift broker's native privilege-drop behavior.
 
 The optional RustDesk tunnel is a fixed loopback SSH adapter. Its source and
 mocked tests are included; its private host declaration and actual authentication

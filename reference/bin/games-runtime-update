@@ -2,6 +2,7 @@
 """Fixed-path reviewed Wine PE update adapter. Source preparation is not apply authority."""
 import sys
 sys.dont_write_bytecode = True
+sys.pycache_prefix = "/dev/null"
 import argparse
 import contextlib
 import hashlib
@@ -34,7 +35,7 @@ CANDIDATE_FILES = {'winemac-i386.drv','winemac-x86_64.drv','wine-source.tar.gz',
 EXTENDED_CANDIDATE_FILES = CANDIDATE_FILES | {'winemac-x86_64.so','oleacc-i386.dll','oleacc-x86_64.dll'}
 PE32 = 'engine/lib/wine/i386-windows/winemac.drv'
 PE64 = 'engine/lib/wine/x86_64-windows/winemac.drv'
-ARCHIVE_IMMUTABLE_SOURCE = (POLICY,DELIVERY,'manifests/games-hub.json','manifests/ds3-marshal-fix.json',
+ARCHIVE_IMMUTABLE_SOURCE: "source-data-only" = (POLICY,DELIVERY,'manifests/games-hub.json','manifests/ds3-marshal-fix.json',
                             'manifests/ds3-source-hub-v1.json','bin/ds3-runtime','bin/ds3-play',
                             'bin/games-play','bin/game-launch-admission','lib/game_operation_readiness.py','lib/operation_readiness.py')
 
@@ -66,10 +67,9 @@ def run(argv, timeout=120, env=None):
 def source_check(commit):
     need(SOURCE_PATH == CONTROL/'bin/games-runtime-update','canonical_source_required')
     need(pin(commit,40),'invalid_commit')
-    def git(*args):
-        return run(['/usr/bin/git','-c','core.hooksPath=/dev/null','-C',CONTROL,*args]).decode().strip()
-    need(git('rev-parse','HEAD') == commit and git('branch','--show-current') == 'main'
-         and git('status','--porcelain') == '', 'clean_exact_main_required')
+    sys.path.insert(0,str(CONTROL))
+    from lib.scoped_source_admission import check
+    check(CONTROL,commit,entrypoints=('bin/games-runtime-update',))
 
 
 def operation_ready(commit,operation,checks,target_guard):
@@ -103,7 +103,7 @@ def source_gate(commit,engine=None,root=None,action='apply'):
         root.validate_namespace();raw=root.read('state/transaction/plan.json')[0]
         tx=engine.Transaction(root,digest(raw),source_only=False)
         need(tx.targets in (engine.TARGETS,engine.EXTENDED_TARGETS,engine.POLICY_SOURCE_TARGETS),'operation_target_scope')
-        need(archival or tx.plan['acceptedCommit']==commit,'transaction_source_commit_drift')
+        if not archival:transaction_source(engine,root,tx,commit,action)
         tx.journal()
         return tx
     if root.anchors['state'].exists(NAMESPACE) and root.exists('state/transaction/journal.json'):
@@ -615,6 +615,14 @@ def archive_prepared(engine,root,current_commit,old_commit,expected_plan,termina
                 'oldTransactionRebound':False,'installedAcceptanceClaimed':False}
 
 
+def transaction_source(engine,root,tx,commit,action):
+    original=tx.plan['acceptedCommit']
+    if original!=commit:
+        need(action in ('rollback','recover','return'),'transaction_source_commit_drift')
+        # Unrelated commits do not invalidate retained recovery. Changed game
+        # policy still needs its specific migration, not arbitrary old code.
+        archive_source_ancestry(engine,root,original,commit)
+
 def operate(operation,commit,expected_plan=None,old_commit=None):
     need(operation in ('plan','apply','rollback','return','recover','archive-prepared','archive-applied','archive-rolled-back','bootstrap-policy-source'),'unsupported_operation')
     need(operation in ('archive-prepared','archive-applied','archive-rolled-back') or old_commit is None,'old_binding_archive_only')
@@ -627,7 +635,7 @@ def operate(operation,commit,expected_plan=None,old_commit=None):
             source_gate(commit,engine,root,operation)
             # Made only after scoped operation readiness under the lock.
             # No persisted or caller-supplied PASS exists.
-            fresh=lambda exact: local_gate(engine,root,exact)
+            fresh=lambda exact: local_gate(engine,root,commit)
             root._publication_check=lambda: fresh(commit)
             if operation == 'bootstrap-policy-source':
                 need(expected_plan is None,'bootstrap_has_no_runtime_plan')
@@ -657,7 +665,7 @@ def operate(operation,commit,expected_plan=None,old_commit=None):
                 need(prepared['planSha256'] == expected_plan,'prepared_plan_drift')
             tx=engine.Transaction(root,expected_plan,gate=fresh,source_only=False)
             root.validate_namespace()
-            need(tx.plan['acceptedCommit'] == commit,'transaction_source_commit_drift')
+            transaction_source(engine,root,tx,commit,operation)
             result=tx.run('before' if operation == 'rollback' else 'after',recover=operation == 'recover')
             # The engine's fixture report always says liveStateChanged=false.
             # This fixed-path route separately reports installed mutation.

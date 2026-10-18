@@ -14,6 +14,7 @@ import re
 import secrets
 import stat
 import struct
+import copy
 from pathlib import Path
 
 from lib import phase5_runtime_paths as paths
@@ -28,6 +29,8 @@ MAX_OUTPUT_BYTES = 16 * 1024 * 1024
 OUTPUT_DIRS = frozenset(("home", "codex", "cwd", "tmp", "schema", "schema/v1",
                          "schema/v2", "codex/tmp", "codex/tmp/arg0"))
 NAMESPACE = "vendor-sentinel-custody"
+TRANSACTION = 'transaction.json'
+MAX_PREPARATIONS = 32
 CHILDREN = ("home", "codex", "cwd", "tmp", "schema")
 SCHEMAS = ("codex_app_server_protocol.schemas.json", "JSONRPCMessage.json")
 STATES = ("reserved", "allocated", "inflight", "retained", "retiring")
@@ -105,10 +108,24 @@ def names(descriptor, maximum=MAX_ENTRIES):
     return result
 
 
+def rename_exclusive(parent, source, target):
+    libc = ctypes.CDLL(None, use_errno=True)
+    function = libc.renameatx_np
+    function.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_uint]
+    function.restype = ctypes.c_int
+    if function(parent, os.fsencode(source), parent, os.fsencode(target), 4):
+        raise OSError(ctypes.get_errno(), 'exclusive_custody_publication_refused')
+
+
+def preparation_name(name):
+    return re.fullmatch(r'\.prepare-[0-9a-f]{32}\.(payload|journal)', name) is not None
+
+
 class Custody:
-    def __init__(self, scratch, home, uid, *, create=True, envelope=None, checkpoint=None,
+    def __init__(self, scratch, home, uid, *, create=True, reconcile=False, envelope=None, checkpoint=None,
                  persistent_identity=None, boot_identity=None):
         self.scratch, self.home, self.uid = scratch, home, uid
+        writable = create or reconcile
         self.envelope = envelope or (lambda handle, module: module.require_empty_envelope(handle))
         self.checkpoint = checkpoint or (lambda point: None)
         self.persistent_identity = persistent_identity or namespace_persistent_identity
@@ -117,6 +134,10 @@ class Custody:
         self.handles, self.lock = [], None
         self.fds, self.close_attempts = [], {}
         self.created = False
+        self.mutation_reason = None
+        self.pending_metadata = []
+        self.namespace_refresh_required = False
+        self.namespace_refresh_records = {}
         self.fresh_slots = set()
         self.path = scratch + "/" + NAMESPACE
         try:
@@ -126,10 +147,15 @@ class Custody:
                 os.stat(NAMESPACE, dir_fd=self.parent.descriptor, follow_symlinks=False)
             except FileNotFoundError:
                 need(create, "fixture_custody_absent")
-                os.mkdir(NAMESPACE, 0o700, dir_fd=self.parent.descriptor)
+                retained = [name for name in names(self.parent.descriptor)
+                            if name.startswith('.' + NAMESPACE + '-')]
+                need(len(retained) < MAX_PREPARATIONS, 'fixture_preparation_capacity')
+                initial = '.' + NAMESPACE + '-' + secrets.token_hex(16)
+                os.mkdir(initial, 0o700, dir_fd=self.parent.descriptor)
+                self.checkpoint('namespace-prepared')
                 self.created = True
                 os.fsync(self.parent.descriptor)
-                self.directory = paths.OwnedParent.open(self.path, home, uid)
+                self.directory = paths.OwnedParent.open(scratch + '/' + initial, home, uid)
                 self._hold(self.directory)
                 self.envelope(self.directory, paths)
                 marker = None
@@ -153,30 +179,74 @@ class Custody:
                 raise CustodyError("fixture_custody_busy") from None
             if self.created:
                 os.fsync(self.lock)
-                self._publish("namespace.json", self._new_namespace_marker(), None)
+                self._write_preparation('namespace.json', self._new_namespace_marker())
+                os.fsync(self.directory.descriptor)
+                self.checkpoint('namespace-ready')
+                self.parent.verify()
+                self.directory.verify()
+                need(set(names(self.directory.descriptor, 2)) == {'namespace.json', 'lock'})
+                self._verify_lock()
+                need(self._namespace_marker(self._read('namespace.json')[0], include_lock=True) is False)
+                rename_exclusive(self.parent.descriptor, initial, NAMESPACE)
+                self.checkpoint('namespace-published')
+                os.fsync(self.parent.descriptor)
+                self.directory.close()
+                self.directory = paths.OwnedParent.open(self.path, home, uid)
+                self._hold(self.directory)
+                self._verify_lock()
+                need(self._namespace_marker(self._read('namespace.json')[0], include_lock=True) is False)
             else:
+                if TRANSACTION in names(self.directory.descriptor):
+                    if writable:
+                        self._recover_transaction()
+                    else:
+                        self.mutation_reason = 'fixture_metadata_pending'
                 # Re-read only after acquiring the named lock: neither a pre-lock
                 # marker nor a pre-lock empty-slot observation can admit refresh.
                 marker, prior = self._read("namespace.json")
                 refresh = self._namespace_marker(marker, include_lock=True)
-                if create and marker['schema'] == 1 and set(names(self.directory.descriptor, SLOTS + 2)) == {'namespace.json', 'lock'}:
+                if writable and marker['schema'] == 1 and self._record_names() == {'namespace.json', 'lock'}:
                     # Exact legacy identity was verified above. Upgrade only an
                     # empty namespace; never infer identity for a stale marker.
                     refresh = True
-                if refresh:
-                    need(set(names(self.directory.descriptor, SLOTS + 2)) == {'namespace.json', 'lock'})
-                    need(create, 'fixture_namespace_refresh_required')
+                if refresh and not writable:
+                    # Observation is not allocation or identity migration. Keep
+                    # the verified old marker and expose the affected boundary.
+                    self.namespace_refresh_required = True
+                    if (marker['identity'] != identity(os.fstat(self.directory.descriptor))
+                            or marker['lock'] != self.lock_identity):
+                        self.mutation_reason = 'fixture_namespace_refresh_required'
+                elif refresh:
+                    present = self._record_names()
+                    if present != {'namespace.json', 'lock'}:
+                        # Namespace-only refresh may retain exact same-device
+                        # records. No fixture identity or settlement is changed.
+                        if (marker['identity'] != identity(os.fstat(self.directory.descriptor))
+                                or marker['lock'] != self.lock_identity):
+                            self._rebase_records()
+                        records = self.records()
+                        self.namespace_refresh_records = {str(slot) + '.json': self._read(str(slot) + '.json')[1]
+                                                          for slot in records}
+                    expected = {'namespace.json', 'lock'} | set(self.namespace_refresh_records)
+                    need(present == expected)
                     self.checkpoint('namespace-refresh-ready')
                     self.directory.verify()
                     self._verify_lock()
-                    need(set(names(self.directory.descriptor, SLOTS + 2)) == {'namespace.json', 'lock'})
+                    need(self._record_names() == expected)
                     need(self._namespace_marker(marker, include_lock=True) or marker['schema'] == 1)
                     self._publish('namespace.json', self._new_namespace_marker(), prior)
                     installed, _ = self._read('namespace.json')
                     need(self._namespace_marker(installed, include_lock=True) is False)
             os.fsync(self.directory.descriptor)
             allowed = {"namespace.json", "lock"} | {str(slot) + ".json" for slot in range(SLOTS)}
-            need(set(names(self.directory.descriptor, len(allowed))) <= allowed)
+            pending = {name + '.pending' for name in allowed if name != 'lock'}
+            observed = set(names(self.directory.descriptor, len(allowed) + len(pending) + MAX_PREPARATIONS * 2 + 1))
+            preparations = {name for name in observed if preparation_name(name)}
+            need(len(preparations) <= MAX_PREPARATIONS * 2, 'fixture_preparation_capacity')
+            need(observed <= allowed | preparations | ((pending | {TRANSACTION}) if not writable else set()))
+            self.pending_metadata = sorted(observed & (pending | {TRANSACTION}))
+            if self.pending_metadata:
+                self.mutation_reason = 'fixture_metadata_pending'
             self.records()
         except BaseException as original:
             try:
@@ -283,7 +353,7 @@ class Custody:
                 raise errors[0]
         handle.close = close
 
-    def _read(self, leaf):
+    def _read(self, leaf, maximum=MAX_RECORD):
         self.directory.verify()
         self._verify_lock()
         fd = os.open(leaf, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK,
@@ -293,10 +363,10 @@ class Custody:
             info = os.fstat(fd)
             need(stat.S_ISREG(info.st_mode) and info.st_uid == self.uid
                  and stat.S_IMODE(info.st_mode) == 0o600 and info.st_nlink == 1
-                 and 0 < info.st_size <= MAX_RECORD)
+                 and 0 < info.st_size <= maximum)
             raw = bytearray()
-            while len(raw) <= MAX_RECORD:
-                block = os.read(fd, MAX_RECORD + 1 - len(raw))
+            while len(raw) <= maximum:
+                block = os.read(fd, maximum + 1 - len(raw))
                 if not block:
                     break
                 raw.extend(block)
@@ -314,13 +384,16 @@ class Custody:
         finally:
             self._close_fd(fd)
 
-    def _publish(self, leaf, value, prior):
+    def _record_names(self):
+        return {name for name in names(self.directory.descriptor)
+                if not preparation_name(name) and name != TRANSACTION}
+
+    def _write_preparation(self, leaf, value, maximum=MAX_RECORD):
         raw = json.dumps(value, sort_keys=True, separators=(",", ":")).encode("ascii")
-        need(len(raw) <= MAX_RECORD)
+        need(len(raw) <= maximum)
         self.directory.verify()
         self._verify_lock()
-        temporary = leaf + ".pending"
-        fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC,
+        fd = os.open(leaf, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_CLOEXEC,
                      0o600, dir_fd=self.directory.descriptor)
         self._register(fd)
         try:
@@ -332,31 +405,163 @@ class Custody:
             os.fsync(fd)
         finally:
             self._close_fd(fd)
-        written, _ = self._read(temporary)
+        written, observed = self._read(leaf, maximum)
         need(written == json.loads(raw))
+        return observed
+
+    def _recover_transaction(self):
+        """Reconcile metadata only; never launch a child or retire a fixture."""
+        transaction, receipt = self._read(TRANSACTION, MAX_RECORD * 5)
+        need(type(transaction) is dict and set(transaction) ==
+             {'schema', 'namespace', 'boot', 'leaf', 'candidate', 'before', 'beforePersistent',
+              'after', 'afterIdentity', 'afterPersistent', 'records'})
+        need(transaction['schema'] == 1 and type(transaction['schema']) is int)
+        need(type(transaction['boot']) is str and re.fullmatch('[0-9a-f]{64}', transaction['boot']) is not None)
+        cross_boot = transaction['boot'] != self.boot
+        leaf, candidate = transaction['leaf'], transaction['candidate']
+        need(leaf in {'namespace.json'} | {str(slot) + '.json' for slot in range(SLOTS)})
+        need(type(candidate) is str and preparation_name(candidate) and candidate.endswith('.payload'))
+        marker, _ = self._read('namespace.json')
+        self._namespace_marker(marker, include_lock=True)
+        need(transaction['namespace'] == self._new_namespace_marker()['persistent'])
+        before, after = transaction['before'], transaction['after']
+        need(before is None or (type(before) is list and len(before) == 2 and
+             type(before[0]) is str and len(before[0]) <= MAX_RECORD * 2 and
+             type(before[1]) is list and len(before[1]) == 8))
+        need(type(after) is str and 0 < len(after) <= MAX_RECORD * 2)
+        expected = bytes.fromhex(after)
+        expected_value = json.loads(expected)
+        self._validate_publication(leaf, expected_value,
+                                   None if before is None else bytes.fromhex(before[0]))
+        need(type(transaction['afterIdentity']) is list and len(transaction['afterIdentity']) == 4)
+        # No unrelated legacy pending name may be hidden by a valid transaction.
+        need(all(not name.endswith('.pending') for name in names(self.directory.descriptor)))
+        try:
+            _, current = self._read(leaf)
+        except FileNotFoundError:
+            current = None
+        def same(left, right):
+            return left[1:] == right[1:] if cross_boot else left == right
+        closure = transaction['records']
+        need(type(closure) is dict and set(closure) <= {str(slot) + '.json' for slot in range(SLOTS)})
+        if leaf == 'namespace.json':
+            need(self._record_names() == {'namespace.json', 'lock'} | set(closure))
+            for name, bound in closure.items():
+                need(type(bound) is dict and set(bound) == {'sha256', 'stamp', 'persistent'})
+                need(type(bound['sha256']) is str and re.fullmatch('[0-9a-f]{64}', bound['sha256']) is not None
+                     and type(bound['stamp']) is list and len(bound['stamp']) == 8)
+                _, observed = self._read(name)
+                need(hashlib.sha256(observed[0]).hexdigest() == bound['sha256'] and same(observed[1], bound['stamp'])
+                     and self._file_persistent(name) == bound['persistent'])
+        else:
+            need(closure == {})
+        is_before = (current is None if before is None else
+                     current is not None and current[0] == bytes.fromhex(before[0]) and same(current[1], before[1])
+                     and self._file_persistent(leaf) == transaction['beforePersistent'])
+        is_after = current is not None and current[0] == expected and \
+            same(identity(os.stat(leaf, dir_fd=self.directory.descriptor, follow_symlinks=False)), transaction['afterIdentity']) and \
+            self._file_persistent(leaf) == transaction['afterPersistent']
+        if is_before:
+            value, prepared = self._read(candidate)
+            need(prepared[0] == expected and value == expected_value and
+                 same(identity(os.stat(candidate, dir_fd=self.directory.descriptor, follow_symlinks=False)), transaction['afterIdentity'])
+                 and self._file_persistent(candidate) == transaction['afterPersistent'])
+            self.directory.verify()
+            self._verify_lock()
+            need(self._read(TRANSACTION, MAX_RECORD * 5)[1] == receipt)
+            # Recheck the exact preimage immediately before publication.
+            if before is None:
+                rename_exclusive(self.directory.descriptor, candidate, leaf)
+            else:
+                need(self._read(leaf)[1] == current)
+                os.replace(candidate, leaf, src_dir_fd=self.directory.descriptor,
+                           dst_dir_fd=self.directory.descriptor)
+            self.checkpoint('record-published')
+        else:
+            need(is_after)
+            # Atomic rename cannot leave both names. Preserve a recreated one.
+            need(candidate not in names(self.directory.descriptor))
+        os.fsync(self.directory.descriptor)
+        self.checkpoint('record-durable')
+        need(self._read(leaf)[1][0] == expected and
+             same(identity(os.stat(leaf, dir_fd=self.directory.descriptor, follow_symlinks=False)), transaction['afterIdentity'])
+             and self._file_persistent(leaf) == transaction['afterPersistent'])
+        if leaf == 'namespace.json':
+            self._namespace_marker(self._read(leaf)[0], include_lock=True)
+        else:
+            self.records()
+        need(self._read(TRANSACTION, MAX_RECORD * 5)[1] == receipt)
+        os.unlink(TRANSACTION, dir_fd=self.directory.descriptor)
+        os.fsync(self.directory.descriptor)
+        self.checkpoint('transaction-cleared')
+
+    def _publish(self, leaf, value, prior):
+        need(self.mutation_reason is None, self.mutation_reason or 'fixture_custody_invalid')
+        need(leaf in {'namespace.json'} | {str(slot) + '.json' for slot in range(SLOTS)})
+        self._validate_publication(leaf, value, None if prior is None else prior[0])
+        listed = names(self.directory.descriptor)
+        need(TRANSACTION not in listed and all(not name.endswith('.pending') for name in listed))
+        need(sum(preparation_name(name) for name in listed) < MAX_PREPARATIONS * 2,
+             'fixture_preparation_capacity')
+        token = secrets.token_hex(16)
+        candidate, journal = '.prepare-' + token + '.payload', '.prepare-' + token + '.journal'
+        prepared = self._write_preparation(candidate, value)
         self.checkpoint("record-written")
         self.directory.verify()
         self._verify_lock()
-        if prior is None:
-            os.link(temporary, leaf, src_dir_fd=self.directory.descriptor,
-                    dst_dir_fd=self.directory.descriptor, follow_symlinks=False)
-            os.unlink(temporary, dir_fd=self.directory.descriptor)
-        else:
+        if prior is not None:
             previous, current = self._read(leaf)
             need(current == prior)
             if leaf == 'namespace.json':
                 # Last pre-publication check, after record-written callbacks:
                 # no old or newly appeared artifact may be silently rebound.
-                need(set(names(self.directory.descriptor, SLOTS + 3)) ==
-                     {'namespace.json', 'lock', 'namespace.json.pending'})
+                need(self._record_names() ==
+                     {'namespace.json', 'lock'} | set(self.namespace_refresh_records))
+                for name, recorded in self.namespace_refresh_records.items():
+                    need(self._read(name)[1] == recorded)
                 need(self._namespace_marker(previous, include_lock=True) or previous['schema'] == 1)
                 self.directory.verify()
                 self._verify_lock()
-            os.replace(temporary, leaf, src_dir_fd=self.directory.descriptor,
-                       dst_dir_fd=self.directory.descriptor)
-        self.checkpoint("record-published")
+        transaction = {'schema': 1, 'namespace': self._new_namespace_marker()['persistent'], 'boot': self.boot, 'leaf': leaf,
+                       'candidate': candidate, 'before': None if prior is None else [prior[0].hex(), prior[1]],
+                       'beforePersistent': None if prior is None else self._file_persistent(leaf),
+                       'after': prepared[0].hex(),
+                       'afterIdentity': identity(os.stat(candidate, dir_fd=self.directory.descriptor, follow_symlinks=False)),
+                       'afterPersistent': self._file_persistent(candidate),
+                       'records': {name: {'sha256': hashlib.sha256(bound[0]).hexdigest(), 'stamp': bound[1],
+                                          'persistent': self._file_persistent(name)}
+                                   for name, bound in self.namespace_refresh_records.items()} if leaf == 'namespace.json' else {}}
+        self._write_preparation(journal, transaction, MAX_RECORD * 5)
+        self.checkpoint('transaction-prepared')
+        rename_exclusive(self.directory.descriptor, journal, TRANSACTION)
         os.fsync(self.directory.descriptor)
-        self.checkpoint("record-durable")
+        self.checkpoint('transaction-ready')
+        self._recover_transaction()
+
+    def _validate_publication(self, leaf, value, previous_raw):
+        if leaf == 'namespace.json':
+            need(type(value) is dict and value.get('schema') == 2)
+            self._namespace_marker(value, include_lock=True)
+            return
+        slot = int(leaf[:-5])
+        self._validate_record(value, slot)
+        if previous_raw is not None:
+            previous = json.loads(previous_raw)
+            self._validate_record(previous, slot)
+            need(value['token'] == previous['token'] and value['schema'] >= previous['schema'])
+
+    def _file_persistent(self, leaf):
+        _, observed = self._read(leaf)
+        fd = os.open(leaf, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK,
+                     dir_fd=self.directory.descriptor)
+        self._register(fd)
+        try:
+            need(stamp(os.fstat(fd)) == observed[1])
+            proof = self._persistent(fd)
+            need(stamp(os.fstat(fd)) == observed[1] and self._read(leaf)[1] == observed)
+            return proof
+        finally:
+            self._close_fd(fd)
 
     def _verify_lock(self):
         if self.lock is not None:
@@ -367,43 +572,153 @@ class Custody:
 
     def records(self):
         result = {}
-        keys = {"schema", "slot", "token", "state", "root", "children", "schemas", "settled", "reason"}
         for slot in range(SLOTS):
             try:
                 value, _ = self._read(str(slot) + ".json")
             except FileNotFoundError:
                 continue
-            need(type(value) is dict and type(value.get("schema")) is int
-                 and value["schema"] in (1, 2)
-                 and set(value) == (keys if value["schema"] == 1 else keys | {"output"})
+            self._validate_record(value, slot)
+            result[slot] = value
+        return result
+
+    def _validate_record(self, value, slot):
+        keys = {"schema", "slot", "token", "state", "root", "children", "schemas", "settled", "reason"}
+        need(type(value) is dict and type(value.get("schema")) is int
+                 and value["schema"] in (1, 2, 3)
+                 and set(value) == (keys if value["schema"] == 1 else
+                     keys | {"output"} if value['schema'] == 2 else keys | {'output', 'provenance'})
                  and type(value["slot"]) is int and value["slot"] == slot
                  and type(value["token"]) is str and re.fullmatch("[0-9a-f]{32}", value["token"]) is not None
                  and value["state"] in STATES and type(value["settled"]) is bool
                  and type(value["reason"]) is str and len(value["reason"]) <= 64
                  and type(value["children"]) is dict and set(value["children"]) <= set(CHILDREN)
                  and type(value["schemas"]) is dict and set(value["schemas"]) <= set(SCHEMAS))
-            identities = ([value["root"]] if value["root"] is not None else []) + list(value["children"].values())
-            need(all(type(row) is list and len(row) == 4 and all(type(item) is int and item >= 0 for item in row)
+        identities = ([value["root"]] if value["root"] is not None else []) + list(value["children"].values())
+        need(all(type(row) is list and len(row) == 4 and all(type(item) is int and item >= 0 for item in row)
                      and row[2] == self.uid and stat.S_IMODE(row[3]) == 0o700 and stat.S_ISDIR(row[3]) for row in identities))
-            need(all(type(row) is list and len(row) == 8 and all(type(item) is int for item in row)
+        need(all(type(row) is list and len(row) == 8 and all(type(item) is int for item in row)
                      for row in value["schemas"].values()))
-            if value["schema"] == 2:
-                self._validate_output(value)
-            result[slot] = value
-        return result
+        if value["schema"] == 2 or (value['schema'] == 3 and value['output'] is not None):
+            self._validate_output(value)
+        if value['schema'] == 3:
+            proof = value['provenance']
+            need(type(proof) is dict and set(proof) == {'boot', 'objects'}
+                     and type(proof['boot']) is str and re.fullmatch('[0-9a-f]{64}', proof['boot']) is not None
+                     and type(proof['objects']) is dict
+                     and set(proof['objects']) == set(self._record_rows(value)))
+            for row in proof['objects'].values():
+                need(type(row) is dict and set(row) == {'volume', 'birth'}
+                         and type(row['volume']) is str and re.fullmatch('[0-9a-f]{32}', row['volume']) is not None
+                         and row['volume'] != '0' * 32 and type(row['birth']) is list and len(row['birth']) == 2
+                         and all(type(n) is int for n in row['birth']) and row['birth'][0] > 0
+                         and 0 <= row['birth'][1] < 1000000000)
 
     def leaf(self, record):
         return "vendor-sentinel-" + record["token"]
 
+    def _record_rows(self, record):
+        rows = {'': record['root']} if record['root'] is not None else {}
+        rows.update(record['children'])
+        rows.update({'schema/' + name: row for name, row in record['schemas'].items()})
+        rows.update(record.get('output') or {})
+        return rows
+
+    def _observe_record_row(self, record, name, row, *, cross_boot=False, proof=None):
+        """Observe only already bound names, through a held no-follow chain."""
+        self.parent.verify()
+        parts = [self.leaf(record)] + (name.split('/') if name else [])
+        held, parent = [], self.parent.descriptor
+        try:
+            for index, component in enumerate(parts):
+                directory = index < len(parts) - 1 or (stat.S_ISDIR(row[3]) if len(row) == 4 else stat.S_ISDIR(row[2]))
+                fd = os.open(component, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK
+                             | (os.O_DIRECTORY if directory else 0), dir_fd=parent)
+                self._register(fd)
+                held.append((parent, component, fd))
+                parent = fd
+            facts = os.fstat(fd)
+            current = identity(facts) if len(row) == 4 else stamp(facts)
+            # Directory timestamps legitimately change during recorded retirement.
+            compared = 4 if len(row) == 8 and stat.S_ISDIR(row[2]) and record['state'] == 'retiring' else len(row)
+            need(current[1:compared] == row[1:compared] if cross_boot else current[:compared] == row[:compared])
+            persistent = self._persistent(fd)
+            if proof is not None:
+                need(persistent == proof)
+            for parent, component, child in held:
+                need(identity(os.stat(component, dir_fd=parent, follow_symlinks=False)) == identity(os.fstat(child)))
+            self.parent.verify()
+            return current, persistent
+        finally:
+            for _, _, fd in reversed(held):
+                self._close_fd(fd)
+
+    def _capture_provenance(self, record):
+        return {name: self._observe_record_row(record, name, row)[1]
+                for name, row in self._record_rows(record).items()}
+
+    def _verify_provenance(self, record):
+        for name, row in self._record_rows(record).items():
+            try:
+                self._observe_record_row(record, name, row,
+                    proof=record['provenance']['objects'][name])
+            except FileNotFoundError:
+                need(record['state'] == 'retiring')
+
+    def _rebased_record(self, record):
+        """A new boot is not settlement; only existing settled proofs can rebind."""
+        need(record['schema'] == 3, 'fixture_legacy_identity_required')
+        need(record['settled'] is True and record['state'] != 'inflight', 'fixture_settlement_required')
+        result = copy.deepcopy(record)
+        changed_boot = record['provenance']['boot'] != self.boot
+        rows = self._record_rows(record)
+        for name, row in rows.items():
+            try:
+                current, _ = self._observe_record_row(record, name, row, cross_boot=changed_boot,
+                                                      proof=record['provenance']['objects'][name])
+            except FileNotFoundError:
+                need(record['state'] == 'retiring')
+                continue
+            # Preserve all content/time guards; only the device number changes.
+            if name == '': result['root'][0] = current[0]
+            if name in result['children']: result['children'][name][0] = current[0]
+            if name.startswith('schema/') and name[7:] in result['schemas']:
+                result['schemas'][name[7:]][0] = current[0]
+            if result['output'] is not None and name in result['output']:
+                result['output'][name][0] = current[0]
+        if not rows:
+            try:
+                os.stat(self.leaf(record), dir_fd=self.parent.descriptor, follow_symlinks=False)
+            except FileNotFoundError:
+                pass
+            else:
+                raise CustodyError('fixture_custody_invalid')
+        result['provenance']['boot'] = self.boot
+        return result
+
+    def _rebase_records(self):
+        records = self.records()
+        # Validate every record before changing any. Legacy/unknown state is not
+        # retroactively assigned a durable identity.
+        replacements = {slot: self._rebased_record(row) for slot, row in records.items()}
+        for slot, replacement in replacements.items():
+            leaf = str(slot) + '.json'
+            current, prior = self._read(leaf)
+            need(current == records[slot] and self._rebased_record(current) == replacement)
+            if current != replacement:
+                self._publish(leaf, replacement, prior)
+
     def reserve(self):
+        need(self.mutation_reason is None, self.mutation_reason or 'fixture_custody_invalid')
+        need(not self.namespace_refresh_required, 'fixture_namespace_refresh_required')
         records = self.records()
         need(len(records) < SLOTS, "fixture_capacity_required")
         need(all(record["settled"] is True for record in records.values()),
              "fixture_settlement_required")
         self.census(records)
         slot = next(slot for slot in range(SLOTS) if slot not in records)
-        record = {"schema": 1, "slot": slot, "token": secrets.token_hex(16), "state": "reserved",
-                  "root": None, "children": {}, "schemas": {}, "settled": True, "reason": "reserved"}
+        record = {"schema": 3, "slot": slot, "token": secrets.token_hex(16), "state": "reserved",
+                  "root": None, "children": {}, "schemas": {}, "settled": True, "reason": "reserved",
+                  'output': None, 'provenance': {'boot': self.boot, 'objects': {}}}
         self._publish(str(slot) + ".json", record, None)
         self.checkpoint("reservation-durable")
         self.fresh_slots.add(slot)
@@ -514,7 +829,7 @@ class Custody:
         """
         need(type(slot) is int and slot in self.fresh_slots)
         record = self.records()[slot]
-        need(record["schema"] == 1 and record["state"] == "allocated"
+        need((record["schema"] == 1 or (record['schema'] == 3 and record['output'] is None)) and record["state"] == "allocated"
              and record["settled"] is True, "fixture_settlement_required")
         need(type(consumed_schemas) is dict and set(consumed_schemas) == set(SCHEMAS))
         output = self._output_tree(record)
@@ -523,14 +838,21 @@ class Custody:
         self._validate_output(sealed)
         # Reobserve after the complete snapshot; no removal occurs on refusal.
         self._output_tree(sealed, output)
-        self.update(slot, schema=2, schemas=sealed["schemas"], output=output)
+        self.update(slot, schema=3 if record['schema'] == 3 else 2, schemas=sealed["schemas"], output=output)
         self.fresh_slots.discard(slot)
 
     def update(self, slot, **changes):
         need(type(slot) is int and 0 <= slot < SLOTS)
         leaf = str(slot) + ".json"
         record, prior = self._read(leaf)
-        self._publish(leaf, {**record, **changes}, prior)
+        updated = {**record, **changes}
+        if record['schema'] == 3 and {'root', 'children', 'schemas', 'output'} & set(changes):
+            need(updated['schema'] == 3)
+            need(set(updated['children']) <= set(CHILDREN) and set(updated['schemas']) <= set(SCHEMAS))
+            if updated['output'] is not None:
+                self._validate_output(updated)
+            updated['provenance'] = {'boot': self.boot, 'objects': self._capture_provenance(updated)}
+        self._publish(leaf, updated, prior)
 
     def census(self, records=None):
         total, count = 0, 0
@@ -582,9 +904,14 @@ class Custody:
                 "slots": [{"slot": slot, "settled": value["settled"], "state": value["state"]}
                           for slot, value in records.items()], "maximumReservations": SLOTS,
                 "retainedByteAdmissionBudget": MAX_BYTES, "retainedBytesObserved": total,
-                "entriesObserved": entries, "capacityReason": reason, "hardDiskQuota": False}
+                "entriesObserved": entries, "capacityReason": self.mutation_reason or
+                    ('fixture_namespace_refresh_required' if self.namespace_refresh_required else reason),
+                "pendingMetadataCount": len(self.pending_metadata),
+                "namespaceRefreshRequired": self.namespace_refresh_required,
+                "hardDiskQuota": False}
 
     def release_absent(self, slot):
+        need(self.mutation_reason is None, self.mutation_reason or 'fixture_custody_invalid')
         record, prior = self._read(str(slot) + ".json")
         need(record["settled"] is True and record["state"] == "retiring")
         try:
@@ -681,12 +1008,15 @@ class Custody:
         not new entries, changed objects, unknown descendants or inferred child
         death. Empty pre-launch constructor fixtures are also disposable.
         """
+        need(self.mutation_reason is None, self.mutation_reason or 'fixture_custody_invalid')
         need(type(slot) is int and 0 <= slot < SLOTS)
         records = self.records()
         need(slot in records)
         record = records[slot]
         need(record["settled"] is True and record["state"] != "inflight",
              "fixture_settlement_required")
+        if record['schema'] == 3:
+            self._verify_provenance(record)
         leaf = self.leaf(record)
         try:
             info = os.stat(leaf, dir_fd=self.parent.descriptor, follow_symlinks=False)
@@ -696,7 +1026,7 @@ class Custody:
             self.release_absent(slot)
             return {"scope": "disposable-vendor-fixture-custody", "retired": True, "slot": slot}
         need(record["root"] is not None and identity(info) == record["root"])
-        if record["schema"] == 2:
+        if record["schema"] == 2 or (record['schema'] == 3 and record['output'] is not None):
             return self._retire_output(slot, record)
         handles = []
         try:

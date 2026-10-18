@@ -91,6 +91,51 @@ class Transactions(unittest.TestCase):
         self.assertEqual(self.sentinel.read_bytes(), b'preserved save')
         self.assertGreater(self.guard_calls, 9)
 
+    def test_namespace_partial_preparation_resumes_without_target_writes(self):
+        stage = self.state.parent / ('.game-admission-stage-' + self.state.name.lstrip('.'))
+        original = os.write
+        fired = []
+        def interrupted(fd, raw):
+            if not fired:
+                fired.append(True)
+                original(fd, raw[:7])
+                raise InterruptedError('fixture interruption')
+            return original(fd, raw)
+        with patch.object(t.os, 'write', interrupted):
+            with self.assertRaises(InterruptedError):
+                self.prepare()
+        self.assertTrue(stage.exists())
+        self.assertFalse(self.state.exists())
+        self.assertEqual(self.images(), self.before)
+        self.prepare()
+        self.assertFalse(stage.exists())
+        self.prepare()  # Complete preparation is idempotent as well.
+        self.assertEqual(self.images(), self.before)
+
+    def test_namespace_foreign_partial_is_preserved(self):
+        stage = self.state.parent / ('.game-admission-stage-' + self.state.name.lstrip('.'))
+        stage.mkdir(mode=0o700)
+        self.fixture.put(stage / 'plan.json', b'foreign')
+        with self.assertRaisesRegex(RuntimeError, 'stage_drift'):
+            self.prepare()
+        self.assertEqual((stage / 'plan.json').read_bytes(), b'foreign')
+        self.assertEqual(set(stage.iterdir()), {stage / 'plan.json'})
+        self.assertEqual(self.images(), self.before)
+
+    def test_namespace_changed_prefix_before_open_is_not_appended(self):
+        stage = self.state.parent / 'fixture-stage'
+        stage.mkdir(mode=0o700)
+        self.fixture.put(stage / 'image', b'abc')
+        original = os.open
+        def race(name, flags, *args, **kwargs):
+            if name == 'image' and flags & os.O_APPEND:
+                (stage / 'image').write_bytes(b'xyz')
+            return original(name, flags, *args, **kwargs)
+        with patch.object(t.os, 'open', race):
+            with self.assertRaisesRegex(RuntimeError, 'stage_drift'):
+                t._complete_namespace(stage, {'image': b'abcdef'})
+        self.assertEqual((stage / 'image').read_bytes(), b'xyz')
+
     def test_each_intent_and_publication_recovers_both_directions(self):
         self.prepare()
         for direction in ('after', 'before'):
@@ -144,7 +189,7 @@ class Transactions(unittest.TestCase):
         stage = self.state.parent / ('.game-admission-stage-' + self.state.name.lstrip('.'))
         stage.mkdir(mode=0o700)
         self.fixture.put(stage / 'partial', b'owned incomplete stage')
-        with self.assertRaisesRegex(b.Blocked, 'stage_collision'):
+        with self.assertRaisesRegex(b.Blocked, 'stage_inventory'):
             self.prepare()
         self.assertEqual(self.images(), self.before)
         self.assertEqual((stage / 'partial').read_bytes(), b'owned incomplete stage')

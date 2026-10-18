@@ -8,10 +8,12 @@ These are reference sources, not instructions to activate them on your Mac.
 | Bounded monitoring | [cycle](../reference/bin/workstation-maintenance-cycle), [snapshot](../reference/bin/workstation-drift-snapshot), [delivery](../reference/lib/workstation_maintenance_delivery.py) |
 | Owner freedom | [ownership](../reference/lib/productivity_ownership.py), [readiness](../reference/lib/operation_readiness.py) |
 | Source admission | [admission](../reference/lib/current_source_admission.py), [transitions](../reference/lib/config_transitions.py) |
+| Affected user-helper source | [closure](../reference/lib/scoped_source_admission.py), [dependency checks](../reference/lib/operation_checks.py), [user readiness](../reference/lib/user_operation_readiness.py) |
 | Vendor compatibility | [doctor](../reference/bin/current-doctor), [policy](../reference/lib/vendor_compatibility_policy.py) |
 | Advisory project context | [hook](../reference/codex/hooks/phase5-contract.py) |
 | Quarantine pair | [delivery](../reference/lib/quarantine_delivery.py) |
 | Typed administrator | [core](../reference/Sources/AidAdminCore/AidAdminCore.swift), [delivery](../reference/lib/root_delivery.py) |
+| Privilege-separated Git observation | [implementation](../reference/Sources/AidAdminCore/GitObservation.swift) |
 | Harness off-ramp | [implementation](../reference/lib/harness_offramp.py) |
 | Optional games | [hub](../reference/bin/games-hub), [updater](../reference/bin/games-runtime-update) |
 | Optional Windows | [client](../reference/bin/windows-host-ssh-client) |

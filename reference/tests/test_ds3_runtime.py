@@ -160,6 +160,47 @@ class DS3Tests(unittest.TestCase):
         self.installed();shutil.rmtree(self.source)
         with patch.object(h,'inactive'),patch.object(h,'run',return_value=b''),patch.object(h.subprocess,'Popen') as launch:h.play()
         self.assertEqual(launch.call_args.kwargs['env']['WINEPREFIX'],str(self.prefix))
+    def schema4_installed(self):
+        self.installed()
+        overrides={}
+        for rel in h.RUNTIME_EXTENDED_PATHS:
+            path=self.root/'runtime'/rel
+            if not path.exists():
+                path.parent.mkdir(parents=True,exist_ok=True);path.write_bytes(b'fixture runtime')
+            overrides[rel]=h.sha(path)
+        policy={'schema':2,'id':'wine-runtime-overlay','owner':'control-games-hub',
+                'previousHubManifestSha256':'a'*64,'previousDS3ManifestSha256':'b'*64,
+                'previousHubCriticalHashes':self.critical,'sourceHubManifestSha256':self.m['sourceHubManifestSha256'],
+                'sourceCriticalHashes':self.critical,'desiredRuntimeHashes':overrides,
+                'lifecycleSha256':h.sha(self.root/'ds3-runtime')}
+        directory=self.root/'policy-source';directory.mkdir(mode=0o700)
+        original=directory/'source-hub-v1.json';original.write_bytes((self.control/h.SOURCE_HUB_MANIFEST).read_bytes());original.chmod(0o600)
+        target=directory/'overlay-policy.json';target.write_text(json.dumps(policy));target.chmod(0o600)
+        manifest=dict(self.m,schema=4,runtimeOverrides=overrides,runtimeOverlayPolicySha256=h.sha(target))
+        (self.root/'manifest.json').write_text(json.dumps(manifest))
+        receipt=json.loads((self.root/'receipt.json').read_text());receipt.update(manifestSha256=h.sha(self.root/'manifest.json'),runtimeTreeSha256=h.code_tree(self.root/'runtime'))
+        (self.root/'receipt.json').write_text(json.dumps(receipt))
+        borderless=self.root/'borderless/receipt.json'
+        row=json.loads(borderless.read_text());row.update(baseManifestSha256=receipt['manifestSha256'],baseRuntimeTreeSha256=receipt['runtimeTreeSha256'])
+        borderless.write_text(json.dumps(row))
+    def test_schema4_launch_and_stop_without_donor_or_control_policy(self):
+        self.schema4_installed();shutil.rmtree(self.source);shutil.rmtree(self.control/'manifests')
+        with patch.object(h,'inactive'),patch.object(h,'run',return_value=b''),patch.object(h.subprocess,'Popen') as launch:
+            h.play()
+        self.assertEqual(launch.call_args.kwargs['env']['WINEPREFIX'],str(self.prefix))
+        with patch.object(h.subprocess,'run',return_value=subprocess.CompletedProcess([],0,stdout=b'',stderr=b'')) as run:
+            h.stop()
+        self.assertTrue(all(call.kwargs['env']['WINEPREFIX']==str(self.prefix) for call in run.call_args_list))
+    def test_drifted_donor_server_never_executed_on_launch(self):
+        self.schema4_installed();(self.source/'runtime/engine/bin/wineserver').write_bytes(b'donor independently updated')
+        (self.source/'manifest.json').write_bytes(b'unrelated donor generation')
+        with patch.object(h,'inactive') as inactive,patch.object(h,'run',return_value=b''),patch.object(h.subprocess,'Popen'):
+            h.play()
+        self.assertTrue(all(call.args[0]==self.root/'runtime' for call in inactive.call_args_list))
+    def test_schema4_owned_policy_drift_still_blocks_stop(self):
+        self.schema4_installed();(self.root/'policy-source/overlay-policy.json').write_text('{}')
+        with patch.object(h.subprocess,'run',side_effect=AssertionError('executed')):
+            with self.assertRaisesRegex(RuntimeError,'overlay_policy_identity'):h.stop()
     def test_corresponding_source_drift_blocks_before_install(self):
         (self.candidate/'source/src/winemetal/test.c').write_bytes(b'changed')
         with patch.object(h,'source_gate'),patch.object(h,'inactive'):

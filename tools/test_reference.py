@@ -19,6 +19,9 @@ names = [
     'test_vendor_compatibility_policy',
     'test_rustdesk_ssh_tunnel',
     'test_custody_namespace',
+    'test_custody_transactions',
+    'test_custody_durable_records',
+    'test_scoped_source_admission',
 ]
 # This single test reads deliberately omitted live hook configuration. Keep it
 # visible as SKIPPED; never synthesize an authority-bearing configuration to pass.

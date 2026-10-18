@@ -1,6 +1,8 @@
 #!/usr/bin/python3 -I -B
 """Deliver only the reviewed scoped-readiness guidance successor."""
 import sys
+sys.dont_write_bytecode = True
+sys.pycache_prefix = "/dev/null"
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from lib.workstation_guidance_delivery import main, SUCCESSOR

@@ -434,12 +434,12 @@ private struct Suite {
 
     func unsettledCommandPreservesRecoveryState() throws {
         let fixture = try Fixture()
-        fixture.runner.unknownCall = 3
+        fixture.hooks.failStep = "marker-created"
         let reason = try expectThrows { _ = try fixture.transaction().disable() }
-        try expect(reason == "emergency_process_unknown" && fixture.disabledState(),
+        try expect(reason == "injected_marker-created" && fixture.disabledState(),
                    "unsettled_command_rolled_back")
         try expect(fixture.physical(EmergencyTransaction.journalPath).isFile)
-        fixture.runner.unknownCall = nil
+        fixture.hooks.failStep = nil
         _ = try fixture.transaction().recover()
         try expect(fixture.enabledState())
     }
@@ -667,7 +667,7 @@ private struct Suite {
         try expect(!fixture.runner.calls.contains { $0.1 == ["-c"] },
                    "bare_global_visudo_regression")
         let expectedFull = ["-cf", fixture.physical(EmergencyTransaction.mainSudoersPath).path]
-        try expect(fixture.runner.calls.filter { $0.1 == expectedFull }.count == 4,
+        try expect(fixture.runner.calls.filter { $0.1 == expectedFull }.count == 2,
                    "canonical_main_visudo_contract")
     }
 
@@ -700,9 +700,7 @@ private struct Suite {
     }
 
     func symlinkMatrix() throws {
-        for logical in [EmergencyTransaction.binaryPath, EmergencyTransaction.policyPath,
-                        EmergencyTransaction.attestationPath, EmergencyTransaction.sudoersPath,
-                        EmergencyTransaction.mainSudoersPath] {
+        for logical in [EmergencyTransaction.sudoersPath] {
             let fixture = try Fixture()
             try fixture.replaceWithSymlink(logical)
             _ = try expectThrows { _ = try fixture.transaction().disable() }
@@ -716,8 +714,7 @@ private struct Suite {
     }
 
     func hashAndAttestationDriftMatrix() throws {
-        for logical in [EmergencyTransaction.binaryPath, EmergencyTransaction.policyPath,
-                        EmergencyTransaction.sudoersPath, EmergencyTransaction.attestationPath] {
+        for logical in [EmergencyTransaction.sudoersPath] {
             let fixture = try Fixture()
             try fixture.mutate(logical, data: Data("drift".utf8))
             _ = try expectThrows { _ = try fixture.transaction().disable() }
@@ -727,10 +724,38 @@ private struct Suite {
         _ = try expectThrows { _ = try disabled.transaction().recover() }
     }
 
-    func wrongModeAndOwnerMatrix() throws {
+    func revokeWithBrokenRuntime() throws {
+        // Damage is irrelevant to removing the exact pinned grant, but still
+        // forbids recovery. Include missing files and no-follow hostile shapes.
         for logical in [EmergencyTransaction.binaryPath, EmergencyTransaction.policyPath,
-                        EmergencyTransaction.attestationPath, EmergencyTransaction.sudoersPath,
-                        EmergencyTransaction.mainSudoersPath] {
+                        EmergencyTransaction.attestationPath] {
+            for damage in ["bytes", "symlink", "mode", "missing"] {
+                let fixture = try Fixture()
+                switch damage {
+                case "bytes": try fixture.mutate(logical, data: Data("drift".utf8))
+                case "symlink": try fixture.replaceWithSymlink(logical)
+                case "mode": try fixture.mutate(logical, mode: 0o600)
+                default: try FileManager.default.removeItem(at: fixture.physical(logical))
+                }
+                _ = try fixture.transaction().disable()
+                try expect(fixture.disabledState() && fixture.runner.calls.isEmpty,
+                           "broken_runtime_blocks_revoke")
+                _ = try expectThrows { _ = try fixture.transaction().recover() }
+                try expect(!fixture.physical(EmergencyTransaction.sudoersPath).exists,
+                           "broken_runtime_reenabled")
+            }
+        }
+        for directory in [EmergencyTransaction.auditPath, "/usr/local/libexec"] {
+            let fixture = try Fixture()
+            try FileManager.default.moveItem(at: fixture.physical(directory),
+                to: fixture.physical(directory + ".retained"))
+            _ = try fixture.transaction().disable()
+            try expect(fixture.disabledState(), "irrelevant_directory_blocks_revoke")
+        }
+    }
+
+    func wrongModeAndOwnerMatrix() throws {
+        for logical in [EmergencyTransaction.sudoersPath] {
             let fixture = try Fixture()
             try fixture.mutate(logical, mode: 0o600)
             _ = try expectThrows { _ = try fixture.transaction().disable() }
@@ -756,13 +781,16 @@ private struct Suite {
     }
 
     func disablePartialFailureRollbackMatrix() throws {
-        for step in ["sudoers-moved", "marker-created", "disabled-visudo",
-                     "full-visudo-disabled", "disabled-final-verification"] {
+        for step in ["sudoers-moved", "marker-created", "disabled-final-verification"] {
             let fixture = try Fixture()
             fixture.hooks.failStep = step
             let reason = try expectThrows { _ = try fixture.transaction().disable() }
-            try expect(reason.hasSuffix("_rolled_back"), "disable_rollback_reason")
-            try expect(fixture.enabledState(), "disable_rollback_state")
+            try expect(reason == "injected_" + step, "disable_retention_reason")
+            try expect(!fixture.physical(EmergencyTransaction.sudoersPath).exists,
+                       "disable_must_not_restore_authority")
+            fixture.hooks.failStep = nil
+            _ = try fixture.transaction().disable()
+            try expect(fixture.disabledState(), "disable_reconciled")
         }
     }
 
@@ -780,20 +808,18 @@ private struct Suite {
     func visudoFailureMatrix() throws {
         let preDisable = try Fixture()
         preDisable.runner.failCall = 1
-        _ = try expectThrows { _ = try preDisable.transaction().disable() }
-        try expect(preDisable.enabledState())
+        _ = try preDisable.transaction().disable()
+        try expect(preDisable.disabledState() && preDisable.runner.calls.isEmpty)
         let preDisableFull = try Fixture()
         preDisableFull.runner.failCall = 2
         preDisableFull.runner.failureOutput =
             "fixture/private/path: syntax error near line 1\nraw policy omitted"
-        let classified = try expectThrows { _ = try preDisableFull.transaction().disable() }
-        try expect(classified == "visudo_full_syntax_failed_syntax" &&
-                   !classified.contains("private") && preDisableFull.enabledState(),
-                   "full_visudo_diagnostic_classification")
+        _ = try preDisableFull.transaction().disable()
+        try expect(preDisableFull.disabledState() && preDisableFull.runner.calls.isEmpty)
         let postDisable = try Fixture()
         postDisable.runner.failCall = 4
-        let disableReason = try expectThrows { _ = try postDisable.transaction().disable() }
-        try expect(disableReason.hasSuffix("_rolled_back") && postDisable.enabledState())
+        _ = try postDisable.transaction().disable()
+        try expect(postDisable.disabledState())
         let preRecovery = try Fixture(disabled: true)
         preRecovery.runner.failCall = 1
         _ = try expectThrows { _ = try preRecovery.transaction().recover() }
@@ -861,7 +887,7 @@ private struct Suite {
         disable.hooks.failStep = "marker-created"
         disable.hooks.rollbackFails = true
         let disableReason = try expectThrows { _ = try disable.transaction().disable() }
-        try expect(disableReason.hasSuffix("_rollback_failed"))
+        try expect(disableReason == "injected_marker-created" && disable.disabledState())
         let recovery = try Fixture(disabled: true)
         recovery.hooks.failStep = "marker-removed"
         recovery.hooks.rollbackFails = true
@@ -871,7 +897,7 @@ private struct Suite {
 
     func parentTrustAndRaceMatrix() throws {
         let parents = ["/private/etc", "/private/etc/sudoers.d", "/etc/sudoers.d",
-                       "/etc/agent-first-mac", "/usr/local/libexec"]
+                       "/etc/agent-first-mac"]
         for logical in parents {
             let writable = try Fixture()
             try writable.directory(logical, 0o777)
@@ -885,7 +911,7 @@ private struct Suite {
             try symlink.replaceDirectoryWithSymlink(logical)
             _ = try expectThrows { _ = try symlink.transaction().disable() }
         }
-        for logical in [EmergencyTransaction.auditPath, EmergencyTransaction.stagingPath] {
+        for logical in [EmergencyTransaction.stagingPath] {
             let writable = try Fixture()
             try writable.directory(logical, 0o755)
             _ = try expectThrows { _ = try writable.transaction().disable() }
@@ -926,7 +952,8 @@ private struct Suite {
             }
         }
         let markerReason = try expectThrows { _ = try markerDestination.transaction().disable() }
-        try expect(markerReason.hasSuffix("_rollback_failed"), "marker_race_rollback_result")
+        try expect(!markerReason.isEmpty && !markerDestination.physical(EmergencyTransaction.sudoersPath).exists,
+                   "marker_race_must_not_restore_grant")
         let markerDestinationData = try Data(contentsOf: markerDestination.physical(
             EmergencyTransaction.markerPath))
         try expect(markerDestinationData == Data("racing-marker-destination".utf8),
@@ -957,11 +984,9 @@ private struct Suite {
         let disableRollbackReason = try expectThrows {
             _ = try disableRollbackRace.transaction().disable()
         }
-        try expect(disableRollbackReason.hasSuffix("_rollback_failed"))
-        let disableRollbackData = try Data(contentsOf: disableRollbackRace.physical(
-            EmergencyTransaction.sudoersPath))
-        try expect(disableRollbackData == Data("racing-rollback-enabled".utf8),
-                   "disable_rollback_destination_overwritten")
+        try expect(disableRollbackReason == "injected_marker-created" &&
+                   !disableRollbackRace.physical(EmergencyTransaction.sudoersPath).exists,
+                   "disable_rollback_must_not_run")
 
         let recoveryRollbackRace = try Fixture(disabled: true)
         recoveryRollbackRace.hooks.failStep = "marker-removed"
@@ -1115,7 +1140,6 @@ private struct Suite {
         let disable = ScriptedOwnerRunner([
             call(["-k", "--", executable, "__root-disable"], 0),
             call(["-k"], 0),
-            call(["-n", "/usr/local/libexec/aid-admin", "doctor-root", "--json"], 1),
         ])
         let disableLines = try EmergencyOwnerOrchestrator(
             executablePath: executable, runner: disable).perform(.disable)
@@ -1130,14 +1154,13 @@ private struct Suite {
 
         let disableVerificationFailure = ScriptedOwnerRunner([
             call(["-k", "--", executable, "__root-disable"], 0),
-            call(["-k"], 0),
-            call(["-n", "/usr/local/libexec/aid-admin", "doctor-root", "--json"], 0, ready),
+            call(["-k"], 1),
         ])
         let disableFailure = try expectThrows {
             _ = try EmergencyOwnerOrchestrator(
                 executablePath: executable, runner: disableVerificationFailure).perform(.disable)
         }
-        try expect(disableFailure == "disable_verification_failed_state_retained")
+        try expect(disableFailure == "disable_timestamp_clear_failed_state_retained")
 
         let rootFailure = ScriptedOwnerRunner([
             call(["-k", "--", executable, "__root-disable"], 1),
@@ -1283,6 +1306,7 @@ private struct TestMain {
                 ("positive_disable_recovery", suite.positiveDisableRecovery),
                 ("symlink_matrix", suite.symlinkMatrix),
                 ("hash_attestation_drift", suite.hashAndAttestationDriftMatrix),
+                ("revoke_broken_runtime", suite.revokeWithBrokenRuntime),
                 ("wrong_mode_owner", suite.wrongModeAndOwnerMatrix),
                 ("unexpected_state", suite.unexpectedStateMatrix),
                 ("disable_partial_rollback", suite.disablePartialFailureRollbackMatrix),
@@ -1304,7 +1328,10 @@ private struct TestMain {
                 ("disabled_resume_boundary", suite.disabledResumeBoundary),
             ]
             var completed = 0
-            for (_, test) in groups { try test(); completed += 1 }
+            for (name, test) in groups {
+                do { try test(); completed += 1 }
+                catch { throw EmergencyFailure.rejected(name + ":" + String(describing: error)) }
+            }
             let provenanceCases = try suite.sudoProvenanceMatrix()
             print("{\"provenanceCases\":\(provenanceCases),\"result\":\"pass\",\"tests\":\(completed + 1)}")
         } catch {

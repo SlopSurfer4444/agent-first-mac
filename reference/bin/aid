@@ -61,6 +61,8 @@ Sections: current, root, revision, productivity, tailscale, amnezia, windows-app
 Doctor defaults to current and always preserves that doctor's native JSON and exit status.
 Inventory is declared-only; plan is scoped routing help, not an executable machine plan.
 Install, adopt, upgrade, remove, rollback and maintenance triggers are unsupported.
+Harness-only disable/restore: see docs/wave-offramp.md and bin/aid-harness-offramp --help.
+That separate adapter preserves apps, games and owner data; this help does not execute it.
 """
 
 

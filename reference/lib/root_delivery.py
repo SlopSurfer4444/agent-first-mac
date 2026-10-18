@@ -1,7 +1,7 @@
 """Closed paired root-runtime release; owner-level custody, never root execution.
 
 The manifest is reviewed intent, not its own acceptance. Native mutation requires
-the existing accepted-source/full-doctor boundary. Synthetic tests inject homes
+the existing admitted-source/scoped-root boundary. Synthetic tests inject homes
 and guards only through the Python API; the CLI has no destination override.
 """
 import argparse
@@ -13,14 +13,17 @@ import os
 from pathlib import Path
 import pwd
 import re
+import secrets
 import stat
 
 ROOT = Path(__file__).resolve().parents[1]
 MANIFEST = 'manifests/root-runtime-release.json'
-RELEASE_ID = 'owner-first-root-849a241-v1'
-BASE = '849a241f9592e1faf3b9a2a9dc2107d6b93ac46a'
+RELEASE_ID = 'security-root-5a778b6-v1'
+# Reviewed build-source anchor, not acceptance of this release or installed state.
+BASE = '5a778b668647fdf660bef64a63cf2c10e08ff388'
 SUFFIX = 'AIDev/state/root-runtime/releases/' + RELEASE_ID
 LIMIT = 2 * 1024 * 1024
+MAX_RETAINED_ATTEMPTS = 32
 FILES = {
     'bootstrap': ('install', 'aid-admin-bootstrap', 'aid-admin-bootstrap', '0555'),
     'broker': ('install', 'aid-admin', 'aid-admin', '0555'),
@@ -258,17 +261,23 @@ def stage_release(release, install_bundle, emergency_bundle, home, uid, *, sourc
         pass
     need(source_guard() is True, 'source_drift')
     with Directory(target.parent, uid, create_from=Path(home) / 'AIDev') as parent:
-        pending = '.' + RELEASE_ID + '.pending'
-        need(pending not in os.listdir(parent.fd), 'partial_release_retained')
         if RELEASE_ID in os.listdir(parent.fd):
             value = verify_durable(release, home, uid)
             need(source_guard() is True, 'source_drift')
             return {**value, 'status': 'UNCHANGED', 'installed': False}
+        # A crashed preparation owns no published target. Never resume or remove
+        # its unknown bytes; use a fresh exclusive sibling instead. Count even
+        # foreign/symlink entries without following them to bound retained work.
+        prefix = '.' + RELEASE_ID + '.pending'
+        need(sum(name == prefix or name.startswith(prefix + '-')
+            for name in os.listdir(parent.fd)) < MAX_RETAINED_ATTEMPTS,
+            'retained_attempt_limit_preserve_and_review')
+        pending = prefix + '-' + secrets.token_hex(16)
         need(source_guard() is True and parent.verify() is True, 'source_drift')
         os.mkdir(pending, 0o700, dir_fd=parent.fd)
         os.fsync(parent.fd)
-        # Failures retain this exact pending directory for diagnosis. No cleanup
-        # can delete foreign contents or turn a failed attempt into success.
+        # Failures retain this isolated attempt. A later invocation starts fresh;
+        # only an exact verified published release can be reported UNCHANGED.
         with Directory(target.parent / pending, uid) as staged:
             rows = [(row['destination'], payloads[role], int(row['mode'], 8))
                 for role, row in release['artifacts'].items()]

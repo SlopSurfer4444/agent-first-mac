@@ -9,14 +9,21 @@ from unittest.mock import patch
 
 from lib import game_operation_readiness as game
 from lib import operation_readiness as operation
+from lib import user_operation_readiness as user_operation
 
 
 class ReadinessTests(unittest.TestCase):
-    def test_final_source_and_policy_hash_closure_is_consistent(self):
+    def test_current_successor_and_retained_overlay_have_separate_hash_closures(self):
         root=Path(__file__).resolve().parents[1]
         def digest(path):return hashlib.sha256((root/path).read_bytes()).hexdigest()
         launch=json.loads((root/'manifests/game-launch-reliability.json').read_text())
-        for path,expected in launch['sourceFiles'].items():self.assertEqual(digest(path),expected,path)
+        # The old launch/overlay intent is retained evidence. The installed
+        # renderer successor owns the current helper closure instead of
+        # rewriting those historical delivery generations on every change.
+        renderer=json.loads((root/'manifests/ds3-renderer-update.json').read_text())
+        self.assertEqual(renderer['schema'],8)
+        for name in ('ds3-runtime','game-launch-admission','games-play','cs2-play'):
+            self.assertEqual(digest('bin/'+name),renderer['candidateFiles'][name],name)
         self.assertEqual(launch['schema'],2);self.assertEqual(launch['receiptPreimages'],'observed-owned')
         self.assertIsNotNone(launch['previousFiles']['helper'])
         helper=digest('bin/game-launch-admission')
@@ -24,7 +31,7 @@ class ReadinessTests(unittest.TestCase):
         overlay=json.loads((root/'manifests/wine-runtime-overlay.json').read_text())
         delivery=json.loads((root/'manifests/wine-runtime-update.json').read_text())
         hub=json.loads((root/'manifests/games-hub.json').read_text())
-        self.assertEqual(overlay['lifecycleSha256'],digest('bin/ds3-runtime'))
+        self.assertEqual(overlay['lifecycleSha256'],launch['sourceFiles']['bin/ds3-runtime'])
         self.assertEqual(delivery['requiredLaunchAdmissionSha256'],helper)
         self.assertEqual(delivery['overlayPolicySha256'],digest('manifests/wine-runtime-overlay.json'))
         self.assertEqual(hub['runtimeOverlayPolicySha256'],delivery['overlayPolicySha256'])
@@ -58,7 +65,7 @@ class ReadinessTests(unittest.TestCase):
             # The actual provider owns its remaining 180-second budget and
             # settlement. There is no independent caller subprocess deadline.
             raise error
-        with patch.object(operation,'require_scoped_operation_ready',side_effect=near_budget),patch.object(subprocess,'run',side_effect=AssertionError('outer diagnostic child forbidden')):
+        with patch.object(user_operation,'require_scoped_operation_ready',side_effect=near_budget),patch.object(subprocess,'run',side_effect=AssertionError('outer diagnostic child forbidden')):
             with self.assertRaises(Unknown) as caught:
                 game.ready(Path('/fixture/control'),'a'*40,'wine-recovery',checks=callbacks,target_guard=lambda:True)
         self.assertIs(caught.exception,error);self.assertIs(caught.exception.private_owner,owner)
@@ -93,7 +100,7 @@ class ExperimentIsolationTests(unittest.TestCase):
             alias=Path(tempfile.gettempdir())/('wine-overlay-fixture-alias-'+Path(scratch).name)
             alias.symlink_to(live,target_is_directory=True)
             try:
-                with self.assertRaises(OSError):module.Root(alias)
+                with self.assertRaisesRegex(module.Blocked,'fixture_root_required'):module.Root(alias)
             finally:alias.unlink()
             self.assertEqual(sentinel.read_bytes(),b'opaque owner bytes')
 
@@ -116,6 +123,17 @@ class DS3ConnectedReadinessTests(unittest.TestCase):
         self.runner=patch.object(self.h,'run',side_effect=command);self.runner.start();self.addCleanup(self.runner.stop)
         self.provider=patch.object(game,'ready',side_effect=scoped);self.provider.start();self.addCleanup(self.provider.stop)
         self.file=patch.dict(self.h.__dict__,{'__file__':str(self.fixture.control/'bin/ds3-runtime')});self.file.start();self.addCleanup(self.file.stop)
+        # This group exercises adapter target/owner callbacks, not repository
+        # admission. Its synthetic source was never a committed Git checkout.
+        # Bind the replacement at the actual new source-check seam; the real
+        # closure engine has its own hostile repository fixtures.
+        from lib import scoped_source_admission
+        def admitted(control,commit,*,entrypoints,extra_paths=()):
+            self.assertEqual(control,self.fixture.control)
+            self.assertEqual(commit,self.commit)
+            self.assertEqual(entrypoints,('bin/ds3-runtime',))
+        self.admitted=patch.object(scoped_source_admission,'check',side_effect=admitted)
+        self.admitted.start();self.addCleanup(self.admitted.stop)
 
     def test_initial_install_scope_exercises_bound_source_owner_and_prefix_without_vendor(self):
         self.h.source_gate(self.commit,'install',self.fixture.candidate)

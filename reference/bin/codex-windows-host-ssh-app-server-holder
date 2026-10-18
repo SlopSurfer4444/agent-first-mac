@@ -19,6 +19,8 @@ import stat
 import struct
 import subprocess
 import sys
+sys.dont_write_bytecode = True
+sys.pycache_prefix = "/dev/null"
 import time
 
 
@@ -67,12 +69,10 @@ def require_exact_commit(expected: str) -> None:
         raise ContractError("wrong_control_root")
     if ROOT != canonical_home() / "AIDev/control":
         raise ContractError("canonical_control_required")
-    if git("rev-parse", "--abbrev-ref", "HEAD") != "main":
-        raise ContractError("canonical_main_required")
-    if git("rev-parse", "HEAD") != expected:
-        raise ContractError("commit_mismatch")
-    if git("status", "--porcelain=v1", "--untracked-files=all"):
-        raise ContractError("dirty_worktree")
+    if str(ROOT) not in sys.path:
+        sys.path.insert(0, str(ROOT))
+    from lib.scoped_source_admission import check
+    check(ROOT, expected, entrypoints=("bin/codex-windows-host-ssh-app-server-holder",))
     if SOURCE_EXPECTED is not None and source_binding() != SOURCE_EXPECTED:
         raise ContractError("holder_physical_source_changed")
 
@@ -967,8 +967,8 @@ def source_binding() -> dict:
              "manifests/codex-windows-host-ssh-app-server-holder.json",
              "manifests/codex-windows-host-ssh-stdio-compat.json",
              "manifests/codex-windows-host-ssh-remote-control-isolation.json",
-             "manifests/windows-host-ssh-client.json", "lib/operation_readiness.py",
-             "lib/current_doctor_native.py", "lib/current_source_admission.py")
+             "manifests/windows-host-ssh-client.json", "lib/user_operation_readiness.py",
+             "lib/operation_checks.py", "lib/scoped_source_admission.py")
     return {name: bound_file(ROOT / name) for name in paths}
 
 
@@ -979,7 +979,7 @@ def mutation_gate(commit: str):
     source = source_binding()
     before = target_binding()
     sys.path.insert(0, str(ROOT))
-    from lib.operation_readiness import require_scoped_operation_ready
+    from lib.user_operation_readiness import require_scoped_operation_ready
     require_scoped_operation_ready(ROOT, "ssh-holder", commit,
         checks={"ssh-transport": session_flags_exact,
                 "native-consent": lambda: (helper_doctor_passes(COMPAT, "runtime-doctor")

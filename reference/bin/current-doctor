@@ -51,6 +51,26 @@ REASONS = frozenset(("source_changed", "fixture_invalid", "signature_invalid",
     "capabilities_incompatible", "process_unsettled", "probe_failed",
     "fixture_capacity_required", "fixture_custody_invalid", "fixture_custody_busy",
     "fixture_settlement_required"))
+SOURCE_REASONS = frozenset(("source_admission_failed", "source_checkout_dirty",
+    "source_checkout_noncanonical", "protected_policy_changed", "protected_policy_missing",
+    "historical_evidence_changed", "checkpoint_history_limit", "checkpoint_not_ancestor",
+    "checkpoint_binding_mismatch", "unregistered_checkpoint_policy",
+    "unaccepted_checkpoint_policy", "unreviewed_checkpoint_evidence",
+    "source_changed_after_evidence_subject", "script_directory_import_shadow",
+    "unexpected_import_initializer"))
+SOURCE_STAGES = frozenset(("git", "historical", "acceptance", "source", "exposure",
+                          "configuration", "final-recheck"))
+# Fixed operator guidance, not exception text, filesystem paths or commands from
+# a receipt. A failed diagnostic pauses only its affected operation.
+DIAGNOSTICS = {
+    "arguments": ("diagnostic-invocation", "check-diagnostic-arguments"),
+    "sentinel": ("vendor-compatibility", "inspect-vendor-diagnostic-not-unrelated-owner-settings"),
+    "runtime": ("observed-runtime", "inspect-affected-runtime"),
+    "close": ("operation-settlement", "reconcile-retained-operation-before-retry"),
+    "native-unbound": ("diagnostic-adapter", "use-the-supported-native-diagnostic"),
+    **{stage: ("control-source", "inspect-source-reason-preserve-owner-work")
+       for stage in SOURCE_STAGES},
+}
 require, digest, oid = D.require, D.digest, D.oid
 
 
@@ -264,10 +284,12 @@ def consistent_report(value):
             or value["gitOnly"] and value["retainedFixtureCount"]):
         return False
     reasons = value["reasonCodes"]
-    if (type(reasons) is not list or len(reasons) > len(REASONS)
-            or any(type(reason) is not str or reason not in REASONS for reason in reasons)
+    if (type(reasons) is not list or len(reasons) > len(REASONS | SOURCE_REASONS)
+            or any(type(reason) is not str or reason not in REASONS | SOURCE_REASONS for reason in reasons)
             or len(set(reasons)) != len(reasons)
-            or reasons and (value["failureStage"] != "sentinel" or value["gitOnly"])):
+            or any(reason in REASONS and (value["failureStage"] != "sentinel" or value["gitOnly"])
+                   or reason in SOURCE_REASONS and value["failureStage"] not in SOURCE_STAGES
+                   for reason in reasons)):
         return False
     h, s, a, i = (value[k] for k in ("historicalPhase5Accepted", "repositoryChecksPassed",
                                      "sentinelAccepted", "integratedMain"))
@@ -329,6 +351,8 @@ def report(*, historical=False, source=False, accepted=False, integrated=False,
         "liveRuntimeChecked": runtime_checked, "currentRuntimeReady": runtime,
         "gitOnly": git_only, "childSettled": settled, "sourceHandlesClosed": closed,
         "failureStage": stage, "reasonCodes": [] if reasons is None else list(reasons),
+        "affectedScope": DIAGNOSTICS[stage][0] if stage else None,
+        "nextAction": DIAGNOSTICS[stage][1] if stage else None,
         "wholeMachineHealthChecked": False,
         "retainedFixtureCount": retained_fixtures,
         "fixtureDisposition": "manual-diagnosis-required" if retained_fixtures else "none",
@@ -341,7 +365,7 @@ def public_report(value, *, git_only=None):
     """Do not serialize arbitrary callback/adapter dictionaries as evidence."""
     require(type(value) is dict and set(value) == set(report()))
     boolean_keys = set(report()) - {"schema", "probe", "scope", "verdict", "failureStage", "reasonCodes", "admissionMode",
-                                   "retainedFixtureCount", "fixtureDisposition"}
+                                   "retainedFixtureCount", "fixtureDisposition", "affectedScope", "nextAction"}
     require(all(type(value[k]) is bool for k in boolean_keys)
             and (value["failureStage"] is None
                  or type(value["failureStage"]) is str and value["failureStage"] in STAGES))
@@ -422,6 +446,14 @@ or serialized here. Runtime results use unchanged R.public's exact schema.
         if (stage == "sentinel" and failure_stage == "sentinel"
                 and type(reason) is str and reason in REASONS and reason not in reasons):
             reasons.append(reason)
+        if stage in SOURCE_STAGES and failure_stage in SOURCE_STAGES:
+            # TransitionError is our parser's closed-code exception. Never
+            # stringify arbitrary errors or copy a caller's reason_class.
+            code = (error.args[0] if type(error) is current_sources.F.TransitionError
+                    and len(error.args) == 1 else None)
+            code = code if type(code) is str and code in SOURCE_REASONS else "source_admission_failed"
+            if code not in reasons:
+                reasons.append(code)
         owner = getattr(error, "private_owner", None)
         if pending_callback:
             # Only the callback currently entered may close its provisional
@@ -486,7 +518,9 @@ or serialized here. Runtime results use unchanged R.public's exact schema.
         if "currentAdmission" in state:
             admission_mode = "current-state"
             require(set(state) == {"head", "branch", "clean", "tree", "currentAdmission"})
-            require(state["branch"] == "main" and canonical_main and state["clean"] is True)
+            current_sources.F.require(state["branch"] == "main" and canonical_main,
+                                      "source_checkout_noncanonical")
+            current_sources.F.require(state["clean"] is True, "source_checkout_dirty")
             current = D.tree(state["tree"])
             stage = "configuration"
             config_admission = current_sources.admit(state["currentAdmission"], state["head"], current)
@@ -867,6 +901,8 @@ def main(arguments=None, *, operation=None, custody_operation=None, emit=print):
             human += "; isolated fixture validation failed; inspect probe fixture metadata, not owner configuration"
         else:
             human += "; diagnose the reported boundary before a custom control mutation"
+    if value["failureStage"] is not None:
+        human += "; affected scope=" + value["affectedScope"] + "; next action=" + value["nextAction"]
     if value["retainedFixtureCount"]:
         human += "; fixture retained for manual diagnosis; no cleanup authorized"
     emit(json.dumps(value, sort_keys=True, separators=(",", ":")) if "--json" in args else human)

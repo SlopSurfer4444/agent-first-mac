@@ -96,6 +96,17 @@ class CheckpointTests(unittest.TestCase):
                 A.admitted_revision(self.git, reviewed)
         self.assertEqual(len(self.updates), 2)
 
+    def test_generic_reviewed_policy_needs_no_named_verifier_registration(self):
+        registry_before = copy.deepcopy(self.updates)
+        reviewed = self.accept('scoped-source-policy', {'lib/engine.py': b'reviewed policy successor'}, kind='policy')
+        result = self.proof()
+        self.assertEqual(result['checkpoint'], self.previous)
+        self.assertEqual(self.updates, registry_before)
+        self.assertNotIn(reviewed, result['admittedRevisions'])
+        self.assertTrue(A.reviewed_target(self.git, self.previous, self.git._tree(self.previous)))
+        self.put('lib/engine.py', b'unreviewed next policy'); self.commit()
+        with self.assertRaises(F.TransitionError): self.admit()
+
     def test_routine_uses_pin_not_migration_replay(self):
         calls = []
         original = self.git._text

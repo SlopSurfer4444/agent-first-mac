@@ -5,6 +5,7 @@ import importlib.util
 import io
 import json
 import os
+import re
 from pathlib import Path
 import sys
 import tempfile
@@ -19,6 +20,17 @@ SPEC.loader.exec_module(D)
 
 
 class DeliveryTests(unittest.TestCase):
+    def test_current_source_closure_and_emergency_pin_match_release(self):
+        release = D.load_release(ROOT)
+        self.assertEqual(release['sourceAcceptanceRole'], 'reference-only-not-release-self-acceptance')
+        source = (ROOT / 'Sources/AidAdminEmergencyCore/AidAdminEmergencyCore.swift').read_text()
+        pin = re.search(r'binarySHA256: "([0-9a-f]{64})",\s+binarySize: ([0-9_]+)', source)
+        self.assertIsNotNone(pin)
+        expected = {'sha256': pin[1], 'size': int(pin[2].replace('_', ''))}
+        self.assertEqual(release['installedContracts']['successor']['broker'], expected)
+        self.assertNotEqual(release['installedContracts']['predecessor']['broker'], expected)
+        self.assertIn('Sources/AidAdminCore/GitObservation.swift', release['sourceArtifactSHA256'])
+
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(prefix='root-delivery-test-')
         self.base = Path(self.temp.name).resolve()
@@ -42,6 +54,10 @@ class DeliveryTests(unittest.TestCase):
 
     def stage(self, guard=lambda: True):
         return D.stage_release(self.release, self.install, self.emergency, self.home, self.uid, source_guard=guard)
+
+    def pending(self, parent=None):
+        parent = parent or self.home / Path(D.SUFFIX).parent
+        return list(parent.glob('.' + D.RELEASE_ID + '.pending-*'))
 
     def test_stage_verify_noop_preserves_originals(self):
         original = {p: p.read_bytes() for folder in (self.install, self.emergency) for p in folder.iterdir()}
@@ -115,10 +131,11 @@ class DeliveryTests(unittest.TestCase):
             self.stage(guard)
         parent = self.home / Path(D.SUFFIX).parent
         self.assertFalse((self.home / D.SUFFIX).exists())
-        pending = parent / ('.' + D.RELEASE_ID + '.pending')
+        pending, = self.pending(parent)
         self.assertTrue(pending.is_dir())
-        with self.assertRaisesRegex(D.Fault, 'partial_release_retained'):
-            self.stage()
+        retained = {p.name: p.read_bytes() for p in pending.iterdir()}
+        self.assertEqual(self.stage()['status'], 'STAGED')
+        self.assertEqual({p.name: p.read_bytes() for p in pending.iterdir()}, retained)
 
     def test_bundle_drift_before_publication_refused(self):
         real = D.verify_bundles
@@ -144,7 +161,7 @@ class DeliveryTests(unittest.TestCase):
         with patch.object(D, 'rename_exclusive', collide), self.assertRaises(OSError):
             self.stage()
         self.assertEqual(list((self.home / D.SUFFIX).iterdir()), [])
-        self.assertTrue((self.home / Path(D.SUFFIX).parent / ('.' + D.RELEASE_ID + '.pending')).is_dir())
+        self.assertEqual(len(self.pending()), 1)
 
     def test_manifest_closed_no_path_or_authority_substitution(self):
         for key, value in [('releaseID', '../outside'), ('destinationSuffix', '/outside'),
@@ -271,8 +288,66 @@ class DeliveryTests(unittest.TestCase):
             self.stage(guard)
         parent = self.home / Path(D.SUFFIX).parent
         self.assertEqual(list(parent.iterdir()), [])
-        pending = parent.with_name('retained-parent') / ('.' + D.RELEASE_ID + '.pending')
+        pending, = self.pending(parent.with_name('retained-parent'))
         self.assertEqual(list(pending.iterdir()), [])
+
+    def test_legacy_and_foreign_pending_are_preserved_not_consumed(self):
+        parent = self.home / Path(D.SUFFIX).parent
+        parent.mkdir(parents=True, mode=0o700)
+        legacy = parent / ('.' + D.RELEASE_ID + '.pending')
+        legacy.mkdir(mode=0o700)
+        (legacy / 'owner-data').write_bytes(b'never adopt or delete')
+        foreign = parent / (legacy.name + '-foreign')
+        foreign.symlink_to(self.emergency, target_is_directory=True)
+        self.assertEqual(self.stage()['status'], 'STAGED')
+        self.assertEqual((legacy / 'owner-data').read_bytes(), b'never adopt or delete')
+        self.assertTrue(foreign.is_symlink())
+        self.assertEqual(self.stage()['status'], 'UNCHANGED')
+
+    def test_retention_limit_is_explicit_and_published_target_still_works(self):
+        parent = self.home / Path(D.SUFFIX).parent
+        parent.mkdir(parents=True, mode=0o700)
+        for index in range(D.MAX_RETAINED_ATTEMPTS):
+            (parent / ('.' + D.RELEASE_ID + '.pending-' + str(index))).mkdir(mode=0o700)
+        with self.assertRaisesRegex(D.Fault, 'retained_attempt_limit_preserve_and_review'):
+            self.stage()
+        self.assertEqual(len(self.pending()), D.MAX_RETAINED_ATTEMPTS)
+        # The bound applies to new staging only, not verification/no-op.
+        with patch.object(D, 'MAX_RETAINED_ATTEMPTS', D.MAX_RETAINED_ATTEMPTS + 1):
+            self.stage()
+        self.assertEqual(self.stage()['status'], 'UNCHANGED')
+
+    def test_failure_after_each_filesystem_mutation_can_retry_without_cleanup(self):
+        operations = [(D.os, name) for name in ('mkdir', 'write', 'fchmod', 'fsync')]
+        operations.append((D, 'rename_exclusive'))
+        observed = []
+        def run_with_failure(fail_at):
+            events = []
+            with contextlib.ExitStack() as stack:
+                for module, name in operations:
+                    real = getattr(module, name)
+                    def wrapped(*args, _real=real, _name=name, **kwargs):
+                        result = _real(*args, **kwargs)
+                        events.append(_name)
+                        if len(events) == fail_at:
+                            raise RuntimeError('injected crash')
+                        return result
+                    stack.enter_context(patch.object(module, name, wrapped))
+                self.stage()
+            return events
+        observed = run_with_failure(None)
+        for index, name in enumerate(observed, 1):
+            with self.subTest(index=index, operation=name):
+                self.home = self.base / ('fault-home-' + str(index))
+                self.home.mkdir(mode=0o700)
+                with self.assertRaisesRegex(RuntimeError, 'injected crash'):
+                    run_with_failure(index)
+                parent = self.home / Path(D.SUFFIX).parent
+                retained = {p: (p.stat().st_ino, p.read_bytes())
+                    for directory in self.pending(parent) for p in directory.iterdir()}
+                self.assertIn(self.stage()['status'], ('STAGED', 'UNCHANGED'))
+                self.assertEqual({p: (p.stat().st_ino, p.read_bytes()) for p in retained}, retained)
+                self.assertEqual(self.stage()['status'], 'UNCHANGED')
 
 
 if __name__ == '__main__':

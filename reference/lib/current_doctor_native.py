@@ -34,7 +34,7 @@ def custody_cli(doctor, slot=None):
     def retire(head, *, source_guard):
         del head
         source_guard()
-        with custody_policy.Custody(scratch, home, uid, create=False,
+        with custody_policy.Custody(scratch, home, uid, create=False, reconcile=True,
                 envelope=probe.require_fixture_envelope) as custody:
             result.append(custody.retire(slot))
         source_guard()

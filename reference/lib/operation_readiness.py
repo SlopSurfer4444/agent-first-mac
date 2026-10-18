@@ -8,47 +8,7 @@ boundary; native permissions and the installed typed broker remain authoritative
 """
 import importlib.machinery
 from pathlib import Path
-import re
-
-
-DEPENDENCIES = {
-    "nix-prepare": ("reviewed-target", "build-inputs"),
-    "root-apply": ("reviewed-target", "root-contract", "built-target"),
-    "wine-install": ("payload-owner", "wine-target", "recovery"),
-    "wine-recovery": ("payload-owner", "recovery"),
-    "ssh-holder": ("ssh-transport", "native-consent"),
-    "shell-apply": ("payload-owner", "recovery"),
-    "shell-recovery": ("payload-owner", "recovery"),
-    "harness-disable": ("owned-target", "recovery", "native-consent"),
-}
-
-
-def require(value, reason):
-    if value is not True:
-        raise RuntimeError(reason)
-
-
-def evaluate(operation, commit, *, checks, source_guard, target_guard):
-    """Pure/injected candidate seam. True means observed, never user authority."""
-    require(type(operation) is str and operation in DEPENDENCIES, "operation_unknown")
-    require(type(commit) is str and commit != "0" * 40
-            and re.fullmatch(r"[0-9a-f]{40}", commit) is not None,
-            "operation_commit")
-    required = DEPENDENCIES[operation]
-    require(type(checks) is dict and set(checks) == set(required)
-            and all(callable(checks[key]) for key in required), "operation_dependencies")
-    require(callable(source_guard) and callable(target_guard), "operation_guard")
-    def guard():
-        require(source_guard() is True, "operation_source_drift")
-        require(target_guard() is True, "operation_target_drift")
-    guard()
-    for name in required:
-        require(checks[name]() is True, "operation_dependency_" + name)
-        guard()
-    return {"schema": 1, "operation": operation, "commit": commit,
-            "scopedCandidateReady": True, "observedDependencies": list(required),
-            "liveGateSatisfied": False, "machineMutationAuthorized": False,
-            "installedStateAccepted": False, "nativeConsentGranted": False}
+from lib.operation_checks import DEPENDENCIES, evaluate, require
 
 
 def require_operation_ready(control, operation, commit, *, checks, target_guard,
@@ -93,12 +53,11 @@ def require_operation_ready(control, operation, commit, *, checks, target_guard,
 
 
 def require_scoped_operation_ready(control, operation, commit, *, checks, target_guard):
-    """Successor runtime seam, dormant until independently reviewed cutover.
+    """Legacy source-admitted route retained for callers not yet migrated.
 
-    Integration itself retains fresh FULL readiness. This function cannot
-    activate that policy, approve source, grant authority, or install itself.
-    The owning adapter must independently enforce request scope, root/native
-    permissions, mutation custody, settlement, and its post-operation checks.
+    Connected user helpers use user_operation_readiness directly so this
+    historical/full-doctor import graph is not their runtime dependency.
+    Root preparation and explicit history audit retain their existing gates.
     """
     return require_operation_ready(control, operation, commit, checks=checks,
                                    target_guard=target_guard, execution=False)

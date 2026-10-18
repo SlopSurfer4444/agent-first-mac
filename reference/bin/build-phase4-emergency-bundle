@@ -16,7 +16,7 @@ DEFAULT_OUTPUT = ROOT / "install-bundles/phase-4/aid-admin-emergency"
 MIGRATION_MAIN = "b67c582b4b07fd91fb6d1487ada7aca011a61833"
 CONTROL_MAIN = "217602def502f515f5c0c554f1d4c1d0aaabcb26"
 TASK_PARENT = "55c556f6566a7dcffc302d073e3f78dfc0ebeb73"
-BROKER_SHA256 = "ccf7c87823476892f35d25ae5b65e614fbd9e2fc1ae6e8c409644e800e291b54"
+BROKER_SHA256 = "447fb83a10f2d66239b3a226a245de247559e1f900434eb80882f500fc659024"
 POLICY_SHA256 = "2555b3f0ed1f75cd26bc41af6512ecc30d444ba1b0113458f72efcfccc304225"
 SUDOERS_SHA256 = "b51a2c60bae3652decef1df7ffe2fd66931ee317305fbf1bc5c50e491f5c3ee6"
 RECEIPT_SHA256 = "cf5e95fd3bf33fc34794055a80865fde9feaeccac4b271aa30561e42ca30a725"
@@ -26,6 +26,7 @@ SOURCES = (
     "Sources/AidAdminEmergencyCore/AidAdminEmergencyCore.swift",
     "Sources/AidAdminRuntime/BoundedProcess.swift",
     "Sources/AidAdminCore/AidAdminCore.swift",
+    "Sources/AidAdminCore/GitObservation.swift",
     "Sources/AidAdminCore/OperationJournal.swift",
     "Sources/AidAdminCore/ResumeLaunchd.swift",
     "Sources/AidAdminCore/ResumeHomeManager.swift",
@@ -149,6 +150,7 @@ def build(destination, cache_root=None):
          Path(cache_root) / "swift-module-cache",
          ROOT / "Sources/AidAdminRuntime/BoundedProcess.swift",
          ROOT / "Sources/AidAdminCore/AidAdminCore.swift",
+         ROOT / "Sources/AidAdminCore/GitObservation.swift",
          ROOT / "Sources/AidAdminCore/OperationJournal.swift",
          ROOT / "Sources/AidAdminCore/ResumeLaunchd.swift",
          ROOT / "Sources/AidAdminCore/ResumeHomeManager.swift",
@@ -274,7 +276,7 @@ def main():
             "installedContract": {
                 "attestation": {"mode": "0400", "size": 341,
                                 "ownerAndExactHashBindingsRequired": True},
-                "binary": {"mode": "0555", "sha256": BROKER_SHA256, "size": 813680},
+                "binary": {"mode": "0555", "sha256": BROKER_SHA256, "size": 847376},
                 "policy": {"mode": "0444", "sha256": POLICY_SHA256, "size": 1617},
                 "receipt": {"mode": "0400", "sha256": RECEIPT_SHA256, "size": 431},
                 "sudoers": {"mode": "0440", "sha256": SUDOERS_SHA256, "size": 122},

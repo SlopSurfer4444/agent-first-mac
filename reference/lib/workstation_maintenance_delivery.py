@@ -540,17 +540,21 @@ def runner(operation, home):
 
 def admitted_source(root, *, full, operation_check=None):
     need(Path(root) == Path(pwd.getpwuid(os.getuid()).pw_dir) / "AIDev/control" and Path(root).resolve() == Path(root), "canonical_source_required")
+    need(full is False, "explicit_full_diagnostic_separate_from_user_delivery")
     import sys
     sys.path.insert(0, str(root))
-    from lib import current_doctor_native
-    doctor = importlib.machinery.SourceFileLoader("maintenance_install_doctor", str(Path(root) / "bin/current-doctor")).load_module()
+    from lib import scoped_source_admission as source
     if operation_check is None:
         def operation_check(head, *, source_guard):
             return source_guard()
-    value = current_doctor_native.native(doctor, not full, operation_check=operation_check)
-    value = doctor.public_report(value, git_only=not full)
-    need(value.get("integratedMain") is True and value.get("verdict") == ("PASS" if full else "GIT_ONLY_VALID"), "source_unadmitted")
-    return value
+    observed = {}
+    def run(head, *, source_guard):
+        need(operation_check(head, source_guard=source_guard) is True, "source_operation_unobserved")
+        observed.update(scope="affected-user-helper-source", verdict="SOURCE_VALID",
+                        commit=head, rootAuthorityGranted=False)
+        return True
+    source.run(Path(root), run, entrypoints=source.callable_paths(Path(root), (operation_check,)))
+    return observed
 
 
 def native_schedule(operation):
@@ -697,13 +701,13 @@ def scheduled_native(D, *, build_report, now, source_gate=None, notifier=notify)
         record = {"schema": 1, "latest": value, "eventId": old["eventId"] if old else None,
                   "notification": old["notification"] if old else "not_attempted",
                   "attemptedEvents": list(old["attemptedEvents"]) if old else []}
-        fresh = event_id is not None and event_id not in record["attemptedEvents"] and record["notification"] != "reserved_unknown"
-        if fresh and len(record["attemptedEvents"]) >= MAX_EVENTS:
-            # Capacity constrains notification attempts, never fresh capture.
-            # Retain every attempted ID without evicting/replaying one.
-            record["notification"] = "capacity_exhausted"
-            fresh = False
+        # The reservation belongs to its event, not the notification channel.
+        # A crashed/unknown A must not mute unrelated B. Retain a bounded recent
+        # attempt window: this is notification deduplication, not an audit log
+        # or proof that a historical command was delivered/settled.
+        fresh = event_id is not None and event_id not in record["attemptedEvents"]
         if fresh:
+            record["attemptedEvents"] = record["attemptedEvents"][-(MAX_EVENTS - 1):]
             record["attemptedEvents"].append(event_id)
             record.update(eventId=event_id, notification="reserved_unknown")
         previous = files.write(CYCLE, record, previous)
@@ -713,7 +717,12 @@ def scheduled_native(D, *, build_report, now, source_gate=None, notifier=notify)
             record["notification"] = notifier()
             need(record["notification"] in {"reserved_unknown", "command_accepted_unverified", "unavailable"}, "notification_unknown")
             files.write(CYCLE, record, previous)
-        value.update(notificationOutcome=record["notification"], notificationDelivered=False)
+        # Outcome is for the last attempted event, not any deduplicated older
+        # event that happens to recur now. Never turn unknown A into accepted A
+        # because intervening B's notification command completed.
+        outcome = record["notification"] if event_id is None or event_id == record["eventId"] else "not_attempted"
+        value.update(notificationOutcome=outcome, notificationEventId=record["eventId"],
+                     notificationDelivered=False)
         holder.append(value)
         need(context["source_guard"]() is True, "current_source_drift")
     def admitted_operation(head, *, source_guard):

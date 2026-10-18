@@ -133,30 +133,64 @@ def _check_guard(guard):
     need(callable(guard) and guard() is True, 'transaction_prerequisite_guard')
 
 
+def _complete_namespace(destination, files):
+    """Resume only exact expected byte prefixes; never retire unknown evidence."""
+    directory = bridge._directory(destination, private=True)
+    try:
+        need(set(os.listdir(directory)) <= set(files), 'transaction_stage_inventory')
+        # Validate the entire retained inventory before completing any file.
+        for name in os.listdir(directory):
+            need(files[name].startswith(bridge._read(destination / name, 0o600, MAX_IMAGE)),
+                 'transaction_stage_drift')
+        for name, raw in files.items():
+            path = destination / name
+            prior = bridge._read(path, 0o600, MAX_IMAGE) if _exists(path) else None
+            flags = os.O_RDWR | os.O_NOFOLLOW | (os.O_APPEND if prior is not None else os.O_CREAT | os.O_EXCL)
+            fd = os.open(name, flags, 0o600, dir_fd=directory)
+            try:
+                s = os.fstat(fd)
+                offset = len(prior) if prior is not None else 0
+                need(stat.S_ISREG(s.st_mode) and s.st_uid == os.getuid() and s.st_nlink == 1
+                     and stat.S_IMODE(s.st_mode) == 0o600 and s.st_size == offset,
+                     'transaction_stage_drift')
+                need(os.read(fd, offset + 1) == (prior or b''), 'transaction_stage_drift')
+                named = os.stat(name, dir_fd=directory, follow_symlinks=False)
+                held = os.fstat(directory)
+                parent_named = destination.lstat()
+                need((named.st_dev, named.st_ino) == (s.st_dev, s.st_ino)
+                     and (parent_named.st_dev, parent_named.st_ino) == (held.st_dev, held.st_ino),
+                     'transaction_stage_drift')
+                need(raw.startswith(prior or b''), 'transaction_stage_drift')
+                while offset < len(raw):
+                    count = os.write(fd, raw[offset:])
+                    need(count > 0, 'transaction_stage_write')
+                    offset += count
+                os.fsync(fd)
+            finally:
+                os.close(fd)
+        _inventory(destination, set(files))
+        need(all(bridge._read(destination / name, 0o600, MAX_IMAGE) == raw
+                 for name, raw in files.items()), 'transaction_stage_drift')
+        os.fsync(directory)
+    finally:
+        os.close(directory)
+
+
 def _new_namespace(destination, files):
     """Publish an entirely fsynced private namespace without replacing a name.
 
-    A partial staging namespace is retained and explicitly blocks retry; no
-    installed target has been changed at this preparation boundary.
+    A partial exact staging namespace resumes; unknown bytes remain untouched.
+    No installed target changes at this preparation boundary.
     """
     parent = bridge._directory(destination.parent)
     stage = '.game-admission-stage-' + destination.name.lstrip('.')
     directory = None
     try:
-        need(not _exists(destination) and not _exists(destination.parent / stage), 'transaction_stage_collision')
-        os.mkdir(stage, 0o700, dir_fd=parent)
+        need(not _exists(destination), 'transaction_stage_collision')
+        if not _exists(destination.parent / stage):
+            os.mkdir(stage, 0o700, dir_fd=parent)
         directory = os.open(stage, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=parent)
-        for name, raw in files.items():
-            fd = os.open(name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=directory)
-            try:
-                with os.fdopen(os.dup(fd), 'wb') as stream:
-                    stream.write(raw)
-                    stream.flush()
-                os.fchmod(fd, 0o600)
-                os.fsync(fd)
-            finally:
-                os.close(fd)
-        os.fsync(directory)
+        _complete_namespace(destination.parent / stage, files)
         # macOS' no-replace rename is used in production. Linux supports the
         # same primitive via renameat2, keeping fixture tests portable.
         import ctypes
@@ -169,6 +203,20 @@ def _new_namespace(destination, files):
             args = (parent, os.fsencode(stage), parent, os.fsencode(destination.name), 1)
         function.argtypes = (ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_uint)
         function.restype = ctypes.c_int
+        held = os.fstat(directory)
+        named = os.stat(stage, dir_fd=parent, follow_symlinks=False)
+        need((held.st_dev, held.st_ino) == (named.st_dev, named.st_ino)
+             and set(os.listdir(directory)) == set(files), 'transaction_stage_drift')
+        for name, raw in files.items():
+            fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=directory)
+            try:
+                facts = os.fstat(fd)
+                need(stat.S_ISREG(facts.st_mode) and facts.st_uid == os.getuid()
+                     and facts.st_nlink == 1 and stat.S_IMODE(facts.st_mode) == 0o600
+                     and facts.st_size == len(raw) and os.read(fd, len(raw) + 1) == raw,
+                     'transaction_stage_drift')
+            finally:
+                os.close(fd)
         if function(*args) != 0:
             raise OSError(ctypes.get_errno(), 'transaction_namespace_publish')
         os.fsync(parent)

@@ -10,6 +10,7 @@ import os
 from pathlib import Path
 import re
 import shlex
+import shutil
 import subprocess
 import tempfile
 import unittest
@@ -86,6 +87,18 @@ elif name == 'rm':
         elif p.is_dir(): shutil.rmtree(p)
 elif name == 'rmdir':
     path(args[-1]).rmdir()
+elif name == 'plutil':
+    key = args[1]
+    print(os.environ.get('FIXTURE_BUNDLE' if key == 'CFBundleIdentifier' else 'FIXTURE_VERSION',
+                         'com.carriez.rustdesk' if key == 'CFBundleIdentifier' else '1.4.6'))
+elif name == 'codesign':
+    if '--verify' in args: sys.exit(int(os.environ.get('FIXTURE_SIGNATURE_FAIL', '0')))
+    print('TeamIdentifier=' + os.environ.get('FIXTURE_TEAM', 'HZF9JMC8YN'))
+elif name == 'sed':
+    value = sys.stdin.read()
+    print(value.split('TeamIdentifier=')[-1].splitlines()[0])
+elif name == 'spctl':
+    sys.exit(int(os.environ.get('FIXTURE_GATEKEEPER_FAIL', '0')))
 else:
     # Every native command is intercepted. Unanticipated operations cannot run.
     sys.exit(91)
@@ -98,8 +111,10 @@ def activation(module):
 
 
 class ModuleFixture:
-    def __init__(self, root, module, enabled=True):
+    def __init__(self, root, module, enabled=True, action=None, real_identity=False):
         self.root, self.module, self.enabled = Path(root), module, enabled
+        self.action = action
+        self.real_identity = real_identity
         self.state = self.root / "state"
         self.state.mkdir(mode=0o755)
         self.directory = self.state / module
@@ -121,13 +136,17 @@ class ModuleFixture:
         code = code.replace("${managedMarker}", str(self.source))
         code = code.replace("${windowsAppPkg}", str(self.root / "package.pkg"))
         code = code.replace("${rustDeskDmg}", str(self.root / "package.dmg"))
+        code = code.replace('${if action == "install" then rustDeskDmg else ""}', str(self.root / "package.dmg"))
+        code = code.replace('${if action != "preserve" then managedMarker else ""}', str(self.source))
+        code = code.replace('${action}', self.action or ("install" if self.enabled else "remove"))
         code = re.sub(r'\$\{if (?:windowsAppEnabled|rustDeskControllerEnabled) then "true" else "false"\}',
                       "true" if self.enabled else "false", code)
         # Real source functions and branch ordering stay unchanged. Only the
         # unrelated signature probe is replaced with a synthetic identity seam.
         marker = "    marker_prestate || fail conflicting_or_unsafe_managed_marker"
         self_test = '\nverify_app() { test -d "$app" && ! test -L "$app" && test -f "$app/.valid"; }\n'
-        code = code.replace(marker, self_test + marker)
+        if not self.real_identity:
+            code = code.replace(marker, self_test + marker)
         commands = set(re.findall(r"/(?:usr/(?:bin|sbin)|bin)/[a-zA-Z0-9_-]+", code))
         for command in sorted(commands, key=len, reverse=True):
             mock = self.tools / Path(command).name
@@ -151,6 +170,27 @@ class ModuleFixture:
 
 
 class ResumeModuleGuardTests(unittest.TestCase):
+    def test_preserve_nix_evaluation_has_no_vendor_payload_dependency(self):
+        nix = shutil.which("nix-instantiate")
+        if not nix:
+            self.skipTest("Nix evaluator unavailable; shell activation fixtures still run")
+        module = json.dumps(str(ROOT / "darwin/rustdesk-controller.nix"))
+        expression = '''let module = import (builtins.toPath MODULE) {
+          config.agentFirst.rustDeskController.action = "preserve";
+          lib = { mkAfter = x: x; mkOption = x: x; types.enum = x: x; };
+          pkgs = { fetchurl = x: throw "unexpected DMG dependency";
+                   writeText = n: x: throw "unexpected marker dependency"; };
+        }; in { defaultAction = module.options.agentFirst.rustDeskController.action.default;
+                activation = module.config.system.activationScripts.extraActivation.text; }
+        '''.replace("MODULE", module)
+        result = subprocess.run([nix, "--eval", "--strict", "--json", "--expr", expression],
+                                capture_output=True, text=True, timeout=15)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        evaluated = json.loads(result.stdout)
+        self.assertEqual(evaluated["defaultAction"], "preserve")
+        self.assertIn("action='preserve'", evaluated["activation"])
+        self.assertIn("dmg=''", evaluated["activation"])
+
     def each(self, test):
         for module in MODULES:
             with self.subTest(module=module), tempfile.TemporaryDirectory() as tmp:
@@ -169,6 +209,60 @@ class ResumeModuleGuardTests(unittest.TestCase):
             self.assertEqual(fixture.marker.read_text(), "foreign owner marker\n")
             self.assertEqual(fixture.marker.stat().st_ino, before.st_ino)
         self.each(check)
+
+    def test_rustdesk_default_preserve_reaches_remaining_activation_without_any_probe(self):
+        # Exercise the real extracted activation, not just Nix text presence.
+        # Even unusable state is unrelated to activation when no RustDesk action
+        # was requested; nothing may inspect, adopt, repair or delete it.
+        module = (ROOT / "darwin/rustdesk-controller.nix").read_text()
+        self.assertIn('default = "preserve";', module)
+        for state in ("absent", "newer-owner-app", "invalid-app", "foreign-marker", "symlink-marker"):
+            with self.subTest(state=state), tempfile.TemporaryDirectory() as tmp:
+                fixture = ModuleFixture(tmp, "rustdesk-controller", action="preserve")
+                if state == "absent":
+                    (fixture.app / ".valid").unlink()
+                    fixture.app.rmdir()
+                elif state == "newer-owner-app":
+                    (fixture.app / "owner-version").write_text("1.4.9")
+                elif state == "invalid-app":
+                    (fixture.app / ".valid").unlink()
+                elif state == "foreign-marker":
+                    fixture.marker.write_text("owner state")
+                else:
+                    fixture.marker.symlink_to(fixture.root / "unknown")
+                before = [(str(p.relative_to(fixture.root)), p.lstat().st_ino,
+                           p.lstat().st_mtime_ns) for p in fixture.root.rglob("*")]
+                result = fixture.run()
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn("FIXTURE_CONTINUED", result.stdout)
+                self.assertEqual(fixture.commands(), [])
+                for name, inode, mtime in before:
+                    # Render creates tool stubs inside tools, so its mtime changes.
+                    if name == "tools": continue
+                    current = (fixture.root / name).lstat()
+                    self.assertEqual((inode, mtime), (current.st_ino, current.st_mtime_ns))
+                self.assertEqual(fixture.app.exists(), state != "absent")
+                self.assertEqual(fixture.marker.exists(), state == "foreign-marker")
+
+    def test_explicit_rustdesk_install_retains_actual_identity_probe_flow(self):
+        for failure in ({"FIXTURE_VERSION": "1.4.9"}, {"FIXTURE_BUNDLE": "foreign"},
+                        {"FIXTURE_TEAM": "foreign"}, {"FIXTURE_SIGNATURE_FAIL": "1"},
+                        {"FIXTURE_GATEKEEPER_FAIL": "1"}, {}):
+            with self.subTest(failure=failure), tempfile.TemporaryDirectory() as tmp:
+                fixture = ModuleFixture(tmp, "rustdesk-controller", action="install", real_identity=True)
+                executable = fixture.app / "Contents/MacOS/RustDesk"
+                executable.parent.mkdir(parents=True)
+                executable.write_text("inert fixture")
+                executable.chmod(0o755)
+                result = fixture.run(**failure)
+                if failure:
+                    self.assert_blocked_without_mutation(fixture, result)
+                    self.assertFalse(fixture.marker.exists())
+                else:
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertIn("FIXTURE_CONTINUED", result.stdout)
+                    self.assertEqual(fixture.marker.read_text(), MARKERS[fixture.module])
+                self.assertTrue(executable.exists())
 
     def test_symlink_and_dangling_symlink_never_followed(self):
         for exists in (True, False):
