@@ -1,5 +1,6 @@
 """Real-file launch-only renderer generations; isolated HOME, no Wine or launch."""
 import copy
+import contextlib
 import inspect
 import json
 from pathlib import Path
@@ -497,6 +498,22 @@ class LaunchRenderer(unittest.TestCase):
         self.assertIsNone(m._RENDERER_LAUNCH_POLICY)
 
     def test_real_lock_order_is_cs2_then_shared_games_and_scope_is_released(self):
+        from lib import scoped_source_admission as source
+        admissions = []
+
+        @contextlib.contextmanager
+        def fixture_admission(control, *, entrypoints, expected_commit):
+            # This fixture has no Git source tree. Keep the source boundary
+            # explicit while exercising actual file locks and drift guards.
+            self.assertEqual(control, m.CONTROL)
+            self.assertEqual(entrypoints, ('bin/ds3-runtime',))
+            self.assertEqual(expected_commit, self.commit)
+            admissions.append('enter')
+            try:
+                yield self.commit, lambda: True
+            finally:
+                admissions.append('exit')
+
         cs2 = self.f.home / 'Library/Application Support/CS2 Standalone/.launcher.lock'
         self.put(cs2, b'')
         locks = []
@@ -504,6 +521,7 @@ class LaunchRenderer(unittest.TestCase):
 
         def flock(fd, operation):
             if operation & m.fcntl.LOCK_EX:
+                self.assertEqual(admissions, ['enter'])
                 facts = m.os.fstat(fd if isinstance(fd, int) else fd.fileno())
                 names = (cs2, self.f.home / 'AIDev/state/games-hub.lock')
                 locks.append(next(path.name for path in names if path.exists()
@@ -512,16 +530,19 @@ class LaunchRenderer(unittest.TestCase):
 
         for command in ('upgrade-renderer', 'recover-renderer', 'rollback-renderer', 'return-renderer'):
             locks.clear()
+            admissions.clear()
             args = ['ds3-runtime', command, self.commit]
             if command == 'upgrade-renderer':
                 args.append(str(self.tx / 'source'))
             with self.subTest(command=command), patch.object(m.sys, 'argv', args), \
+                    patch.object(source, 'admitted_source', side_effect=fixture_admission), \
                     patch.object(m, 'renderer_policy', return_value=self.policy), \
                     patch.object(m.fcntl, 'flock', side_effect=flock), \
                     patch.object(m, 'renderer_operation', side_effect=RuntimeError('boundary reached')):
                 with self.assertRaisesRegex(RuntimeError, 'boundary reached'):
                     m.main()
             self.assertEqual(locks, ['.launcher.lock', 'games-hub.lock'])
+            self.assertEqual(admissions, ['enter', 'exit'])
             self.assertIsNone(m._RENDERER_CS2_GUARD)
         shared = self.f.home / 'AIDev/state/games-hub.lock'
 
@@ -533,6 +554,7 @@ class LaunchRenderer(unittest.TestCase):
             m._RENDERER_CS2_GUARD()
 
         with patch.object(m.sys, 'argv', ['ds3-runtime', 'recover-renderer', self.commit]), \
+                patch.object(source, 'admitted_source', side_effect=fixture_admission), \
                 patch.object(m, 'renderer_policy', return_value=self.policy), \
                 patch.object(m, 'renderer_operation', side_effect=change_shared):
             with self.assertRaisesRegex(RuntimeError, 'renderer_shared_lock_changed'):

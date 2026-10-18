@@ -3,10 +3,13 @@
 import sys
 sys.dont_write_bytecode=True
 sys.pycache_prefix = "/dev/null"
-import fcntl,importlib.machinery,importlib.util,os,re,stat,tempfile
+if __name__=='__main__' and not globals().get('__source_bound__') and __file__.endswith('/AIDev/control/bin/game-app-launcher-update'):
+    import posix
+    posix.execv(sys.executable,[sys.executable,'-I','-S','-B',__file__.rsplit('/',2)[0]+'/lib/scoped_source_admission.py',__file__,'[]',*sys.argv[1:]])
+import contextlib,fcntl,importlib.machinery,importlib.util,os,pwd,re,stat,tempfile
 from pathlib import Path
-loader=importlib.machinery.SourceFileLoader('game_apps',str(Path(__file__).resolve().with_name('game-app-launchers')))
-spec=importlib.util.spec_from_loader(loader.name,loader);h=importlib.util.module_from_spec(spec);loader.exec_module(h)
+sys.path.insert(0,str(Path(__file__).resolve().parent.parent))
+from lib import game_app_files as h
 
 def targets():
     result={str(i):h.HOME/'Games'/name/'Contents/MacOS/launcher' for i,name in enumerate(h.NAMES)}
@@ -18,7 +21,8 @@ def source_check(commit):
     h.need(type(commit) is str and re.fullmatch('[0-9a-f]{40}',commit),'invalid_commit')
     sys.path.insert(0,str(h.CONTROL))
     from lib.scoped_source_admission import check
-    check(h.CONTROL,commit,entrypoints=('bin/game-app-launcher-update',))
+    check(h.CONTROL,commit,entrypoints=('bin/game-app-launcher-update',),
+          data_paths=(h.MANIFEST,h.ERROR_POLICY,'bin/game-app-launcher.m'))
 
 def status():
     """Only the four launcher bundles and the two owned receipt fields.
@@ -50,7 +54,7 @@ def source_gate(commit,recovery_check=None):
     held=bridge.bound(snapshot)
     checks={'payload-owner':owner,'recovery':recovery}
     if recovery_check is None:checks['wine-target']=status
-    report=bridge.ready(h.CONTROL,commit,'wine-recovery' if recovery_check else 'wine-install',checks=checks,target_guard=held)
+    report=bridge.ready(h.CONTROL,commit,'wine-recovery' if recovery_check else 'wine-install',checks=checks,target_guard=held,extra_paths=())
     h.need(report.get('scopedCandidateReady') is True,'scoped_operation_readiness_required')
     source_check(commit)
     return held
@@ -129,11 +133,17 @@ def main():
     s=os.fstat(fd);h.need(stat.S_ISREG(s.st_mode) and s.st_uid == os.getuid() and s.st_nlink == 1 and not s.st_mode & 0o022,'unsafe_lock')
     with os.fdopen(fd,'w') as lock:
         fcntl.flock(lock,fcntl.LOCK_EX|fcntl.LOCK_NB)
-        if len(args)==3 and args[0]=='install':result=update(args[1],Path(args[2]))
-        elif len(args)==3 and args[0]=='rollback':result=rollback(args[1],args[2])
-        elif args==['status']:
-            status();result={'state':'GAME_APP_LAUNCHERS_VALID','sourcePolicyCurrent':h.load(h.DS3/'receipt.json')['appPolicySha256']==h.policy_digest(h.policy()),'gameStarted':False}
-        else:raise RuntimeError('usage: game-app-launcher-update install COMMIT CANDIDATE | rollback COMMIT APPLY_COMMIT | status')
+        with contextlib.ExitStack() as held:
+            if len(args)==3 and args[0] in ('install','rollback'):
+                sys.path.insert(0,str(h.CONTROL))
+                from lib.scoped_source_admission import admitted_source
+                held.enter_context(admitted_source(h.CONTROL,entrypoints=('bin/game-app-launcher-update',),
+                    data_paths=(h.MANIFEST,h.ERROR_POLICY,'bin/game-app-launcher.m'),expected_commit=args[1]))
+            if len(args)==3 and args[0]=='install':result=update(args[1],Path(args[2]))
+            elif len(args)==3 and args[0]=='rollback':result=rollback(args[1],args[2])
+            elif args==['status']:
+                status();result={'state':'GAME_APP_LAUNCHERS_VALID','sourcePolicyCurrent':h.load(h.DS3/'receipt.json')['appPolicySha256']==h.policy_digest(h.policy()),'gameStarted':False}
+            else:raise RuntimeError('usage: game-app-launcher-update install COMMIT CANDIDATE | rollback COMMIT APPLY_COMMIT | status')
     print(h.jb(result).decode())
 if __name__=='__main__':
     try:main()

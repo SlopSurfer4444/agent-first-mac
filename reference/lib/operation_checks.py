@@ -9,7 +9,7 @@ DEPENDENCIES = {
     "ssh-holder": ("ssh-transport", "native-consent"),
     "shell-apply": ("payload-owner", "recovery"),
     "shell-recovery": ("payload-owner", "recovery"),
-    "harness-disable": ("owned-target", "recovery", "native-consent"),
+    "harness-disable": ("owned-target", "recovery"),
 }
 
 

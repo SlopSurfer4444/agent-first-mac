@@ -44,7 +44,9 @@ REASONS = frozenset(("source_changed", "fixture_invalid", "signature_invalid",
     "cli_identity_invalid", "command_failed", "schema_output_invalid",
     "capabilities_incompatible", "process_unsettled", "probe_failed",
     "fixture_capacity_required", "fixture_custody_invalid", "fixture_custody_busy",
-    "fixture_settlement_required"))
+    "fixture_settlement_required", "fixture_metadata_pending", "fixture_preparation_capacity",
+    "fixture_preparation_recovery_required", "fixture_namespace_refresh_required",
+    "fixture_legacy_identity_required"))
 
 
 class ProbeError(Exception):

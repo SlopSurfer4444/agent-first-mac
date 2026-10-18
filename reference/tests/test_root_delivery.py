@@ -57,7 +57,7 @@ class DeliveryTests(unittest.TestCase):
 
     def pending(self, parent=None):
         parent = parent or self.home / Path(D.SUFFIX).parent
-        return list(parent.glob('.' + D.RELEASE_ID + '.pending-*'))
+        return [p for p in parent.glob('.' + D.RELEASE_ID + '.pending-*') if not p.name.endswith('.json')]
 
     def test_stage_verify_noop_preserves_originals(self):
         original = {p: p.read_bytes() for folder in (self.install, self.emergency) for p in folder.iterdir()}
@@ -204,25 +204,36 @@ class DeliveryTests(unittest.TestCase):
         native.assert_not_called()
 
     def test_connected_native_source_gate_never_launches_vendor_and_keeps_target_guards(self):
-        from lib import current_doctor_native as N
         root = self.home / 'AIDev/control'
         root.mkdir(parents=True, mode=0o700)
-        doctor = SimpleNamespace(public_report=lambda value, **kwargs: value)
         calls = []
+        active = []
         source_ok = [True]
-        def native(loaded, git_only, *, operation_check):
-            self.assertIs(loaded, doctor)
-            self.assertIs(git_only, True, 'unrelated vendor sentinel requested')
-            calls.append(git_only)
+        @contextlib.contextmanager
+        def held(control, *, entrypoints=(), data_paths, opaque_paths):
+            self.assertEqual(control, root)
+            self.assertEqual(entrypoints, () if active else ('bin/root-delivery',))
+            self.assertEqual(data_paths, ())
+            self.assertEqual(set(opaque_paths), set(self.release['sourceArtifactSHA256']) if active else {D.MANIFEST})
+            calls.append(True)
             if not source_ok[0]:
                 raise D.Fault('source_unadmitted')
-            self.assertIs(operation_check(D.BASE, source_guard=lambda: True), True)
-            return {'integratedMain': True, 'verdict': 'GIT_ONLY_VALID'}
-        with patch.object(D, 'ROOT', root), patch.object(D, 'load_release', return_value=self.release), \
+            active.append(True)
+            try:
+                yield D.BASE, lambda: True
+            finally:
+                active.pop()
+        def manifest():
+            self.assertEqual(len(active), 1, 'manifest consumed before its source hold')
+            return self.release
+        def release():
+            self.assertEqual(len(active), 2, 'artifact provenance consumed before its source hold')
+            return self.release
+        with patch.object(D, 'ROOT', root), patch.object(D, 'load_release', side_effect=release), \
+                patch.object(D, 'load_manifest', side_effect=manifest), \
                 patch.object(D.pwd, 'getpwuid', return_value=SimpleNamespace(pw_dir=str(self.home))), \
-                patch.object(D.importlib.machinery.SourceFileLoader, 'load_module', return_value=doctor), \
-                patch.object(N, 'native', side_effect=native), \
-                patch.object(N.probe, 'observe', side_effect=AssertionError('vendor launch forbidden')):
+                patch.dict(sys.modules, {'lib.scoped_source_admission': SimpleNamespace(
+                    admitted_source=held, require_execution=lambda control: self.assertEqual(control, root))}):
             source_ok[0] = False
             with patch.object(D, 'stage_release') as stage, self.assertRaises(D.Fault):
                 D.native('stage', self.install, self.emergency)
@@ -239,7 +250,166 @@ class DeliveryTests(unittest.TestCase):
             artifact.write_bytes(original)
             artifact.chmod(0o555)
             self.assertEqual(D.native('stage', self.install, self.emergency)['status'], 'STAGED')
-        self.assertEqual(calls, [True, True, True])
+        self.assertEqual(calls, [True] * 5)
+
+    def test_recorded_empty_preparation_inventory_and_retirement_restores_capacity(self):
+        parent = self.home / Path(D.SUFFIX).parent
+        parent.mkdir(parents=True, mode=0o700)
+        for index in range(D.MAX_RETAINED_ATTEMPTS):
+            token = f'{index:032x}'
+            record = parent / (D.attempt_name(token) + '.json')
+            record.write_bytes(D.attempt_record(self.release, token))
+            record.chmod(0o600)
+        report = D.inventory_attempts(self.release, self.home, self.uid)
+        self.assertEqual(report['retainedAttempts'], D.MAX_RETAINED_ATTEMPTS)
+        self.assertEqual(report['pendingMetadata'], D.MAX_RETAINED_ATTEMPTS)
+        self.assertIsNotNone(report['capacityReason'])
+        with self.assertRaisesRegex(D.Fault, 'retained_attempt_limit'):
+            self.stage()
+        self.assertEqual(self.retire('0' * 32)['status'], 'PREPARATION_RETIRED')
+        self.assertEqual(self.stage()['status'], 'STAGED')
+
+    def retire(self, token):
+        return D.retire_attempt(self.release, token, self.install, self.emergency,
+            self.home, self.uid, source_guard=lambda: True)
+
+    def retained_attempt(self):
+        with patch.object(D, 'rename_exclusive', side_effect=RuntimeError('interrupted')):
+            with self.assertRaises(RuntimeError):
+                self.stage()
+        pending, = self.pending()
+        return pending, pending.name.rsplit('-', 1)[1]
+
+    def test_retire_partial_exact_attempt_preserves_published_release_and_unknown(self):
+        pending, token = self.retained_attempt()
+        # A partial expected prefix, including empty write, is known work only
+        # because the exact durable record reserved this attempt before mkdir.
+        leaf = pending / 'aid-admin'
+        leaf.chmod(0o600)
+        leaf.write_bytes(leaf.read_bytes()[:4])
+        unknown = pending.parent / ('.' + D.RELEASE_ID + '.pending-foreign')
+        unknown.mkdir(mode=0o700)
+        (unknown / 'owner-data').write_bytes(b'preserve')
+        self.stage()
+        published = self.home / D.SUFFIX
+        before = {p.name: (p.stat().st_ino, p.read_bytes()) for p in published.iterdir()}
+        self.retire(token)
+        self.assertFalse(pending.exists())
+        self.assertEqual({p.name: (p.stat().st_ino, p.read_bytes()) for p in published.iterdir()}, before)
+        self.assertEqual((unknown / 'owner-data').read_bytes(), b'preserve')
+
+    def test_retire_unknown_bytes_inventory_links_and_record_refused_before_delete(self):
+        for variant in ('unknown', 'symlink', 'hardlink', 'extra', 'record'):
+            self.home = self.base / ('home-' + variant)
+            self.home.mkdir(mode=0o700)
+            pending, token = self.retained_attempt()
+            leaf = pending / 'aid-admin'
+            if variant == 'unknown':
+                leaf.chmod(0o600); leaf.write_bytes(b'foreign')
+            elif variant == 'symlink':
+                leaf.unlink(); leaf.symlink_to(self.install / 'aid-admin')
+            elif variant == 'hardlink':
+                leaf.unlink(); os.link(self.install / 'aid-admin', leaf)
+            elif variant == 'extra':
+                (pending / 'foreign').write_bytes(b'foreign')
+            else:
+                pending.with_name(pending.name + '.json').write_bytes(b'{}')
+            before = set(pending.iterdir())
+            with self.subTest(variant=variant), self.assertRaises((D.Fault, OSError)):
+                self.retire(token)
+            self.assertEqual(set(pending.iterdir()), before)
+            if variant == 'hardlink':
+                leaf.unlink()  # Restore only this test's synthetic input nlink.
+
+    def test_retirement_interruption_is_exact_retryable(self):
+        pending, token = self.retained_attempt()
+        real = D.os.unlink
+        calls = 0
+        def interrupt(*args, **kwargs):
+            nonlocal calls
+            real(*args, **kwargs)
+            calls += 1
+            if calls == 3:
+                raise RuntimeError('retire interrupted')
+        with patch.object(D.os, 'unlink', interrupt), self.assertRaises(RuntimeError):
+            self.retire(token)
+        self.assertTrue(pending.exists())
+        self.assertEqual(self.retire(token)['status'], 'PREPARATION_RETIRED')
+        self.assertFalse(pending.exists())
+
+    def test_retirement_after_final_record_unlink_reports_absence_on_retry(self):
+        pending, token = self.retained_attempt()
+        real = D.os.unlink
+        def interrupt(name, **kwargs):
+            real(name, **kwargs)
+            if name == pending.name + '.json':
+                raise RuntimeError('final record interrupted')
+        with patch.object(D.os, 'unlink', interrupt), self.assertRaises(RuntimeError):
+            self.retire(token)
+        self.assertEqual(self.retire(token)['status'], 'PREPARATION_ABSENT')
+        self.assertFalse(pending.exists())
+
+    def test_inventory_unknown_legacy_and_metadata_debt_truthful(self):
+        parent = self.home / Path(D.SUFFIX).parent
+        parent.mkdir(parents=True, mode=0o700)
+        (parent / ('.' + D.RELEASE_ID + '.pending')).mkdir(mode=0o700)
+        token = 'a' * 32
+        record = parent / (D.attempt_name(token) + '.json')
+        record.write_bytes(b'partial metadata'); record.chmod(0o600)
+        report = D.inventory_attempts(self.release, self.home, self.uid)
+        self.assertEqual(report['retainedAttempts'], 2)
+        self.assertEqual(report['pendingMetadata'], 1)
+        self.assertFalse(any(row['recordVerified'] for row in report['attempts']))
+        with self.assertRaises(D.Fault):
+            self.retire(token)
+
+    def test_inventory_does_not_wait_for_preparation_lease(self):
+        parent = self.home / Path(D.SUFFIX).parent
+        parent.mkdir(parents=True, mode=0o700)
+        with D.Directory(parent, self.uid) as held:
+            D.fcntl.flock(held.fd, D.fcntl.LOCK_EX | D.fcntl.LOCK_NB)
+            with self.assertRaisesRegex(D.Fault, 'preparation_busy'):
+                D.inventory_attempts(self.release, self.home, self.uid)
+
+    def test_retirement_record_change_before_first_unlink_preserves_every_payload(self):
+        for replacement in (False, True):
+            self.home = self.base / ('record-race-' + str(replacement))
+            self.home.mkdir(mode=0o700)
+            pending, token = self.retained_attempt()
+            record = pending.with_name(pending.name + '.json')
+            before = {p.name: p.read_bytes() for p in pending.iterdir()}
+            calls = 0
+            def guard():
+                nonlocal calls
+                calls += 1
+                if calls == 2:
+                    if replacement:
+                        record.unlink()
+                        record.write_bytes(D.attempt_record(self.release, token))
+                        record.chmod(0o600)
+                    else:
+                        record.write_bytes(b'foreign')
+                return True
+            with self.assertRaisesRegex(D.Fault, 'attempt_record_unknown'):
+                D.retire_attempt(self.release, token, self.install, self.emergency,
+                    self.home, self.uid, source_guard=guard)
+            self.assertEqual({p.name: p.read_bytes() for p in pending.iterdir()}, before)
+
+    def test_retirement_new_unknown_member_before_first_unlink_preserved(self):
+        pending, token = self.retained_attempt()
+        before = {p.name: p.read_bytes() for p in pending.iterdir()}
+        calls = 0
+        def guard():
+            nonlocal calls
+            calls += 1
+            if calls == 2:
+                (pending / 'unknown').write_bytes(b'owner data')
+            return True
+        with self.assertRaisesRegex(D.Fault, 'attempt_inventory_unknown'):
+            D.retire_attempt(self.release, token, self.install, self.emergency,
+                self.home, self.uid, source_guard=guard)
+        self.assertEqual({p.name: p.read_bytes() for p in pending.iterdir()},
+            {**before, 'unknown': b'owner data'})
 
     def test_handoff_requires_held_source_and_known_predecessor_not_vendor(self):
         self.stage()

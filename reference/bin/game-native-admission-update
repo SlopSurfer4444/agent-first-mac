@@ -3,13 +3,16 @@
 import sys
 sys.dont_write_bytecode=True
 sys.pycache_prefix = "/dev/null"
+if __name__=='__main__' and not globals().get('__source_bound__') and __file__.endswith('/AIDev/control/bin/game-native-admission-update'):
+ import posix
+ posix.execv(sys.executable,[sys.executable,'-I','-S','-B',__file__.rsplit('/',2)[0]+'/lib/scoped_source_admission.py',__file__,'[]',*sys.argv[1:]])
 import argparse,contextlib,fcntl,hashlib,importlib.machinery,json,os,pwd,stat,subprocess
 from pathlib import Path
 HERE=Path(__file__).absolute().parent.parent
 if str(HERE) not in sys.path:sys.path.insert(0,str(HERE))
+HOME=Path(pwd.getpwuid(os.getuid()).pw_dir);CONTROL=HOME/'AIDev/control'
 from lib import game_native_admission_bridge as b
 from lib import game_native_admission_capability as cap
-HOME=Path(pwd.getpwuid(os.getuid()).pw_dir);CONTROL=HOME/'AIDev/control'
 DS3=HOME/'Library/Application Support/Adapted Games DS3';CS2=HOME/'Library/Application Support/CS2 Standalone';HUB=HOME/'Library/Application Support/Adapted Games'
 STATE=HOME/'AIDev/state';POLICY='manifests/game-native-launch-admission.json'
 RECOVERY_SOURCE=('bin/game-native-admission-update','bin/game-native-admission-plan',

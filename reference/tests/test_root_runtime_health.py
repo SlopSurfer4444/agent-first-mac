@@ -223,26 +223,20 @@ class RootRuntimeHealthTests(unittest.TestCase):
         with self.assertRaisesRegex(health.HealthError, "root_observation_drift"):
             f.inspect(observe=lambda kind, path: f.values[path], runner=run)
 
-    def test_native_entry_holds_admitted_source_and_requires_integrated_result(self):
-        from lib import current_doctor_native
-        doctor = mock.Mock()
-        doctor.public_report.side_effect = lambda value, **kw: value
+    def test_native_entry_holds_scoped_source_without_historical_admission(self):
         source_guard = mock.Mock(return_value=True)
         release = object()
         report = {"verdict": "synthetic-result"}
-        def admitted(module, git_only, *, operation_check):
-            self.assertIs(module, doctor)
-            self.assertIs(git_only, True)
+        def admitted(*, operation_check, entrypoint):
+            self.assertEqual(entrypoint, 'bin/root-runtime-doctor')
             self.assertIs(operation_check("f" * 40, source_guard=source_guard), True)
-            return {"verdict": "GIT_ONLY_VALID", "integratedMain": True}
         with mock.patch.object(health.os, "getuid", return_value=501), \
              mock.patch.object(health.pwd, "getpwuid", return_value=mock.Mock(pw_dir="/synthetic")), \
              mock.patch.object(health, "ROOT", Path("/synthetic/AIDev/control")), \
              mock.patch.object(Path, "resolve", return_value=Path("/synthetic/AIDev/control")), \
-             mock.patch.object(health.importlib.machinery, "SourceFileLoader", return_value=mock.Mock(load_module=lambda: doctor)), \
              mock.patch.object(health.delivery, "load_release", return_value=release), \
              mock.patch.object(health, "native_health", return_value=report) as inspect, \
-             mock.patch.object(current_doctor_native, "native", side_effect=admitted):
+             mock.patch.object(health.delivery, "admitted_source", side_effect=admitted):
             self.assertIs(health.native(), report)
             inspect.assert_called_once_with(release, "/synthetic", 501, source_guard)
 

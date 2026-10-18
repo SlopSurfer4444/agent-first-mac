@@ -42,6 +42,31 @@ class NativeFixture:
 
 
 class ScheduledResourceTests(unittest.TestCase):
+    def test_isolated_cycle_loader_exposes_existing_source_package(self):
+        code = '''import runpy,sys
+from pathlib import Path
+root=Path(sys.argv[1])
+entry=runpy.run_path(str(root/'bin/workstation-maintenance-cycle'))
+entry['delivery_api']()
+from lib import scoped_source_admission
+assert str(root) in sys.path
+'''
+        result = subprocess.run(["/usr/bin/python3", "-I", "-B", "-c", code, str(ROOT)],
+            cwd="/private/tmp", capture_output=True, timeout=10)
+        self.assertEqual(result.returncode, 0, result.stderr.decode())
+
+    def test_scheduled_source_error_is_bounded_and_actionable_without_observation(self):
+        from lib import scoped_source_admission as source
+        def blocked(callback):
+            raise source.SourceError("affected_source_uncommitted")
+        with patch.object(M, "prepare_scheduled_limits", return_value=True):
+            result = M.scheduled_native(None, build_report=lambda _: self.fail("source failure must not observe"),
+                now=lambda: 0, source_gate=blocked)
+        self.assertEqual(result["status"], "UNAVAILABLE")
+        self.assertEqual(result["reason"], "affected_source_uncommitted")
+        self.assertTrue(result["nextAction"])
+        self.assertFalse(result["runSourceAccepted"])
+
     def child(self, soft, hard):
         before = resource.getrlimit(resource.RLIMIT_NOFILE)
         code = '''import json,resource,sys
@@ -339,12 +364,13 @@ class DeliveryTests(unittest.TestCase):
     def test_actual_source_gate_wrapper_uses_affected_source_and_held_callback(self):
         from lib import scoped_source_admission
         calls = []
-        def scoped(root, callback, **options):
+        def scoped(root, **options):
             calls.append(root)
-            self.assertTrue(callback("f" * 40, source_guard=lambda: True))
-            return True
+            self.assertIs(options["full"], False)
+            self.assertEqual(options["extra_paths"], M.SOURCE_FILES)
+            return {"verdict": "SOURCE_VALID"}
         owner = type("Owner", (), {"pw_dir": str(self.home)})()
-        with patch.object(M.pwd, "getpwuid", return_value=owner), patch.object(scoped_source_admission, "run", side_effect=scoped):
+        with patch.object(M.pwd, "getpwuid", return_value=owner), patch.object(scoped_source_admission, "observe", side_effect=scoped):
             self.assertEqual(M.admitted_source(self.root, full=False)["verdict"], "SOURCE_VALID")
         self.assertEqual(calls, [self.root])
 
@@ -528,26 +554,53 @@ class DeliveryTests(unittest.TestCase):
         self.assertNotIn("bootstrap", self.native.calls)
         self.assertFalse((self.home / "Library/LaunchAgents" / M.PLIST).exists())
 
+    def test_source_failure_reports_closed_reason_without_native_dispatch(self):
+        from lib import scoped_source_admission as source
+        owner = type("Owner", (), {"pw_dir": str(self.home)})()
+        with patch.object(M, "ROOT", self.root), patch.object(M.pwd, "getpwuid", return_value=owner), \
+                patch.object(M, "runner", self.native), \
+                patch.object(M, "admitted_source", side_effect=source.SourceError("affected_source_uncommitted")):
+            result = M.native_schedule("install")
+        self.assertEqual(result["reason"], "affected_source_uncommitted")
+        self.assertTrue(result["nextAction"])
+        self.assertNotIn("bootstrap", self.native.calls)
+
+    def test_catalog_is_first_consumed_inside_held_source_callback(self):
+        active, consumed = [False], []
+        actual = M.sources
+        def inputs(root):
+            consumed.append(active[0])
+            return actual(root)
+        def admitted(root, *, full, operation_check):
+            active[0] = True
+            try:
+                return operation_check('f' * 40, source_guard=lambda: active[0])
+            finally:
+                active[0] = False
+        owner = type('Owner', (), {'pw_dir': str(self.home)})()
+        with patch.object(M, 'ROOT', self.root), patch.object(M.pwd, 'getpwuid', return_value=owner), \
+                patch.object(M, 'runner', self.native), patch.object(M, 'sources', side_effect=inputs), \
+                patch.object(M, 'admitted_source', side_effect=admitted):
+            self.assertEqual(M.native_schedule('install')['status'], 'INSTALLED')
+        self.assertTrue(consumed)
+        self.assertTrue(all(consumed))
+
     def test_connected_install_source_gate_never_requests_full_vendor_probe(self):
+        from contextlib import contextmanager
         from lib import current_doctor_native as N
-        doctor = type('Doctor', (), {'public_report': staticmethod(lambda value, **kwargs: value)})()
+        from lib import scoped_source_admission as source
         calls = []
-        original_load = M.importlib.machinery.SourceFileLoader.load_module
-        def load(loader, *args):
-            return doctor if loader.name == 'maintenance_install_doctor' else original_load(loader, *args)
-        def native(loaded, git_only, *, operation_check):
-            self.assertIs(loaded, doctor)
-            self.assertIs(git_only, True, 'unrelated vendor sentinel requested')
-            calls.append(git_only)
-            self.assertIs(operation_check('f' * 40, source_guard=lambda: True), True)
-            return {'integratedMain': True, 'verdict': 'GIT_ONLY_VALID'}
+        @contextmanager
+        def held(root, **options):
+            self.assertEqual(options['data_paths'], ())
+            self.assertEqual(options['opaque_paths'], M.SOURCE_FILES)
+            calls.append(True)
+            yield 'f' * 40, lambda: True
         owner = type('Owner', (), {'pw_dir': str(self.home)})()
         with patch.object(M, 'ROOT', self.root), patch.object(M.pwd, 'getpwuid', return_value=owner), \
                 patch.object(M, 'runner', self.native), \
-                patch.object(M.importlib.machinery.SourceFileLoader, 'load_module', load), \
-                patch.object(N, 'native', side_effect=native), \
-                patch('lib.scoped_source_admission.run', side_effect=lambda root, callback, **kwargs:
-                      native(doctor, True, operation_check=callback)), \
+                patch.object(source, 'require_execution', return_value=True), \
+                patch.object(source, 'admitted_source', side_effect=held), \
                 patch.object(N.probe, 'observe', side_effect=AssertionError('vendor launch forbidden')):
             result = M.native_schedule('install')
         self.assertEqual(result['status'], 'INSTALLED')

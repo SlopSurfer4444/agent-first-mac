@@ -559,6 +559,188 @@ private struct BootstrapTests {
         try expect(fixture.expectedPathsPresent())
     }
 
+    private var preparationID: String { "11111111-2222-3333-4444-555555555555" }
+    private var retainedPath: String { "/var/db/agent-first-mac/bootstrap/retained-preparations" }
+
+    func testPreparationRetirementExactNamespacesAndRestart() throws {
+        for preparationStep in ["preparation-intent", "preparation-directory-created",
+                                "preparation-directory-recorded", "preparation-file-recorded-install-inputs.json",
+                                "preparation-file-recorded-aid-admin-policy.json"] {
+            let fixture = try Fixture()
+            try expect(try fixture.subprocess("--crash", step: preparationStep) == 77)
+            try expect(try fixture.subprocess("--reconcile") == 0)
+            let inventory = try fixture.installer().inventoryPreparations()
+            try expect(inventory.entries.count == 1 && inventory.entries[0].status == "RETIRABLE")
+            try expect(inventory.unknownEntries == 0 && !inventory.truncated && !inventory.activeInstall)
+            if preparationStep.contains("recorded-aid-admin-policy") {
+                try expect(inventory.entries[0].knownFiles == 3 && inventory.entries[0].knownBytes > 0)
+            }
+            try expect(try fixture.installer().retirePreparation(identifier: preparationID) == "PREPARATION_RETIRED")
+            try expect(try fixture.installer().inventoryPreparations().observedEntries == 0)
+            try expect(fixture.expectedPathsAbsent() && fixture.runner.calls.isEmpty, "retirement_touched_live_targets")
+        }
+        for step in ["preparation-retirement-intent", "preparation-retirement-file-install-inputs.json",
+                     "preparation-retirement-file-aid-admin", "preparation-retirement-file-aid-admin-policy.json",
+                     "preparation-retirement-directory"] {
+            let fixture = try Fixture()
+            try expect(try fixture.subprocess("--crash", step: "preparation-file-recorded-aid-admin-policy.json") == 77)
+            try expect(try fixture.subprocess("--reconcile") == 0)
+            try expect(try fixture.subprocess("--retire-crash", step: step) == 77, step)
+            try expect(try fixture.installer().inventoryPreparations().entries[0].status == "RETIREMENT_PENDING")
+            try expect(try fixture.installer().retirePreparation(identifier: preparationID) == "PREPARATION_RETIRED")
+            try expect(try fixture.installer().inventoryPreparations().observedEntries == 0)
+            try expect(fixture.expectedPathsAbsent())
+        }
+        let installed = try Fixture()
+        _ = try installed.installer().install(installed.request())
+        let before = try installed.fileHashes()
+        try expect(try installed.subprocess("--crash", step: "preparation-file-recorded-aid-admin-policy.json") == 77)
+        try expect(try installed.subprocess("--reconcile") == 0)
+        _ = try installed.installer().retirePreparation(identifier: preparationID)
+        try expect(try installed.fileHashes() == before && installed.expectedPathsPresent(), "retirement_changed_installed_state")
+    }
+
+    func testPreparationRetirementUnknownAndRollbackPreservation() throws {
+        for attack in ["unknown-name", "allowed-name-unrecorded", "file-identity", "directory-identity",
+                       "symlink", "hardlink", "missing-file", "legacy-partial", "rollback-journal",
+                       "file-content", "legacy-empty-identity", "missing-directory"] {
+            let fixture = try Fixture()
+            try expect(try fixture.subprocess("--crash", step: "preparation-file-recorded-install-inputs.json") == 77)
+            try expect(try fixture.subprocess("--reconcile") == 0)
+            let directory = fixture.physical(retainedPath + "/transaction-" + preparationID)
+            let journal = directory.appendingPathExtension("json")
+            let file = directory.appendingPathComponent("install-inputs.json")
+            if attack == "unknown-name" || attack == "allowed-name-unrecorded" {
+                try Data("foreign".utf8).write(to: directory.appendingPathComponent(attack == "unknown-name" ? "foreign" : "aid-admin"))
+            } else if attack == "directory-identity" || attack == "missing-directory" {
+                try FileManager.default.moveItem(at: directory, to: directory.appendingPathExtension("saved"))
+                if attack == "directory-identity" {
+                    try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: false,
+                                                           attributes: [.posixPermissions: 0o700])
+                }
+            } else if attack == "file-content" {
+                try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: file.path)
+                try Data("changed-content".utf8).write(to: file)
+                try FileManager.default.setAttributes([.posixPermissions: 0o400], ofItemAtPath: file.path)
+            } else if attack == "legacy-partial" || attack == "rollback-journal" || attack == "legacy-empty-identity" {
+                var record = try JSONSerialization.jsonObject(with: Data(contentsOf: journal)) as! [String: Any]
+                if attack == "legacy-partial" { record["stagedFiles"] = [String: Any]() }
+                else if attack == "legacy-empty-identity" {
+                    record["stagedFiles"] = [String: Any](); record["directoryIdentities"] = [String: Any]()
+                    try FileManager.default.removeItem(at: file)
+                }
+                else { record["mutationStarted"] = true; record["phase"] = "prepared" }
+                try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: journal.path)
+                try JSONSerialization.data(withJSONObject: record, options: [.sortedKeys]).write(to: journal)
+                try FileManager.default.setAttributes([.posixPermissions: 0o400], ofItemAtPath: journal.path)
+            } else {
+                let bytes = try Data(contentsOf: file)
+                try FileManager.default.moveItem(at: file, to: fixture.root.appendingPathComponent("saved-inputs"))
+                if attack == "symlink" { try FileManager.default.createSymbolicLink(at: file, withDestinationURL: fixture.inputs) }
+                else if attack == "hardlink" { try FileManager.default.linkItem(at: fixture.inputs, to: file) }
+                else if attack != "missing-file" {
+                    try bytes.write(to: file)
+                    try FileManager.default.setAttributes([.posixPermissions: 0o400], ofItemAtPath: file.path)
+                }
+            }
+            let before = try Data(contentsOf: journal)
+            try expect(try fixture.installer().inventoryPreparations().entries[0].status == "UNKNOWN_PRESERVED", attack)
+            let reason = try expectThrows { _ = try fixture.installer().retirePreparation(identifier: preparationID) }
+            try expect(!reason.contains("noncanonical"), "test_journal_not_canonical_" + attack)
+            try expect(try Data(contentsOf: journal) == before, "unknown_journal_changed_" + attack)
+            try expect((directory.exists || attack == "missing-directory") && fixture.expectedPathsAbsent(), "unknown_state_deleted_" + attack)
+        }
+        let opaque = try Fixture()
+        try expect(try opaque.subprocess("--crash", step: "preparation-file-created-active.json.next") == 77)
+        try expect(try opaque.subprocess("--reconcile") == 0)
+        let inventory = try opaque.installer().inventoryPreparations()
+        try expect(inventory.unknownEntries == 1 && inventory.entries.isEmpty, "opaque_inventory_hidden")
+        _ = try expectThrows { _ = try opaque.installer().retirePreparation(identifier: preparationID) }
+        try expect(try opaque.installer().inventoryPreparations().unknownEntries == 1)
+    }
+
+    func testPreparationCustodyCannotAdoptOrDeleteReplacements() throws {
+        let fixture = try Fixture()
+        fixture.hooks.afterStep = { step in
+            if step == "preparation-file-synced-aid-admin" {
+                let path = fixture.physical("/var/db/agent-first-mac/bootstrap/transaction-" + preparationID + "/aid-admin")
+                let bytes = try Data(contentsOf: path)
+                try FileManager.default.moveItem(at: path, to: fixture.root.appendingPathComponent("saved-broker"))
+                try bytes.write(to: path)
+                try FileManager.default.setAttributes([.posixPermissions: 0o400], ofItemAtPath: path.path)
+            }
+        }
+        try expect(try expectThrows { _ = try fixture.installer().install(fixture.request()) }.contains("preparation_write_identity_UNKNOWN"))
+        try expect(try fixture.installer().inventoryPreparations().entries[0].status == "UNKNOWN_PRESERVED")
+        try expect(fixture.expectedPathsAbsent())
+        for step in ["preparation-retirement-intent", "preparation-retirement-file-install-inputs.json",
+                     "preparation-retirement-directory"] {
+            let fixture = try Fixture()
+            try expect(try fixture.subprocess("--crash", step: "preparation-file-recorded-install-inputs.json") == 77)
+            try expect(try fixture.subprocess("--reconcile") == 0)
+            let marker = fixture.physical(retainedPath + "/transaction-" + preparationID + ".retiring.json")
+            let foreign = Data("foreign-journal-must-survive".utf8)
+            fixture.hooks.afterStep = { actual in
+                if actual == step {
+                    try FileManager.default.moveItem(at: marker, to: fixture.root.appendingPathComponent("saved-marker"))
+                    try foreign.write(to: marker)
+                    try FileManager.default.setAttributes([.posixPermissions: 0o400], ofItemAtPath: marker.path)
+                }
+            }
+            try expect(try expectThrows { _ = try fixture.installer().retirePreparation(identifier: preparationID) }.contains("preparation_journal_identity_UNKNOWN"))
+            try expect(try Data(contentsOf: marker) == foreign && fixture.expectedPathsAbsent(), "replacement_journal_deleted")
+        }
+    }
+
+    func testPreparationRetirementActiveAndCapacity() throws {
+        let fixture = try Fixture()
+        try expect(try fixture.subprocess("--crash", step: "preparation-directory-recorded") == 77)
+        try expect(try fixture.subprocess("--reconcile") == 0)
+        let active = fixture.physical("/var/db/agent-first-mac/bootstrap/active.json")
+        let journal = fixture.physical(retainedPath + "/transaction-" + preparationID + ".json")
+        try FileManager.default.copyItem(at: journal, to: active)
+        try expect(try fixture.installer().inventoryPreparations().activeInstall)
+        try expect(try expectThrows { _ = try fixture.installer().retirePreparation(identifier: preparationID) }.contains("active_install"))
+        try FileManager.default.removeItem(at: active)
+        let staging = fixture.physical(BootstrapInstaller.brokerStagingPath)
+        try FileManager.default.createDirectory(at: staging, withIntermediateDirectories: false,
+                                               attributes: [.posixPermissions: 0o700])
+        let operation = staging.appendingPathComponent("operation.json")
+        let hash = String(repeating: "a", count: 64)
+        let target = "/nix/store/" + String(repeating: "a", count: 32) + "-darwin-system-fixture"
+        let record: [String: Any] = ["schema": 1, "identifier": preparationID,
+            "commit": String(repeating: "a", count: 40), "tree": String(repeating: "b", count: 40),
+            "policyHash": hash, "receiptHash": hash, "previousIdentifier": "1",
+            "previousTarget": target, "target": target,
+            "activationExecutable": "/nix/store/activation", "activationHash": hash,
+            "nixEnvExecutable": "/nix/store/nix-env", "nixEnvHash": hash,
+            "caller": "sudo-user", "targetIdentifier": "2", "phase": "activation_pending", "sourceDrift": false]
+        try JSONSerialization.data(withJSONObject: record, options: [.sortedKeys]).write(to: operation)
+        try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: operation.path)
+        _ = try expectThrows { _ = try fixture.installer().retirePreparation(identifier: preparationID) }
+        try expect(journal.exists, "active_apply_retirement")
+        try FileManager.default.removeItem(at: operation)
+        try FileManager.default.removeItem(at: staging)
+        for index in 0..<129 {
+            try Data("opaque".utf8).write(to: fixture.physical(retainedPath + "/opaque-\(index)"))
+        }
+        let inventory = try fixture.installer().inventoryPreparations()
+        try expect(inventory.truncated && inventory.observedEntries == 129)
+        try expect(try expectThrows { _ = try fixture.installer().install(fixture.request()) }.contains("preparation_capacity"))
+        try expect(fixture.expectedPathsAbsent())
+        try expect(try fixture.installer().retirePreparation(identifier: preparationID) == "PREPARATION_RETIRED")
+        try expect(try FileManager.default.contentsOfDirectory(atPath: fixture.physical(retainedPath).path).count == 129,
+                   "capacity_retirement_swept_unknown")
+        let repeated = try Fixture()
+        for _ in 0..<66 {
+            try expect(try repeated.subprocess("--crash", step: "preparation-file-recorded-install-inputs.json") == 77)
+            try expect(try repeated.subprocess("--reconcile") == 0)
+            _ = try repeated.installer().retirePreparation(identifier: preparationID)
+        }
+        try expect(try repeated.installer().inventoryPreparations().observedEntries == 0 && repeated.expectedPathsAbsent(),
+                   "retirement_accumulates_capacity_debt")
+    }
+
     func testForeignAndUntrustedRecoveryStayUnknown() throws {
         for attack in ["target", "journal-mode", "journal-symlink", "backup"] {
             let fixture = try Fixture()
@@ -680,7 +862,8 @@ private struct TestMain {
             let installer = BootstrapInstaller(context: context, runner: FakeRunner(), hooks: hooks,
                 actionID: { "11111111-2222-3333-4444-555555555555" })
             do {
-                if mode == "--reconcile" || mode == "--rollback-crash" { _ = try installer.reconcileInterruptedInstall() }
+                if mode == "--retire-crash" { _ = try installer.retirePreparation(identifier: "11111111-2222-3333-4444-555555555555") }
+                else if mode == "--reconcile" || mode == "--rollback-crash" { _ = try installer.reconcileInterruptedInstall() }
                 else {
                     let inputs = root + "/reviewed/install-inputs.json"
                     let bytes = try Data(contentsOf: URL(fileURLWithPath: inputs))
@@ -711,6 +894,10 @@ private struct TestMain {
             ("bootstrap_self_attestation", suite.testBootstrapSelfAttestationFailsClosed),
             ("crash_restart_matrix", suite.testCrashRestartMatrix),
             ("preparation_crash_retention", suite.testPreparationCrashPreservesAndUnblocks),
+            ("preparation_retirement_restart", suite.testPreparationRetirementExactNamespacesAndRestart),
+            ("preparation_retirement_unknown", suite.testPreparationRetirementUnknownAndRollbackPreservation),
+            ("preparation_retirement_capacity", suite.testPreparationRetirementActiveAndCapacity),
+            ("preparation_custody_substitutions", suite.testPreparationCustodyCannotAdoptOrDeleteReplacements),
             ("committed_crash", suite.testCommittedCrashDoesNotUndoInstall),
             ("foreign_recovery", suite.testForeignAndUntrustedRecoveryStayUnknown),
             ("restart_before_admission", suite.testInstallReconcilesBeforeNewAdmission),

@@ -1,6 +1,10 @@
 #!/usr/bin/python3
 """Deterministic metadata cycle and exact schedule adapter; no model or repair."""
 import sys
+if __name__ == "__main__" and not globals().get("__source_bound__"):
+    import posix
+    posix.execv(sys.executable, [sys.executable, "-I", "-S", "-B",
+        __file__.rsplit("/", 2)[0] + "/lib/scoped_source_admission.py", __file__, "[]", *sys.argv[1:]])
 sys.dont_write_bytecode = True
 sys.pycache_prefix = "/dev/null"
 
@@ -8,6 +12,8 @@ import importlib.machinery
 import json
 from pathlib import Path
 import time
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 D = importlib.machinery.SourceFileLoader("workstation_maintenance_observation",
     str(Path(__file__).absolute().with_name("workstation-drift-snapshot"))).load_module()
@@ -80,6 +86,7 @@ def run(operation, *, observe, now):
 def delivery_api():
     """Load reviewed source lazily; importing is not a lifecycle action."""
     root = Path(__file__).absolute().parent.parent
+    sys.path.insert(0, str(root))
     sys.path.insert(0, str(root / "lib"))
     import workstation_maintenance_delivery
     return workstation_maintenance_delivery

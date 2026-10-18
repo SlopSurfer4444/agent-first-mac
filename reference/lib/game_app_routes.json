@@ -1,0 +1,6 @@
+{
+  "CS2.app": ["games-play", "cs2"],
+  "Prince — Ubisoft Connect.app": ["games-play", "prince"],
+  "Steam — другие игры.app": ["games-play", "steam"],
+  "Dark Souls III.app": ["ds3-play", "play"]
+}

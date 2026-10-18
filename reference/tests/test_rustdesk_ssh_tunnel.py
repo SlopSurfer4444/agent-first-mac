@@ -116,10 +116,10 @@ class TunnelTests(unittest.TestCase):
     def test_admitted_source_callback_holds_guard_without_full_probe(self):
         import sys
         sys.path.insert(0, str(M.ROOT))
-        from lib import workstation_maintenance_delivery as delivery
+        from lib import scoped_source_admission as delivery
         commit = 'a' * 40
         events = []
-        def admission(root, *, full, operation_check):
+        def admission(root, *, full=False, operation_check):
             self.assertFalse(full)
             self.assertEqual(root, M.ROOT)
             events.append('opened')
@@ -130,7 +130,7 @@ class TunnelTests(unittest.TestCase):
             self.assertNotIn('closed', events)
             self.assertTrue(guard())
             return True
-        with patch.object(delivery, 'admitted_source', side_effect=admission), patch.object(M, 'apply', side_effect=operation):
+        with patch.object(delivery, 'observe', side_effect=admission), patch.object(M, 'apply', side_effect=operation):
             self.assertTrue(M.admitted_mutation('apply', commit))
         self.assertEqual(events[-1], 'closed')
 

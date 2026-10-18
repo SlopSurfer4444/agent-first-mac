@@ -35,12 +35,23 @@ from source availability and unit tests.
 
 ## Review the boundaries, not only the happy path
 
-The second 2026-10-18 source snapshot includes affected-source admission for
+The 2026-10-19 review snapshot includes affected-source admission for
 owner-authorized user helpers. Static imports, deferred imports, literal helper
 and data references, and declared dynamic inputs form a conservative closure.
 Unrelated notes or commits should not invalidate an operation; changed affected
 inputs, import shadowing and replaced targets must still be rejected. A source
 check is not owner authorization, root admission or native consent.
+
+The latest source also binds executable entrypoints and their local imports
+before helper effects. Review preloaded modules, import shadowing, changed source
+between observation and use, and bounded child-process settlement rather than
+assuming a recorded source hash proves what executed. Shared command custody and
+launcher file operations are separated from unrelated delivery policy to avoid
+expanding a small operation into the entire historical dependency graph.
+
+Exact opaque data inputs are still held and checked even when their contents are
+not interpreted as executable dependencies. Inspect each caller's declarations:
+excluding dormant history is useful only if consumed inputs remain covered.
 
 Delivery consumers include scheduler, quarantine file delivery, guidance and
 root bundle staging. Their affected-source and exact-target checks must not be

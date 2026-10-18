@@ -3,6 +3,7 @@ from types import SimpleNamespace
 from pathlib import Path
 from unittest.mock import Mock,patch
 from lib import game_operation_readiness as game_ready
+from lib import scoped_source_admission as source_admission
 P=Path(__file__).resolve().parents[1]
 loader=importlib.machinery.SourceFileLoader('ds3_runtime',str(P/'bin/ds3-runtime'))
 spec=importlib.util.spec_from_loader(loader.name,loader); h=importlib.util.module_from_spec(spec);loader.exec_module(h)
@@ -134,14 +135,12 @@ class DS3Tests(unittest.TestCase):
         for ready in (False,1,None):
             report={'verdict':'PASS','gitOnly':True,'scopedCandidateReady':ready}
             bridge=SimpleNamespace(metadata=game_ready.metadata,bound=game_ready.bound,ready=Mock(return_value=report))
-            responses=[b'a'*40,b'main',b'']
-            with patch.object(h.Path,'absolute',return_value=self.control/'bin/ds3-runtime'),patch.object(h,'run',side_effect=responses),patch.object(h,'readiness_bridge',return_value=bridge):
+            with patch.object(h.Path,'absolute',return_value=self.control/'bin/ds3-runtime'),patch.object(source_admission,'check'),patch.object(h,'readiness_bridge',return_value=bridge):
                 with self.assertRaisesRegex(RuntimeError,'scoped_operation_readiness_required'):h.source_gate('a'*40)
     def test_source_drift_after_scoped_readiness_rejects(self):
         bridge=SimpleNamespace(metadata=game_ready.metadata,bound=game_ready.bound,ready=Mock(return_value={'scopedCandidateReady':True}))
-        responses=[b'a'*40,b'main',b'',b'b'*40]
-        with patch.object(h.Path,'absolute',return_value=self.control/'bin/ds3-runtime'),patch.object(h,'run',side_effect=responses),patch.object(h,'readiness_bridge',return_value=bridge):
-            with self.assertRaisesRegex(RuntimeError,'clean_exact_main_required'):h.source_gate('a'*40)
+        with patch.object(h.Path,'absolute',return_value=self.control/'bin/ds3-runtime'),patch.object(source_admission,'check',side_effect=[None,source_admission.SourceError('source_dirty')]),patch.object(h,'readiness_bridge',return_value=bridge):
+            with self.assertRaisesRegex(RuntimeError,'source_dirty'):h.source_gate('a'*40)
     def test_runtime_external_symlink_and_critical_symlink_block(self):
         runtime=self.source/'runtime';(runtime/'outside').symlink_to(self.candidate)
         with self.assertRaisesRegex(RuntimeError,'external_runtime_link'):h.code_tree(runtime)
@@ -197,10 +196,21 @@ class DS3Tests(unittest.TestCase):
         with patch.object(h,'inactive') as inactive,patch.object(h,'run',return_value=b''),patch.object(h.subprocess,'Popen'):
             h.play()
         self.assertTrue(all(call.args[0]==self.root/'runtime' for call in inactive.call_args_list))
-    def test_schema4_owned_policy_drift_still_blocks_stop(self):
+    def test_schema4_unrelated_overlay_policy_drift_does_not_block_stop(self):
         self.schema4_installed();(self.root/'policy-source/overlay-policy.json').write_text('{}')
+        with patch.object(h.subprocess,'run',return_value=subprocess.CompletedProcess([],0,stdout=b'',stderr=b'')) as run:
+            self.assertEqual(h.stop()['state'],'DS3_PREFIX_STOPPED')
+        self.assertEqual(run.call_args_list[0].args[0],[str(self.root/'runtime/engine/bin/wineserver'),'-k'])
+        self.assertEqual(run.call_args_list[1].args[0],[str(self.root/'runtime/engine/bin/wineserver'),'-w'])
+    def test_stop_own_server_drift_still_blocks_before_execution(self):
+        self.schema4_installed();(self.root/'runtime/engine/bin/wineserver').write_bytes(b'foreign server')
         with patch.object(h.subprocess,'run',side_effect=AssertionError('executed')):
-            with self.assertRaisesRegex(RuntimeError,'overlay_policy_identity'):h.stop()
+            with self.assertRaisesRegex(RuntimeError,'installed_server_drift'):h.stop()
+    def test_already_running_skips_history_but_keeps_process_admission(self):
+        self.request.allow_client.return_value={'targetActive':True,'clientActive':True}
+        with patch.object(h,'verify_installed',side_effect=AssertionError('history replay')),patch.object(h,'verify_borderless',side_effect=AssertionError('history replay')),patch.object(h.subprocess,'Popen',side_effect=AssertionError('launch')):
+            self.assertEqual(h.play()['state'],'DS3_ALREADY_RUNNING')
+        self.request.reconcile.assert_called_once();self.request.allow_client.assert_called_once()
     def test_corresponding_source_drift_blocks_before_install(self):
         (self.candidate/'source/src/winemetal/test.c').write_bytes(b'changed')
         with patch.object(h,'source_gate'),patch.object(h,'inactive'):

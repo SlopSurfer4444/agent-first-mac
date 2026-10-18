@@ -1,12 +1,17 @@
 #!/usr/bin/python3
 """Exact user LaunchAgent for RustDesk via the existing strict SSH alias."""
 import sys
+if __name__ == "__main__" and not globals().get("__source_bound__"):
+    import posix
+    posix.execv(sys.executable, [sys.executable, "-I", "-S", "-B",
+        __file__.rsplit("/", 2)[0] + "/lib/scoped_source_admission.py", __file__, "[]", *sys.argv[1:]])
 sys.dont_write_bytecode = True
 sys.pycache_prefix = "/dev/null"
 import argparse
 import json
 import os
 from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import plistlib
 import re
 import socket
@@ -123,7 +128,7 @@ def admitted_mutation(operation, commit):
     need(re.fullmatch('[0-9a-f]{40}', commit or '') is not None, 'invalid_commit')
     import sys
     sys.path.insert(0, str(ROOT))
-    from lib.workstation_maintenance_delivery import admitted_source
+    from lib import scoped_source_admission as source
     result = []
     def mutate(head, *, source_guard):
         need(head == commit, 'source_commit_mismatch')
@@ -131,7 +136,7 @@ def admitted_mutation(operation, commit):
         result.append({'apply': apply, 'rollback': rollback}[operation](source_guard))
         require_guard(source_guard)
         return True
-    admitted_source(ROOT, full=False, operation_check=mutate)
+    source.observe(ROOT, operation_check=mutate)
     need(len(result) == 1, 'source_operation_not_completed')
     return result[0]
 

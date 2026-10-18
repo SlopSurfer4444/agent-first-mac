@@ -22,6 +22,8 @@ names = [
     'test_custody_transactions',
     'test_custody_durable_records',
     'test_scoped_source_admission',
+    'test_scoped_execution',
+    'test_bounded_command',
 ]
 # This single test reads deliberately omitted live hook configuration. Keep it
 # visible as SKIPPED; never synthesize an authority-bearing configuration to pass.

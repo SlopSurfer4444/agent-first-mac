@@ -111,11 +111,12 @@ class DeliveryTests(unittest.TestCase):
         with self.assertRaises(Q.H.OfframpError):
             Q.execute(self.home, "apply", "../outside", admission=lambda f,g:f())
     def test_live_wrapper_holds_source_and_returns_true_callback(self):
-        from lib import workstation_maintenance_delivery as D
+        from lib import scoped_source_admission as D
         calls = []
         canonical = Path(Q.pwd.getpwuid(os.getuid()).pw_dir)/"AIDev/control"
-        def admitted(root, *, full, operation_check=None):
+        def admitted(root, *, full=False, operation_check=None, extra_paths=()):
             self.assertFalse(full, 'unrelated full vendor gate')
+            self.assertIn("manifests/quarantine-boundary-successor.json", extra_paths)
             calls.append("full" if full else "held")
             if operation_check:
                 self.assertIs(operation_check("a" * 40, source_guard=lambda: True), True)
@@ -124,41 +125,36 @@ class DeliveryTests(unittest.TestCase):
             self.assertTrue(source_guard())
             return admission(lambda: {"schema": 1, "status": "INSTALLED"}, lambda: True)
         with patch.object(Q, "ROOT", canonical), patch.object(Q.Path, "cwd", return_value=canonical), \
-             patch.object(D, "admitted_source", admitted), patch.object(Q, "execute", execute), patch("builtins.print"):
+             patch.object(D, "observe", admitted), patch.object(Q, "execute", execute), patch("builtins.print"):
             self.assertEqual(Q.main(["apply"]), 0)
         self.assertEqual(calls, ["held", "execute"])
     def test_source_admission_failure_never_calls_delivery(self):
-        from lib import workstation_maintenance_delivery as D
+        from lib import scoped_source_admission as D
         canonical = Path(Q.pwd.getpwuid(os.getuid()).pw_dir)/"AIDev/control"
         with patch.object(Q, "ROOT", canonical), patch.object(Q.Path, "cwd", return_value=canonical), \
-             patch.object(D, "admitted_source", side_effect=RuntimeError("not ready")), \
+             patch.object(D, "observe", side_effect=RuntimeError("not ready")), \
              patch.object(Q, "execute") as execute, patch("builtins.print"):
             self.assertEqual(Q.main(["apply"]), 1)
             execute.assert_not_called()
 
     def test_connected_held_gate_without_vendor_preserves_unknown_targets(self):
-        from lib import workstation_maintenance_delivery as D
-        from lib import current_doctor_native as N
+        from lib import scoped_source_admission as D
         from types import SimpleNamespace as NS
         canonical = self.home / 'AIDev/control'
         canonical.mkdir(parents=True, mode=0o700, exist_ok=True)
-        doctor = NS(public_report=lambda value, **kwargs: value)
         calls = []
         source_ok = [False]
-        def native(loaded, git_only, *, operation_check):
-            self.assertIs(git_only, True, 'unrelated vendor sentinel requested')
-            self.assertIs(loaded, doctor)
-            calls.append(git_only)
+        def admitted(root, *, full=False, operation_check, extra_paths=()):
+            self.assertIs(full, False, 'unrelated vendor sentinel requested')
+            calls.append(full)
             if not source_ok[0]:
-                raise RuntimeError('source_unadmitted')
+                raise D.SourceError('affected_source_uncommitted')
             self.assertIs(operation_check('a' * 40, source_guard=lambda: True), True)
-            return {'integratedMain': True, 'verdict': 'GIT_ONLY_VALID'}
+            return {'verdict': 'SOURCE_VALID'}
         with patch.object(Q, 'ROOT', canonical), patch.object(Q.Path, 'cwd', return_value=canonical), \
                 patch.object(Q.pwd, 'getpwuid', return_value=NS(pw_dir=str(self.home))), \
                 patch.object(Q, 'sources', return_value=self.images), \
-                patch.object(D.importlib.machinery.SourceFileLoader, 'load_module', return_value=doctor), \
-                patch.object(N, 'native', side_effect=native), \
-                patch.object(N.probe, 'observe', side_effect=AssertionError('vendor launch forbidden')), patch('builtins.print'):
+                patch.object(D, 'observe', side_effect=admitted), patch('builtins.print'):
             with patch.object(Q, 'execute') as execute:
                 self.assertEqual(Q.main(['apply']), 1)
                 execute.assert_not_called()
@@ -169,6 +165,21 @@ class DeliveryTests(unittest.TestCase):
             self.path('profile').write_bytes(self.images['profile'][0])
             self.assertEqual(Q.main(['apply']), 0)
             self.assert_pair(1)
-        self.assertEqual(calls, [True, True, True])
+        self.assertEqual(calls, [False, False, False])
+
+    def test_source_failure_reports_closed_reason_and_one_next_action(self):
+        canonical = Path(Q.pwd.getpwuid(os.getuid()).pw_dir) / "AIDev/control"
+        for reason, expected in (("affected_source_uncommitted", "affected_source_uncommitted"),
+                                 ("private/path/secret", "source_admission_failed")):
+            with self.subTest(reason=reason), patch.object(Q, "ROOT", canonical), \
+                    patch.object(Q.Path, "cwd", return_value=canonical), \
+                    patch.object(Q.source, "observe", side_effect=Q.source.SourceError(reason)), \
+                    patch("builtins.print") as emit, patch.object(Q, "execute") as execute:
+                self.assertEqual(Q.main(["apply"]), 1)
+                result = Q.H.parse(emit.call_args.args[0].encode())
+                self.assertEqual(result["reason"], expected)
+                self.assertIsInstance(result["nextAction"], str)
+                self.assertNotIn("private/path", emit.call_args.args[0])
+                execute.assert_not_called()
 
 if __name__ == "__main__": unittest.main()

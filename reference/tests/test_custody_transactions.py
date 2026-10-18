@@ -52,7 +52,7 @@ class TransactionTests(unittest.TestCase):
                     self.assertIn(custody.status()['outstanding'], (0, 1))
                 self.assertEqual(self.snapshot(root), before, 'status mutated interrupted state')
                 with self.open(root) as custody:
-                    expected = 0 if point in ('record-written', 'transaction-prepared') else 1
+                    expected = 0 if point == 'transaction-prepared' else 1
                     self.assertEqual(custody.status()['outstanding'], expected)
                     self.assertNotIn(C.TRANSACTION, os.listdir(custody.directory.descriptor))
                     # Complete transactions never leave payload aliases/hard links.
@@ -170,6 +170,100 @@ class TransactionTests(unittest.TestCase):
             with self.assertRaisesRegex(C.CustodyError, 'fixture_custody_absent'):
                 self.open(root, create=False, reconcile=True)
             self.assertEqual(list(Path(root).iterdir()), [])
+
+    def test_repeated_known_prelaunch_interruptions_retry_without_capacity_debt(self):
+        with tempfile.TemporaryDirectory(dir='/private/tmp') as root:
+            with self.open(root):
+                pass
+            for _ in range(C.MAX_PREPARATIONS * 2):
+                with self.assertRaisesRegex(RuntimeError, 'crash'):
+                    with self.open(root, checkpoint=self.crash('record-written')) as custody:
+                        custody.reserve()
+            with self.open(root) as custody:
+                slot = custody.reserve()
+                self.assertEqual(slot, 0)
+                report = custody.status()
+                self.assertEqual(report['outstanding'], 1)
+                self.assertIsNone(report['capacityReason'])
+                self.assertEqual(report['preparationCount'], 0)
+                self.assertEqual(report['pendingMetadataCount'], 0)
+
+    def test_unknown_preparation_capacity_debt_is_visible_and_preserved(self):
+        with tempfile.TemporaryDirectory(dir='/private/tmp') as root:
+            with self.open(root):
+                pass
+            directory = Path(root) / C.NAMESPACE
+            for index in range(C.MAX_PREPARATIONS * 2):
+                (directory / ('.prepare-%032x.payload' % index)).write_bytes(b'unknown')
+            before = self.snapshot(root)
+            with self.open(root, create=False) as custody:
+                report = custody.status()
+                self.assertEqual(report['capacityReason'], 'fixture_preparation_capacity')
+                self.assertEqual(report['preparationReason'], 'fixture_preparation_recovery_required')
+                self.assertEqual(report['preparationCount'], C.MAX_PREPARATIONS * 2)
+                self.assertEqual(report['pendingMetadataCount'], C.MAX_PREPARATIONS * 2)
+                self.assertEqual(report['retainedBytesObserved'], 7 * C.MAX_PREPARATIONS * 2)
+                self.assertEqual(report['entriesObserved'], C.MAX_PREPARATIONS * 2)
+                self.assertEqual(report['nextAction'], 'preserve-preparations-for-bounded-recovery')
+            with self.open(root) as custody, self.assertRaisesRegex(C.CustodyError, 'fixture_preparation_capacity'):
+                custody.reserve()
+            self.assertEqual(self.snapshot(root), before)
+
+    def test_status_remains_available_above_preparation_allocation_limit(self):
+        with tempfile.TemporaryDirectory(dir='/private/tmp') as root:
+            with self.open(root):
+                pass
+            directory = Path(root) / C.NAMESPACE
+            for index in range(C.MAX_PREPARATIONS * 2 + 1):
+                (directory / ('.prepare-%032x.payload' % index)).write_bytes(b'foreign bytes')
+            before = self.snapshot(root)
+            with self.open(root, create=False) as custody:
+                report = custody.status()
+                self.assertEqual(report['preparationCount'], 65)
+                self.assertEqual(report['retainedBytesObserved'], 65 * len(b'foreign bytes'))
+                self.assertEqual(report['capacityReason'], 'fixture_preparation_capacity')
+                self.assertEqual(report['nextAction'], 'preserve-preparations-for-bounded-recovery')
+            with self.assertRaisesRegex(C.CustodyError, 'fixture_preparation_capacity'):
+                self.open(root)
+            self.assertEqual(self.snapshot(root), before)
+
+    def test_publication_requires_room_for_both_preparation_names(self):
+        with tempfile.TemporaryDirectory(dir='/private/tmp') as root:
+            with self.open(root):
+                pass
+            directory = Path(root) / C.NAMESPACE
+            for index in range(C.MAX_PREPARATIONS * 2 - 1):
+                (directory / ('.prepare-%032x.payload' % index)).write_bytes(b'unknown')
+            before = self.snapshot(root)
+            with self.open(root) as custody, self.assertRaisesRegex(C.CustodyError, 'fixture_preparation_capacity'):
+                custody.reserve()
+            with self.open(root, create=False) as custody:
+                self.assertEqual(custody.status()['preparationCount'], 63)
+                self.assertEqual(custody.status()['capacityReason'], 'fixture_preparation_capacity')
+            self.assertEqual(self.snapshot(root), before)
+
+    def test_same_process_reservations_are_not_auto_retired(self):
+        with tempfile.TemporaryDirectory(dir='/private/tmp') as root:
+            with self.open(root) as custody:
+                self.assertEqual(custody.reserve(), 0)
+                self.assertEqual(custody.reserve(), 1)
+                self.assertEqual(custody.status()['outstanding'], 2)
+
+    def test_unknown_root_or_unsettled_empty_reservation_is_never_auto_retired(self):
+        for case in ('unknown-root', 'unsettled'):
+            with self.subTest(case=case), tempfile.TemporaryDirectory(dir='/private/tmp') as root:
+                with self.open(root) as custody:
+                    slot = custody.reserve()
+                    if case == 'unknown-root':
+                        foreign = Path(root) / custody.leaf(custody.records()[slot])
+                        foreign.mkdir(mode=0o700)
+                        (foreign / 'owner-file').write_bytes(b'preserve')
+                    else:
+                        custody.update(slot, settled=False)
+                before = self.snapshot(root)
+                with self.open(root) as custody, self.assertRaises(C.CustodyError):
+                    custody.reserve()
+                self.assertEqual(self.snapshot(root), before)
 
     def test_unknown_transaction_fields_preserved_without_mutation(self):
         with tempfile.TemporaryDirectory(dir='/private/tmp') as root:

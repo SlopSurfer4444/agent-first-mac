@@ -186,10 +186,11 @@ class AdapterTests(unittest.TestCase):
     def test_native_live_adapter_injected_source_acceptance_observes_dependencies(self):
         control = self.home / "AIDev/control"
         observed = []
-        def observe(root, operation, commit, *, checks, target_guard):
+        def observe(root, operation, commit, *, checks, target_guard, extra_paths):
             self.assertEqual(root, control)
             self.assertEqual(operation, "harness-disable")
             self.assertEqual(commit, "a" * 40)
+            self.assertEqual(extra_paths, ("manifests/harness-hook-retirement.json", "manifests/sessionstart-exposure.json"))
             self.assertTrue(target_guard())
             for name, callback in checks.items():
                 self.assertTrue(callback())
@@ -201,7 +202,7 @@ class AdapterTests(unittest.TestCase):
                 patch("lib.operation_readiness.require_operation_ready", side_effect=AssertionError("no full doctor")):
             result = h.execute_live("disable", "a" * 40)
         self.assertEqual(result["status"], "APPLIED")
-        self.assertEqual(set(observed), {"owned-target", "recovery", "native-consent"})
+        self.assertEqual(set(observed), {"owned-target", "recovery"})
         self.assertEqual(self.config.read_text(), 'native-trust = "owner-state"\n')
 
     def test_native_live_adapter_source_refusal_preserves_target(self):
@@ -233,7 +234,7 @@ class AdapterTests(unittest.TestCase):
                 self.assertEqual(result["status"], "APPLIED")
                 self.assertEqual(self.config.read_bytes() if self.config.exists() else None, content)
 
-    def test_live_absent_native_config_appearing_during_admission_refuses(self):
+    def test_live_absent_unrelated_config_appearing_during_admission_is_preserved(self):
         self.config.unlink()
         control = self.home / "AIDev/control"
         def change(*args, **kwargs):
@@ -241,9 +242,8 @@ class AdapterTests(unittest.TestCase):
         with patch.object(h, "ROOT", control), patch.object(Path, "home", return_value=self.home), \
                 patch.object(Path, "cwd", return_value=control), patch.object(h, "_sources", return_value=(MANIFEST, HISTORICAL)), \
                 patch("lib.user_operation_readiness.require_scoped_operation_ready", side_effect=change):
-            with self.assertRaisesRegex(h.OfframpError, "native_state_drift"):
-                h.execute_live("disable", "a" * 40)
-        self.assertEqual(self.target.read_bytes(), self.before)
+            self.assertEqual(h.execute_live("disable", "a" * 40)["status"], "APPLIED")
+        self.assertNotEqual(self.target.read_bytes(), self.before)
         self.assertEqual(self.config.read_bytes(), b"owner-new-state")
 
     def test_native_snapshot_does_not_follow_dangling_symlink(self):
@@ -328,17 +328,46 @@ class AdapterTests(unittest.TestCase):
             self.run_action("disable", operation=None)
         self.assertFalse(self.home.joinpath(*h.RECOVERY, "hooks-2").exists())
 
-    def test_native_live_adapter_native_drift_during_admission_preserves_hooks(self):
+    def test_live_adapter_unrelated_config_drift_does_not_veto_hook_removal(self):
         control = self.home / "AIDev/control"
         def change(*args, **kwargs):
             self.config.write_text('native-trust = "third-choice"\n')
         with patch.object(h, "ROOT", control), patch.object(Path, "home", return_value=self.home), \
                 patch.object(Path, "cwd", return_value=control), patch.object(h, "_sources", return_value=(MANIFEST, HISTORICAL)), \
                 patch("lib.user_operation_readiness.require_scoped_operation_ready", side_effect=change):
-            with self.assertRaisesRegex(h.OfframpError, "native_state_drift"):
-                h.execute_live("disable", "a" * 40)
-        self.assertEqual(self.target.read_bytes(), self.before)
+            self.assertEqual(h.execute_live("disable", "a" * 40)["status"], "APPLIED")
+        self.assertNotEqual(self.target.read_bytes(), self.before)
         self.assertEqual(self.config.read_text(), 'native-trust = "third-choice"\n')
+
+    def test_live_plan_status_and_disable_ignore_cwd_and_unrelated_config_symlink(self):
+        control = self.home / "AIDev/control"
+        self.config.unlink()
+        self.config.symlink_to(self.home / "private-missing-config")
+        def observed(*args, **kwargs):
+            self.assertEqual(set(kwargs["checks"]), {"owned-target", "recovery"})
+            self.assertTrue(kwargs["target_guard"]())
+            self.assertTrue(all(check() for check in kwargs["checks"].values()))
+        with patch.object(h, "ROOT", control), patch.object(Path, "home", return_value=self.home), \
+                patch.object(Path, "cwd", return_value=self.home), \
+                patch.object(h, "_sources", return_value=(MANIFEST, HISTORICAL)), \
+                patch.object(h, "native_snapshot", side_effect=AssertionError("unrelated config read")), \
+                patch("lib.user_operation_readiness.require_scoped_operation_ready", side_effect=observed):
+            self.assertTrue(h.execute_live("plan", "a" * 40)["readOnly"])
+            self.assertTrue(h.execute_live("status", "a" * 40)["readOnly"])
+            self.assertEqual(h.execute_live("disable", "a" * 40)["status"], "APPLIED")
+        self.assertTrue(self.config.is_symlink())
+        self.assertFalse(self.config.exists())
+
+    def test_live_hooks_symlink_is_still_refused_from_another_cwd(self):
+        control = self.home / "AIDev/control"
+        self.target.rename(self.codex / "owner-hooks.json")
+        self.target.symlink_to(self.codex / "owner-hooks.json")
+        with patch.object(h, "ROOT", control), patch.object(Path, "home", return_value=self.home), \
+                patch.object(Path, "cwd", return_value=self.home), \
+                patch.object(h, "_sources", return_value=(MANIFEST, HISTORICAL)):
+            with self.assertRaises(OSError):
+                h.execute_live("disable", "a" * 40)
+        self.assertEqual((self.codex / "owner-hooks.json").read_bytes(), self.before)
 
     def test_durable_preimages_private_and_second_operation_identity(self):
         self.run_action("disable", operation="first")
@@ -627,6 +656,27 @@ class AdapterTests(unittest.TestCase):
         self.assertNotIn("private-data", "".join(emitted))
         with self.assertRaises(h.OfframpError):
             h.execute_fixture(Path.home(), "status")
+
+    def test_cli_source_refusal_keeps_closed_reason_scope_and_next_action(self):
+        from lib import scoped_source_admission as source
+        control = self.home / "AIDev/control"
+        for reason, public in (("affected_source_drift", "affected_source_drift"),
+                               ("private/path/not-a-public-code", "source_admission_failed")):
+            emitted = []
+            with self.subTest(reason=reason), patch.object(h, "ROOT", control), \
+                    patch.object(Path, "home", return_value=self.home), \
+                    patch.object(h, "_sources", return_value=(MANIFEST, HISTORICAL)), \
+                    patch("lib.user_operation_readiness.require_scoped_operation_ready",
+                          side_effect=source.SourceError(reason)):
+                self.assertEqual(h.main(["disable", "--live-commit", "a" * 40,
+                                         "--operation", "source-error-" + public.replace("_", "-")],
+                                        emit=emitted.append), 1)
+            report = json.loads(emitted[0])
+            self.assertEqual(report["reason"], public)
+            self.assertEqual(report["affectedScope"], "affected-user-helper-source")
+            self.assertEqual(report["nextAction"], "review_affected_source_and_retry")
+            self.assertNotIn("private/path", emitted[0])
+            self.assertEqual(self.target.read_bytes(), self.before)
 
 
 if __name__ == "__main__":

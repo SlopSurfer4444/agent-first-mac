@@ -13,14 +13,15 @@ import plistlib
 import pwd
 import re
 import stat
-import subprocess
 import ctypes
 import errno
-import selectors
-import signal
-import time
 import copy
 import resource
+if __package__ == "lib":
+    from lib.bounded_command import bounded
+else:
+    # The installed cycle loads this existing module from its lib search path.
+    from bounded_command import bounded
 
 LABEL = "com.aidev.workstation-maintenance"
 PLIST = LABEL + ".plist"
@@ -457,61 +458,6 @@ class Schedule:
         return output("remove", "REMOVED", phase="removed")
 
 
-def bounded(command, *, timeout, limit=32768):
-    """Private native command custody; retained output and group lifetime bounded."""
-    process, selector, chunks, count = None, selectors.DefaultSelector(), {"out": [], "err": []}, 0
-    try:
-        process = subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE, start_new_session=True,
-            env={"PATH": "/usr/bin:/bin:/usr/sbin:/sbin"})
-        for pipe, key in ((process.stdout, "out"), (process.stderr, "err")):
-            os.set_blocking(pipe.fileno(), False)
-            selector.register(pipe, selectors.EVENT_READ, key)
-        deadline = time.monotonic() + timeout
-        while selector.get_map() or process.poll() is None:
-            need(time.monotonic() < deadline, "child_timeout")
-            for entry, _ in selector.select(min(0.05, max(0, deadline - time.monotonic()))):
-                raw = os.read(entry.fileobj.fileno(), min(4096, limit + 1 - count))
-                if not raw:
-                    selector.unregister(entry.fileobj)
-                else:
-                    count += len(raw)
-                    need(count <= limit, "child_output_limit")
-                    chunks[entry.data].append(raw)
-        try:
-            os.killpg(process.pid, 0)
-        except ProcessLookupError:
-            return process.returncode, b"".join(chunks["out"]), b"".join(chunks["err"]), True
-        raise Fault("descendant_still_running")
-    except (OSError, Fault):
-        if process is not None:
-            for action in (signal.SIGTERM, signal.SIGKILL):
-                try: os.killpg(process.pid, action)
-                except ProcessLookupError: break
-                except OSError: return None, b"", b"", False
-                deadline = time.monotonic() + 1
-                while time.monotonic() < deadline:
-                    process.poll()
-                    try: os.killpg(process.pid, 0)
-                    except ProcessLookupError:
-                        return None, b"", b"", process.poll() is not None
-                    except OSError:
-                        return None, b"", b"", False
-                    time.sleep(0.02)
-            try:
-                os.killpg(process.pid, 0)
-            except ProcessLookupError:
-                return None, b"", b"", process.poll() is not None
-            except OSError:
-                return None, b"", b"", False
-        return None, b"", b"", False
-    finally:
-        selector.close()
-        if process is not None:
-            if process.stdout is not None: process.stdout.close()
-            if process.stderr is not None: process.stderr.close()
-
-
 def runner(operation, home):
     uid = os.getuid()
     domain = "gui/" + str(uid)
@@ -539,29 +485,17 @@ def runner(operation, home):
 
 
 def admitted_source(root, *, full, operation_check=None):
-    need(Path(root) == Path(pwd.getpwuid(os.getuid()).pw_dir) / "AIDev/control" and Path(root).resolve() == Path(root), "canonical_source_required")
-    need(full is False, "explicit_full_diagnostic_separate_from_user_delivery")
-    import sys
-    sys.path.insert(0, str(root))
     from lib import scoped_source_admission as source
-    if operation_check is None:
-        def operation_check(head, *, source_guard):
-            return source_guard()
-    observed = {}
-    def run(head, *, source_guard):
-        need(operation_check(head, source_guard=source_guard) is True, "source_operation_unobserved")
-        observed.update(scope="affected-user-helper-source", verdict="SOURCE_VALID",
-                        commit=head, rootAuthorityGranted=False)
-        return True
-    source.run(Path(root), run, entrypoints=source.callable_paths(Path(root), (operation_check,)))
-    return observed
+    return source.observe(root, full=full, operation_check=operation_check,
+                          extra_paths=SOURCE_FILES)
 
 
 def native_schedule(operation):
     need(operation in {"plan", "install", "remove", "recover", "status"}, "fixed_operation")
     uid, home = os.getuid(), Path(pwd.getpwuid(os.getuid()).pw_dir)
     store, schedule = None, None
-    try:
+    def perform(source_guard=None):
+        nonlocal store, schedule
         need(uid > 0 and ROOT == home / "AIDev/control", "canonical_source_required")
         D = importlib.machinery.SourceFileLoader("maintenance_schedule_store", str(ROOT / "bin/workstation-drift-snapshot")).load_module()
         try:
@@ -595,23 +529,31 @@ def native_schedule(operation):
             phase = schedule.row["phase"]
             state = "INSTALLED" if phase == "installed" and schedule.observe() == "PRESENT" else "REMOVED" if phase == "removed" and schedule.observe() == "ABSENT" else "RECOVERY_REQUIRED"
             return output(operation, state, phase=phase)
+        need(callable(source_guard) and source_guard() is True, "current_source_drift")
+        schedule.source_guard = source_guard
+        value = getattr(schedule, operation)()
+        need(source_guard() is True, "current_source_drift")
+        value["operation"] = operation
+        return value
+    try:
+        if operation in {"plan", "status"}:
+            return perform()
         result = []
         def mutation(head, *, source_guard):
             need(callable(source_guard) and source_guard() is True, "current_source_drift")
-            schedule.source_guard = source_guard
-            value = getattr(schedule, operation)()
-            need(source_guard() is True, "current_source_drift")
-            value["operation"] = operation
-            result.append(value)
+            result.append(perform(source_guard))
             return True
-        # Accepted-current source custody spans the lifecycle mutation. The
-        # schedule checks its exact plist/job/recovery state; unrelated vendor
-        # schema capability is not a prerequisite for this launchd lifecycle.
+        # Hold actual catalog inputs BEFORE Schedule consumes their bytes or
+        # creates private state, then preserve the same guard through mutation.
         admitted_source(ROOT, full=False, operation_check=mutation)
         need(len(result) == 1, "source_unadmitted")
         return result[0]
     except Exception as error:
-        return output(operation, "BUSY" if str(error) == "busy" else "RECOVERY_REQUIRED" if schedule and schedule.row else "UNAVAILABLE", phase=schedule.row["phase"] if schedule and schedule.row else None)
+        from lib import scoped_source_admission as source
+        result = output(operation, "BUSY" if str(error) == "busy" else "RECOVERY_REQUIRED" if schedule and schedule.row else "UNAVAILABLE", phase=schedule.row["phase"] if schedule and schedule.row else None)
+        if isinstance(error, source.SourceError):
+            result.update(source.public_failure(error))
+        return result
     finally:
         if schedule is not None: schedule.close()
         if store is not None: store.close()
@@ -757,9 +699,12 @@ def scheduled_native(D, *, build_report, now, source_gate=None, notifier=notify)
         else:
             source_gate(admitted_operation)
         need("observed" in context, "source_unadmitted")
-    except Exception:
+    except Exception as error:
+        from lib import scoped_source_admission as source
         result = output("scheduled", "UNAVAILABLE")
         result.update(sourceAdmission=False, runSourceAccepted=False, installedHealthChecked=False)
+        if isinstance(error, source.SourceError):
+            result.update(source.public_failure(error))
         return result
     observed = context["observed"]
     if holder and holder[0]["observation"] == observed:

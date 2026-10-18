@@ -1,8 +1,14 @@
 #!/usr/bin/python3 -I -B
 """Read-only successor root component health; no arbitrary command or path."""
 import sys
+if __name__ == '__main__' and not globals().get('__source_bound__'):
+    import posix
+    posix.execv(sys.executable, [sys.executable, '-I', '-S', '-B',
+        __file__.rsplit('/', 2)[0] + '/lib/scoped_source_admission.py',
+        __file__, '[]', *sys.argv[1:]])
 from pathlib import Path
 sys.dont_write_bytecode = True
+sys.pycache_prefix = '/dev/null'
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from lib.root_runtime_health import main
 if __name__ == "__main__":

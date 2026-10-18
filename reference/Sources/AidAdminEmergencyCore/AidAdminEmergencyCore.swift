@@ -366,16 +366,11 @@ public final class EmergencyOwnerOrchestrator {
         }
         do {
             try clearTimestamp()
-            let disabledDoctor = try doctorResult()
-            guard disabledDoctor.status != 0 else {
-                throw EmergencyFailure.rejected(original + "_rollback_failed")
-            }
-        } catch let failure as EmergencyFailure
-            where failure.description.hasSuffix("_rollback_failed") {
-            throw failure
         } catch {
             throw EmergencyFailure.rejected(original + "_rollback_failed")
         }
+        // The authenticated disable transaction verified exact grant absence.
+        // An enabled-only broker doctor cannot attest revocation and may be broken.
         throw EmergencyFailure.rejected(original + "_rolled_back")
     }
 
@@ -448,7 +443,7 @@ private struct TrustedEmergencyParents {
     let agentConfiguration: TrustedEmergencyDirectory
     let libexec: TrustedEmergencyDirectory?
     let audit: TrustedEmergencyDirectory?
-    let staging: TrustedEmergencyDirectory
+    let staging: TrustedEmergencyDirectory?
     let operationRoot: TrustedEmergencyDirectory
     let revocationOnly: Bool
 }
@@ -484,9 +479,13 @@ public final class EmergencyTransaction {
     public static let auditPath = "/var/log/agent-first-mac/aid-admin"
     public static let stagingPath = "/var/db/agent-first-mac/staging"
     public static let operationRootPath = "/var/db/agent-first-mac"
-    public static let journalPath = stagingPath + "/emergency-operation.json"
+    // Revocation must not depend on the apply staging directory. The existing
+    // operation root also holds the installer/emergency exclusion lease.
+    public static let journalPath = operationRootPath + "/emergency-operation.json"
     public static let journalTemporaryPath = journalPath + ".new"
     public static let operationPath = stagingPath + "/operation.json"
+    private static let legacyJournalPath = stagingPath + "/emergency-operation.json"
+    private static let legacyJournalTemporaryPath = legacyJournalPath + ".new"
 
     public static let binarySHA256 = EmergencyArtifactExpectations.production.binarySHA256
     public static let binarySize = EmergencyArtifactExpectations.production.binarySize
@@ -521,6 +520,10 @@ public final class EmergencyTransaction {
         if try reconcileInterrupted(parents) {
             return "EMERGENCY_DISABLE_TRANSACTION_COMMITTED"
         }
+        if try !exists(Self.sudoersPath, parents) {
+            try validateDisabledState(parents)
+            return "EMERGENCY_DISABLE_ALREADY_DISABLED"
+        }
         try validateEnabledState(parents)
         try beginJournal(action: "disable", sudoers: Self.sudoersPath, parents)
         do {
@@ -547,9 +550,11 @@ public final class EmergencyTransaction {
         try validateContext()
         let parents = try openTrustedParents()
         let lease = try acquireLease(".emergency.lock", parents)
+        defer { withExtendedLifetime(lease) {} }
+        try requireNoLegacyEmergencyJournal(parents)
         _ = try reconcileInterrupted(parents)
         let applyLease = try acquireLease(".operation.lock", parents)
-        defer { withExtendedLifetime((lease, applyLease)) {} }
+        defer { withExtendedLifetime(applyLease) {} }
         try requireSettledApply(parents)
         try validateDisabledState(parents)
         try validateSudoers(Self.disabledSudoersPath, parents)
@@ -612,6 +617,7 @@ public final class EmergencyTransaction {
         let parents = try openTrustedParents()
         let lease = try acquireLease(".emergency.lock", parents)
         defer { withExtendedLifetime(lease) {} }
+        try requireNoLegacyEmergencyJournal(parents)
         _ = try reconcileInterrupted(parents)
         try validateDisabledState(parents)
         try validateSudoers(Self.disabledSudoersPath, parents)
@@ -674,6 +680,16 @@ public final class EmergencyTransaction {
               (["complete", "rollback_verified"].contains(phase) ||
                (schema.intValue == 2 && phase == "resumed")) else {
             throw EmergencyFailure.rejected("emergency_apply_unresolved")
+        }
+    }
+
+    private func requireNoLegacyEmergencyJournal(_ parents: TrustedEmergencyParents) throws {
+        // Do not infer settlement, migrate, or delete records from the previous
+        // layout. Revocation needs only the exact grant; regrant/resume cannot
+        // ignore retained legacy recovery ownership.
+        for path in [Self.legacyJournalPath, Self.legacyJournalTemporaryPath] {
+            let present = try exists(path, parents)
+            try require(!present, "emergency_legacy_journal_unresolved")
         }
     }
 
@@ -898,7 +914,8 @@ public final class EmergencyTransaction {
                     "attestation_sudoers_binding")
         guard let audit = parents.audit else { throw EmergencyFailure.rejected("recovery_audit_missing") }
         try revalidateDirectory(audit)
-        try revalidateDirectory(parents.staging)
+        guard let staging = parents.staging else { throw EmergencyFailure.rejected("recovery_staging_missing") }
+        try revalidateDirectory(staging)
     }
 
     private func readExpectedSudoers(
@@ -1099,7 +1116,7 @@ public final class EmergencyTransaction {
             agentConfiguration: try openTrustedDirectory("/etc/agent-first-mac", mode: 0o755),
             libexec: revocationOnly ? nil : try openTrustedDirectory("/usr/local/libexec", mode: 0o755),
             audit: revocationOnly ? nil : try openTrustedDirectory(Self.auditPath, mode: 0o700),
-            staging: try openTrustedDirectory(Self.stagingPath, mode: 0o700),
+            staging: revocationOnly ? nil : try openTrustedDirectory(Self.stagingPath, mode: 0o700),
             operationRoot: try openTrustedDirectory(Self.operationRootPath, mode: 0o755),
             revocationOnly: revocationOnly)
     }
@@ -1171,11 +1188,16 @@ public final class EmergencyTransaction {
         case Self.disabledSudoersPath:
             return (parents.sudoers, "agent-first-mac-aid-admin.disabled")
         case Self.journalPath:
-            return (parents.staging, "emergency-operation.json")
+            return (parents.operationRoot, "emergency-operation.json")
         case Self.journalTemporaryPath:
-            return (parents.staging, "emergency-operation.json.new")
+            return (parents.operationRoot, "emergency-operation.json.new")
+        case Self.legacyJournalPath, Self.legacyJournalTemporaryPath:
+            guard let staging = parents.staging else { throw EmergencyFailure.rejected("recovery_staging_missing") }
+            return (staging, logical == Self.legacyJournalPath ?
+                    "emergency-operation.json" : "emergency-operation.json.new")
         case Self.operationPath:
-            return (parents.staging, "operation.json")
+            guard let staging = parents.staging else { throw EmergencyFailure.rejected("recovery_staging_missing") }
+            return (staging, "operation.json")
         default:
             throw EmergencyFailure.rejected("fixed_path_not_allowed")
         }

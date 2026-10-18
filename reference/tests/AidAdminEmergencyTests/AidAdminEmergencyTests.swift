@@ -745,7 +745,8 @@ private struct Suite {
                            "broken_runtime_reenabled")
             }
         }
-        for directory in [EmergencyTransaction.auditPath, "/usr/local/libexec"] {
+        for directory in [EmergencyTransaction.auditPath, "/usr/local/libexec",
+                          EmergencyTransaction.stagingPath] {
             let fixture = try Fixture()
             try FileManager.default.moveItem(at: fixture.physical(directory),
                 to: fixture.physical(directory + ".retained"))
@@ -766,6 +767,128 @@ private struct Suite {
         }
     }
 
+    func independentRevocationStaging() throws {
+        for damage in ["missing", "mode", "symlink", "file"] {
+            let fixture = try Fixture()
+            let staging = EmergencyTransaction.stagingPath
+            switch damage {
+            case "missing": try FileManager.default.moveItem(at: fixture.physical(staging),
+                to: fixture.physical(staging + ".retained"))
+            case "mode": try fixture.directory(staging, 0o777)
+            case "symlink": try fixture.replaceDirectoryWithSymlink(staging)
+            default: try fixture.replaceDirectoryWithFile(staging)
+            }
+            fixture.hooks.failStep = "sudoers-moved"
+            _ = try expectThrows { _ = try fixture.transaction().disable() }
+            try expect(!fixture.physical(EmergencyTransaction.sudoersPath).exists &&
+                       fixture.physical(EmergencyTransaction.journalPath).isFile)
+            fixture.hooks.failStep = nil
+            _ = try fixture.transaction().disable()
+            let repeated = try fixture.transaction().disable()
+            try expect(repeated == "EMERGENCY_DISABLE_ALREADY_DISABLED" && fixture.disabledState() &&
+                       fixture.runner.calls.isEmpty, "staging_damage_blocks_revocation")
+            _ = try expectThrows { _ = try fixture.transaction().recover() }
+            var called = false
+            _ = try expectThrows {
+                _ = try fixture.transaction().resume(commit: String(repeating: "a", count: 40)) { _ in
+                    called = true
+                    return "OPERATION_RESUMED_DISABLED"
+                }
+            }
+            try expect(!called && fixture.disabledState(), "staging_damage_permits_regrant")
+        }
+        let busy = try Fixture()
+        let lock = busy.physical(EmergencyTransaction.operationRootPath)
+            .appendingPathComponent(".emergency.lock")
+        let fd = open(lock.path, O_RDWR | O_CREAT | O_EXCL, 0o600)
+        try expect(fd >= 0 && flock(fd, LOCK_EX | LOCK_NB) == 0, "fixture_installer_lease")
+        defer { Darwin.close(fd) }
+        let child = try EmergencyProcessRunner().run(executable: fixtureExecutablePath(),
+            arguments: ["__emergency-fixture", busy.root.path, "disable", "none"],
+            environment: EmergencyTransaction.cleanEnvironment)
+        try expect(child.status == 74 && child.output == "emergency_busy" && busy.enabledState(),
+                   "revocation_bypassed_installer_lease")
+    }
+
+    func legacyEmergencyJournalPreservation() throws {
+        for suffix in ["", ".new"] {
+            for kind in ["file", "symlink", "directory", "new-journal-collision"] {
+                let fixture = try Fixture()
+                let legacy = EmergencyTransaction.stagingPath + "/emergency-operation.json" + suffix
+                let bytes = Data("legacy-unresolved-record".utf8)
+                if kind == "directory" { try fixture.directory(legacy, 0o700) }
+                else {
+                    try fixture.write(legacy, bytes, 0o600)
+                    if kind == "symlink" { try fixture.replaceWithSymlink(legacy) }
+                }
+                if kind == "new-journal-collision" { fixture.hooks.failStep = "marker-created" }
+                if kind == "new-journal-collision" {
+                    _ = try expectThrows { _ = try fixture.transaction().disable() }
+                    fixture.hooks.failStep = nil
+                } else { _ = try fixture.transaction().disable() }
+                let recovery = try expectThrows { _ = try fixture.transaction().recover() }
+                var called = false
+                let resume = try expectThrows {
+                    _ = try fixture.transaction().resume(commit: String(repeating: "a", count: 40)) { _ in
+                        called = true
+                        return "OPERATION_RESUMED_DISABLED"
+                    }
+                }
+                try expect(recovery == "emergency_legacy_journal_unresolved" &&
+                           resume == recovery && !called && fixture.disabledState())
+                try expect(fixture.physical(legacy).exists, "legacy_record_removed")
+                if kind == "file" || kind == "new-journal-collision" {
+                    let retained = try Data(contentsOf: fixture.physical(legacy))
+                    try expect(retained == bytes, "legacy_record_changed")
+                }
+                if kind == "new-journal-collision" {
+                    try expect(fixture.physical(EmergencyTransaction.journalPath).isFile,
+                               "new_record_reconciled_before_legacy_refusal")
+                }
+            }
+        }
+    }
+
+    func exactDisabledNoOp() throws {
+        let fixture = try Fixture(disabled: true)
+        let paths = [EmergencyTransaction.disabledSudoersPath, EmergencyTransaction.markerPath]
+        var before: [stat] = []
+        for path in paths {
+            var facts = stat()
+            try expect(lstat(fixture.physical(path).path, &facts) == 0)
+            before.append(facts)
+        }
+        for _ in 0..<2 {
+            let result = try fixture.transaction().disable()
+            try expect(result == "EMERGENCY_DISABLE_ALREADY_DISABLED")
+        }
+        for (index, path) in paths.enumerated() {
+            var facts = stat()
+            try expect(lstat(fixture.physical(path).path, &facts) == 0 &&
+                       facts.st_ino == before[index].st_ino && facts.st_mode == before[index].st_mode &&
+                       facts.st_mtimespec.tv_sec == before[index].st_mtimespec.tv_sec &&
+                       facts.st_mtimespec.tv_nsec == before[index].st_mtimespec.tv_nsec)
+        }
+        try expect(!fixture.physical(EmergencyTransaction.journalPath).exists &&
+                   !fixture.physical(EmergencyTransaction.journalTemporaryPath).exists &&
+                   fixture.runner.calls.isEmpty)
+        for path in paths {
+            for damage in ["bytes", "mode", "missing", "symlink"] {
+                let unknown = try Fixture(disabled: true)
+                switch damage {
+                case "bytes": try unknown.mutate(path, data: Data("unknown".utf8))
+                case "mode": try unknown.mutate(path, mode: 0o600)
+                case "symlink": try unknown.replaceWithSymlink(path)
+                default: try FileManager.default.removeItem(at: unknown.physical(path))
+                }
+                _ = try expectThrows { _ = try unknown.transaction().disable() }
+                try expect(!unknown.physical(EmergencyTransaction.sudoersPath).exists &&
+                           !unknown.physical(EmergencyTransaction.journalPath).exists,
+                           "unknown_disabled_state_mutated")
+            }
+        }
+    }
+
     func unexpectedStateMatrix() throws {
         let both = try Fixture()
         try both.write(EmergencyTransaction.disabledSudoersPath,
@@ -777,7 +900,9 @@ private struct Suite {
         let enabledRecover = try Fixture()
         _ = try expectThrows { _ = try enabledRecover.transaction().recover() }
         let disabledDisable = try Fixture(disabled: true)
-        _ = try expectThrows { _ = try disabledDisable.transaction().disable() }
+        let repeated = try disabledDisable.transaction().disable()
+        try expect(repeated == "EMERGENCY_DISABLE_ALREADY_DISABLED" &&
+                   disabledDisable.disabledState() && disabledDisable.runner.calls.isEmpty)
     }
 
     func disablePartialFailureRollbackMatrix() throws {
@@ -911,9 +1036,9 @@ private struct Suite {
             try symlink.replaceDirectoryWithSymlink(logical)
             _ = try expectThrows { _ = try symlink.transaction().disable() }
         }
-        for logical in [EmergencyTransaction.stagingPath] {
+        for logical in [EmergencyTransaction.operationRootPath] {
             let writable = try Fixture()
-            try writable.directory(logical, 0o755)
+            try writable.directory(logical, 0o777)
             _ = try expectThrows { _ = try writable.transaction().disable() }
         }
         let racingMode = try Fixture()
@@ -1188,7 +1313,6 @@ private struct Suite {
             call(["-n", "/usr/local/libexec/aid-admin", "doctor-root", "--json"], 0),
             call(["-n", "--", executable, "__root-disable"], 0),
             call(["-k"], 0),
-            call(["-n", "/usr/local/libexec/aid-admin", "doctor-root", "--json"], 1),
         ])
         unknownDoctor.throwOnCall = 2
         let unknownReason = try expectThrows {
@@ -1222,7 +1346,6 @@ private struct Suite {
             call(["-n", "/usr/local/libexec/aid-admin", "doctor-root", "--json"], 1),
             call(["-n", "--", executable, "__root-disable"], 0),
             call(["-k"], 0),
-            call(["-n", "/usr/local/libexec/aid-admin", "doctor-root", "--json"], 1),
         ])
         let rolledBackReason = try expectThrows {
             _ = try EmergencyOwnerOrchestrator(
@@ -1249,19 +1372,18 @@ private struct Suite {
         try expect(rollbackFailure == "recovery_verification_failed_rollback_failed" &&
                    rollbackCommandFailure.expected.isEmpty)
 
-        let rollbackProofFailure = ScriptedOwnerRunner([
+        let rollbackTimestampFailure = ScriptedOwnerRunner([
             call(["-k", "--", executable, "__root-recover"], 0),
             call(["-n", "/usr/local/libexec/aid-admin", "doctor-root", "--json"], 1),
             call(["-n", "--", executable, "__root-disable"], 0),
-            call(["-k"], 0),
-            call(["-n", "/usr/local/libexec/aid-admin", "doctor-root", "--json"], 0, ready),
+            call(["-k"], 1),
         ])
         let proofFailure = try expectThrows {
             _ = try EmergencyOwnerOrchestrator(
-                executablePath: executable, runner: rollbackProofFailure).perform(.recover)
+                executablePath: executable, runner: rollbackTimestampFailure).perform(.recover)
         }
         try expect(proofFailure == "recovery_verification_failed_rollback_failed" &&
-                   rollbackProofFailure.expected.isEmpty)
+                   rollbackTimestampFailure.expected.isEmpty)
     }
 
     func noRecursiveOrUnrelatedMutation() throws {
@@ -1307,6 +1429,9 @@ private struct TestMain {
                 ("symlink_matrix", suite.symlinkMatrix),
                 ("hash_attestation_drift", suite.hashAndAttestationDriftMatrix),
                 ("revoke_broken_runtime", suite.revokeWithBrokenRuntime),
+                ("independent_revocation_staging", suite.independentRevocationStaging),
+                ("legacy_emergency_journal_preservation", suite.legacyEmergencyJournalPreservation),
+                ("exact_disabled_noop", suite.exactDisabledNoOp),
                 ("wrong_mode_owner", suite.wrongModeAndOwnerMatrix),
                 ("unexpected_state", suite.unexpectedStateMatrix),
                 ("disable_partial_rollback", suite.disablePartialFailureRollbackMatrix),

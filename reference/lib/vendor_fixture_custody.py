@@ -139,6 +139,7 @@ class Custody:
         self.namespace_refresh_required = False
         self.namespace_refresh_records = {}
         self.fresh_slots = set()
+        self.retirement_slot = None
         self.path = scratch + "/" + NAMESPACE
         try:
             self.parent = paths.OwnedParent.open(scratch, home, uid)
@@ -213,17 +214,12 @@ class Custody:
                     # Observation is not allocation or identity migration. Keep
                     # the verified old marker and expose the affected boundary.
                     self.namespace_refresh_required = True
-                    if (marker['identity'] != identity(os.fstat(self.directory.descriptor))
-                            or marker['lock'] != self.lock_identity):
-                        self.mutation_reason = 'fixture_namespace_refresh_required'
                 elif refresh:
                     present = self._record_names()
                     if present != {'namespace.json', 'lock'}:
-                        # Namespace-only refresh may retain exact same-device
-                        # records. No fixture identity or settlement is changed.
-                        if (marker['identity'] != identity(os.fstat(self.directory.descriptor))
-                                or marker['lock'] != self.lock_identity):
-                            self._rebase_records()
+                        # Refresh the namespace against the exact unchanged
+                        # record closure. Rebinding one fixture must not depend
+                        # on settlement or persistent proof of another slot.
                         records = self.records()
                         self.namespace_refresh_records = {str(slot) + '.json': self._read(str(slot) + '.json')[1]
                                                           for slot in records}
@@ -240,9 +236,9 @@ class Custody:
             os.fsync(self.directory.descriptor)
             allowed = {"namespace.json", "lock"} | {str(slot) + ".json" for slot in range(SLOTS)}
             pending = {name + '.pending' for name in allowed if name != 'lock'}
-            observed = set(names(self.directory.descriptor, len(allowed) + len(pending) + MAX_PREPARATIONS * 2 + 1))
+            observed = set(names(self.directory.descriptor, MAX_ENTRIES))
             preparations = {name for name in observed if preparation_name(name)}
-            need(len(preparations) <= MAX_PREPARATIONS * 2, 'fixture_preparation_capacity')
+            need(not writable or len(preparations) <= MAX_PREPARATIONS * 2, 'fixture_preparation_capacity')
             need(observed <= allowed | preparations | ((pending | {TRANSACTION}) if not writable else set()))
             self.pending_metadata = sorted(observed & (pending | {TRANSACTION}))
             if self.pending_metadata:
@@ -501,12 +497,11 @@ class Custody:
         self._validate_publication(leaf, value, None if prior is None else prior[0])
         listed = names(self.directory.descriptor)
         need(TRANSACTION not in listed and all(not name.endswith('.pending') for name in listed))
-        need(sum(preparation_name(name) for name in listed) < MAX_PREPARATIONS * 2,
+        need(sum(preparation_name(name) for name in listed) + 2 <= MAX_PREPARATIONS * 2,
              'fixture_preparation_capacity')
         token = secrets.token_hex(16)
         candidate, journal = '.prepare-' + token + '.payload', '.prepare-' + token + '.journal'
         prepared = self._write_preparation(candidate, value)
-        self.checkpoint("record-written")
         self.directory.verify()
         self._verify_lock()
         if prior is not None:
@@ -536,6 +531,10 @@ class Custody:
         rename_exclusive(self.directory.descriptor, journal, TRANSACTION)
         os.fsync(self.directory.descriptor)
         self.checkpoint('transaction-ready')
+        # A complete candidate is recoverable before announcing it written.
+        # An interruption at this supported boundary cannot accumulate orphan
+        # payloads; partial writes before durable intent remain unknown debt.
+        self.checkpoint("record-written")
         self._recover_transaction()
 
     def _validate_publication(self, leaf, value, previous_raw):
@@ -695,25 +694,38 @@ class Custody:
         result['provenance']['boot'] = self.boot
         return result
 
-    def _rebase_records(self):
-        records = self.records()
-        # Validate every record before changing any. Legacy/unknown state is not
-        # retroactively assigned a durable identity.
-        replacements = {slot: self._rebased_record(row) for slot, row in records.items()}
-        for slot, replacement in replacements.items():
-            leaf = str(slot) + '.json'
-            current, prior = self._read(leaf)
-            need(current == records[slot] and self._rebased_record(current) == replacement)
-            if current != replacement:
-                self._publish(leaf, replacement, prior)
+    def _rebase_slot(self, slot):
+        leaf = str(slot) + '.json'
+        current, prior = self._read(leaf)
+        replacement = self._rebased_record(current)
+        need(self._read(leaf)[1] == prior and self._rebased_record(current) == replacement)
+        if current != replacement:
+            self._publish(leaf, replacement, prior)
+        return replacement
+
+    def _empty_reservation(self, record):
+        return (record['state'] in ('reserved', 'retiring') and record['settled'] is True
+                and record['root'] is None and not record['children']
+                and not record['schemas'] and record.get('output') is None)
 
     def reserve(self):
         need(self.mutation_reason is None, self.mutation_reason or 'fixture_custody_invalid')
         need(not self.namespace_refresh_required, 'fixture_namespace_refresh_required')
         records = self.records()
+        # Only a pre-launch empty reservation may be retried automatically.
+        # Existing retirement supplies durable intent, exact absence and fsync;
+        # no mkdir/child, process observation or unknown bytes imply settlement.
+        for slot, record in records.items():
+            if slot not in self.fresh_slots and self._empty_reservation(record):
+                self.retire(slot)
+        records = self.records()
         need(len(records) < SLOTS, "fixture_capacity_required")
         need(all(record["settled"] is True for record in records.values()),
              "fixture_settlement_required")
+        for slot, record in records.items():
+            if record['schema'] == 3:
+                self._rebase_slot(slot)
+        records = self.records()
         self.census(records)
         slot = next(slot for slot in range(SLOTS) if slot not in records)
         record = {"schema": 3, "slot": slot, "token": secrets.token_hex(16), "state": "reserved",
@@ -843,6 +855,8 @@ class Custody:
 
     def update(self, slot, **changes):
         need(type(slot) is int and 0 <= slot < SLOTS)
+        need(not self.namespace_refresh_required or self.retirement_slot == slot,
+             'fixture_namespace_refresh_required')
         leaf = str(slot) + ".json"
         record, prior = self._read(leaf)
         updated = {**record, **changes}
@@ -882,6 +896,11 @@ class Custody:
                         raise CustodyError("fixture_capacity_required")
         for record in (self.records() if records is None else records).values():
             if record["root"] is None:
+                if self._empty_reservation(record):
+                    try:
+                        os.stat(self.leaf(record), dir_fd=self.parent.descriptor, follow_symlinks=False)
+                    except FileNotFoundError:
+                        continue
                 raise CustodyError("fixture_capacity_required")
             fd = os.open(self.leaf(record), os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC,
                          dir_fd=self.parent.descriptor)
@@ -895,23 +914,41 @@ class Custody:
 
     def status(self):
         records = self.records()
+        preparations = [name for name in names(self.directory.descriptor) if preparation_name(name)]
+        preparation_bytes = sum(os.stat(name, dir_fd=self.directory.descriptor,
+            follow_symlinks=False).st_size for name in preparations)
         total, entries, reason = None, None, None
         try:
             total, entries = self.census(records)
         except (CustodyError, OSError) as error:
             reason = (error.reason_class if type(error) is CustodyError else "fixture_capacity_required")
+        capacity_reason = self.mutation_reason or (
+            'fixture_namespace_refresh_required' if self.namespace_refresh_required else
+            'fixture_preparation_capacity' if len(preparations) + 2 > MAX_PREPARATIONS * 2 else
+            'fixture_capacity_required' if len(records) >= SLOTS else
+            'fixture_settlement_required' if any(not row['settled'] for row in records.values()) else reason)
         return {"scope": "disposable-vendor-fixture-custody", "outstanding": len(records),
                 "slots": [{"slot": slot, "settled": value["settled"], "state": value["state"]}
                           for slot, value in records.items()], "maximumReservations": SLOTS,
-                "retainedByteAdmissionBudget": MAX_BYTES, "retainedBytesObserved": total,
-                "entriesObserved": entries, "capacityReason": self.mutation_reason or
-                    ('fixture_namespace_refresh_required' if self.namespace_refresh_required else reason),
-                "pendingMetadataCount": len(self.pending_metadata),
+                "retainedByteAdmissionBudget": MAX_BYTES,
+                "retainedBytesObserved": None if total is None else total + preparation_bytes,
+                "entriesObserved": None if entries is None else entries + len(preparations),
+                "preparationCount": len(preparations), "preparationBytesObserved": preparation_bytes,
+                "maximumPreparations": MAX_PREPARATIONS * 2,
+                "preparationReason": 'fixture_preparation_recovery_required' if preparations else None,
+                "nextAction": ('reconcile-recorded-metadata-before-retry' if self.pending_metadata else
+                    'preserve-preparations-for-bounded-recovery' if preparations else
+                    'reconcile-retained-child-before-retry' if capacity_reason == 'fixture_settlement_required' else
+                    'inspect-custody-status-before-retry' if capacity_reason else None),
+                "capacityReason": capacity_reason,
+                "pendingMetadataCount": len(self.pending_metadata) + len(preparations),
                 "namespaceRefreshRequired": self.namespace_refresh_required,
                 "hardDiskQuota": False}
 
     def release_absent(self, slot):
         need(self.mutation_reason is None, self.mutation_reason or 'fixture_custody_invalid')
+        need(not self.namespace_refresh_required or self.retirement_slot == slot,
+             'fixture_namespace_refresh_required')
         record, prior = self._read(str(slot) + ".json")
         need(record["settled"] is True and record["state"] == "retiring")
         try:
@@ -1002,6 +1039,15 @@ class Custody:
                 self._close_fd(fd)
 
     def retire(self, slot):
+        """Retire only the selected settled slot, preserving unrelated debt."""
+        need(self.retirement_slot is None)
+        self.retirement_slot = slot
+        try:
+            return self._retire(slot)
+        finally:
+            self.retirement_slot = None
+
+    def _retire(self, slot):
         """Explicit restart-capable retirement of a settled exact known set.
 
         A persisted retiring intent permits missing *known* entries on resume,
@@ -1016,6 +1062,7 @@ class Custody:
         need(record["settled"] is True and record["state"] != "inflight",
              "fixture_settlement_required")
         if record['schema'] == 3:
+            record = self._rebase_slot(slot)
             self._verify_provenance(record)
         leaf = self.leaf(record)
         try:

@@ -17,6 +17,27 @@ private func fail(_ reason: String, code: Int32 = 64) -> Never {
 }
 
 let arguments = Array(CommandLine.arguments.dropFirst())
+// These fixed maintenance actions share the same standard-sudo provenance as
+// installation; they add no broker command or passwordless grant.
+if arguments == ["inventory-preparations"] ||
+    (arguments.count == 2 && arguments[0] == "retire-preparation") {
+    do {
+        let invokingOwner = try deriveStandardSudoInvokingOwner(
+            environment: ProcessInfo.processInfo.environment,
+            accounts: SystemBootstrapAccountLookup())
+        let context = BootstrapContext(effectiveUID: geteuid(), currentExecutablePath: executablePath(),
+                                       invokingOwner: invokingOwner)
+        let installer = BootstrapInstaller(context: context)
+        if arguments[0] == "inventory-preparations" {
+            let encoder = JSONEncoder(); encoder.outputFormatting = [.sortedKeys]
+            let bytes = try encoder.encode(installer.inventoryPreparations())
+            FileHandle.standardOutput.write(bytes + Data("\n".utf8))
+        } else {
+            print(try installer.retirePreparation(identifier: arguments[1]))
+        }
+        exit(0)
+    } catch { fail(String(describing: error), code: 65) }
+}
 guard arguments.count == 10, arguments[0] == "install" else {
     fail("usage")
 }

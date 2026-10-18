@@ -1,6 +1,10 @@
 #!/usr/bin/python3
-from __future__ import annotations
-
+import sys
+if __name__ == "__main__" and not globals().get("__source_bound__"):
+    import posix
+    posix.execv(sys.executable, [sys.executable, "-I", "-S", "-B",
+        __file__.rsplit("/", 2)[0] + "/lib/scoped_source_admission.py", __file__,
+        '["payload/macos/codex-windows-host-app-server-holder.sh","manifests/codex-windows-host-ssh-app-server-holder.json","manifests/codex-windows-host-ssh-stdio-compat.json","manifests/codex-windows-host-ssh-remote-control-isolation.json","manifests/windows-host-ssh-client.json"]', *sys.argv[1:]])
 import argparse
 import base64
 from contextlib import contextmanager
@@ -18,9 +22,9 @@ import selectors
 import stat
 import struct
 import subprocess
-import sys
 sys.dont_write_bytecode = True
 sys.pycache_prefix = "/dev/null"
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import time
 
 
@@ -41,8 +45,8 @@ class ContractError(RuntimeError):
     pass
 
 
-def run(argv: list[str], *, timeout: float = 20,
-        input_bytes: bytes | None = None) -> subprocess.CompletedProcess:
+def run(argv: 'list[str]', *, timeout: 'float' = 20,
+        input_bytes: 'bytes | None' = None) -> 'subprocess.CompletedProcess':
     return subprocess.run(
         argv,
         input=input_bytes,
@@ -53,7 +57,7 @@ def run(argv: list[str], *, timeout: float = 20,
     )
 
 
-def git(*args: str) -> str:
+def git(*args: 'str') -> 'str':
     result = run(["/usr/bin/git", "-c", "core.fsmonitor=false",
                   "-c", "core.hooksPath=/dev/null", "-c", "core.untrackedCache=false",
                   "-C", str(ROOT), *args])
@@ -62,7 +66,7 @@ def git(*args: str) -> str:
     return result.stdout.decode().strip()
 
 
-def require_exact_commit(expected: str) -> None:
+def require_exact_commit(expected: 'str') -> 'None':
     if not COMMIT_RE.fullmatch(expected):
         raise ContractError("invalid_commit")
     if git("rev-parse", "--show-toplevel") != str(ROOT):
@@ -77,7 +81,7 @@ def require_exact_commit(expected: str) -> None:
         raise ContractError("holder_physical_source_changed")
 
 
-def canonical_home() -> Path:
+def canonical_home() -> 'Path':
     if os.geteuid() == 0:
         raise ContractError("refusing_root")
     home = Path(pwd.getpwuid(os.getuid()).pw_dir)
@@ -86,7 +90,7 @@ def canonical_home() -> Path:
     return home
 
 
-def layout() -> dict[str, Path]:
+def layout() -> 'dict[str, Path]':
     home = canonical_home()
     return {
         "runtime": home / "AIDev/bin/codex-windows-host-app-server-holder-runtime",
@@ -98,11 +102,11 @@ def layout() -> dict[str, Path]:
     }
 
 
-def sha256(data: bytes) -> str:
+def sha256(data: 'bytes') -> 'str':
     return hashlib.sha256(data).hexdigest()
 
 
-def payload_bytes() -> bytes:
+def payload_bytes() -> 'bytes':
     if not PAYLOAD.is_file() or PAYLOAD.is_symlink():
         raise ContractError("payload_missing_or_unsafe")
     data = PAYLOAD.read_bytes()
@@ -111,7 +115,7 @@ def payload_bytes() -> bytes:
     return data
 
 
-def render_plist(runtime: Path) -> bytes:
+def render_plist(runtime: 'Path') -> 'bytes':
     payload = {
         "Label": LABEL,
         "ProgramArguments": [str(runtime)],
@@ -125,14 +129,14 @@ def render_plist(runtime: Path) -> bytes:
     return plistlib.dumps(payload, fmt=plistlib.FMT_XML, sort_keys=True)
 
 
-def validate_parent(path: Path) -> None:
+def validate_parent(path: 'Path') -> 'None':
     if not path.is_dir() or path.is_symlink():
         raise ContractError("managed_parent_missing_or_unsafe")
 
 
 class HeldParent:
     """Hold every ancestor without following links; mutation uses its dirfd."""
-    def __init__(self, path: Path):
+    def __init__(self, path: 'Path'):
         if not path.is_absolute() or ".." in path.parts:
             raise ContractError("noncanonical_parent")
         self.chain = []
@@ -171,7 +175,7 @@ class HeldParent:
         self.close()
 
 
-def read_bound(parent: HeldParent, name: str) -> tuple[bytes, dict]:
+def read_bound(parent: 'HeldParent', name: 'str') -> 'tuple[bytes, dict]':
     parent.verify()
     descriptor = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=parent.fd)
     try:
@@ -201,7 +205,7 @@ def read_bound(parent: HeldParent, name: str) -> tuple[bytes, dict]:
         os.close(descriptor)
 
 
-def rename_exclusive(parent: HeldParent, source: str, target: str):
+def rename_exclusive(parent: 'HeldParent', source: 'str', target: 'str'):
     """Atomic rename without clobbering a concurrent custody/target entry."""
     parent.verify()
     library = ctypes.CDLL(None, use_errno=True)
@@ -243,7 +247,7 @@ def lifecycle_lock():
             os.close(descriptor)
 
 
-def load_receipt(path: Path) -> dict[str, object] | None:
+def load_receipt(path: 'Path') -> 'dict[str, object] | None':
     if not path.exists() and not path.is_symlink():
         return None
     if not path.is_file() or path.is_symlink():
@@ -267,11 +271,11 @@ def load_receipt(path: Path) -> dict[str, object] | None:
     return data
 
 
-def file_mode(path: Path) -> int:
+def file_mode(path: 'Path') -> 'int':
     return path.stat().st_mode & 0o777
 
 
-def filesystem_state() -> tuple[str, dict[str, object] | None]:
+def filesystem_state() -> 'tuple[str, dict[str, object] | None]':
     paths = layout()
     journal = load_journal()
     if journal is not None and journal["phase"] != "complete" and ACTIVE_JOURNAL is None:
@@ -318,7 +322,7 @@ def filesystem_state() -> tuple[str, dict[str, object] | None]:
     return "exact", receipt
 
 
-def observe_launchd() -> str:
+def observe_launchd() -> 'str':
     domain = f"gui/{os.getuid()}/{LABEL}"
     try:
         result = run(["/bin/launchctl", "print", domain], timeout=8)
@@ -335,12 +339,12 @@ def observe_launchd() -> str:
     return "UNKNOWN"
 
 
-def launchd_loaded() -> bool:
+def launchd_loaded() -> 'bool':
     """Compatibility predicate; never use its false result as absence proof."""
     return observe_launchd() == "PRESENT"
 
 
-def helper_doctor_passes(path: Path, command: str) -> bool:
+def helper_doctor_passes(path: 'Path', command: 'str') -> 'bool':
     result = run([str(path), command, "--json"], timeout=50)
     if result.returncode != 0:
         return False
@@ -351,7 +355,7 @@ def helper_doctor_passes(path: Path, command: str) -> bool:
     return payload.get("verdict") == "PASS"
 
 
-def session_flags_exact() -> bool:
+def session_flags_exact() -> 'bool':
     command = (
         "if [ \"${CODEX_INTERNAL_APP_SERVER_REMOTE_CONTROL_DISABLED:-}\" = 1 ] "
         "&& [ \"${CODEX_SSH_SKIP_APP_SERVER_BOOT:-}\" = true ]; then "
@@ -366,7 +370,7 @@ def session_flags_exact() -> bool:
     return result.returncode == 0 and result.stdout == b"session_flags=exact"
 
 
-def validate_websocket_upgrade(response: bytes, key: str) -> bool:
+def validate_websocket_upgrade(response: 'bytes', key: 'str') -> 'bool':
     if type(response) is not bytes or type(key) is not str:
         return False
     if b"\r\n\r\n" not in response or len(response.split(b"\r\n\r\n", 1)[0]) > 16384:
@@ -382,7 +386,7 @@ def validate_websocket_upgrade(response: bytes, key: str) -> bool:
     lines = header.split(b"\r\n")
     if not re.fullmatch(rb"HTTP/1\.1 101(?: [\x20-\x7e]*)?", lines[0]):
         return False
-    headers: dict[bytes, bytes] = {}
+    headers: 'dict[bytes, bytes]' = {}
     for line in lines[1:]:
         if b":" not in line:
             return False
@@ -401,7 +405,7 @@ def validate_websocket_upgrade(response: bytes, key: str) -> bool:
             and b"sec-websocket-protocol" not in headers)
 
 
-def encode_websocket_text(payload: dict) -> bytes:
+def encode_websocket_text(payload: 'dict') -> 'bytes':
     data = json.dumps(payload, separators=(",", ":"), allow_nan=False).encode()
     if len(data) > 65536:
         raise ContractError("websocket_frame_oversize")
@@ -415,7 +419,7 @@ def encode_websocket_text(payload: dict) -> bytes:
     return b"\x81" + length + mask + bytes(v ^ mask[i % 4] for i, v in enumerate(data))
 
 
-def decode_websocket_frame(data: bytes) -> tuple[bytes, bytes] | None:
+def decode_websocket_frame(data: 'bytes') -> 'tuple[bytes, bytes] | None':
     if len(data) < 2:
         return None
     if data[0] != 0x81 or data[1] & 0x80:
@@ -442,7 +446,7 @@ def decode_websocket_frame(data: bytes) -> tuple[bytes, bytes] | None:
     return data[offset:offset + length], data[offset + length:]
 
 
-def validate_initialize_response(data: bytes, request_id: str | int) -> bool:
+def validate_initialize_response(data: 'bytes', request_id: 'str | int') -> 'bool':
     def unique(pairs):
         result = {}
         for key, value in pairs:
@@ -470,7 +474,7 @@ def validate_initialize_response(data: bytes, request_id: str | int) -> bool:
             and 0 < len(result["userAgent"]) <= 1024)
 
 
-def remote_proxy_observation(timeout: float = 5) -> dict:
+def remote_proxy_observation(timeout: 'float' = 5) -> 'dict':
     facts = {"state": "UNKNOWN", "transport": False, "application": False}
     key = base64.b64encode(secrets.token_bytes(16)).decode("ascii")
     request_id = secrets.token_hex(16)
@@ -568,11 +572,11 @@ def remote_proxy_observation(timeout: float = 5) -> dict:
                     stream.close()
 
 
-def remote_proxy_handshake_passes(timeout: float = 5) -> bool:
+def remote_proxy_handshake_passes(timeout: 'float' = 5) -> 'bool':
     return remote_proxy_observation(timeout)["state"] == "PRESENT"
 
 
-def preflight() -> dict[str, object]:
+def preflight() -> 'dict[str, object]':
     state, _ = filesystem_state()
     loaded = observe_launchd()
     proxy = remote_proxy_observation(timeout=3)
@@ -604,7 +608,7 @@ def preflight() -> dict[str, object]:
     return facts
 
 
-def doctor() -> dict[str, object]:
+def doctor() -> 'dict[str, object]':
     facts = preflight()
     facts["verdict"] = "PASS" if (
         facts["verdict"] == "PASS"
@@ -616,11 +620,11 @@ def doctor() -> dict[str, object]:
     return facts
 
 
-ACTIVE_JOURNAL: dict | None = None
-JOURNAL_EXPECTED: tuple[bytes, dict] | None = None
+ACTIVE_JOURNAL: 'dict | None' = None
+JOURNAL_EXPECTED: 'tuple[bytes, dict] | None' = None
 
 
-def atomic_create(path: Path, data: bytes, mode: int, *, expected_parent=None) -> None:
+def atomic_create(path: 'Path', data: 'bytes', mode: 'int', *, expected_parent=None) -> 'None':
     with HeldParent(path.parent) as parent:
         verify_parent_identity(path.parent, parent, expected_parent)
         if ACTIVE_JOURNAL is not None and path.parent == layout()["state"]:
@@ -676,12 +680,12 @@ def atomic_create(path: Path, data: bytes, mode: int, *, expected_parent=None) -
                     pass
 
 
-def bound_file(path: Path) -> tuple[bytes, dict]:
+def bound_file(path: 'Path') -> 'tuple[bytes, dict]':
     with HeldParent(path.parent) as parent:
         return read_bound(parent, path.name)
 
 
-def withdraw_exact(path: Path, expected: tuple[bytes, dict], *, expected_parent=None) -> Path:
+def withdraw_exact(path: 'Path', expected: 'tuple[bytes, dict]', *, expected_parent=None) -> 'Path':
     """Withdraw via no-clobber rename, then verify displaced inode and bytes.
 
     An external edit racing the rename is retained in custody, never unlinked.
@@ -706,8 +710,8 @@ def withdraw_exact(path: Path, expected: tuple[bytes, dict], *, expected_parent=
         return path.parent / custody
 
 
-def replace_exact_file(path: Path, data: bytes, mode: int,
-                       expected: tuple[bytes, dict], *, expected_parent=None) -> None:
+def replace_exact_file(path: 'Path', data: 'bytes', mode: 'int',
+                       expected: 'tuple[bytes, dict]', *, expected_parent=None) -> 'None':
     old = withdraw_exact(path, expected, expected_parent=expected_parent)
     try:
         atomic_create(path, data, mode, expected_parent=expected_parent)
@@ -730,7 +734,7 @@ def replace_exact_file(path: Path, data: bytes, mode: int,
         os.fsync(parent.fd)
 
 
-def save_journal(value: dict) -> None:
+def save_journal(value: 'dict') -> 'None':
     global JOURNAL_EXPECTED
     path = layout()["journal"]
     data = (json.dumps(value, sort_keys=True, separators=(",", ":")) + "\n").encode()
@@ -746,7 +750,7 @@ def save_journal(value: dict) -> None:
     JOURNAL_EXPECTED = bound_file(path)
 
 
-def load_journal() -> dict | None:
+def load_journal() -> 'dict | None':
     global JOURNAL_EXPECTED
     path = layout()["journal"]
     previous = path.parent / f".{PROFILE}-operation.previous.json"
@@ -814,18 +818,18 @@ def load_journal() -> dict | None:
     return value
 
 
-def directory_identity(path: Path) -> list[int]:
+def directory_identity(path: 'Path') -> 'list[int]':
     with HeldParent(path) as parent:
         parent.verify()
         value = os.fstat(parent.fd)
         return [value.st_dev, value.st_ino, value.st_uid, value.st_mode]
 
 
-def state_identity() -> list[int]:
+def state_identity() -> 'list[int]':
     return directory_identity(layout()["state"])
 
 
-def verify_parent_identity(path: Path, parent: HeldParent, expected=None):
+def verify_parent_identity(path: 'Path', parent: 'HeldParent', expected=None):
     if expected is None and ACTIVE_JOURNAL is not None:
         expected = ACTIVE_JOURNAL.get("parents", {}).get(str(path))
     parent.verify()
@@ -835,7 +839,7 @@ def verify_parent_identity(path: Path, parent: HeldParent, expected=None):
         raise ContractError("holder_bound_parent_changed")
 
 
-def verify_state_identity(value: dict, *, parent: HeldParent | None = None):
+def verify_state_identity(value: 'dict', *, parent: 'HeldParent | None' = None):
     expected = value.get("stateIdentity")
     if parent is None:
         actual = state_identity()
@@ -847,7 +851,7 @@ def verify_state_identity(value: dict, *, parent: HeldParent | None = None):
         raise ContractError("holder_state_directory_changed")
 
 
-def create_owned_state(value: dict):
+def create_owned_state(value: 'dict'):
     path = layout()["state"]
     with HeldParent(path.parent) as parent:
         verify_parent_identity(path.parent, parent)
@@ -874,8 +878,8 @@ def create_owned_state(value: dict):
             os.close(descriptor)
 
 
-def write_receipt(path: Path, commit: str, runtime_hash: str,
-                  plist_hash: str) -> None:
+def write_receipt(path: 'Path', commit: 'str', runtime_hash: 'str',
+                  plist_hash: 'str') -> 'None':
     payload = {
         "schema": 1,
         "profile": PROFILE,
@@ -891,8 +895,8 @@ def write_receipt(path: Path, commit: str, runtime_hash: str,
     )
 
 
-def replace_receipt(path: Path, commit: str, runtime_hash: str,
-                    plist_hash: str, expected: tuple[bytes, dict]) -> None:
+def replace_receipt(path: 'Path', commit: 'str', runtime_hash: 'str',
+                    plist_hash: 'str', expected: 'tuple[bytes, dict]') -> 'None':
     if not path.is_file() or path.is_symlink() or file_mode(path) != 0o600:
         raise ContractError("receipt_rebind_target_not_exact")
     payload = {
@@ -908,7 +912,7 @@ def replace_receipt(path: Path, commit: str, runtime_hash: str,
     ).encode(), 0o600, expected)
 
 
-def bootstrap(plist: Path) -> None:
+def bootstrap(plist: 'Path') -> 'None':
     result = run([
         "/bin/launchctl", "bootstrap", f"gui/{os.getuid()}", str(plist)
     ], timeout=15)
@@ -916,14 +920,14 @@ def bootstrap(plist: Path) -> None:
         raise ContractError("launchctl_bootstrap_failed")
 
 
-def bootout() -> bool:
+def bootout() -> 'bool':
     result = run([
         "/bin/launchctl", "bootout", f"gui/{os.getuid()}/{LABEL}"
     ], timeout=15)
     return result.returncode == 0
 
 
-def wait_for_proxy(expected: str, seconds: float = 25) -> bool:
+def wait_for_proxy(expected: 'str', seconds: 'float' = 25) -> 'bool':
     deadline = time.monotonic() + seconds
     while time.monotonic() < deadline:
         if remote_proxy_observation(timeout=min(3, max(.001, deadline - time.monotonic())))["state"] == expected:
@@ -932,14 +936,14 @@ def wait_for_proxy(expected: str, seconds: float = 25) -> bool:
     return False
 
 
-def remove_exact(path: Path, expected_hash: str) -> None:
+def remove_exact(path: 'Path', expected_hash: 'str') -> 'None':
     expected = bound_file(path)
     if expected[1]["hash"] != expected_hash:
         raise ContractError("rollback_target_hash_mismatch")
     withdraw_exact(path, expected)
 
 
-def target_binding() -> dict:
+def target_binding() -> 'dict':
     paths = layout()
     facts = {"parents": {str(paths[key].parent): directory_identity(paths[key].parent)
                          for key in ("runtime", "plist", "state")}}
@@ -957,7 +961,7 @@ def target_binding() -> dict:
     return facts
 
 
-def source_binding() -> dict:
+def source_binding() -> 'dict':
     # Recheck consumed code/manifest bytes and identities, not only Git's stat
     # cache, after slow preflight/launchd observations and before publication.
     paths = ("bin/codex-windows-host-ssh-app-server-holder",
@@ -972,7 +976,7 @@ def source_binding() -> dict:
     return {name: bound_file(ROOT / name) for name in paths}
 
 
-def mutation_gate(commit: str):
+def mutation_gate(commit: 'str'):
     global SOURCE_EXPECTED
     SOURCE_EXPECTED = None
     require_exact_commit(commit)
@@ -984,12 +988,17 @@ def mutation_gate(commit: str):
         checks={"ssh-transport": session_flags_exact,
                 "native-consent": lambda: (helper_doctor_passes(COMPAT, "runtime-doctor")
                     and helper_doctor_passes(ISOLATION, "doctor"))},
-        target_guard=lambda: target_binding() == before and source_binding() == source)
+        target_guard=lambda: target_binding() == before and source_binding() == source,
+        extra_paths=("payload/macos/codex-windows-host-app-server-holder.sh",
+                     "manifests/codex-windows-host-ssh-app-server-holder.json",
+                     "manifests/codex-windows-host-ssh-stdio-compat.json",
+                     "manifests/codex-windows-host-ssh-remote-control-isolation.json",
+                     "manifests/windows-host-ssh-client.json"))
     SOURCE_EXPECTED = source
     require_exact_commit(commit)
 
 
-def begin_operation(operation: str, commit: str, *, parents=None) -> dict:
+def begin_operation(operation: 'str', commit: 'str', *, parents=None) -> 'dict':
     prior = load_journal()
     if prior is not None and prior["phase"] != "complete":
         raise ContractError("holder_incomplete_operation_recover_required")
@@ -1000,12 +1009,12 @@ def begin_operation(operation: str, commit: str, *, parents=None) -> dict:
     return value
 
 
-def set_phase(value: dict, phase: str):
+def set_phase(value: 'dict', phase: 'str'):
     value["phase"] = phase
     save_journal(value)
 
 
-def apply(commit: str) -> dict[str, object]:
+def apply(commit: 'str') -> 'dict[str, object]':
     global ACTIVE_JOURNAL
     mutation_gate(commit)
     with lifecycle_lock():
@@ -1087,7 +1096,7 @@ def apply(commit: str) -> dict[str, object]:
             ACTIVE_JOURNAL = None
 
 
-def rollback(commit: str) -> dict[str, object]:
+def rollback(commit: 'str') -> 'dict[str, object]':
     global ACTIVE_JOURNAL
     mutation_gate(commit)
     if not REMOTE_ABSENCE_SUPPORTED:
@@ -1132,7 +1141,7 @@ def rollback(commit: str) -> dict[str, object]:
             ACTIVE_JOURNAL = None
 
 
-def recover(commit: str) -> dict[str, object]:
+def recover(commit: 'str') -> 'dict[str, object]':
     """Explicit narrow withdrawal, never reinstallation or blind continuation."""
     global ACTIVE_JOURNAL
     mutation_gate(commit)
@@ -1178,7 +1187,7 @@ def recover(commit: str) -> dict[str, object]:
             ACTIVE_JOURNAL = None
 
 
-def emit(payload: dict[str, object], as_json: bool) -> None:
+def emit(payload: 'dict[str, object]', as_json: 'bool') -> 'None':
     if as_json:
         print(json.dumps(payload, sort_keys=True, separators=(",", ":")))
         return
@@ -1189,7 +1198,7 @@ def emit(payload: dict[str, object], as_json: bool) -> None:
         print(f"{key}={value}")
 
 
-def main() -> int:
+def main() -> 'int':
     parser = argparse.ArgumentParser()
     subparsers = parser.add_subparsers(dest="command", required=True)
     prepare_parser = subparsers.add_parser("prepare")

@@ -1,6 +1,13 @@
 #!/usr/bin/python3 -I -B
 """Fixed paired release staging; never invokes the root installer."""
 import sys
+if __name__ == '__main__' and not globals().get('__source_bound__'):
+    import posix
+    posix.execv(sys.executable, [sys.executable, '-I', '-S', '-B',
+        __file__.rsplit('/', 2)[0] + '/lib/scoped_source_admission.py',
+        __file__, '[]', *sys.argv[1:]])
+sys.dont_write_bytecode = True
+sys.pycache_prefix = '/dev/null'
 from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from lib.root_delivery import main

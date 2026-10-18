@@ -157,14 +157,15 @@ class PersistentFullscreen(unittest.TestCase):
                 mock.patch.object(self.h, 'inactive') as inactive:
             yield request, source, inactive
 
-    def test_fullscreen_guard_failure_precedes_admission_and_log_creation(self):
+    def test_fullscreen_guard_failure_precedes_dispatch_and_log_creation(self):
         self.graphics.write_bytes(xml('FULLSCREEN'))
         self.reg.write_bytes(registry('N', 'Y', 'N'))
+        request=mock.Mock();request.allow_client.return_value={'targetActive':False,'clientActive':False}
         with mock.patch.object(self.h, 'verify_installed', return_value=({'aspectFit': True}, None)), \
-                mock.patch.object(self.h, 'admission') as admission:
+                mock.patch.object(self.h, 'admission',return_value=request):
             with self.assertRaisesRegex(RuntimeError, 'virtual_fullscreen_registry_required'):
                 self.h.play()
-        admission.assert_not_called()
+        request.begin.assert_not_called();request.dispatched.assert_not_called()
         self.assertFalse((self.root / 'logs/launch-ds3.log').exists())
 
     def test_plan_without_preset_preserves_existing_fullscreen_dimensions(self):

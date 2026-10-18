@@ -1,6 +1,11 @@
 #!/usr/bin/python3
 """Explicit hook-only lifecycle; never native trust or root/payload removal."""
 import sys
+if __name__ == "__main__" and not globals().get("__source_bound__"):
+    import posix
+    posix.execv(sys.executable, [sys.executable, "-I", "-S", "-B",
+        __file__.rsplit("/", 2)[0] + "/lib/scoped_source_admission.py", __file__,
+        '["manifests/harness-hook-retirement.json","manifests/sessionstart-exposure.json"]', *sys.argv[1:]])
 sys.dont_write_bytecode = True
 sys.pycache_prefix = "/dev/null"
 from pathlib import Path

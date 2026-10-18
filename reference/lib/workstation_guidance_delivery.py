@@ -10,6 +10,7 @@ from pathlib import Path
 import pwd
 import stat
 from lib import harness_offramp as H
+from lib import scoped_source_admission as admission_source
 
 ROOT = Path(__file__).resolve().parents[1]
 TARGET = (".codex", "skills", "manage-workstation")
@@ -222,7 +223,6 @@ def main(arguments=None, *, operation=OPERATION):
         execution_options = {} if operation == OPERATION else {"operation": SUCCESSOR}
         home = Path(pwd.getpwuid(os.getuid()).pw_dir)
         H.require(os.getuid() > 0 and ROOT == home / "AIDev/control" and Path.cwd() == ROOT, "canonical_source_required")
-        from lib.workstation_maintenance_delivery import admitted_source
         if args.action in ("plan", "status"):
             result = execute(home, args.action, admission=None, **execution_options)
         else:
@@ -237,11 +237,17 @@ def main(arguments=None, *, operation=OPERATION):
                 results.append(execute(home, args.action, admission=admission, source_guard=source_guard, **execution_options))
                 H.require(source_guard() is True, "source_drift")
                 return True
-            admitted_source(ROOT, full=False, operation_check=run)
+            admission_source.observe(ROOT, operation_check=run, extra_paths=(
+                "manifests/workstation-guidance-successor.json" if operation == SUCCESSOR else
+                "manifests/workstation-guidance-delivery.json",
+                "skills/manage-workstation/SKILL.md" if operation == SUCCESSOR else LEGACY_PAYLOAD))
             H.require(len(results) == 1, "source_unadmitted")
             result = results[0]
         print(H.wire(result).decode()); return 0
     except Exception as error:
-        print(H.wire({"schema": 1, "status": "REFUSED", "reason": str(error) if isinstance(error, H.OfframpError)
-            else "guidance_unavailable", "unknownStateRetained": True}).decode())
+        result = {"schema": 1, "status": "REFUSED", "reason": str(error) if isinstance(error, H.OfframpError)
+            else "guidance_unavailable", "unknownStateRetained": True}
+        if isinstance(error, admission_source.SourceError):
+            result.update(admission_source.public_failure(error))
+        print(H.wire(result).decode())
         return 1

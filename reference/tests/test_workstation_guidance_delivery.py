@@ -216,23 +216,35 @@ class GuidanceTests(unittest.TestCase):
         self.assertEqual(self.path.read_bytes(), self.old)
 
     def test_held_source_before_execute_and_failure_stops(self):
-        from lib import workstation_maintenance_delivery as D
+        from lib import scoped_source_admission as D
         canonical = Path(G.pwd.getpwuid(os.getuid()).pw_dir) / "AIDev/control"
         calls = []
-        def admitted(root, *, full, operation_check=None):
+        def admitted(root, *, full=False, operation_check=None, extra_paths=()):
             calls.append("full" if full else "held")
             if operation_check: self.assertIs(operation_check("a" * 40, source_guard=lambda: True), True)
         def execute(home, action, *, admission, source_guard):
             calls.append("execute")
             return admission(lambda: {"status": "INSTALLED"}, lambda: True)
         with patch.object(G, "ROOT", canonical), patch.object(G.Path, "cwd", return_value=canonical), \
-             patch.object(D, "admitted_source", admitted), patch.object(G, "execute", execute), patch("builtins.print"):
+             patch.object(D, "observe", admitted), patch.object(G, "execute", execute), patch("builtins.print"):
             self.assertEqual(G.main(["apply"]), 0)
         self.assertEqual(calls, ["held", "execute"])
         with patch.object(G, "ROOT", canonical), patch.object(G.Path, "cwd", return_value=canonical), \
-             patch.object(D, "admitted_source", side_effect=RuntimeError("blocked")), \
+             patch.object(D, "observe", side_effect=RuntimeError("blocked")), \
              patch.object(G, "execute") as execute_mock, patch("builtins.print"):
             self.assertEqual(G.main(["apply"]), 1); execute_mock.assert_not_called()
+
+    def test_source_failure_keeps_closed_reason_next_action_and_private_state(self):
+        canonical = Path(G.pwd.getpwuid(os.getuid()).pw_dir) / "AIDev/control"
+        with patch.object(G, "ROOT", canonical), patch.object(G.Path, "cwd", return_value=canonical), \
+                patch.object(G.admission_source, "observe", side_effect=G.admission_source.SourceError("affected_source_uncommitted")), \
+                patch.object(G, "execute") as execute, patch("builtins.print") as emit:
+            self.assertEqual(G.main(["apply"]), 1)
+            report = G.H.parse(emit.call_args.args[0].encode())
+            self.assertEqual(report["reason"], "affected_source_uncommitted")
+            self.assertTrue(report["nextAction"])
+            self.assertTrue(report["unknownStateRetained"])
+            execute.assert_not_called()
 
 
 class SuccessorGuidanceTests(GuidanceTests):
@@ -259,11 +271,12 @@ class SuccessorGuidanceTests(GuidanceTests):
         finally: self.mock_source.start()
 
     def test_scoped_cli_uses_held_source_only_and_denies_failed_source(self):
-        from lib import workstation_maintenance_delivery as D
+        from lib import scoped_source_admission as D
         canonical = Path(G.pwd.getpwuid(os.getuid()).pw_dir) / "AIDev/control"
         calls = []
-        def admitted(root, *, full, operation_check=None):
+        def admitted(root, *, full=False, operation_check=None, extra_paths=()):
             self.assertFalse(full, "unrelated vendor health must not be invoked")
+            self.assertIn("manifests/workstation-guidance-successor.json", extra_paths)
             calls.append("held")
             self.assertIs(operation_check("a" * 40, source_guard=lambda: True), True)
         def execute(home, action, *, admission, source_guard, operation):
@@ -271,11 +284,11 @@ class SuccessorGuidanceTests(GuidanceTests):
             calls.append("execute")
             return admission(lambda: {"status": "INSTALLED"}, lambda: True)
         with patch.object(G, "ROOT", canonical), patch.object(G.Path, "cwd", return_value=canonical), \
-             patch.object(D, "admitted_source", admitted), patch.object(G, "execute", execute), patch("builtins.print"):
+             patch.object(D, "observe", admitted), patch.object(G, "execute", execute), patch("builtins.print"):
             self.assertEqual(G.main(["apply"], operation=G.SUCCESSOR), 0)
         self.assertEqual(calls, ["held", "execute"])
         with patch.object(G, "ROOT", canonical), patch.object(G.Path, "cwd", return_value=canonical), \
-             patch.object(D, "admitted_source", side_effect=RuntimeError("unaccepted source")), \
+             patch.object(D, "observe", side_effect=RuntimeError("unaccepted source")), \
              patch.object(G, "execute") as execute_mock, patch("builtins.print"):
             self.assertEqual(G.main(["apply"], operation=G.SUCCESSOR), 1)
             execute_mock.assert_not_called()

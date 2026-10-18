@@ -62,6 +62,26 @@ class FixtureCustodyCliTests(unittest.TestCase):
         self.assertEqual(C.main(['--fixture-custody-status'], custody_operation=capacity, emit=output.append), 1)
         self.assertEqual(json.loads(output[0])['reason'], 'fixture_capacity_required')
 
+    def test_custody_recovery_reasons_remain_closed_specific_and_actionable(self):
+        from lib.vendor_fixture_custody import CustodyError
+        from lib.vendor_compatibility_probe import ProbeError
+        for reason in ('fixture_metadata_pending', 'fixture_preparation_capacity',
+                       'fixture_preparation_recovery_required', 'fixture_namespace_refresh_required',
+                       'fixture_legacy_identity_required', 'private-path-exception'):
+            with self.subTest(reason=reason):
+                output = []
+                def failure(slot):
+                    raise CustodyError(reason)
+                self.assertEqual(C.main(['--fixture-custody-status'], custody_operation=failure,
+                                        emit=output.append), 1)
+                value = json.loads(output[0])
+                expected = 'fixture_custody_invalid' if reason == 'private-path-exception' else reason
+                self.assertEqual(value['reason'], expected)
+                self.assertTrue(value['nextAction'])
+                if reason != 'private-path-exception':
+                    self.assertIn(reason, C.REASONS)
+                    self.assertEqual(ProbeError(reason).reason_class, reason)
+
 
 def historical_blob(revision, path):
     result = subprocess.run(

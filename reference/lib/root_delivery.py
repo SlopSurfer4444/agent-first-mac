@@ -7,7 +7,7 @@ and guards only through the Python API; the CLI has no destination override.
 import argparse
 import ctypes
 import hashlib
-import importlib.machinery
+import fcntl
 import json
 import os
 from pathlib import Path
@@ -15,15 +15,17 @@ import pwd
 import re
 import secrets
 import stat
+from lib.scoped_source_admission import SourceError
 
 ROOT = Path(__file__).resolve().parents[1]
 MANIFEST = 'manifests/root-runtime-release.json'
-RELEASE_ID = 'security-root-5a778b6-v1'
+RELEASE_ID = 'usability-root-9123d91-v1'
 # Reviewed build-source anchor, not acceptance of this release or installed state.
-BASE = '5a778b668647fdf660bef64a63cf2c10e08ff388'
+BASE = '9123d91269c673d4c58878a54bd5ba9fa728150d'
 SUFFIX = 'AIDev/state/root-runtime/releases/' + RELEASE_ID
 LIMIT = 2 * 1024 * 1024
 MAX_RETAINED_ATTEMPTS = 32
+MAX_INVENTORY = 256
 FILES = {
     'bootstrap': ('install', 'aid-admin-bootstrap', 'aid-admin-bootstrap', '0555'),
     'broker': ('install', 'aid-admin', 'aid-admin', '0555'),
@@ -199,10 +201,15 @@ def read_file(directory, name, uid, *, record=None, mode=None):
         os.close(fd)
 
 
-def load_release(root=ROOT):
+def load_manifest(root=ROOT):
     uid = os.getuid()
     with Directory(Path(root) / 'manifests', uid) as directory:
-        release = validate_release(parse(read_file(directory, 'root-runtime-release.json', uid)))
+        return validate_release(parse(read_file(directory, 'root-runtime-release.json', uid)))
+
+
+def load_release(root=ROOT):
+    uid = os.getuid()
+    release = load_manifest(root)
     # Build-time heads differ; the complete recorded source closure, not a fake
     # manifest acceptance flag, binds these reused binaries to accepted source.
     for name, expected in release['sourceArtifactSHA256'].items():
@@ -251,6 +258,153 @@ def rename_exclusive(fd, source, target):
         raise OSError(ctypes.get_errno(), 'exclusive_publication_refused')
 
 
+def attempt_name(token):
+    need(type(token) is str and re.fullmatch('[0-9a-f]{32}', token) is not None, 'attempt_id')
+    return '.' + RELEASE_ID + '.pending-' + token
+
+
+def attempt_record(release, token):
+    return encoded({'schema': 1, 'owner': 'root-delivery-preparation',
+        'releaseSHA256': digest(encoded(release)), 'attempt': token})
+
+
+def preparation_names(parent):
+    # Bound iteration itself, not just the resulting pending count.
+    names = []
+    with os.scandir(parent.fd) as entries:
+        for entry in entries:
+            need(len(names) < MAX_INVENTORY, 'preparation_inventory_limit')
+            names.append(entry.name)
+    return names
+
+
+def preparation_lease(parent, *, exclusive):
+    try:
+        fcntl.flock(parent.fd, (fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH) | fcntl.LOCK_NB)
+    except BlockingIOError:
+        raise Fault('preparation_busy') from None
+
+
+def inventory_attempts(release, home, uid):
+    """Report metadata debt too; never adopt an unknown legacy attempt."""
+    parent_path = (Path(home) / SUFFIX).parent
+    current = Path(home)
+    with Directory(current, uid):
+        pass
+    for part in parent_path.relative_to(home).parts:
+        current /= part
+        if not os.path.lexists(current):
+            return {'status': 'PREPARATION_INVENTORY', 'attempts': [], 'retainedAttempts': 0,
+                'pendingMetadata': 0, 'capacityReason': None, 'installed': False}
+        with Directory(current, uid):
+            pass
+    with Directory(parent_path, uid) as parent:
+        preparation_lease(parent, exclusive=False)
+        names = preparation_names(parent)
+        prefix = '.' + RELEASE_ID + '.pending'
+        bases = sorted({name.removesuffix('.json') for name in names
+            if name == prefix or name.startswith(prefix + '-')})
+        rows = []
+        for name in bases:
+            token = name[len(prefix) + 1:]
+            known = False
+            if re.fullmatch('[0-9a-f]{32}', token) and name + '.json' in names:
+                try:
+                    known = read_file(parent, name + '.json', uid, mode=0o600) == attempt_record(release, token)
+                except (Fault, OSError):
+                    pass
+            rows.append({'attempt': token if re.fullmatch('[0-9a-f]{32}', token) else None,
+                'recordVerified': known, 'directoryPresent': name in names,
+                'metadataPresent': name + '.json' in names,
+                'nextAction': 'retire-exact-attempt-with-sealed-bundles' if known else 'preserve-unknown-attempt'})
+        parent.verify()
+        return {'status': 'PREPARATION_INVENTORY', 'attempts': rows,
+            'retainedAttempts': len(rows),
+            'pendingMetadata': sum(row['metadataPresent'] for row in rows),
+            'capacityReason': 'retained_attempt_limit_preserve_and_review' if len(rows) >= MAX_RETAINED_ATTEMPTS else None,
+            'installed': False}
+
+
+def retire_attempt(release, token, install_bundle, emergency_bundle, home, uid, *, source_guard):
+    """Retire one recorded preparation only, never a release/recovery journal.
+
+    The complete inventory must be absent or exact expected byte prefixes from
+    the supplied sealed bundles. The record is removed last, so interruption
+    leaves a re-verifiable subset. Unknown names/bytes/metadata are untouched.
+    The shared directory lease serializes this with cooperating preparation.
+    """
+    name = attempt_name(token)
+    need(source_guard() is True, 'source_drift')
+    payloads = verify_bundles(release, install_bundle, emergency_bundle, uid)
+    expected = {row['destination']: (payloads[role], int(row['mode'], 8))
+        for role, row in release['artifacts'].items()}
+    expected['root-runtime-release.json'] = (encoded(release), 0o444)
+    with Directory((Path(home) / SUFFIX).parent, uid) as parent:
+        preparation_lease(parent, exclusive=True)
+        record = name + '.json'
+        names = preparation_names(parent)
+        if name not in names and record not in names:
+            need(source_guard() is True and parent.verify() is True, 'source_drift')
+            return {'status': 'PREPARATION_ABSENT', 'attempt': token, 'installed': False,
+                'publishedReleaseChanged': False, 'recoveryMaterialRemoved': False}
+        need(read_file(parent, record, uid, mode=0o600) == attempt_record(release, token), 'attempt_record_unknown')
+        record_fd = os.open(record, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=parent.fd)
+        parent.fds.append(record_fd)
+        record_identity = identity(os.fstat(record_fd))
+        def record_guard():
+            need(read_file(parent, record, uid, mode=0o600) == attempt_record(release, token)
+                and identity(os.stat(record, dir_fd=parent.fd, follow_symlinks=False)) ==
+                identity(os.fstat(record_fd)) == record_identity, 'attempt_record_unknown')
+        record_guard()
+        if name in names:
+            with Directory(parent.path / name, uid) as staged:
+                need(stat.S_IMODE(os.fstat(staged.fd).st_mode) == 0o700, 'attempt_directory_metadata')
+                members = set(preparation_names(staged))
+                need(members <= set(expected), 'attempt_inventory_unknown')
+                held = []
+                try:
+                    for leaf in sorted(members):
+                        raw, mode = expected[leaf]
+                        fd = os.open(leaf, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=staged.fd)
+                        held.append((leaf, fd, None, None))
+                        facts = os.fstat(fd)
+                        need(stat.S_ISREG(facts.st_mode) and facts.st_uid == uid and facts.st_nlink == 1
+                            and stat.S_IMODE(facts.st_mode) in (0o600, mode)
+                            and 0 <= facts.st_size <= len(raw)
+                            and (stat.S_IMODE(facts.st_mode) == 0o600 or facts.st_size == len(raw)), 'attempt_file_unknown')
+                        actual = os.pread(fd, len(raw) + 1, 0)
+                        need(len(actual) == facts.st_size and raw.startswith(actual), 'attempt_bytes_unknown')
+                        stamp = lambda s: (s.st_dev, s.st_ino, s.st_uid, s.st_gid,
+                            s.st_mode, s.st_nlink, s.st_size, s.st_mtime_ns, s.st_ctime_ns)
+                        held[-1] = leaf, fd, stamp(facts), actual
+                    # Validate every file before deleting any. Repeat binding at
+                    # each unlink; no path traversal or recursive removal.
+                    for leaf, fd, before, actual in held:
+                        need(source_guard() is True and parent.verify() and staged.verify(), 'source_drift')
+                        record_guard()
+                        need(set(os.listdir(staged.fd)) == members, 'attempt_inventory_unknown')
+                        facts = os.fstat(fd)
+                        named = os.stat(leaf, dir_fd=staged.fd, follow_symlinks=False)
+                        raw, mode = expected[leaf]
+                        need(stamp(named) == stamp(facts) == before
+                            and os.pread(fd, len(raw) + 1, 0) == actual, 'attempt_drift')
+                        os.unlink(leaf, dir_fd=staged.fd)
+                        members.remove(leaf)
+                    need(not os.listdir(staged.fd) and staged.verify() and parent.verify(), 'attempt_drift')
+                    record_guard()
+                    os.rmdir(name, dir_fd=parent.fd)
+                    os.fsync(parent.fd)
+                finally:
+                    for _, fd, _, _ in held:
+                        os.close(fd)
+        need(source_guard() is True and parent.verify() is True, 'source_drift')
+        record_guard()
+        os.unlink(record, dir_fd=parent.fd)
+        os.fsync(parent.fd)
+    return {'status': 'PREPARATION_RETIRED', 'attempt': token, 'installed': False,
+        'publishedReleaseChanged': False, 'recoveryMaterialRemoved': False}
+
+
 def stage_release(release, install_bundle, emergency_bundle, home, uid, *, source_guard):
     need(uid > 0 and callable(source_guard) and source_guard() is True, 'source_guard_required')
     payloads = verify_bundles(release, install_bundle, emergency_bundle, uid)
@@ -261,7 +415,9 @@ def stage_release(release, install_bundle, emergency_bundle, home, uid, *, sourc
         pass
     need(source_guard() is True, 'source_drift')
     with Directory(target.parent, uid, create_from=Path(home) / 'AIDev') as parent:
-        if RELEASE_ID in os.listdir(parent.fd):
+        preparation_lease(parent, exclusive=True)
+        names = preparation_names(parent)
+        if RELEASE_ID in names:
             value = verify_durable(release, home, uid)
             need(source_guard() is True, 'source_drift')
             return {**value, 'status': 'UNCHANGED', 'installed': False}
@@ -269,11 +425,27 @@ def stage_release(release, install_bundle, emergency_bundle, home, uid, *, sourc
         # its unknown bytes; use a fresh exclusive sibling instead. Count even
         # foreign/symlink entries without following them to bound retained work.
         prefix = '.' + RELEASE_ID + '.pending'
-        need(sum(name == prefix or name.startswith(prefix + '-')
-            for name in os.listdir(parent.fd)) < MAX_RETAINED_ATTEMPTS,
+        need(len({name.removesuffix('.json') for name in names
+            if name == prefix or name.startswith(prefix + '-')}) < MAX_RETAINED_ATTEMPTS,
             'retained_attempt_limit_preserve_and_review')
-        pending = prefix + '-' + secrets.token_hex(16)
+        token = secrets.token_hex(16)
+        pending = attempt_name(token)
         need(source_guard() is True and parent.verify() is True, 'source_drift')
+        # Reserve ownership before mkdir. A completed record with no directory
+        # is truthful metadata debt and is safely retireable by exact token.
+        record = pending + '.json'
+        fd = os.open(record, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=parent.fd)
+        try:
+            raw = attempt_record(release, token)
+            offset = 0
+            while offset < len(raw):
+                count = os.write(fd, raw[offset:])
+                need(count > 0, 'short_write')
+                offset += count
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+        os.fsync(parent.fd)
         os.mkdir(pending, 0o700, dir_fd=parent.fd)
         os.fsync(parent.fd)
         # Failures retain this isolated attempt. A later invocation starts fresh;
@@ -303,29 +475,43 @@ def stage_release(release, install_bundle, emergency_bundle, home, uid, *, sourc
             os.fsync(parent.fd)
         value = verify_durable(release, home, uid)
         need(source_guard() is True and parent.verify() is True, 'postpublication_drift')
+        need(read_file(parent, record, uid, mode=0o600) == attempt_record(release, token), 'attempt_record_unknown')
+        os.unlink(record, dir_fd=parent.fd)
+        os.fsync(parent.fd)
         return {**value, 'status': 'STAGED', 'installed': False}
 
 
-def admitted_source(*, full, operation_check=None):
-    from lib import current_doctor_native
+def admitted_source(*, full=False, operation_check=None, entrypoint='bin/root-delivery'):
+    from lib.scoped_source_admission import admitted_source as held_source, require_execution
+    need(full is False, 'source_scope')
     need(ROOT == Path(pwd.getpwuid(os.getuid()).pw_dir) / 'AIDev/control', 'canonical_source_required')
-    doctor = importlib.machinery.SourceFileLoader('root_delivery_doctor', str(ROOT / 'bin/current-doctor')).load_module()
-    if operation_check is None:
-        def operation_check(head, *, source_guard):
-            return source_guard()
-    value = current_doctor_native.native(doctor, not full, operation_check=operation_check)
-    report = doctor.public_report(value, git_only=not full)
-    need(report.get('integratedMain') is True and report.get('verdict') ==
-        ('PASS' if full else 'GIT_ONLY_VALID'), 'source_unadmitted')
+    require_execution(ROOT)
+    # This is unprivileged custody/observation, not review of a root apply
+    # target. The sealed artifacts and installed-owner/native boundary remain
+    # separate. Hold every computed release input without replaying history.
+    # Build scripts/tests in the release closure are hash-only provenance,
+    # not programs this adapter executes. Actual runtime imports still promote
+    # normal executable discovery even if also present in this opaque set.
+    with held_source(ROOT, entrypoints=(entrypoint,), data_paths=(),
+            opaque_paths=(MANIFEST,)) as (head, guard):
+        # Select dynamic provenance inputs only from the already held manifest.
+        # The nested context extends the original snapshot, not a newer HEAD.
+        release = load_manifest()
+        need(guard() is True, 'source_drift')
+        with held_source(ROOT, data_paths=(), opaque_paths=tuple(release['sourceArtifactSHA256'])) as (same_head, extended):
+            need(same_head == head and extended() is True and load_release() == release, 'source_drift')
+            if operation_check is not None:
+                need(operation_check(head, source_guard=extended) is True, 'source_operation_failed')
+            need(extended() is True and load_release() == release, 'source_drift')
 
 
-def native(operation, install_bundle=None, emergency_bundle=None):
+def native(operation, install_bundle=None, emergency_bundle=None, attempt=None):
     uid = os.getuid()
     home = pwd.getpwuid(uid).pw_dir
     need(uid > 0, 'owner_only')
-    release = load_release()
-    need(operation in ('inspect', 'verify', 'stage', 'handoff'), 'fixed_operation')
+    need(operation in ('inspect', 'verify', 'stage', 'handoff', 'inventory', 'retire'), 'fixed_operation')
     if operation == 'inspect':
+        release = load_release()
         verify_bundles(release, install_bundle, emergency_bundle, uid)
         return {'status': 'BUNDLES_VERIFIED', 'releaseID': RELEASE_ID, 'installed': False,
             'sourceAdmissionClaimed': False}
@@ -336,9 +522,13 @@ def native(operation, install_bundle=None, emergency_bundle=None):
     results = []
     def operation_check(head, *, source_guard):
         need(source_guard() is True, 'source_drift')
-        need(load_release() == release, 'release_source_drift')
+        release = load_release()
         if operation == 'stage':
             result = stage_release(release, install_bundle, emergency_bundle, home, uid, source_guard=source_guard)
+        elif operation == 'inventory':
+            result = inventory_attempts(release, home, uid)
+        elif operation == 'retire':
+            result = retire_attempt(release, attempt, install_bundle, emergency_bundle, home, uid, source_guard=source_guard)
         else:
             result = verify_durable(release, home, uid)
             result['status'] = 'DURABLE_RELEASE_VERIFIED'
@@ -363,17 +553,28 @@ def native(operation, install_bundle=None, emergency_bundle=None):
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('operation', choices=('inspect', 'verify', 'stage', 'handoff'))
+    parser.add_argument('operation', choices=('inspect', 'verify', 'stage', 'handoff', 'inventory', 'retire'))
     parser.add_argument('--install-bundle')
     parser.add_argument('--emergency-bundle')
+    parser.add_argument('--attempt')
     parser.add_argument('--json', action='store_true')
     args = parser.parse_args(argv)
     try:
-        need((args.operation in ('inspect', 'stage')) == (args.install_bundle is not None and args.emergency_bundle is not None)
-            and (args.operation in ('inspect', 'stage') or (args.install_bundle is None and args.emergency_bundle is None)), 'paired_bundle_arguments')
-        value = native(args.operation, args.install_bundle, args.emergency_bundle)
+        need((args.operation in ('inspect', 'stage', 'retire')) == (args.install_bundle is not None and args.emergency_bundle is not None)
+            and (args.operation in ('inspect', 'stage', 'retire') or (args.install_bundle is None and args.emergency_bundle is None)), 'paired_bundle_arguments')
+        need((args.operation == 'retire') == (args.attempt is not None), 'attempt_argument')
+        value = native(args.operation, args.install_bundle, args.emergency_bundle, args.attempt)
     except Exception as error:
         value = {'status': 'BLOCKED', 'reason': str(error) if isinstance(error, Fault) else 'delivery_unavailable',
             'installerExecuted': False, 'rootOperationsPerformed': False}
+        if isinstance(error, SourceError):
+            from lib.scoped_source_admission import public_failure
+            value.update(public_failure(error))
+        elif isinstance(error, Fault) and str(error) in {
+                'retained_attempt_limit_preserve_and_review', 'preparation_inventory_limit',
+                'preparation_busy', 'attempt_record_unknown', 'attempt_inventory_unknown',
+                'attempt_file_unknown', 'attempt_bytes_unknown', 'attempt_drift'}:
+            value['nextAction'] = ('retry-after-preparation-settles' if str(error) == 'preparation_busy'
+                else 'inspect-preparations-and-preserve-unknown')
     print(json.dumps(value, sort_keys=True))
     return 1 if value['status'] == 'BLOCKED' else 0

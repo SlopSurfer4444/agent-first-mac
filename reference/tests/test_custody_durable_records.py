@@ -52,6 +52,8 @@ class DurableRecordTests(unittest.TestCase):
                 record = self.renumber(path)
                 old = json.loads(record.read_bytes())
                 with self.open(path, 'b' * 64) as custody:
+                    self.assertEqual(record.read_bytes(), json.dumps(old).encode())
+                    custody._rebase_slot(0)
                     current = custody.records()[0]
                     self.assertEqual(current['provenance']['objects'], old['provenance']['objects'])
                     self.assertEqual(current['provenance']['boot'], 'b' * 64)
@@ -74,8 +76,12 @@ class DurableRecordTests(unittest.TestCase):
                     root.mkdir(mode=0o700)
                 record.write_text(json.dumps(value))
                 before = record.read_bytes()
-                with self.assertRaises(C.CustodyError):
-                    self.open(path, ('a' if failure == 'same-boot' else 'b') * 64)
+                if failure == 'same-boot':
+                    with self.assertRaises(C.CustodyError):
+                        self.open(path, 'a' * 64)
+                else:
+                    with self.open(path, 'b' * 64) as custody, self.assertRaises(C.CustodyError):
+                        custody.retire(0)
                 self.assertEqual(record.read_bytes(), before)
                 self.assertTrue(root.is_dir())
 
@@ -91,8 +97,8 @@ class DurableRecordTests(unittest.TestCase):
             before = record.read_bytes()
             with self.open(path, 'b' * 64, create=False) as custody:
                 self.assertEqual(custody.status()['outstanding'], 1)
-            with self.assertRaisesRegex(C.CustodyError, 'fixture_legacy_identity_required'):
-                self.open(path, 'b' * 64)
+            with self.open(path, 'b' * 64) as custody, self.assertRaises(C.CustodyError):
+                custody.retire(0)
             self.assertEqual(record.read_bytes(), before)
             self.assertTrue(root.is_dir())
 
@@ -108,6 +114,35 @@ class DurableRecordTests(unittest.TestCase):
                 custody.retire(0)
             self.assertEqual(record.read_bytes(), before)
             self.assertTrue(root.is_dir())
+
+    def test_unknown_sibling_does_not_veto_selected_settled_retirement(self):
+        for legacy in (False, True):
+            with self.subTest(legacy=legacy), tempfile.TemporaryDirectory(dir='/private/tmp') as path:
+                root = self.seed(path)
+                with self.open(path) as custody:
+                    slot = custody.reserve()
+                    other = Path(path) / custody.leaf(custody.records()[slot])
+                    other.mkdir(mode=0o700)
+                    (other / 'unknown').write_bytes(b'preserve unknown child')
+                    custody.update(slot, root=C.identity(other.stat()), state='inflight', settled=False)
+                self.renumber(path)
+                record = Path(path) / C.NAMESPACE / '1.json'
+                value = json.loads(record.read_bytes())
+                value['root'][0] += 100
+                if legacy:
+                    value['schema'] = 1
+                    value.pop('provenance')
+                    value.pop('output')
+                record.write_text(json.dumps(value))
+                preserved = record.read_bytes(), (other / 'unknown').read_bytes()
+                with self.open(path, 'b' * 64, create=False, reconcile=True) as custody:
+                    self.assertTrue(custody.retire(0)['retired'])
+                    with self.assertRaisesRegex(C.CustodyError, 'fixture_settlement_required'):
+                        custody.retire(1)
+                    with self.assertRaisesRegex(C.CustodyError, 'fixture_settlement_required'):
+                        custody.reserve()
+                self.assertFalse(root.exists())
+                self.assertEqual((record.read_bytes(), (other / 'unknown').read_bytes()), preserved)
 
 
 if __name__ == '__main__':

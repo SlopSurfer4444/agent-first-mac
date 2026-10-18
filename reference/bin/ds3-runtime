@@ -3,6 +3,9 @@
 import sys
 sys.dont_write_bytecode = True
 sys.pycache_prefix = "/dev/null"
+if __name__=='__main__' and not globals().get('__source_bound__') and __file__.endswith('/AIDev/control/bin/ds3-runtime'):
+    import posix
+    posix.execv(sys.executable,[sys.executable,'-I','-S','-B',__file__.rsplit('/',2)[0]+'/lib/scoped_source_admission.py',__file__,'[]',*sys.argv[1:]])
 import contextlib, ctypes, fcntl, hashlib, importlib.machinery, importlib.util, json, os, pwd, re, shutil, stat, subprocess, tempfile, time
 import xml.etree.ElementTree as ET
 from pathlib import Path
@@ -92,10 +95,10 @@ def load(p, limit=65536):
 def pinned(digest):
     return type(digest) is str and re.fullmatch('[0-9a-f]{64}', digest) is not None
 
-def manifest(p):
+def manifest(p, operational=False):
     m = load(p)
     need(type(m) is dict and type(m.get('schema')) is int and m.get('schema') in (1,2,3,4) and m.get('id') == 'ds3-marshal-fix' and m.get('owner') == 'control-ds3-marshal-fix', 'manifest_identity')
-    allowed = set(DS3_MANIFEST_FIELDS) | ({'runtimeOverrides','runtimeOverlayPolicySha256'} if m['schema'] >= 2 else set())
+    allowed = set(DS3_MANIFEST_FIELDS) | {'helperOverride'} | ({'runtimeOverrides','runtimeOverlayPolicySha256'} if m['schema'] >= 2 else set())
     need(set(m) <= allowed and (m['schema'] >= 2 or 'runtimeOverrides' not in m and 'runtimeOverlayPolicySha256' not in m), 'manifest_field_schema')
     for k in ('candidateSha256', 'provenanceSha256'):
         need(pinned(m.get(k)), 'candidate_pins_pending')
@@ -148,10 +151,10 @@ def manifest(p):
         need(type(policy) is dict and set(policy) == (RUNTIME_OVERLAY_POLICY_FIELDS - {'desiredPEHashes'} | {'desiredRuntimeHashes'} if m['schema'] >= 3 else RUNTIME_OVERLAY_POLICY_FIELDS) and type(policy.get('schema')) is int and policy.get('schema') == (2 if m['schema'] >= 3 else 1) and policy.get('id') == 'wine-runtime-overlay' and policy.get('owner') == 'control-games-hub', 'overlay_policy_identity')
         need(pinned(m.get('runtimeOverlayPolicySha256')) and m['runtimeOverlayPolicySha256'] == sha(policy_path), 'overlay_policy_pin')
         override=renderer_fields(m)
-        if override and 'nativeRuntimeHashes' in override:
+        if override and 'nativeRuntimeHashes' in override and not operational and 'helperOverride' not in m:
             need(pinned(policy.get('lifecycleSha256')) and policy['lifecycleSha256']==renderer_overlay_lifecycle(m)
                  and (native_admission_lifecycle(m) if m.get('launchAdmissionOverride') is not None else override['lifecycleSha256'])==sha(lifecycle_path),'overlay_renderer_lifecycle_pin')
-        else:
+        elif not override or 'nativeRuntimeHashes' not in override:
             need(pinned(policy.get('lifecycleSha256')) and policy['lifecycleSha256'] == sha(lifecycle_path), 'overlay_lifecycle_pin')
         need(policy.get('desiredRuntimeHashes' if m['schema'] >= 3 else 'desiredPEHashes') == overrides and policy.get('sourceHubManifestSha256') == m['sourceHubManifestSha256'] and policy.get('sourceCriticalHashes') == m['sourceCriticalHashes'], 'overlay_source_binding')
         if hub_path is not None:
@@ -165,7 +168,8 @@ def manifest(p):
     renderer_fields(m)
     if 'launchAdmissionOverride' in m:
         need(m['schema']==4 and 'nativeRuntimeHashes' in (m.get('rendererOverride') or {}),'native_admission_manifest_scope')
-        native_admission_lifecycle(m)
+        if not operational and 'helperOverride' not in m:native_admission_lifecycle(m)
+    if 'helperOverride' in m:helper_verify_binding(m)
     return m
 
 def installed_critical_hashes(m):
@@ -367,10 +371,10 @@ def borderless_candidate(m, candidate):
 def borderless_binding(m, base):
     need(m['nativeBinding'] == {'winemetalSha256':renderer_metal_hash(base),'donorSha256':base['donorSha256'],'d3d11Sha256':renderer_hash(base)}, 'borderless_native_drift')
 
-def verify_borderless():
+def verify_borderless(operational=False):
     destination = ROOT/'borderless'; safe_directory(destination)
     m = borderless_manifest(destination/'manifest.json'); receipt = load(destination/'receipt.json')
-    base = manifest(ROOT/'manifest.json'); current = load(ROOT/'receipt.json'); borderless_binding(m,base)
+    base = manifest(ROOT/'manifest.json',operational=operational); current = load(ROOT/'receipt.json'); borderless_binding(m,base)
     need(set(receipt) == {'schema','owner','commit','manifestSha256','baseRuntimeTreeSha256','baseManifestSha256'} and type(receipt['schema']) is int and receipt['schema'] == 1 and type(receipt['commit']) is str and re.fullmatch('[0-9a-f]{40}',receipt['commit']) is not None, 'borderless_receipt_schema')
     need(receipt.get('owner') == m['owner'] and receipt.get('manifestSha256') == sha(destination/'manifest.json') and receipt.get('baseRuntimeTreeSha256') == current.get('runtimeTreeSha256') and receipt.get('baseManifestSha256') == current.get('manifestSha256'), 'borderless_installed_binding')
     borderless_candidate(m,destination)
@@ -440,8 +444,8 @@ def verify_app_shortcuts(receipt, expected):
     for name in expected.values():
         p = HOME/'Games'/name; need(not p.exists() and not p.is_symlink(), 'legacy_shortcut_collision')
 
-def verify_installed(allow_virtual_transaction=None):
-    safe_directory(ROOT); m = manifest(ROOT/'manifest.json'); r = load(ROOT/'receipt.json')
+def verify_installed(allow_virtual_transaction=None, operational=False):
+    safe_directory(ROOT); m = manifest(ROOT/'manifest.json',operational=operational); r = load(ROOT/'receipt.json')
     need(r.get('owner') == m['owner'] and r.get('manifestSha256') == sha(ROOT/'manifest.json'), 'installed_owner_or_manifest_drift')
     for name,key in (('ds3-runtime','lifecycleSha256'),('ds3-play','launcherSha256')):
         need(sha(ROOT/name) == r.get(key), 'installed_helper_drift')
@@ -449,7 +453,10 @@ def verify_installed(allow_virtual_transaction=None):
     for rel,digest in expected.items(): need(sha(ROOT/'runtime'/rel) == digest, 'installed_critical_drift')
     need(code_tree(ROOT/'runtime',allow_installed_loader_hardlinks=True) == r.get('runtimeTreeSha256'), 'installed_runtime_drift')
     virtual_fullscreen_pending_guard(allow_virtual_transaction)
-    native_admission_pending_guard();renderer_pending_guard();renderer_verify_binding(m)
+    if operational or 'helperOverride' in m:
+        renderer_pending_guard(metadata_only=True);installed_native_binding(m)
+    else:
+        native_admission_pending_guard();renderer_pending_guard();renderer_verify_binding(m)
     snapshot(PREFIX); safe_directory(ROOT/'logs')
     resolver = HOME/'AIDev/bin/ds3-play'
     safe_directory(resolver.parent)
@@ -2005,7 +2012,7 @@ def renderer_launch_scope(policy):
     # update/recovery. Ordinary play/status retain the current lifecycle pin.
     global _RENDERER_LAUNCH_POLICY
     renderer_policy_validate(policy);previous=_RENDERER_LAUNCH_POLICY
-    if policy['schema']==8:
+    if policy['schema'] in (8,10):
         need(previous is None or previous==policy,'renderer_launch_scope_conflict')
         _RENDERER_LAUNCH_POLICY=policy
     try:yield
@@ -2047,6 +2054,8 @@ def native_admission_bridge():
 
 def native_admission_lifecycle(m):
     need(type(m.get('launchAdmissionOverride')) is dict,'native_admission_helper_binding')
+    if 'helperOverride' in m:
+        helper_verify_binding(m);installed_native_binding(m);return m['helperOverride']['lifecycleSha256']
     if renderer_admission_record(m) is not None:
         return renderer_admission_lifecycle(m)
     need(m['launchAdmissionOverride'].get('admissionSha256') in renderer_launch_helper_pins(),'native_admission_helper_binding')
@@ -2125,9 +2134,14 @@ def renderer_ntdll_approval(base,pin):
     approval={'schema':2,'owner':b['OWNER'],'route':'ds3','prefix':str(PREFIX),'image':route['image'],'machine':0x8664,'target':str(target),'loader':str(loader),'bundleIdentifier':route['bundleIdentifier'],'files':{str(target):route['targetSha256'],str(loader):route['bundleFiles']['Contents/MacOS/wine']['sha256'],str(app/'Contents/Info.plist'):route['bundleFiles']['Contents/Info.plist']['sha256'],str(ROOT/'runtime/engine/lib/wine/x86_64-unix/ntdll.so'):pin,str(ROOT/'runtime/engine/bin/wineserver'):intent['preserveServerSha256']}}
     return b['json_bytes'](approval)
 
-def renderer_admission_base_check(base, ntdll_pins=None):
-    renderer_admission_base_policy(base);b=native_admission_bridge();b['pending_guard'](ROOT);images=renderer_admission_snapshots(base['descriptor'])
-    need({key:digest_bytes(raw) for key,raw in images['after'].items()}==base['images'],'renderer_admission_base_images')
+def renderer_admission_base_check(base, ntdll_pins=None, history=True):
+    renderer_admission_base_policy(base);b=native_admission_bridge();images=None
+    # Pending native publication remains a relevant stop; this reads journal
+    # metadata only, without reconstructing retired native before/after images.
+    b['pending_guard'](ROOT)
+    if history:
+        images=renderer_admission_snapshots(base['descriptor'])
+        need({key:digest_bytes(raw) for key,raw in images['after'].items()}==base['images'],'renderer_admission_base_images')
     for namespace,path in (('companions',HOME/'AIDev/lib/game-launch-admission-v2/receipt.json'),('native',ROOT/'native/receipt.json')):
         raw=b['_read'](path,0o600);receipt=b['decode'](raw)
         need(digest_bytes(raw)==base['assetReceipts'][namespace] and receipt.get('schema')==1
@@ -2166,6 +2180,7 @@ def renderer_admission_ancestry(record,images,max_generations=RENDERER_MAX_GENER
     pins=tuple(dict.fromkeys(digest_bytes(images[side]['nativeNtdll']) for side in sides)) if record['policy']['schema']>=5 else None
     native=renderer_admission_base_check(base,pins);seen=set()
     launch_before={key:images['before'][key] for key in RENDERER_LAUNCH_MODES} if record['policy']['schema']==8 else None
+    launch_bound=False
     for generation in range(max_generations):
         need(record['commit'] not in seen and record['policy'].get('nativeAdmissionBase')==base,'renderer_admission_ancestry');seen.add(record['commit'])
         before=images['before']
@@ -2173,15 +2188,25 @@ def renderer_admission_ancestry(record,images,max_generations=RENDERER_MAX_GENER
             if launch_before is not None:
                 need(all(digest_bytes(launch_before[key])==base['intent']['sourceFiles']['bin/'+name] for key,name in RENDERER_LAUNCH_FILES.items()),'renderer_launch_history_anchor')
             return
-        prior=json.loads(before['manifest']);path=renderer_binding_transaction(prior);previous,older=renderer_read(path)
+        prior=json.loads(before['manifest']);helper=None
+        if 'helperOverride' in prior:
+            helper=helper_predecessor_images(record,images)
+            if launch_before is not None:
+                need(all(launch_before[key]==helper['after'][key] for key in RENDERER_LAUNCH_MODES),'renderer_launch_history_chain')
+            elif not launch_bound:
+                for key,path in renderer_launch_targets().items():
+                    need(path.stat().st_mode&0o777==RENDERER_LAUNCH_MODES[key] and sha(path)==digest_bytes(helper['after'][key]),'renderer_launch_endpoint_drift')
+            launch_bound=True;launch_before=None
+        path=renderer_binding_transaction(prior);previous,older=renderer_read(path)
+        changed={'lifecycle','manifest','receipt','borderlessReceipt'} if helper is not None else set()
         need(previous['policy']['schema']>=4 and previous['phase']=='complete' and previous['direction']=='after' and previous['intent'] is None
-             and all(before[k]==older['after'][k] for k in set(before)&set(older['after']))
+             and all(before[k]==older['after'][k] for k in set(before)&set(older['after'])-changed)
              and set(older['after'])-set(before) <= (set(RENDERER_LAUNCH_MODES) if previous['policy']['schema']==8 else set())
              and set(before)-set(older['after']) <= {'nativeApproval','dxgiRuntime','dxgiPrefix',*(RENDERER_LAUNCH_MODES if record['policy']['schema']==8 else ())},'renderer_admission_ancestry')
         if previous['policy']['schema']==8:
             if launch_before is not None:
                 need(all(launch_before[key]==older['after'][key] for key in RENDERER_LAUNCH_MODES),'renderer_launch_history_chain')
-            else:
+            elif not launch_bound:
                 for key,path in renderer_launch_targets().items():
                     need(path.stat().st_mode&0o777==RENDERER_LAUNCH_MODES[key] and sha(path)==previous['images'][key]['after'],'renderer_launch_endpoint_drift')
             launch_before={key:older['before'][key] for key in RENDERER_LAUNCH_MODES}
@@ -2214,9 +2239,12 @@ def renderer_overlay_lifecycle(m,max_generations=RENDERER_MAX_GENERATIONS):
         if prior and 'nativeRuntimeHashes' in prior and prior['lifecycleSha256']!=baseline:
             need(record['policy']['schema']>=4,'renderer_lifecycle_ancestry')
             renderer_admission_ancestry(*(admitted_head or (record,images)))
-            joined=renderer_admission_snapshots(record['policy']['nativeAdmissionBase']['descriptor'])
-            # Native admission does not change the underlying renderer metadata.
-            need(json.loads(joined['after']['manifest'])['rendererOverride']==prior,'renderer_lifecycle_ancestry')
+            if 'helperOverride' in current:
+                helper_predecessor_images(record,images)
+            else:
+                joined=renderer_admission_snapshots(record['policy']['nativeAdmissionBase']['descriptor'])
+                # Native admission does not change underlying renderer metadata.
+                need(json.loads(joined['after']['manifest'])['rendererOverride']==prior,'renderer_lifecycle_ancestry')
             baseline=prior['lifecycleSha256']
     raise RuntimeError('renderer_lifecycle_depth')
 
@@ -2247,6 +2275,9 @@ def renderer_hash(m):
     return override['d3d11Sha256'] if override else m['sourceCriticalHashes'][RENDERER_REL]
 
 def renderer_targets(policy=None):
+    if policy is not None and policy.get('schema')==10:
+        return dict(renderer_launch_targets(),lifecycle=ROOT/'ds3-runtime',manifest=ROOT/'manifest.json',
+                    receipt=ROOT/'receipt.json',borderlessReceipt=ROOT/'borderless/receipt.json')
     targets = {'runtime':ROOT/'runtime'/RENDERER_REL,'prefix':PREFIX/RENDERER_PREFIX,
             'manifest':ROOT/'manifest.json','borderless':ROOT/'borderless/manifest.json',
             'borderlessReceipt':ROOT/'borderless/receipt.json','receipt':ROOT/'receipt.json'}
@@ -2258,20 +2289,39 @@ def renderer_targets(policy=None):
     if policy is not None and policy.get('schema')==8:targets=dict(renderer_launch_targets(),**targets)
     return targets
 
-def renderer_transaction(commit,native=False,admission=False,launch=False,d3d=False):
+def renderer_transaction(commit,native=False,admission=False,launch=False,d3d=False,helper=False):
     need(type(commit) is str and re.fullmatch('[0-9a-f]{40}',commit) is not None,'renderer_commit')
-    return ROOT/(('.d3d-renderer-' if d3d else '.launch-renderer-' if launch else '.admitted-renderer-' if admission else '.native-renderer-' if native else '.renderer-')+commit)
+    return ROOT/(('.helper-renderer-' if helper else '.d3d-renderer-' if d3d else '.launch-renderer-' if launch else '.admitted-renderer-' if admission else '.native-renderer-' if native else '.renderer-')+commit)
 
 def renderer_policy_validate(p):
+    if type(p) is dict and type(p.get('schema')) is int and p['schema']==10:
+        fields={'schema','id','owner','candidateFiles','previousManifestSha256','previousEffectiveLifecycleSha256',
+                'nativeAdmissionBase','launchAdmission','rendererBinding'}
+        need(set(p)==fields and p['id']=='ds3-renderer-update' and p['owner']=='control-ds3-marshal-fix'
+             and type(p['candidateFiles']) is dict and set(p['candidateFiles'])=={'ds3-runtime',*RENDERER_LAUNCH_FILES.values()}
+             and all(pinned(v) for v in p['candidateFiles'].values())
+             and pinned(p['previousManifestSha256']) and pinned(p['previousEffectiveLifecycleSha256'])
+             and type(p['launchAdmission']) is dict and set(p['launchAdmission'])==set(RENDERER_LAUNCH_FILES)
+             and all(pinned(v) for v in p['launchAdmission'].values()),'renderer_helper_policy')
+        renderer_admission_base_policy(p['nativeAdmissionBase'])
+        binding=renderer_fields({'schema':4,'rendererOverride':p['rendererBinding']})
+        need(binding is not None and 'nativeRuntimeHashes' in binding and 'dxgiSha256' in binding,'renderer_helper_native_binding')
+        return p
     fields={'schema','id','owner','previousRendererSha256','candidateFiles','diagnosticCapable'}
     need(type(p) is dict and type(p.get('schema')) is int and p['schema'] in (1,2,3,4,5,6,7,8,9)
-         and set(p)-({'previousDxgiSha256'} if p['schema'] in (6,7,8,9) else set())-({'launchAdmission'} if p['schema']==8 else set())==(fields|{'nativeBorderlessCapable','traceProtocolVersion','previousNativeRuntimeHashes','nativeIdentityHashes','nativeAdmissionBase','previousManifestSha256','previousEffectiveLifecycleSha256'} if p['schema']>=4 else fields|{'nativeBorderlessCapable','traceProtocolVersion','previousNativeRuntimeHashes','nativeIdentityHashes'} if p['schema']==3 else fields|{'nativeBorderlessCapable','traceProtocolVersion'} if p['schema']==2 else fields)
+         and set(p)-({'helperPredecessor'} if p['schema'] in (7,9) else set())-({'previousDxgiSha256'} if p['schema'] in (6,7,8,9) else set())-({'launchAdmission'} if p['schema']==8 else set())==(fields|{'nativeBorderlessCapable','traceProtocolVersion','previousNativeRuntimeHashes','nativeIdentityHashes','nativeAdmissionBase','previousManifestSha256','previousEffectiveLifecycleSha256'} if p['schema']>=4 else fields|{'nativeBorderlessCapable','traceProtocolVersion','previousNativeRuntimeHashes','nativeIdentityHashes'} if p['schema']==3 else fields|{'nativeBorderlessCapable','traceProtocolVersion'} if p['schema']==2 else fields)
          and (p['schema']==1 or type(p['nativeBorderlessCapable']) is bool)
          and (p['schema']==1 or type(p['traceProtocolVersion']) is int and p['traceProtocolVersion']==2)
          and p['id']=='ds3-renderer-update' and p['owner']=='control-ds3-marshal-fix'
          and pinned(p['previousRendererSha256']) and type(p['diagnosticCapable']) is bool
          and type(p['candidateFiles']) is dict and set(p['candidateFiles'])==((RENDERER_NATIVE_FILES|{'dxgi.dll'}|set(RENDERER_LAUNCH_FILES.values())) if p['schema']==8 else (RENDERER_NATIVE_FILES|{'dxgi.dll'}) if p['schema'] in (6,7,9) else RENDERER_NATIVE_FILES if p['schema']>=3 else RENDERER_FILES)
          and all(pinned(x) for x in p['candidateFiles'].values()),'renderer_policy_schema')
+    if 'helperPredecessor' in p:
+        prior=p['helperPredecessor']
+        need(type(prior) is dict and set(prior)=={'descriptor','launchAdmission'}
+             and type(prior['launchAdmission']) is dict and set(prior['launchAdmission'])==set(RENDERER_LAUNCH_FILES)
+             and all(pinned(v) for v in prior['launchAdmission'].values()),'renderer_helper_predecessor_policy')
+        helper_descriptor(prior['descriptor'])
     if p['schema']>=3:
         need(type(p['previousNativeRuntimeHashes']) is dict and set(p['previousNativeRuntimeHashes'])=={rel for rel,_ in RENDERER_NATIVE.values()}
              and all(pinned(v) for v in p['previousNativeRuntimeHashes'].values())
@@ -2312,6 +2362,9 @@ def renderer_candidate(candidate,p):
     for name in p['candidateFiles']:
         path=candidate/name;safe_file(path);need(path.stat().st_size<=renderer_file_limit(name),'renderer_candidate_limit')
         files[name]=path.read_bytes();need(digest_bytes(files[name])==p['candidateFiles'][name],'renderer_candidate_pin')
+    if p['schema']==10:
+        need({path.name for path in candidate.iterdir()}==set(p['candidateFiles']),'renderer_helper_candidate_scope')
+        return files
     provenance=json.loads(files['provenance.json'])
     need(type(provenance) is dict and provenance.get('d3d11Sha256')==p['candidateFiles']['d3d11.dll']
          and provenance.get('sourceArchiveSha256')==p['candidateFiles']['source.tar.gz']
@@ -2326,8 +2379,133 @@ def renderer_candidate(candidate,p):
     if p['schema']==8:need(provenance.get('launchAdmissionFiles')=={name:p['candidateFiles'][name] for name in RENDERER_LAUNCH_FILES.values()},'renderer_launch_provenance')
     return files
 
+def helper_after(before,modes,files,p,commit,tree_rows):
+    """Helper-only delta: preserve native policy, approval and historical proofs."""
+    renderer_policy_validate(p)
+    old=json.loads(before['manifest']);receipt=json.loads(before['receipt']);brr=json.loads(before['borderlessReceipt'])
+    need(old.get('schema')==4 and old.get('owner')==p['owner']
+         and old.get('rendererOverride')==p['rendererBinding']
+         and old.get('launchAdmissionOverride')==p['nativeAdmissionBase']['descriptor']
+         and digest_bytes(before['manifest'])==p['previousManifestSha256']
+         and digest_bytes(before['lifecycle'])==p['previousEffectiveLifecycleSha256'],'renderer_helper_predecessor')
+    tree=digest_bytes(json.dumps(tree_rows,separators=(',',':')).encode())
+    need(receipt.get('owner')==p['owner'] and receipt.get('manifestSha256')==brr.get('baseManifestSha256')==digest_bytes(before['manifest'])
+         and receipt.get('lifecycleSha256')==digest_bytes(before['lifecycle'])
+         and receipt.get('runtimeTreeSha256')==brr.get('baseRuntimeTreeSha256')==tree,'renderer_helper_receipt')
+    need(modes['lifecycle']==0o700 and all(modes[k]==0o600 for k in ('manifest','receipt','borderlessReceipt')),'renderer_helper_modes')
+    override={'transactionCommit':commit,'policySha256':digest_bytes(json_bytes(p)),
+              'lifecycleSha256':p['candidateFiles']['ds3-runtime'],'admissionSha256':p['candidateFiles']['game-launch-admission']}
+    after={'lifecycle':files['ds3-runtime'],'manifest':json_bytes(dict(old,helperOverride=override))}
+    after['receipt']=json_bytes(dict(receipt,lifecycleSha256=override['lifecycleSha256'],manifestSha256=digest_bytes(after['manifest'])))
+    after['borderlessReceipt']=json_bytes(dict(brr,baseManifestSha256=digest_bytes(after['manifest'])))
+    for key,name in RENDERER_LAUNCH_FILES.items():
+        need(modes[key]==RENDERER_LAUNCH_MODES[key] and digest_bytes(before[key])==p['launchAdmission'][key],'renderer_launch_preimage')
+        after[key]=files[name]
+    hub=json.loads(before['launchHubReceipt']);cs2=json.loads(before['launchCs2Receipt'])
+    need(modes['launchHubReceipt']==modes['launchCs2Receipt']==0o600
+         and hub.get('owner')=='control-games-hub' and hub.get('launcherSha256')==digest_bytes(before['launchHub'])
+         and hub.get('launchAdmissionSha256')==digest_bytes(before['launchHelper'])
+         and cs2.get('owner')=='control-cs2-standalone' and cs2.get('launcherSha256')==digest_bytes(before['launchCs2']),'renderer_launch_receipt_preimage')
+    canonical=lambda value:(json.dumps(value,sort_keys=True,indent=2)+'\n').encode()
+    after['launchHubReceipt']=canonical(dict(hub,launcherSha256=digest_bytes(after['launchHub']),launchAdmissionSha256=digest_bytes(after['launchHelper']),launchReliabilityCommit=commit))
+    after['launchCs2Receipt']=canonical(dict(cs2,launcherSha256=digest_bytes(after['launchCs2']),launcherCommit=commit))
+    return after
+
+def helper_verify_binding(m):
+    override=helper_descriptor(m.get('helperOverride'))
+    record,images=renderer_read(renderer_transaction(override['transactionCommit'],helper=True))
+    need(record['policy']['schema']==10 and record['phase']=='complete' and record['direction']=='after' and record['intent'] is None
+         and images['after']['manifest']==json_bytes(m) and digest_bytes(json_bytes(record['policy']))==override['policySha256']
+         and record['policy']['rendererBinding']==m['rendererOverride'],'renderer_helper_binding')
+    # Hub/CS2 are co-delivered, not dependencies of ordinary DS3 use.
+    for name in ('lifecycle','manifest','receipt','borderlessReceipt','launchHelper'):
+        path=renderer_targets(record['policy'])[name]
+        need(sha(path)==record['images'][name]['after'] and path.stat().st_mode&0o777==record['images'][name]['mode'],'renderer_helper_endpoint')
+    return record['policy']
+
+def helper_descriptor(override):
+    need(type(override) is dict and set(override)=={'transactionCommit','policySha256','lifecycleSha256','admissionSha256'}
+         and type(override['transactionCommit']) is str and re.fullmatch('[0-9a-f]{40}',override['transactionCommit'])
+         and all(pinned(override[k]) for k in ('policySha256','lifecycleSha256','admissionSha256')),'renderer_helper_override')
+    return override
+
+def helper_predecessor_images(record,images):
+    before=json.loads(images['before']['manifest']);descriptor=helper_descriptor(before.get('helperOverride'))
+    binding=record['policy'].get('helperPredecessor')
+    need(type(binding) is dict and binding['descriptor']==descriptor,'renderer_helper_predecessor_binding')
+    previous,retained=renderer_read(renderer_transaction(descriptor['transactionCommit'],helper=True))
+    need(previous['policy']['schema']==10 and previous['phase']=='complete' and previous['direction']=='after' and previous['intent'] is None
+         and digest_bytes(json_bytes(previous['policy']))==descriptor['policySha256']
+         and previous['policy']['nativeAdmissionBase']==record['policy']['nativeAdmissionBase']
+         and previous['policy']['rendererBinding']==before['rendererOverride']
+         and all(images['before'][key]==retained['after'][key] for key in set(images['before'])&set(retained['after']))
+         and binding['launchAdmission']=={key:digest_bytes(retained['after'][key]) for key in RENDERER_LAUNCH_FILES},'renderer_helper_predecessor_binding')
+    return retained
+
+def installed_native_binding(m):
+    """Check current DS3 native capability, not retired transaction genealogy."""
+    override=renderer_fields(m)
+    current_policy=None
+    if override:
+        current_policy=current_renderer_policy(override)
+        if 'helperOverride' not in m and 'nativeRuntimeHashes' in override:
+            need(sha(ROOT/'ds3-runtime')==override['lifecycleSha256'],'renderer_lifecycle_drift')
+        pairs=((RENDERER_REL,RENDERER_PREFIX,override['d3d11Sha256'],0o755,0o644),)
+        if 'dxgiSha256' in override:pairs+=((DXGI_REL,DXGI_PREFIX,override['dxgiSha256'],0o644,0o644),)
+        for runtime,prefix,pin,rmode,pmode in pairs:
+            for path,mode in ((ROOT/'runtime'/runtime,rmode),(PREFIX/prefix,pmode)):
+                need(sha(path)==pin and path.stat().st_mode&0o777==mode,'renderer_prefix_drift')
+        for key,(rel,_) in RENDERER_NATIVE.items():
+            if rel in override.get('nativeRuntimeHashes',{}):
+                path=ROOT/'runtime'/rel
+                need(sha(path)==override['nativeRuntimeHashes'][rel] and path.stat().st_mode&0o777==RENDERER_NATIVE_MODES[key],'renderer_native_drift')
+    if m.get('launchAdmissionOverride') is None:return
+    if 'helperOverride' in m:
+        policy=helper_verify_binding(m)
+        need(policy['candidateFiles']['game-launch-admission'] in renderer_launch_helper_pins(),'native_admission_helper_binding')
+        helper_native_policy(policy)
+    else:
+        policy=current_policy
+    base=policy['nativeAdmissionBase']
+    need(base['descriptor']==m['launchAdmissionOverride'],'renderer_admission_binding')
+    pin=m['rendererOverride']['nativeRuntimeHashes']['engine/lib/wine/x86_64-unix/ntdll.so']
+    renderer_admission_base_check(base,(pin,),history=False)
+    need(sha(HOME/'AIDev/bin/game-launch-admission') in renderer_launch_helper_pins(),'native_admission_helper_drift')
+
+def native_policy_binding(override,policy):
+    need(override['d3d11Sha256']==policy['candidateFiles']['d3d11.dll']
+         and override['provenanceSha256']==policy['candidateFiles']['provenance.json']
+         and override['diagnosticCapable']==policy['diagnosticCapable']
+         and override.get('nativeBorderlessCapable')==policy.get('nativeBorderlessCapable')
+         and override.get('traceProtocolVersion')==policy.get('traceProtocolVersion')
+         and override.get('dxgiSha256')==policy['candidateFiles'].get('dxgi.dll'),'renderer_native_binding')
+    if policy['schema']>=3:
+        need(override.get('nativeRuntimeHashes')=={rel:policy['candidateFiles'][name] for rel,name in RENDERER_NATIVE.values()}
+             and override.get('lifecycleSha256')==policy['candidateFiles']['ds3-runtime'],'renderer_native_binding')
+
+def current_renderer_policy(override):
+    record=load(renderer_binding_transaction({'schema':4,'rendererOverride':override})/'record.json',32*1024*1024)
+    need(type(record) is dict and set(record)=={'schema','commit','policy','images','treeRows','phase','direction','intent'}
+         and type(record['schema']) is int and record['schema']==1 and record['commit']==override['transactionCommit'],'renderer_record_schema')
+    prior=renderer_policy_validate(record['policy'])
+    need(prior['schema']<10 and record['phase']=='complete' and record['direction']=='after' and record['intent'] is None
+         and digest_bytes(json_bytes(prior))==override['policySha256'],'renderer_installed_binding')
+    native_policy_binding(override,prior)
+    return prior
+
+def helper_native_policy(policy):
+    # One immutable current native-policy binding, not a walk of superseded
+    # helper generations or their source/archive/rollback images.
+    override=policy['rendererBinding']
+    prior=current_renderer_policy(override)
+    need(prior.get('nativeAdmissionBase')==policy['nativeAdmissionBase'],'renderer_helper_native_policy')
+
 def renderer_after(before,modes,files,p,commit,tree_rows):
+    if p['schema']==10:return helper_after(before,modes,files,p,commit,tree_rows)
     old=json.loads(before['manifest']);br=json.loads(before['borderless']);receipt=json.loads(before['receipt']);brr=json.loads(before['borderlessReceipt'])
+    if 'helperOverride' in old:
+        need(p['schema'] in (7,9) and p.get('helperPredecessor',{}).get('descriptor')==old['helperOverride'],'renderer_helper_predecessor_binding')
+    else:need('helperPredecessor' not in p,'renderer_helper_predecessor_binding')
     need(old['schema']==4 and renderer_hash(old)==p['previousRendererSha256'],'renderer_predecessor')
     if p['schema']>=4:
         renderer_admission_base_policy(p['nativeAdmissionBase'])
@@ -2346,6 +2524,7 @@ def renderer_after(before,modes,files,p,commit,tree_rows):
     need(modes['runtime']==0o755 and modes['prefix']==0o644,'renderer_pair_modes')
     new=dict(old,rendererOverride={'d3d11Sha256':p['candidateFiles']['d3d11.dll'],'provenanceSha256':p['candidateFiles']['provenance.json'],
                                 'policySha256':digest_bytes(json_bytes(p)),'transactionCommit':commit,'diagnosticCapable':p['diagnosticCapable']})
+    new.pop('helperOverride',None)
     if p['schema']>=2:new['rendererOverride'].update(nativeBorderlessCapable=p['nativeBorderlessCapable'],traceProtocolVersion=p['traceProtocolVersion'])
     after={'runtime':files['d3d11.dll'],'prefix':files['d3d11.dll'],'manifest':json_bytes(new),
            'borderless':json_bytes(dict(br,nativeBinding=dict(br['nativeBinding'],d3d11Sha256=p['candidateFiles']['d3d11.dll'])))}
@@ -2412,7 +2591,7 @@ def renderer_rows():
 def renderer_read(transaction):
     safe_directory(transaction);safe_file(transaction/'record.json');record_raw=(transaction/'record.json').read_bytes();need(len(record_raw)<=32*1024*1024,'renderer_record_limit');r=json.loads(record_raw)
     need(type(r) is dict and set(r)=={'schema','commit','policy','images','treeRows','phase','direction','intent'} and type(r['schema']) is int and r['schema']==1
-         and transaction==renderer_transaction(r['commit'],native=r['policy'].get('schema',0)>=3,admission=r['policy'].get('schema',0)>=4,launch=r['policy'].get('schema')==8,d3d=r['policy'].get('schema')==9) and r['phase'] in ('prepared','running','complete')
+         and transaction==renderer_transaction(r['commit'],native=r['policy'].get('schema',0)>=3,admission=r['policy'].get('schema',0)>=4,launch=r['policy'].get('schema')==8,d3d=r['policy'].get('schema')==9,helper=r['policy'].get('schema')==10) and r['phase'] in ('prepared','running','complete')
          and r['direction'] in ('after','before') and r['intent'] in (None,*renderer_targets(r['policy'])),'renderer_record_schema')
     need(type(r['images']) is dict and set(r['images'])==set(renderer_targets(r['policy'])),'renderer_target_scope')
     captured={side:{} for side in ('before','after')};modes={}
@@ -2433,12 +2612,21 @@ def renderer_save(transaction,record,guard=None):
 def renderer_checkpoint(label):
     """Test-only fault injection seam; no environment-controlled production input."""
 
-def renderer_pending_guard(allow=None):
-    for t in (*ROOT.glob('.renderer-*'),*ROOT.glob('.native-renderer-*'),*ROOT.glob('.admitted-renderer-*'),*ROOT.glob('.launch-renderer-*'),*ROOT.glob('.d3d-renderer-*')):
-        r,_=renderer_read(t)
+def renderer_pending_guard(allow=None,metadata_only=False):
+    for t in (*ROOT.glob('.renderer-*'),*ROOT.glob('.native-renderer-*'),*ROOT.glob('.admitted-renderer-*'),*ROOT.glob('.launch-renderer-*'),*ROOT.glob('.d3d-renderer-*'),*ROOT.glob('.helper-renderer-*')):
+        if metadata_only or t.name.startswith('.helper-renderer-'):
+            r=load(t/'record.json',32*1024*1024);p=renderer_policy_validate(r['policy'])
+            need(set(r)=={'schema','commit','policy','images','treeRows','phase','direction','intent'}
+                 and type(r['schema']) is int and r['schema']==1
+                 and t==renderer_transaction(r['commit'],native=p['schema']>=3,admission=p['schema']>=4,launch=p['schema']==8,d3d=p['schema']==9,helper=p['schema']==10)
+                 and r['phase'] in ('prepared','running','complete') and r['direction'] in ('before','after')
+                 and r['intent'] in (None,*renderer_targets(p)),'renderer_record_schema')
+        else:r=renderer_read(t)[0]
         need(t==allow or (r['phase']=='complete' and r['intent'] is None),'renderer_recovery_required')
 
 def renderer_verify_binding(m):
+    if 'helperOverride' in m:
+        helper_verify_binding(m);installed_native_binding(m);return
     override=renderer_fields(m)
     if override:
         t=renderer_binding_transaction(m);r,_=renderer_read(t)
@@ -2468,14 +2656,22 @@ def renderer_admission_guard(policy,source_guard):
            HOME/'Library/Application Support/CS2 Standalone/runtime/.owner.json',ADMISSION_BRIDGE_PATH,
            HOME/'AIDev/lib/game-launch-admission-v2/receipt.json',ROOT/'native/receipt.json',
            HOME/'AIDev/state/ds3-native-launch-approval.json',PREFIX/'native-applications.routes'}
-    if policy['schema']==8:paths.difference_update(renderer_launch_targets().values())
-    for pattern in ('.native-admission-*','.native-launch-admission-*'):
-        for directory in ROOT.glob(pattern):paths.update(directory.iterdir())
+    if policy['schema'] in (8,10):paths.difference_update(renderer_launch_targets().values())
+    if policy['schema']!=10:
+        for pattern in ('.native-admission-*','.native-launch-admission-*'):
+            for directory in ROOT.glob(pattern):paths.update(directory.iterdir())
+        if 'helperPredecessor' in policy:
+            directory=renderer_transaction(policy['helperPredecessor']['descriptor']['transactionCommit'],helper=True)
+            paths.update(path for path in directory.rglob('*') if path.is_file())
     paths.update(HOME/'AIDev/lib/game-launch-admission-v2'/relative for relative in base['intent']['companions'])
     route=base['intent']['nativeRoute'];app=ROOT/'native/Dark Souls III Native.app'
     paths.update(app/rel for rel in route['bundleFiles'])
     paths.update((PREFIX/'drive_c/Program Files (x86)/Steam/steamapps/common/DARK SOULS III/Game/DarkSoulsIII.exe',
                   ROOT/'runtime/engine/lib/wine/x86_64-unix/ntdll.so',ROOT/'runtime/engine/bin/wineserver'))
+    if policy['schema']==10:
+        paths.add(renderer_binding_transaction({'schema':4,'rendererOverride':policy['rendererBinding']})/'record.json')
+        paths.update(ROOT/'runtime'/rel for rel in (RENDERER_REL,DXGI_REL,*[rel for rel,_ in RENDERER_NATIVE.values()]))
+        paths.update((PREFIX/RENDERER_PREFIX,PREFIX/DXGI_PREFIX))
     directories={parent for path in paths for parent in path.parents}
     def facts():
         result={}
@@ -2487,14 +2683,18 @@ def renderer_admission_guard(policy,source_guard):
             result[path]=(st.st_dev,st.st_ino,st.st_mode,st.st_uid)
         return result
     pins=None
-    if policy['schema']>=5:
+    if policy['schema']==10:
+        pins=(policy['rendererBinding']['nativeRuntimeHashes']['engine/lib/wine/x86_64-unix/ntdll.so'],)
+    elif policy['schema']>=5:
         paths.discard(HOME/'AIDev/state/ds3-native-launch-approval.json')
         paths.discard(ROOT/'runtime/engine/lib/wine/x86_64-unix/ntdll.so')
         pins=(policy['previousNativeRuntimeHashes']['engine/lib/wine/x86_64-unix/ntdll.so'],policy['candidateFiles']['ntdll.so'])
-    frozen=facts();renderer_admission_base_check(base,pins)
+    frozen=facts()
+    if policy['schema']==10:helper_native_policy(policy)
+    renderer_admission_base_check(base,pins,history=policy['schema']!=10)
     need(facts()==frozen,'renderer_admission_static_drift')
     def guard():
-        if policy['schema']==8 and _RENDERER_CS2_GUARD is not None:_RENDERER_CS2_GUARD()
+        if policy['schema'] in (8,10) and _RENDERER_CS2_GUARD is not None:_RENDERER_CS2_GUARD()
         source_guard()
         pending=HOME/'AIDev/state/game-launch-pending.json'
         need(not pending.exists() and not pending.is_symlink(),'pending_launch_requires_recovery')
@@ -2507,20 +2707,20 @@ def renderer_run(transaction,direction,recover=False,guard=None):
     with renderer_launch_scope(record['policy']):return renderer_run_scoped(transaction,direction,recover,guard)
 
 def renderer_run_scoped(transaction,direction,recover=False,guard=None):
-    native_admission_pending_guard()
     r,images=renderer_read(transaction);targets=renderer_targets(r['policy'])
-    renderer_pending_guard(allow=transaction)
+    if r['policy']['schema']!=10:native_admission_pending_guard()
+    renderer_pending_guard(allow=transaction,metadata_only=r['policy']['schema']==10)
     if r['policy']['schema']<4:need('launchAdmissionOverride' not in load(ROOT/'manifest.json'),'rollback_native_admission_first')
     local=guard or (lambda:None)
     if r['policy']['schema']>=4:
-        renderer_admission_ancestry(r,images,sides=('before','after'))
+        if r['policy']['schema']!=10:renderer_admission_ancestry(r,images,sides=('before','after'))
         local=renderer_admission_guard(r['policy'],local)
     local()
     if recover:need(r['direction']==direction,'renderer_recovery_direction')
     else:need(r['phase'] in ('prepared','complete') and r['intent'] is None,'renderer_recovery_required')
     current_rows=renderer_rows();expected_rows=[list(row) for row in r['treeRows']]
-    runtime_keys={RENDERER_REL:'runtime'}
-    if r['policy']['schema']>=3:runtime_keys.update({rel:key for key,(rel,_) in RENDERER_NATIVE.items()})
+    runtime_keys={} if r['policy']['schema']==10 else {RENDERER_REL:'runtime'}
+    if 3<=r['policy']['schema']<10:runtime_keys.update({rel:key for key,(rel,_) in RENDERER_NATIVE.items()})
     if r['policy']['schema'] in (6,7,8,9):runtime_keys[DXGI_REL]='dxgiRuntime'
     for row in current_rows:
         if row[0] in runtime_keys:
@@ -2586,18 +2786,18 @@ def renderer_operation(commit,operation,candidate=None):
 def renderer_operation_scoped(commit,operation,candidate=None):
     need(operation in ('upgrade','recover','rollback','return'),'renderer_operation')
     exact=source_gate(commit,action='renderer-'+operation);window_repair_pending_guard();inactive(ROOT/'runtime',PREFIX)
-    p=renderer_policy();transaction=renderer_transaction(commit,native=p['schema']>=3,admission=p['schema']>=4,launch=p['schema']==8,d3d=p['schema']==9)
-    if p['schema']==8 and HERE==CONTROL:need(_RENDERER_CS2_GUARD is not None,'renderer_launch_lock_required')
+    p=renderer_policy();transaction=renderer_transaction(commit,native=p['schema']>=3,admission=p['schema']>=4,launch=p['schema']==8,d3d=p['schema']==9,helper=p['schema']==10)
+    if p['schema'] in (8,10) and HERE==CONTROL:need(_RENDERER_CS2_GUARD is not None,'renderer_launch_lock_required')
     publication_guard=renderer_admission_guard(p,exact or (lambda:None)) if p['schema']>=4 else exact
     if publication_guard is not None:publication_guard()
     if operation=='upgrade' and not transaction.exists():
-        renderer_pending_guard();old,_=verify_installed();verify_borderless();p=renderer_policy();files=renderer_candidate(candidate,p)
-        if renderer_native_hashes(old):renderer_overlay_lifecycle(old,max_generations=RENDERER_MAX_GENERATIONS-1)
+        renderer_pending_guard(metadata_only=p['schema']==10);old,_=verify_installed(operational=p['schema']==10);verify_borderless(operational=p['schema']==10);p=renderer_policy();files=renderer_candidate(candidate,p)
+        if p['schema']!=10 and renderer_native_hashes(old):renderer_overlay_lifecycle(old,max_generations=RENDERER_MAX_GENERATIONS-1)
         targets=renderer_targets(p);before={};modes={}
         for name,path in targets.items():
             safe_file(path);need(path.stat().st_size<=64*1024*1024,'renderer_target_limit');before[name]=path.read_bytes();modes[name]=path.stat().st_mode&0o777
         if p['schema']>=3:need(files['ds3-runtime']==(CONTROL/'bin/ds3-runtime').read_bytes(),'renderer_lifecycle_source')
-        if p['schema']==8:
+        if p['schema'] in (8,10):
             for name in RENDERER_LAUNCH_FILES.values():need(files[name]==(CONTROL/'bin'/name).read_bytes(),'renderer_launch_source')
         rows=renderer_rows();after=renderer_after(before,modes,files,p,commit,rows)
         record={'schema':1,'commit':commit,'policy':p,'images':{n:{'before':digest_bytes(before[n]),'after':digest_bytes(after[n]),'mode':modes[n]} for n in targets},
@@ -2635,11 +2835,11 @@ def renderer_operation_scoped(commit,operation,candidate=None):
     need(r['policy']==renderer_policy(),'renderer_policy_changed')
     direction=r['direction'] if operation=='recover' else 'before' if operation=='rollback' else 'after'
     changed=renderer_run(transaction,direction,recover=operation=='recover',guard=publication_guard)
-    verify_installed();verify_borderless()
+    verify_installed(operational=p['schema']==10);verify_borderless(operational=p['schema']==10)
     return {'state':'DS3_RENDERER_'+('INSTALLED' if direction=='after' else 'RESTORED'),'changed':changed,'gameStarted':False,'gameplayVerified':False}
 
 def renderer_replace(target,data,mode,expected,guard=None):
-    need((target in renderer_targets({'schema':8}).values() or (target.name=='record.json' and target.parent.parent==ROOT and re.fullmatch(r'\.(?:renderer|native-renderer|admitted-renderer|launch-renderer|d3d-renderer)-[0-9a-f]{40}',target.parent.name)))
+    need((target in renderer_targets({'schema':8}).values() or (target.name=='record.json' and target.parent.parent==ROOT and re.fullmatch(r'\.(?:renderer|native-renderer|admitted-renderer|launch-renderer|d3d-renderer|helper-renderer)-[0-9a-f]{40}',target.parent.name)))
          and type(data) is bytes and len(data)<=64*1024*1024 and pinned(expected),'renderer_replace_scope')
     parent=lifecycle_parent_fd(target);stage_parent=lifecycle_parent_fd(ROOT/'unused');temp='.ds3-renderer-write-'+digest_bytes(data);fd=None
     def facts(st):return tuple(getattr(st,k) for k in ('st_dev','st_ino','st_mode','st_uid','st_nlink','st_size','st_mtime_ns','st_ctime_ns'))
@@ -2683,7 +2883,14 @@ def no_foreign_steam():
 def play(measure=False, preset=None, trace=False, quit_trace=False):
     need(type(measure) is bool and type(trace) is bool and type(quit_trace) is bool, 'invalid_measure_mode')
     need(not quit_trace or not (measure or trace or preset is not None),'quit_trace_exclusive')
-    base,_ = verify_installed(); graphics = verify_window_config(); borderless,receipt = verify_borderless()
+    # Already-running observation needs current process/native identity, not
+    # completed delivery archives or unrelated Hub/CS2 launcher endpoints.
+    request=admission(HOME,'ds3');request.reconcile()
+    session=request.allow_client()
+    if quit_trace:need(not session['clientActive'] and not session['targetActive'],'quit_trace_requires_stopped_client_target')
+    if session['targetActive']:
+        return {'state':'DS3_ALREADY_RUNNING','gameplayVerified':False,'borderlessVerified':False}
+    base,_ = verify_installed(operational=True); graphics = verify_window_config(); borderless,receipt = verify_borderless(operational=True)
     # The admitted virtual-display policy must survive the game's WINDOW
     # preference, so an in-game fullscreen toggle can reach real DXGI modeset.
     # Missing policy keeps the existing geometric-borderless fallback.
@@ -2691,11 +2898,6 @@ def play(measure=False, preset=None, trace=False, quit_trace=False):
     native_borderless = (renderer_fields(base) or {}).get('nativeBorderlessCapable',False) and not virtual_fullscreen
     need(not virtual_fullscreen or base.get('aspectFit') is True,'virtual_fullscreen_requires_aspect')
     need(not native_borderless or base.get('aspectFit') is True,'native_borderless_requires_aspect')
-    request=admission(HOME,'ds3');request.reconcile()
-    session=request.allow_client()
-    if quit_trace:need(not session['clientActive'] and not session['targetActive'],'quit_trace_requires_stopped_client_target')
-    if session['targetActive']:
-        return {'state':'DS3_ALREADY_RUNNING','gameplayVerified':False,'borderlessVerified':False}
     # allow_client observed actual processes and rejects foreign Steam. Do not
     # execute the donor server merely because an unrelated Hub still exists.
     if trace: need(not session['clientActive'] and renderer_fields(base) and base['rendererOverride']['diagnosticCapable'], 'trace_requires_stopped_diagnostic_client')
@@ -2739,7 +2941,9 @@ def play(measure=False, preset=None, trace=False, quit_trace=False):
 def stop_attestation():
     # Emergency stop must not scan mutable profiles, full trees or shortcuts.
     safe_directory(ROOT); safe_directory(PREFIX)
-    m = manifest(ROOT/'manifest.json'); r = load(ROOT/'receipt.json')
+    m = load(ROOT/'manifest.json'); r = load(ROOT/'receipt.json')
+    need(type(m) is dict and m.get('id')=='ds3-marshal-fix' and m.get('owner')=='control-ds3-marshal-fix'
+         and type(m.get('sourceCriticalHashes')) is dict and pinned(m['sourceCriticalHashes'].get('engine/bin/wineserver')),'stop_manifest_identity')
     need(r.get('owner') == m['owner'] and r.get('manifestSha256') == sha(ROOT/'manifest.json'), 'installed_owner_or_manifest_drift')
     need(sha(ROOT/'ds3-runtime') == r.get('lifecycleSha256'), 'installed_helper_drift')
     need(sha(ROOT/'runtime/engine/bin/wineserver') == m['sourceCriticalHashes']['engine/bin/wineserver'], 'installed_server_drift')
@@ -2841,9 +3045,13 @@ def lifecycle_retire(j,complete=False):
     return {'state':'RETIRED_DATA_RETAINED','profileDeleted':False,'changed':True}
 
 def main():
-    if len(sys.argv)>1 and sys.argv[1] in ('upgrade-renderer','recover-renderer','rollback-renderer','return-renderer') and renderer_policy()['schema']==8:
+    if len(sys.argv)>1 and sys.argv[1] in ('upgrade-renderer','recover-renderer','rollback-renderer','return-renderer') and renderer_policy()['schema'] in (8,10):
         # CS2's launcher takes its local lock before the shared lock below.
-        with renderer_cs2_locked():return main_locked()
+        need(len(sys.argv)>2,'renderer_commit')
+        sys.path.insert(0,str(CONTROL))
+        from lib.scoped_source_admission import admitted_source
+        with admitted_source(CONTROL,entrypoints=('bin/ds3-runtime',),expected_commit=sys.argv[2]):
+            with renderer_cs2_locked():return main_locked()
     return main_locked()
 
 def main_locked():

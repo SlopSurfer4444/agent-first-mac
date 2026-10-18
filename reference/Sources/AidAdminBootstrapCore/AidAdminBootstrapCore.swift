@@ -233,6 +233,20 @@ private struct TransactionState: Codable {
     var boundDirectories: [String: [UInt64]] = [:]
 }
 
+public struct BootstrapPreparationInventory: Codable {
+    public struct Entry: Codable {
+        public let identifier: String
+        public let status: String
+        public let knownFiles: Int
+        public let knownBytes: Int
+    }
+    public let entries: [Entry]
+    public let observedEntries: Int
+    public let truncated: Bool
+    public let activeInstall: Bool
+    public let unknownEntries: Int
+}
+
 public final class BootstrapInstaller {
     public static let binaryPath = "/usr/local/libexec/aid-admin"
     public static let policyPath = "/etc/agent-first-mac/aid-admin-policy.json"
@@ -245,6 +259,11 @@ public final class BootstrapInstaller {
     private static let bootstrapRoot = "/var/db/agent-first-mac/bootstrap"
     private static let journalPath = bootstrapRoot + "/active.json"
     private static let retainedPreparations = bootstrapRoot + "/retained-preparations"
+    private static let preparationLimit = 128
+    private static let preparationNames: Set<String> = ["install-inputs.json", "aid-admin",
+        "aid-admin-policy.json", "sudoers-template", "sudoers-rendered", "aid-admin-install.json",
+        "new-aid-admin", "new-aid-admin-policy.json", "new-aid-admin-install.json",
+        "new-agent-first-mac-aid-admin"]
     private static let token = "@@AGENT_OWNER@@"
     private static let cleanEnvironment = [
         "HOME": "/var/empty", "LANG": "C", "LC_ALL": "C",
@@ -255,6 +274,7 @@ public final class BootstrapInstaller {
     private let runner: BootstrapCommandRunning
     private let hooks: BootstrapHooks
     private let actionID: () -> String
+    private var writtenPreparationFiles: [String: FileSnapshot] = [:]
 
     public init(context: BootstrapContext, runner: BootstrapCommandRunning = BootstrapProcessRunner(),
                 hooks: BootstrapHooks = NoBootstrapHooks(),
@@ -276,6 +296,11 @@ public final class BootstrapInstaller {
         defer { for fd in leases { Darwin.close(fd) } }
         _ = try reconcileLocked()
         try preflightState()
+        if exists(Self.retainedPreparations) {
+            try validateDirectory(Self.retainedPreparations, mode: 0o700)
+            try require(try boundedNames(Self.retainedPreparations, limit: Self.preparationLimit).count < Self.preparationLimit - 1,
+                        "preparation_capacity_retire_known_or_preserve_UNKNOWN")
+        }
 
         var transaction = TransactionState()
         do {
@@ -301,6 +326,7 @@ public final class BootstrapInstaller {
             try copyReviewedSource(request.inputsPath, to: stagedInputs,
                                    pin: ArtifactPin(sha256: request.inputsSHA256,
                                                     size: request.inputsSize))
+            try recordPreparationFile(stagedInputs, mode: 0o400, state: &transaction)
             let inputsData = try readTrustedFile(stagedInputs, mode: 0o400, maximum: 64 * 1024)
             let inputs = try InstallInputs.decodeStrict(inputsData)
             let executable = try readExternalFile(context.currentExecutablePath,
@@ -313,9 +339,12 @@ public final class BootstrapInstaller {
             let stagedPolicy = transaction.staging + "/aid-admin-policy.json"
             let stagedTemplate = transaction.staging + "/sudoers-template"
             try copyReviewedSource(request.brokerPath, to: stagedBroker, pin: inputs.broker)
+            try recordPreparationFile(stagedBroker, mode: 0o400, state: &transaction)
             try copyReviewedSource(request.policyPath, to: stagedPolicy, pin: inputs.policy)
+            try recordPreparationFile(stagedPolicy, mode: 0o400, state: &transaction)
             try copyReviewedSource(request.sudoersTemplatePath, to: stagedTemplate,
                                    pin: inputs.sudoersTemplate)
+            try recordPreparationFile(stagedTemplate, mode: 0o400, state: &transaction)
             try hooks.afterStaging(paths: ["broker": physical(stagedBroker),
                                            "policy": physical(stagedPolicy),
                                            "sudoersTemplate": physical(stagedTemplate)])
@@ -331,6 +360,7 @@ public final class BootstrapInstaller {
                         "rendered_sudoers_drift")
             let stagedRendered = transaction.staging + "/sudoers-rendered"
             try writeExclusive(rendered, logical: stagedRendered, mode: 0o440)
+            try recordPreparationFile(stagedRendered, mode: 0o440, state: &transaction)
             let visudo = context.fixtureMode ? "/usr/sbin/visudo" : "/usr/sbin/visudo"
             let visudoStatus = try runner.run(executable: visudo,
                                               arguments: ["-cf", physical(stagedRendered)],
@@ -340,6 +370,7 @@ public final class BootstrapInstaller {
             let attestation = try makeAttestation(owner: owner, inputs: inputs)
             let stagedAttestation = transaction.staging + "/aid-admin-install.json"
             try writeExclusive(attestation, logical: stagedAttestation, mode: 0o400)
+            try recordPreparationFile(stagedAttestation, mode: 0o400, state: &transaction)
 
             // Freeze every preimage and the exact inode to be published before
             // the first externally visible artifact mutation.
@@ -357,6 +388,7 @@ public final class BootstrapInstaller {
                 let bytes = try readTrustedFile(source, mode: source == stagedRendered ? 0o440 : 0o400,
                                                 maximum: 64 * 1024 * 1024)
                 try writeExclusive(bytes, logical: publication, mode: mode)
+                try recordPreparationFile(publication, mode: mode, state: &transaction)
                 try verifyPin(publication, pin: pin, mode: mode)
                 transaction.post[target] = try trustedFileSnapshot(publication, mode: mode)
             }
@@ -464,16 +496,20 @@ public final class BootstrapInstaller {
         return try reconcileLocked()
     }
 
-    private func acquireLeases() throws -> [Int32] {
+    private func acquireLeases(create: Bool = true) throws -> [Int32] {
         var setup = TransactionState()
-        try ensureDirectory("/var/db/agent-first-mac", mode: 0o755, state: &setup)
-        try ensureDirectory(Self.bootstrapRoot, mode: 0o700, state: &setup)
+        if create {
+            try ensureDirectory("/var/db/agent-first-mac", mode: 0o755, state: &setup)
+            try ensureDirectory(Self.bootstrapRoot, mode: 0o700, state: &setup)
+        } else {
+            try validateDirectory(Self.bootstrapRoot, mode: 0o700)
+        }
         var result: [Int32] = []
         do {
             let paths = ["/var/db/agent-first-mac/.operation.lock"]
             for path in paths {
                 try validateAncestors(path)
-                let fd = Darwin.open(physical(path), O_RDWR | O_CREAT | O_NOFOLLOW | O_CLOEXEC, 0o600)
+                let fd = Darwin.open(physical(path), (create ? O_RDWR | O_CREAT : O_RDONLY) | O_NOFOLLOW | O_CLOEXEC, 0o600)
                 try require(fd >= 0, "bootstrap_lock_open_UNKNOWN")
                 result.append(fd)
                 var facts = stat()
@@ -497,6 +533,166 @@ public final class BootstrapInstaller {
             for fd in result { Darwin.close(fd) }
             throw error
         }
+    }
+
+    private func recordPreparationFile(_ path: String, mode: mode_t, state: inout TransactionState) throws {
+        guard let created = writtenPreparationFiles[path], created.mode == mode else {
+            throw BootstrapFailure.rejected("preparation_write_identity_UNKNOWN")
+        }
+        try require(try matches(path, created), "preparation_write_identity_UNKNOWN")
+        state.stagedFiles[URL(fileURLWithPath: path).lastPathComponent] = created
+        try syncParent(path)
+        // Pre/post target snapshots are not authority until the final prepared
+        // journal. Keep this durable record strictly pre-mutation.
+        var preparation = state
+        preparation.files = [:]; preparation.post = [:]
+        try saveJournal(preparation)
+        try hooks.afterMutation(step: "preparation-file-recorded-" + URL(fileURLWithPath: path).lastPathComponent)
+    }
+
+    private func boundedNames(_ logical: String, limit: Int) throws -> [String] {
+        try validateDirectory(logical, mode: 0o700)
+        guard let directory = opendir(physical(logical)) else {
+            throw BootstrapFailure.rejected("preparation_inventory_UNKNOWN")
+        }
+        defer { closedir(directory) }
+        var names: [String] = []
+        errno = 0
+        while let entry = readdir(directory) {
+            let name = withUnsafePointer(to: &entry.pointee.d_name) {
+                $0.withMemoryRebound(to: CChar.self, capacity: Int(entry.pointee.d_namlen) + 1) { String(cString: $0) }
+            }
+            if name == "." || name == ".." { continue }
+            names.append(name)
+            if names.count > limit { return names }
+            errno = 0
+        }
+        try require(errno == 0, "preparation_inventory_UNKNOWN")
+        return names.sorted()
+    }
+
+    private func preparationState(_ journal: String) throws -> TransactionState {
+        let bytes = try readTrustedFile(journal, mode: 0o400, maximum: 128 * 1024)
+        let state = try JSONDecoder().decode(TransactionState.self, from: bytes)
+        let encoder = JSONEncoder(); encoder.outputFormatting = [.sortedKeys]
+        try require(try encoder.encode(state) == bytes, "preparation_journal_noncanonical_UNKNOWN")
+        try validatePreparationIntent(state)
+        return state
+    }
+
+    private func validateRetirement(_ state: TransactionState, retained: String, retiring: Bool) throws {
+        if !exists(retained) {
+            try require(retiring || state.directoryIdentities.isEmpty, "preparation_directory_missing_UNKNOWN")
+            return
+        }
+        try validateDirectory(retained, mode: 0o700)
+        let names = try boundedNames(retained, limit: Self.preparationNames.count)
+        if state.directoryIdentities[state.staging] != nil {
+            try validateDirectoryIdentity(retained, state: state, expectedPath: state.staging)
+        } else {
+            throw BootstrapFailure.rejected("preparation_directory_identity_UNKNOWN")
+        }
+        try require(Set(names).isSubset(of: Set(state.stagedFiles.keys)), "preparation_unknown_contents_preserved")
+        for name in names {
+            try require(try matches(retained + "/" + name, state.stagedFiles[name]!), "preparation_file_identity_UNKNOWN")
+        }
+        if !retiring {
+            try require(Set(names) == Set(state.stagedFiles.keys), "preparation_file_missing_UNKNOWN")
+        }
+    }
+
+    /// Authenticated, read-only bounded custody report; never reconciles an
+    /// install or interprets unpublished journal candidates as authority.
+    public func inventoryPreparations() throws -> BootstrapPreparationInventory {
+        try validateContext()
+        guard exists(Self.bootstrapRoot) else {
+            return .init(entries: [], observedEntries: 0, truncated: false, activeInstall: false, unknownEntries: 0)
+        }
+        let leases = try acquireLeases(create: false)
+        defer { for fd in leases { Darwin.close(fd) } }
+        let active = exists(Self.journalPath) || exists(Self.journalPath + ".next")
+        guard exists(Self.retainedPreparations) else {
+            return .init(entries: [], observedEntries: 0, truncated: false, activeInstall: active, unknownEntries: 0)
+        }
+        let names = try boundedNames(Self.retainedPreparations, limit: Self.preparationLimit)
+        var entries: [BootstrapPreparationInventory.Entry] = []
+        var accounted: Set<String> = []
+        for name in names.prefix(Self.preparationLimit) {
+            let retiring = name.hasSuffix(".retiring.json")
+            let suffix = retiring ? ".retiring.json" : ".json"
+            guard name.hasSuffix(suffix) else { continue }
+            let stem = String(name.dropLast(suffix.count))
+            guard stem.range(of: "^transaction-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", options: .regularExpression) != nil else { continue }
+            let journal = Self.retainedPreparations + "/" + name
+            let retained = Self.retainedPreparations + "/" + stem
+            do {
+                let state = try preparationState(journal)
+                try require(state.staging == Self.bootstrapRoot + "/" + stem &&
+                    !exists(retained + (retiring ? ".json" : ".retiring.json")) && !exists(state.staging),
+                    "preparation_retention_collision_UNKNOWN")
+                try validateRetirement(state, retained: retained, retiring: retiring)
+                let remaining = exists(retained) ? try boundedNames(retained, limit: Self.preparationNames.count) : []
+                entries.append(.init(identifier: String(stem.dropFirst("transaction-".count)),
+                    status: active ? "ACTIVE_INSTALL_PRESERVED" : (retiring ? "RETIREMENT_PENDING" : "RETIRABLE"),
+                    knownFiles: remaining.count, knownBytes: remaining.reduce(0) { $0 + state.stagedFiles[$1]!.size }))
+                accounted.insert(name); if exists(retained) { accounted.insert(stem) }
+            } catch {
+                entries.append(.init(identifier: String(stem.dropFirst("transaction-".count)),
+                                     status: "UNKNOWN_PRESERVED", knownFiles: 0, knownBytes: 0))
+            }
+        }
+        return .init(entries: entries, observedEntries: names.count, truncated: names.count > Self.preparationLimit,
+                     activeInstall: active, unknownEntries: names.filter { !accounted.contains($0) }.count)
+    }
+
+    /// Deletes only one journal-proven pre-mutation namespace. The journal is
+    /// renamed first and removed last so every interrupted step is restartable.
+    /// No broker target, rollback preimage, opaque candidate or sibling is used.
+    public func retirePreparation(identifier: String) throws -> String {
+        try validateContext()
+        try require(identifier.range(of: "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", options: .regularExpression) != nil,
+                    "preparation_identifier")
+        let leases = try acquireLeases(create: false)
+        defer { for fd in leases { Darwin.close(fd) } }
+        try require(!exists(Self.journalPath) && !exists(Self.journalPath + ".next"), "preparation_active_install_preserved")
+        try validateDirectory(Self.retainedPreparations, mode: 0o700)
+        let retained = Self.retainedPreparations + "/transaction-" + identifier
+        let original = retained + ".json", retiring = retained + ".retiring.json"
+        try require(!(exists(original) && exists(retiring)), "preparation_retention_collision_UNKNOWN")
+        let inProgress = exists(retiring)
+        let journal = inProgress ? retiring : original
+        let journalSnapshot = try trustedFileSnapshot(journal, mode: 0o400)
+        let state = try preparationState(journal)
+        try require(try matches(journal, journalSnapshot), "preparation_journal_identity_UNKNOWN")
+        try require(state.staging == Self.bootstrapRoot + "/transaction-" + identifier && !exists(state.staging),
+                    "preparation_retention_collision_UNKNOWN")
+        try validateRetirement(state, retained: retained, retiring: inProgress)
+        if !inProgress {
+            try require(renameatx_np(AT_FDCWD, physical(original), AT_FDCWD, physical(retiring), UInt32(RENAME_EXCL)) == 0,
+                        "preparation_retirement_intent_UNKNOWN")
+            try syncParent(retiring)
+            try hooks.afterMutation(step: "preparation-retirement-intent")
+        }
+        if exists(retained) {
+            for name in state.stagedFiles.keys.sorted() where exists(retained + "/" + name) {
+                try require(try matches(retiring, journalSnapshot), "preparation_journal_identity_UNKNOWN")
+                try validateRetirement(state, retained: retained, retiring: true)
+                try require(unlink(physical(retained + "/" + name)) == 0, "preparation_retirement_file_UNKNOWN")
+                try syncParent(retained + "/" + name)
+                try hooks.afterMutation(step: "preparation-retirement-file-" + name)
+            }
+            try require(try matches(retiring, journalSnapshot), "preparation_journal_identity_UNKNOWN")
+            try validateRetirement(state, retained: retained, retiring: true)
+            try require(rmdir(physical(retained)) == 0, "preparation_retirement_directory_UNKNOWN")
+            try syncParent(retained)
+            try hooks.afterMutation(step: "preparation-retirement-directory")
+        }
+        try require(try matches(retiring, journalSnapshot), "preparation_journal_identity_UNKNOWN")
+        try require(!exists(retained), "preparation_retirement_directory_UNKNOWN")
+        try require(unlink(physical(retiring)) == 0, "preparation_retirement_journal_UNKNOWN")
+        try syncParent(retiring)
+        try hooks.afterMutation(step: "preparation-retirement-complete")
+        return "PREPARATION_RETIRED"
     }
 
     private func saveJournal(_ state: TransactionState) throws {
@@ -611,18 +807,32 @@ public final class BootstrapInstaller {
         }
     }
 
-    /// No preparation content is executed, adopted or deleted. The durable
-    /// intent owns only this UUID namespace; exact directory identity is held
-    /// once available. A crash between mkdir and identity publication can retain
-    /// an empty private directory but cannot infer ownership of populated state.
-    private func retainInterruptedPreparation(_ state: TransactionState) throws -> String {
-        try require(state.schema == 1 && !state.mutationStarted && state.files.isEmpty &&
-                    state.post.isEmpty && state.stagedFiles.isEmpty &&
+    private func validatePreparationIntent(_ state: TransactionState) throws {
+        try require(state.schema == 1 && state.phase == "preparing" && !state.mutationStarted && state.files.isEmpty &&
+                    state.post.isEmpty && Set(state.stagedFiles.keys).isSubset(of: Self.preparationNames) &&
                     state.directoryStaging.isEmpty && state.boundDirectories.isEmpty &&
                     state.staging.range(of: "^" + Self.bootstrapRoot + "/transaction-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", options: .regularExpression) != nil &&
                     Set(state.createdDirectories).isSubset(of: [state.staging]) &&
                     Set(state.directoryIdentities.keys).isSubset(of: [state.staging]),
                     "preparation_intent_UNKNOWN")
+        for snapshot in state.stagedFiles.values {
+            try require(snapshot.existed && snapshot.backup == nil && snapshot.device > 0 && snapshot.inode > 0 &&
+                        snapshot.uid == context.trustedUID && snapshot.gid == context.trustedGID &&
+                        [mode_t(0o400), 0o440, 0o444, 0o555].contains(snapshot.mode) &&
+                        snapshot.size >= 0 && snapshot.size <= 64 * 1024 * 1024 &&
+                        snapshot.sha256.range(of: "^[0-9a-f]{64}$", options: .regularExpression) != nil &&
+                        state.directoryIdentities[state.staging]?.count == 2,
+                        "preparation_file_proof_UNKNOWN")
+        }
+    }
+
+    /// No preparation content is executed, adopted or deleted. The durable
+    /// intent owns only this UUID namespace; exact directory identity is held
+    /// once available. A crash between mkdir and identity publication can retain
+    /// an empty private directory but cannot infer ownership of populated state.
+    private func retainInterruptedPreparation(_ original: TransactionState) throws -> String {
+        var state = original
+        try validatePreparationIntent(state)
         var retention = TransactionState()
         try ensureDirectory(Self.retainedPreparations, mode: 0o700, state: &retention)
         let name = URL(fileURLWithPath: state.staging).lastPathComponent
@@ -637,6 +847,10 @@ public final class BootstrapInstaller {
             } else {
                 try require(try FileManager.default.contentsOfDirectory(atPath: physical(state.staging)).isEmpty,
                             "preparation_unrecorded_contents_UNKNOWN")
+                var facts = stat()
+                try require(lstat(physical(state.staging), &facts) == 0, "preparation_directory_identity_UNKNOWN")
+                state.directoryIdentities[state.staging] = [UInt64(facts.st_dev), UInt64(facts.st_ino)]
+                try saveJournal(state)
             }
             try require(renameatx_np(AT_FDCWD, physical(state.staging), AT_FDCWD,
                                     physical(retained), UInt32(RENAME_EXCL)) == 0,
@@ -651,6 +865,10 @@ public final class BootstrapInstaller {
             } else {
                 try require(try FileManager.default.contentsOfDirectory(atPath: physical(retained)).isEmpty,
                             "preparation_unrecorded_contents_UNKNOWN")
+                var facts = stat()
+                try require(lstat(physical(retained), &facts) == 0, "preparation_directory_identity_UNKNOWN")
+                state.directoryIdentities[state.staging] = [UInt64(facts.st_dev), UInt64(facts.st_ino)]
+                try saveJournal(state)
             }
         } else {
             try require(state.directoryIdentities.isEmpty, "preparation_directory_missing_UNKNOWN")
@@ -917,6 +1135,14 @@ public final class BootstrapInstaller {
             if preparationFile { try hooks.afterMutation(step: "preparation-file-written-" + name) }
         }
         try require(fsync(fd) == 0, "exclusive_write_sync")
+        if logical.hasPrefix(Self.bootstrapRoot + "/transaction-") {
+            var facts = stat()
+            try require(fstat(fd, &facts) == 0 && facts.st_nlink == 1 && facts.st_size == data.count,
+                        "preparation_write_identity_UNKNOWN")
+            writtenPreparationFiles[logical] = FileSnapshot(existed: true,
+                sha256: bootstrapSHA256(data), size: data.count, uid: facts.st_uid, gid: facts.st_gid,
+                mode: facts.st_mode & 0o777, backup: nil, device: UInt64(facts.st_dev), inode: UInt64(facts.st_ino))
+        }
         if preparationFile { try hooks.afterMutation(step: "preparation-file-synced-" + name) }
     }
 

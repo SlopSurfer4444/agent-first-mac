@@ -1,6 +1,12 @@
 #!/usr/bin/python3
 """Exact-source user-shell soft open-file limit lifecycle; no root changes."""
 import sys
+if (__name__ == '__main__' and not globals().get('__source_bound__')
+        and len(sys.argv) > 1 and sys.argv[1] in ('apply', 'rollback', 'recover', 'migrate-receipt', 'migrate-block')):
+    import posix
+    posix.execv(sys.executable, [sys.executable, '-I', '-S', '-B',
+        __file__.rsplit('/', 2)[0] + '/lib/scoped_source_admission.py',
+        __file__, '["manifests/shell-nofile.json"]', *sys.argv[1:]])
 sys.dont_write_bytecode = True
 sys.pycache_prefix = "/dev/null"
 import argparse, fcntl, hashlib, json, os, pwd, re, stat

@@ -162,6 +162,7 @@ class ReadinessTests(unittest.TestCase):
                 with patch.object(Path, 'home', return_value=home), \
                      patch.object(O.importlib.machinery.SourceFileLoader, 'load_module', return_value=C), \
                      patch.object(N, 'native', side_effect=native), \
+                     patch('lib.scoped_source_admission.require_execution', return_value=True), \
                      patch('lib.scoped_source_admission.run', side_effect=lambda root, callback, **kwargs:
                            native(C, True, operation_check=callback)), \
                      patch.object(N.probe, 'observe', side_effect=AssertionError('retained vendor fixture')):

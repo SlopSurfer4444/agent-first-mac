@@ -94,6 +94,7 @@ class UpdateTests(unittest.TestCase):
         self.h.write_image(self.fixture.ds3/'receipt.json',self.h.jb(receipt))
         self.gate.stop()
         def evaluate(control,commit,operation,**kwargs):
+            self.assertEqual(kwargs.pop('extra_paths'),())
             return readiness.evaluate(operation,commit,source_guard=lambda:True,**kwargs)
         with patch.object(self.h,'module_bridge',return_value=bridge),patch.object(bridge,'ready',side_effect=evaluate),patch.object(self.h,'module',side_effect=AssertionError('runtime dependency forbidden')):
             held=u.source_gate(self.commit)
@@ -107,6 +108,7 @@ class UpdateTests(unittest.TestCase):
         from lib import operation_readiness as readiness
         self.gate.stop()
         def evaluate(control,commit,operation,**kwargs):
+            self.assertEqual(kwargs.pop('extra_paths'),())
             return readiness.evaluate(operation,commit,source_guard=lambda:True,**kwargs)
         with patch.object(self.h,'module_bridge',return_value=bridge),patch.object(bridge,'ready',side_effect=evaluate),self.assertRaisesRegex(RuntimeError,'operation_payload_owner'):
             u.source_gate(self.commit)

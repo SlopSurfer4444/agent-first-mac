@@ -1,6 +1,10 @@
 #!/usr/bin/python3 -I -B
 """Deliver only the exact reviewed manage-workstation guidance successor."""
 import sys
+if __name__ == "__main__" and not globals().get("__source_bound__"):
+    import posix
+    posix.execv(sys.executable, [sys.executable, "-I", "-S", "-B",
+        __file__.rsplit("/", 2)[0] + "/lib/scoped_source_admission.py", __file__, "[]", *sys.argv[1:]])
 sys.dont_write_bytecode = True
 sys.pycache_prefix = "/dev/null"
 from pathlib import Path

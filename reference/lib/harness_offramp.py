@@ -3,9 +3,9 @@
 Private images stay in owner-private recovery storage. No config.toml, native
 trust, applications, profiles, Nix generations or root policy are written.
 Exact-owned passive skill/link objects may be moved recoverably. The fixture
-adapter is deliberately independent of a machine doctor;
-    the live adapter requires canonical accepted source and scoped observations.
-    Integration/cutover itself retains the preceding full readiness gate.
+adapter is deliberately independent of a machine doctor; the live adapter
+requires canonical admitted source and affected target/recovery observations.
+Independent protected-policy acceptance and native permissions remain separate.
 """
 import argparse
 import sys
@@ -883,35 +883,19 @@ def execute_live(action, commit, operation="hooks", plan_action="remove"):
     """Explicit owner-requested off-ramp after protected source acceptance.
 
     This candidate cannot approve its own canonical source; the independent
-    current-source admission engine must accept the actual clean commit. The
-    sole integration owner obtains preceding fresh FULL readiness at cutover.
-    After that accepted live-source cutover, an unrelated vendor compatibility
-    failure does not block this scoped exit. Nothing edits native consent.
+    current-source admission engine must accept the affected committed inputs.
+    Unrelated vendor health, invocation cwd and native config content are not
+    hook ownership or consent observations. Nothing edits native consent.
     """
     from lib.user_operation_readiness import require_scoped_operation_ready
     home = Path.home()
-    require(ROOT == home / "AIDev/control" and Path.cwd() == ROOT, "canonical_source")
-    native = Directory(home, (".codex",))
-    try:
-        native_before = native_snapshot(native)
-        def native_unchanged():
-            try:
-                return native_snapshot(native) == native_before
-            except Exception:
-                return False
-        def admission(guard, recovery_guard):
-            def scope_guard():
-                return guard() and native_unchanged()
-            require_scoped_operation_ready(ROOT, "harness-disable", commit, checks={
-                "owned-target": guard, "recovery": recovery_guard,
-                # Observed unchanged native configuration, not a consent grant.
-                "native-consent": native_unchanged}, target_guard=scope_guard)
-            require(scope_guard() and recovery_guard(), "native_state_drift")
-        result = execute(home, action, admission=admission, operation=operation, plan_action=plan_action)
-        require(native_unchanged(), "native_state_drift")
-        return result
-    finally:
-        native.close()
+    require(ROOT == home / "AIDev/control", "canonical_source")
+    def admission(guard, recovery_guard):
+        require_scoped_operation_ready(ROOT, "harness-disable", commit, checks={
+            "owned-target": guard, "recovery": recovery_guard}, target_guard=guard,
+            extra_paths=("manifests/harness-hook-retirement.json", "manifests/sessionstart-exposure.json"))
+        require(guard() and recovery_guard(), "preimage_drift")
+    return execute(home, action, admission=admission, operation=operation, plan_action=plan_action)
 
 
 def main(arguments=None, emit=print):
@@ -932,8 +916,11 @@ def main(arguments=None, emit=print):
             args.action, args.live_commit, args.operation, args.scope)
         code = 0
     except Exception as error:
+        from lib import scoped_source_admission as source
         report = {"schema": 1, "status": "REFUSED", "reason":
                   str(error) if isinstance(error, OfframpError) else "operation_refused"}
+        if isinstance(error, source.SourceError):
+            report.update(source.public_failure(error))
         code = 1
     emit(json.dumps(report, sort_keys=True, separators=(",", ":")))
     return code

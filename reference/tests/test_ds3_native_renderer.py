@@ -75,7 +75,9 @@ class NativeRenderer(unittest.TestCase):
  def test_actual_native_operation_prepares_applies_noop_and_recovers(self):
   candidate=self.root/'candidate';shutil.copytree(self.tx/'source',candidate);shutil.rmtree(self.tx)
   control=self.root/'control';(control/'bin').mkdir(parents=True,mode=0o700);(control/'bin/ds3-runtime').write_bytes(self.files['ds3-runtime'])
-  def installed():return tuple(json.loads((self.root/name).read_bytes()) for name in ('manifest.json','receipt.json'))
+  def installed(*,operational=False):
+   self.assertIs(operational,False)
+   return tuple(json.loads((self.root/name).read_bytes()) for name in ('manifest.json','receipt.json'))
   with patch.object(m,'source_gate'),patch.object(m,'window_repair_pending_guard'),patch.object(m,'inactive'),patch.object(m,'CONTROL',control),patch.object(m,'renderer_policy',return_value=self.policy),patch.object(m,'verify_installed',side_effect=installed),patch.object(m,'verify_borderless'):
    self.assertTrue(m.renderer_operation(self.commit,'upgrade',candidate)['changed']);self.assert_images(self.after)
    self.assertFalse(m.renderer_operation(self.commit,'upgrade',candidate)['changed'])

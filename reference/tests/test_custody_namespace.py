@@ -56,7 +56,7 @@ class NamespaceTests(unittest.TestCase):
                 self.open(d)
             self.assertEqual(self.marker(d).read_bytes(), before)
 
-    def test_retained_slot_prevents_cross_boot_refresh(self):
+    def test_namespace_refresh_preserves_legacy_slot_without_rebinding_it(self):
         with tempfile.TemporaryDirectory(dir='/private/tmp') as d:
             old = self.seed(d, slot=True)
             self.stale_device(old)
@@ -69,9 +69,9 @@ class NamespaceTests(unittest.TestCase):
             legacy.pop('provenance')
             slot.write_text(json.dumps(legacy))
             slot_before = slot.read_bytes()
-            with self.assertRaises(C.CustodyError):
-                self.open(d, 'b' * 64)
-            self.assertEqual(self.marker(d).read_bytes(), before)
+            with self.open(d, 'b' * 64) as custody:
+                self.assertEqual(custody.records()[0], legacy)
+            self.assertNotEqual(self.marker(d).read_bytes(), before)
             self.assertEqual(slot.read_bytes(), slot_before)
 
     def test_other_persistent_identity_changes_are_never_rebound(self):
@@ -189,7 +189,7 @@ class NamespaceTests(unittest.TestCase):
             self.assertEqual(self.marker(d).read_bytes(), before)
             self.assertEqual(self.marker(d).with_name('0.json').read_text(), 'preserve')
 
-    def test_interrupted_refresh_preserves_original_marker_and_pending_evidence(self):
+    def test_interrupted_refresh_has_durable_transaction_and_recovers(self):
         with tempfile.TemporaryDirectory(dir='/private/tmp') as d:
             old = self.seed(d)
             self.stale_device(old)
@@ -202,10 +202,11 @@ class NamespaceTests(unittest.TestCase):
                 self.open(d, 'b' * 64, checkpoint=stop)
             self.assertEqual(self.marker(d).read_bytes(), before)
             pending, = self.marker(d).parent.glob('.prepare-*.payload')
-            preserved = pending.read_bytes()
+            self.assertTrue(self.marker(d).with_name(C.TRANSACTION).exists())
             with self.open(d, 'b' * 64):
                 pass
-            self.assertEqual(pending.read_bytes(), preserved)
+            self.assertFalse(pending.exists())
+            self.assertFalse(self.marker(d).with_name(C.TRANSACTION).exists())
 
     def test_native_stable_volume_provider_reads_held_directory_and_lock(self):
         with tempfile.TemporaryDirectory(dir='/private/tmp') as d:
@@ -253,12 +254,14 @@ class NamespaceTests(unittest.TestCase):
                 report = custody.status()
                 self.assertEqual(report['outstanding'], 1)
                 self.assertTrue(report['namespaceRefreshRequired'])
-                for action in (lambda: custody.reserve(), lambda: custody.retire(0),
+                for action in (lambda: custody.reserve(),
                                lambda: custody.update(0, state='retiring'),
                                lambda: custody.release_absent(0)):
                     with self.assertRaisesRegex(C.CustodyError, 'fixture_namespace_refresh_required'):
                         action()
             self.assertEqual(before, {p.name: p.read_bytes() for p in self.marker(d).parent.iterdir()})
+            with self.open(d, 'b' * 64, create=False) as custody:
+                self.assertTrue(custody.retire(0)['retired'])
 
     def test_same_device_crossboot_retained_record_can_refresh_or_retire_exact_absence(self):
         for create in (False, True):
@@ -344,7 +347,8 @@ class NamespaceTests(unittest.TestCase):
                 with self.open(d, create=False) as custody:
                     report = custody.status()
                     self.assertEqual(report['outstanding'], int(point != 'record-written'))
-                    self.assertEqual(report['pendingMetadataCount'], int(point in ('record-published', 'record-durable')))
+                    self.assertEqual(report['pendingMetadataCount'],
+                                     2 if point == 'record-written' else int(point in ('record-published', 'record-durable')))
                 self.assertEqual(before, {p.name: p.read_bytes() for p in self.marker(d).parent.iterdir()})
 
 

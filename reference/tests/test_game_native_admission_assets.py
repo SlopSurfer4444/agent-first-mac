@@ -103,7 +103,7 @@ class Assets(unittest.TestCase):
                 self.assertFalse((self.home / 'AIDev/lib').exists())
                 shutil.rmtree(namespace)
 
-    def test_every_owned_checkpoint_resumes_and_ownerless_stage_refuses(self):
+    def test_every_owned_checkpoint_including_stage_created_resumes(self):
         self.publish()
         cuts = list(self.events)
         _, namespaces = m.layout(self.intent)
@@ -122,13 +122,62 @@ class Assets(unittest.TestCase):
             with self.subTest(cut=cut), self.assertRaises(SystemExit):
                 self.publish(fault)
             self.assertTrue(fired)
-            if cut.endswith(':stage-created'):
-                with self.assertRaises(FileNotFoundError):
+            self.publish()
+            m.verify_assets(self.intent)
+
+    def test_receipt_construction_syscall_interruptions_resume(self):
+        _, namespaces = m.layout(self.intent)
+        for namespace, parent, name, stage, _ in namespaces:
+            for cut in ('mkdir', 'write'):
+                with self.subTest(namespace=namespace, cut=cut):
+                    original = getattr(os, cut)
+                    fired = []
+                    def interrupt(*args, **kwargs):
+                        if cut == 'mkdir':
+                            result = original(*args, **kwargs)
+                            matched = args[0] == m._initial_stage(stage)
+                        else:
+                            matched = (parent / m._initial_stage(stage)).exists()
+                            result = original(args[0], args[1][:100] if matched and not fired else args[1])
+                        if matched and not fired:
+                            fired.append(True)
+                            raise SystemExit(77)
+                        return result
+                    with patch.object(os, cut, interrupt), self.assertRaises(SystemExit):
+                        self.publish()
+                    self.assertTrue(fired)
+                    self.assertFalse((parent / stage).exists())
+                    self.assertFalse((parent / name).exists())
+                    self.publish(commit='b' * 40 if namespace == 'native' else self.commit)
+                    m.verify_assets(self.intent)
+                    for _, base, final, _, _ in namespaces:
+                        shutil.rmtree(base / final)
+
+    def test_unknown_construction_scratch_preserved_before_publication(self):
+        stage = self.ds3 / m._initial_stage('.native-admission-assets-stage')
+        stage.mkdir(mode=0o700)
+        for leaf, raw in [('foreign', b'owner data'), ('receipt.json', b'foreign receipt')]:
+            with self.subTest(leaf=leaf):
+                path = stage / leaf
+                path.write_bytes(raw)
+                path.chmod(0o600)
+                before = m._facts(path.lstat())
+                with self.assertRaisesRegex(m.Blocked, 'initial_(stage_inventory|receipt_drift)'):
                     self.publish()
-                self.assertFalse((self.ds3 / 'native').exists())
-            else:
-                self.publish()
-                m.verify_assets(self.intent)
+                self.assertEqual(m._facts(path.lstat()), before)
+                self.assertEqual(path.read_bytes(), raw)
+                self.assertFalse((self.home / 'AIDev/lib').exists())
+                path.unlink()
+
+    def test_empty_unknown_fixed_stage_is_not_adopted(self):
+        stage = self.ds3 / '.native-admission-assets-stage'
+        stage.mkdir(mode=0o700)
+        before = m._facts(stage.lstat())
+        with self.assertRaises(FileNotFoundError):
+            self.publish()
+        self.assertEqual(m._facts(stage.lstat()), before)
+        self.assertEqual(list(stage.iterdir()), [])
+        self.assertFalse((self.home / 'AIDev/lib').exists())
 
     def test_third_states_modes_receipts_and_extra_inventory_refused(self):
         self.publish()
@@ -395,16 +444,11 @@ class GenerationTwo(unittest.TestCase):
                     raise SystemExit(77)
             with self.subTest(cut=cut), self.assertRaises(SystemExit):
                 self.publish(event=fault)
-            if cut.endswith(':stage-created'):
-                with self.assertRaises(FileNotFoundError):
-                    self.publish()
-                shutil.rmtree(self.stage)
-            else:
-                self.f.signature_mock.side_effect = lambda app: None
-                self.publish(commit='c' * 40)
-                verified = m.verify_assets(self.intent)
-                self.assertEqual(verified['receipts']['companions']['acceptedCommit'], self.commit)
-                shutil.rmtree(self.final)
+            self.f.signature_mock.side_effect = lambda app: None
+            self.publish(commit='c' * 40)
+            verified = m.verify_assets(self.intent)
+            self.assertEqual(verified['receipts']['companions']['acceptedCommit'], self.commit)
+            shutil.rmtree(self.final)
             self.assertEqual(self.old, self.snapshot_old())
 
     def test_old_root_drift_inside_guard_blocks_before_v2_promotion(self):

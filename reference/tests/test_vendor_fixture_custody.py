@@ -394,14 +394,11 @@ raise SystemExit(C.main(sys.argv[2:]))
                 self.assertEqual(result.returncode, 73)
                 self.assertFalse(any(p.name.startswith("vendor-sentinel-") and p.name != C.NAMESPACE
                                      for p in Path(d).iterdir()))
-                if point == "record-written":
-                    with C.Custody(d, d, os.getuid(), envelope=EMPTY) as custody:
-                        self.assertEqual(custody.status()['outstanding'], 0)
-                        self.assertEqual(len(list((Path(d)/C.NAMESPACE).glob('.prepare-*.payload'))), 1)
-                else:
-                    with C.Custody(d, d, os.getuid(), envelope=EMPTY) as custody:
-                        self.assertEqual(custody.status()["outstanding"], 1)
-                        custody.retire(0)  # positive absent, pre-launch reservation
+                with C.Custody(d, d, os.getuid(), envelope=EMPTY) as custody:
+                    self.assertEqual(custody.status()["outstanding"], 1)
+                    self.assertEqual(custody.status()['preparationCount'], 0)
+                    self.assertEqual(custody.reserve(), 0)  # exact known-empty retry, no separate CLI retirement
+                    custody.retire(0)  # positive absent, pre-launch reservation
 
     def test_retirement_intent_survives_abrupt_process_exit_and_resumes(self):
         with tempfile.TemporaryDirectory(dir="/private/tmp") as d:

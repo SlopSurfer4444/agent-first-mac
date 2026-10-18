@@ -18,6 +18,18 @@ loader = importlib.machinery.SourceFileLoader(
 module = loader.load_module()
 
 
+def effective_fixture(paths, *, proxy=False, user="fixture"):
+    rows = ["stricthostkeychecking true", "passwordauthentication no",
+            "kbdinteractiveauthentication no", "identitiesonly yes", "forwardagent no",
+            "preferredauthentications publickey", "pubkeyauthentication yes",
+            "permitlocalcommand no", "forwardx11 no", "hostname 100.64.0.1", "user " + user,
+            "identityfile " + str(paths["private"]), "userknownhostsfile " + str(paths["known"])]
+    if proxy:
+        rows += ["proxycommand " + module.PROXY, "hostkeyalgorithms ssh-ed25519",
+                 "globalknownhostsfile /dev/null", "batchmode yes"]
+    return "\n".join(rows)
+
+
 class WindowsHostSSHClientTests(unittest.TestCase):
     def test_atomic_publication_preserves_racing_owner_file_and_symlink(self):
         for symlink in (False, True):
@@ -65,7 +77,7 @@ class WindowsHostSSHClientTests(unittest.TestCase):
                     module.apply_profile("fixture", "fixture")
             self.assertEqual(paths["alias"].read_bytes(), b"owner replacement")
             self.assertEqual(owner_config.read_bytes(), b"Host owner\n")
-            self.assertEqual(paths["main"].read_bytes(), module.render_main_config())
+            self.assertEqual(paths["main"].read_bytes(), module.enrollment_main(None))
 
     def test_rollback_keeps_shared_include_and_other_profiles(self):
         for edited in (False, True):
@@ -108,7 +120,7 @@ class WindowsHostSSHClientTests(unittest.TestCase):
                  patch.object(Path, "unlink", no_cleanup):
                 with self.assertRaisesRegex(module.ProfileError, "injected_failure"):
                     module.apply_profile("fixture", "fixture")
-            self.assertEqual(paths["main"].read_bytes(), module.render_main_config())
+            self.assertEqual(paths["main"].read_bytes(), module.enrollment_main(None))
             self.assertTrue(paths["alias"].is_file())
 
     def test_rollback_race_before_capture_restores_actual_owner_entry(self):
@@ -251,9 +263,7 @@ class WindowsHostSSHClientTests(unittest.TestCase):
     def test_routine_doctor_authenticates_pin_without_keyscan_or_full_doctor(self):
         with tempfile.TemporaryDirectory(prefix="ssh-client-fixture-") as directory:
             home, paths = self.fixture(directory)
-            effective = "\n".join(("stricthostkeychecking true", "passwordauthentication no",
-                "kbdinteractiveauthentication no", "identitiesonly yes", "forwardagent no",
-                "preferredauthentications publickey", "pubkeyauthentication yes"))
+            effective = effective_fixture(paths)
             with patch.object(module, "canonical_home", return_value=home), \
                  patch.object(module, "resolve_windows_peer", return_value="100.64.0.1"), \
                  patch.object(module, "scan_ed25519_host_key", side_effect=AssertionError("routine keyscan")), \
@@ -270,10 +280,8 @@ class WindowsHostSSHClientTests(unittest.TestCase):
 
     def test_changed_host_key_fails_strict_smoke_without_fallback(self):
         with tempfile.TemporaryDirectory(prefix="ssh-client-fixture-") as directory:
-            home, _ = self.fixture(directory)
-            effective = "\n".join(("stricthostkeychecking true", "passwordauthentication no",
-                "kbdinteractiveauthentication no", "identitiesonly yes", "forwardagent no",
-                "preferredauthentications publickey", "pubkeyauthentication yes"))
+            home, paths = self.fixture(directory)
+            effective = effective_fixture(paths)
             with patch.object(module, "canonical_home", return_value=home), \
                  patch.object(module, "resolve_windows_peer", return_value="100.64.0.1"), \
                  patch.object(module, "scan_ed25519_host_key", side_effect=AssertionError("routine keyscan")), \
@@ -299,6 +307,234 @@ class WindowsHostSSHClientTests(unittest.TestCase):
                     module.prepare("SHA256:" + "A" * 43, "fixture")
                 scan.assert_called_once()
 
+
+
+class EnrollmentRecoveryTests(unittest.TestCase):
+    def local_only(self, paths, command, **kwargs):
+        self.assertEqual(command, ["/usr/bin/ssh", "-G", "-o", "CanonicalizeHostname=no", module.ALIAS])
+        return SimpleNamespace(stdout=effective_fixture(paths))
+
+    def fixture(self, directory, main=None):
+        home = Path(directory)
+        paths = module.layout(home)
+        paths["ssh"].mkdir(mode=0o700)
+        paths["config_dir"].mkdir(mode=0o700)
+        (paths["config_dir"] / "owner.conf").write_bytes(b"Host owner\n  HostName localhost\n")
+        for name, mode in (("private", 0o600), ("public", 0o644)):
+            paths[name].write_bytes(b"must never be read")
+            paths[name].chmod(mode)
+        if main is not None:
+            paths["main"].write_bytes(main)
+            paths["main"].chmod(0o600)
+        body = base64.b64encode(b"synthetic enrollment pin").decode()
+        fingerprint = module.public_blob_fingerprint(body)
+        for name, value in (("canonical_home", home), ("resolve_windows_peer", "100.64.0.1"),
+                            ("scan_ed25519_host_key", ("100.64.0.1", "ssh-ed25519", body))):
+            patcher = patch.object(module, name, return_value=value)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        patcher = patch.object(module.subprocess, "run", side_effect=lambda command, **kwargs:
+                              self.local_only(paths, command, **kwargs))
+        patcher.start(); self.addCleanup(patcher.stop)
+        return paths, fingerprint
+
+    def test_prepare_and_apply_coexist_with_config_and_fragments(self):
+        for main in (None, b"# owned\nHost owner\n  User owner\n", module.render_main_config(),
+                     b"Host owner\n  Include config.d/*.conf\n"):
+            with self.subTest(main=main), tempfile.TemporaryDirectory() as directory:
+                paths, fingerprint = self.fixture(directory, main)
+                owner = (paths["config_dir"] / "owner.conf").read_bytes()
+                with patch.object(module, "doctor", side_effect=AssertionError("remote health")), \
+                     patch.object(module.subprocess, "run", side_effect=lambda command, **kwargs: self.local_only(paths, command, **kwargs)):
+                    module.prepare(fingerprint, "fixture")
+                    self.assertTrue(module.apply_profile(fingerprint, "fixture"))
+                    expected = module.enrollment_main(main)
+                    self.assertEqual(paths["main"].read_bytes(), expected)
+                    paths["main"].write_bytes(expected + b"\n# new owner edit\n")
+                    self.assertFalse(module.apply_profile(fingerprint, "fixture"))
+                    module.rollback()
+                self.assertEqual((paths["config_dir"] / "owner.conf").read_bytes(), owner)
+                self.assertEqual(paths["main"].read_bytes(), expected + b"\n# new owner edit\n")
+
+    def test_every_publication_interruption_can_retry_or_rollback(self):
+        for main in (None, b"Host owner\n  User owner\n"):
+            for stage in ("enrollment", "main", "alias", "known", "receipt"):
+                for after in (False, True):
+                    for recover in ("retry", "rollback"):
+                        with self.subTest(main=main, stage=stage, after=after, recover=recover), \
+                             tempfile.TemporaryDirectory() as directory:
+                            paths, fingerprint = self.fixture(directory, main)
+                            atomic = module.atomic_write
+
+                            def interrupt(path, data, mode):
+                                if path == paths[stage]:
+                                    if after:
+                                        atomic(path, data, mode)
+                                    raise module.ProfileError("injected_interruption")
+                                atomic(path, data, mode)
+
+                            with patch.object(module, "atomic_write", side_effect=interrupt):
+                                with self.assertRaisesRegex(module.ProfileError, "injected_interruption"):
+                                    module.apply_profile(fingerprint, "fixture")
+                            with patch.object(module, "doctor", side_effect=AssertionError("remote health")), \
+                                 patch.object(module.subprocess, "run", side_effect=lambda command, **kwargs: self.local_only(paths, command, **kwargs)):
+                                if recover == "retry":
+                                    module.apply_profile(fingerprint, "fixture")
+                                    self.assertFalse(module.apply_profile(fingerprint, "fixture"))
+                                    module.validate_local_profile(paths, module.load_receipt(paths))
+                                elif paths["enrollment"].exists():
+                                    module.rollback()
+                                    self.assertFalse(paths["alias"].exists())
+                                    self.assertFalse(paths["known"].exists())
+                                    self.assertEqual(json.loads(paths["receipt"].read_bytes())["status"], "rolled_back")
+                                else:
+                                    self.assertFalse(paths["alias"].exists())
+                                    self.assertFalse(paths["known"].exists())
+                            self.assertEqual((paths["config_dir"] / "owner.conf").read_bytes(),
+                                             b"Host owner\n  HostName localhost\n")
+                            if main is not None:
+                                self.assertIsNotNone(module.read_main(paths))
+
+    def test_partial_foreign_payload_is_preserved_by_retry_and_rollback(self):
+        for name in ("alias", "known"):
+            for symlink in (False, True):
+                with self.subTest(name=name, symlink=symlink), tempfile.TemporaryDirectory() as directory:
+                    paths, fingerprint = self.fixture(directory)
+                    atomic = module.atomic_write
+
+                    def interrupt(path, data, mode):
+                        if path == paths["receipt"]:
+                            raise module.ProfileError("injected_interruption")
+                        atomic(path, data, mode)
+
+                    with patch.object(module, "atomic_write", side_effect=interrupt):
+                        with self.assertRaises(module.ProfileError):
+                            module.apply_profile(fingerprint, "fixture")
+                    paths[name].unlink()
+                    if symlink:
+                        owner = Path(directory) / "foreign"
+                        owner.write_bytes(b"owner replacement")
+                        paths[name].symlink_to(owner)
+                    else:
+                        paths[name].write_bytes(b"owner replacement")
+                        paths[name].chmod(0o600)
+                    with self.assertRaisesRegex(module.ProfileError, "preparing_payload_drift"):
+                        module.apply_profile(fingerprint, "fixture")
+                    with self.assertRaisesRegex(module.ProfileError, "rollback_refuses_managed_drift"):
+                        module.rollback()
+                    self.assertEqual(paths[name].read_bytes(), b"owner replacement")
+                    self.assertEqual(paths[name].is_symlink(), symlink)
+
+    def test_foreign_config_at_capture_is_restored_not_overwritten(self):
+        with tempfile.TemporaryDirectory() as directory:
+            paths, fingerprint = self.fixture(directory, b"# original\n")
+            rename = module.rename_exclusive
+
+            def race(source, destination):
+                if source == paths["main"]:
+                    source.write_bytes(b"# newer owner config\n")
+                rename(source, destination)
+
+            with patch.object(module, "rename_exclusive", side_effect=race):
+                with self.assertRaisesRegex(module.ProfileError, "preparing_shared_config_drift"):
+                    module.apply_profile(fingerprint, "fixture")
+            with self.assertRaisesRegex(module.ProfileError, "preparing_shared_config_drift"):
+                module.apply_profile(fingerprint, "fixture")
+            module.rollback()
+            self.assertEqual(paths["main"].read_bytes(), b"# newer owner config\n")
+
+    def test_intermediate_symlink_refused_without_outside_writes(self):
+        with tempfile.TemporaryDirectory() as directory, tempfile.TemporaryDirectory() as outside:
+            paths, fingerprint = self.fixture(directory)
+            (Path(directory) / "AIDev").symlink_to(outside)
+            with self.assertRaisesRegex(module.ProfileError, "unsafe_managed_parent"):
+                module.apply_profile(fingerprint, "fixture")
+            self.assertEqual(list(Path(outside).iterdir()), [])
+
+    def test_dedicated_include_precedes_foreign_wildcard_fragments(self):
+        with tempfile.TemporaryDirectory() as directory:
+            original = b"# owner shared include\nInclude config.d/*.conf\nHost owner\n  User owner\n"
+            paths, fingerprint = self.fixture(directory, original)
+            foreign = paths["config_dir"] / "a.conf"
+            foreign.write_bytes(b"Host *\n  PasswordAuthentication yes\n  ForwardAgent yes\n")
+            module.apply_profile(fingerprint, "fixture")
+            self.assertEqual(paths["main"].read_bytes(),
+                             b"Include config.d/windows-host.conf\nHost *\n" + original)
+            self.assertEqual(foreign.read_bytes(),
+                             b"Host *\n  PasswordAuthentication yes\n  ForwardAgent yes\n")
+
+    def test_local_noop_checks_effective_additive_identity_and_forwarding_without_remote_health(self):
+        with tempfile.TemporaryDirectory() as directory:
+            paths, fingerprint = self.fixture(directory)
+            module.apply_profile(fingerprint, "fixture")
+            for extra in ("identityfile /synthetic/foreign-identity", "localforward 10000 localhost:22",
+                          "remoteforward 10001 localhost:22", "dynamicforward 10002",
+                          "proxycommand unexpected-proxy"):
+                with self.subTest(extra=extra), \
+                        patch.object(module, "doctor", side_effect=AssertionError("remote health")), \
+                        patch.object(module, "resolve_windows_peer", side_effect=AssertionError("peer lookup")), \
+                        patch.object(module, "scan_ed25519_host_key", side_effect=AssertionError("key scan")), \
+                        patch.object(module.subprocess, "run", return_value=SimpleNamespace(stdout=effective_fixture(paths) + "\n" + extra)) as run:
+                    with self.assertRaisesRegex(module.ProfileError, "effective_ssh_policy_drift"):
+                        module.apply_profile(fingerprint, "fixture")
+                    self.assertEqual(run.call_count, 1)
+                    self.assertIn("-G", run.call_args.args[0])
+
+    def test_new_journal_reads_are_bounded_and_single_link(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "journal"
+            path.write_bytes(b"x" * (module.MAX_MANAGED_FILE + 1)); path.chmod(0o600)
+            with self.assertRaisesRegex(module.ProfileError, "managed_file_unsafe"):
+                module.read_file(path)
+            path.write_bytes(b"synthetic")
+            os.link(path, path.with_name("second-link"))
+            with self.assertRaisesRegex(module.ProfileError, "managed_file_unsafe"):
+                module.read_file(path)
+
+    def test_real_local_parser_preserves_first_values_but_rejects_additive_owner_inputs(self):
+        # -F disables user/system config loading. All Include/key/pin paths are
+        # explicit temporary fixtures; this command never opens a connection.
+        actual_run = subprocess.run
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory); paths = module.layout(home)
+            paths["ssh"].mkdir(mode=0o700); paths["config_dir"].mkdir()
+            alias = module.render_alias_config("100.64.0.1", "fixture")
+            alias = alias.replace(b"~/.ssh/", os.fsencode(paths["ssh"]) + b"/")
+            paths["alias"].write_bytes(alias)
+            original = b"Host *\n  PasswordAuthentication yes\n  ForwardAgent yes\n"
+            def local(command, **kwargs):
+                self.assertEqual(command, ["/usr/bin/ssh", "-G", "-o", "CanonicalizeHostname=no", module.ALIAS])
+                return actual_run(command[:1] + ["-F", str(paths["main"])] + command[1:], **kwargs)
+            for extra, refused in ((b"", False),
+                                   (b"  IdentityFile /synthetic/foreign-key\n", True),
+                                   (b"  LocalForward 10000 localhost:22\n", True)):
+                config = module.enrollment_main(original + extra)
+                config = config.replace(b"Include config.d/windows-host.conf", b"Include " + os.fsencode(paths["alias"]))
+                paths["main"].write_bytes(config)
+                with self.subTest(extra=extra), patch.object(module.subprocess, "run", side_effect=local):
+                    if refused:
+                        with self.assertRaisesRegex(module.ProfileError, "effective_ssh_policy_drift"):
+                            module.validate_effective_policy(paths, {"host": "100.64.0.1", "user": "fixture"})
+                    else:
+                        module.validate_effective_policy(paths, {"host": "100.64.0.1", "user": "fixture"})
+    def test_atomic_parent_swap_does_not_follow_new_symlink(self):
+        with tempfile.TemporaryDirectory() as directory, tempfile.TemporaryDirectory() as outside:
+            parent = Path(directory) / "parent"
+            parent.mkdir()
+            target = parent / "config"
+            retained = Path(directory) / "retained"
+            link = os.link
+
+            def race(source, destination, **kwargs):
+                parent.rename(retained)
+                parent.symlink_to(outside)
+                return link(source, destination, **kwargs)
+
+            with patch.object(module.os, "link", side_effect=race):
+                with self.assertRaisesRegex(module.ProfileError, "unsafe_managed_parent"):
+                    module.atomic_write(target, b"managed", 0o600)
+            self.assertEqual(list(Path(outside).iterdir()), [])
+            self.assertEqual((retained / "config").read_bytes(), b"managed")
 
 
 class TransportMigrationTests(unittest.TestCase):
@@ -336,14 +572,27 @@ class TransportMigrationTests(unittest.TestCase):
 
     def test_migrate_noop_and_restore_exact(self):
         from unittest.mock import patch
-        with patch.object(module, 'doctor') as doctor:
+        with patch.object(module, 'doctor') as doctor, patch.object(module, 'validate_effective_policy') as local:
             self.assertTrue(module.migrate_transport())
             self.assertFalse(module.migrate_transport())
-            self.assertEqual(doctor.call_count, 2)
+            self.assertEqual(doctor.call_count, 1)
+            self.assertEqual(local.call_count, 1)
         self.assertIn(b'ProxyCommand ', self.paths['alias'].read_bytes())
         module.transport_restore(self.paths)
         for name, value in self.before.items():
             self.assertEqual(self.paths[name].read_bytes(), value)
+
+    def test_already_proxy_migration_noop_uses_only_local_effective_policy(self):
+        with patch.object(module, 'doctor'):
+            module.migrate_transport()
+        with patch.object(module, 'doctor', side_effect=AssertionError('remote health')), \
+                patch.object(module, 'resolve_windows_peer', side_effect=AssertionError('peer lookup')), \
+                patch.object(module, 'scan_ed25519_host_key', side_effect=AssertionError('key scan')), \
+                patch.object(module.subprocess, 'run', return_value=SimpleNamespace(
+                    stdout=effective_fixture(self.paths, proxy=True, user='fixture-user'))) as run:
+            self.assertFalse(module.migrate_transport())
+            self.assertEqual(run.call_count, 1)
+            self.assertIn('-G', run.call_args.args[0])
 
     def test_failed_smoke_restores_exact(self):
         from unittest.mock import patch
@@ -391,12 +640,7 @@ class TransportMigrationTests(unittest.TestCase):
         import subprocess
         with patch.object(module, 'doctor'):
             module.migrate_transport()
-        effective = '\n'.join(['stricthostkeychecking true', 'passwordauthentication no',
-                               'kbdinteractiveauthentication no', 'identitiesonly yes',
-                               'forwardagent no', f'proxycommand {module.PROXY}',
-                               'preferredauthentications publickey', 'pubkeyauthentication yes',
-                               'hostkeyalgorithms ssh-ed25519', 'globalknownhostsfile /dev/null',
-                               'batchmode yes', f"userknownhostsfile {self.paths['known']}"])
+        effective = effective_fixture(self.paths, proxy=True, user="fixture-user")
         results = [subprocess.CompletedProcess([], 0, effective),
                    subprocess.CompletedProcess([], 0, 'BRIDGE_STRICT_OK')]
         with patch.object(module, 'resolve_windows_peer', return_value='100.64.0.1'), \

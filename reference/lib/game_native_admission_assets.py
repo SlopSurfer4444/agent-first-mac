@@ -14,6 +14,8 @@ import re
 import stat
 import subprocess
 
+from lib import game_native_admission_transaction as transaction
+
 HOME = Path(pwd.getpwuid(os.getuid()).pw_dir)
 OWNER = 'control-ds3-native-launch'
 APP = 'Dark Souls III Native.app'
@@ -242,6 +244,35 @@ def _owned(parent, name, intent, all_files, namespace, files, partial=False, com
         os.close(fd)
 
 
+def _initial_stage(stage):
+    return '.game-admission-stage-' + stage.lstrip('.')
+
+
+def _initial_receipt(parent, stage, intent, files, namespace, commit=None):
+    """Read-only preflight of the transaction primitive's receipt-only scratch.
+
+    The fixed asset stage still requires a complete receipt. Only the separate
+    construction scratch admits missing/exact-prefix receipt bytes; unknown
+    entries or bytes are never repaired or removed.
+    """
+    fd = _open_namespace(parent, _initial_stage(stage))
+    try:
+        need(set(os.listdir(fd)) <= {'receipt.json'}, 'asset_initial_stage_inventory')
+        if not _exists(fd, 'receipt.json'):
+            return None
+        raw = _read_at(fd, 'receipt.json', 0o600)
+        try:
+            receipt = _expected_receipt(intent, files, namespace, raw)
+        except Blocked:
+            if commit is not None:
+                need(encode(_receipt(intent, files, namespace, commit)).startswith(raw),
+                     'asset_initial_receipt_drift')
+            return None
+        return receipt
+    finally:
+        os.close(fd)
+
+
 def _predecessor_assets(intent):
     """Verify exactly the retained first generation from its trusted receipts.
 
@@ -265,7 +296,8 @@ def _predecessor_assets(intent):
     for namespace, parent, name, stage, receipt_pin in namespaces:
         parent_fd = _directory(parent)
         try:
-            need(not _exists(parent_fd, stage), 'asset_predecessor_stage_pending')
+            need(not _exists(parent_fd, stage) and not _exists(parent_fd, _initial_stage(stage)),
+                 'asset_predecessor_stage_pending')
             fd = _open_namespace(parent_fd, name)
             try:
                 raw = _read_at(fd, 'receipt.json', 0o600)
@@ -305,7 +337,7 @@ def verify_assets(intent):
     for namespace, parent, name, stage, expected in namespaces:
         fd = _directory(parent)
         try:
-            need(not _exists(fd, stage), 'asset_stage_pending')
+            need(not _exists(fd, stage) and not _exists(fd, _initial_stage(stage)), 'asset_stage_pending')
             receipts[namespace] = _owned(fd, name, intent, files, namespace, expected)
         finally:
             os.close(fd)
@@ -374,7 +406,9 @@ def publish(intent, payload, commit, guard, event):
     """Publish only immutable assets, with caller guard before every mutation.
 
     payload contains exactly companions/<six fixed files> and native/<app>/<three
-    fixed files>. A receipt-less interrupted stage is retained and refused.
+    fixed files>. The stage is atomically published with its complete receipt.
+    Receipt construction uses the existing exact-prefix transaction scratch.
+    A foreign receipt-less asset stage is retained and refused.
     Known partial stages resume only absent files; no existing file is repaired.
     """
     need(pinned(commit, 40) and callable(guard) and callable(event), 'asset_publish_arguments')
@@ -418,6 +452,11 @@ def publish(intent, payload, commit, guard, event):
         fd = _directory(parent)
         try:
             need(not (_exists(fd, name) and _exists(fd, stage)), 'asset_final_and_stage_conflict')
+            if _exists(fd, _initial_stage(stage)):
+                need(not _exists(fd, name) and not _exists(fd, stage), 'asset_initial_stage_conflict')
+                receipt = _initial_receipt(fd, stage, intent, files, namespace)
+                if receipt is not None:
+                    first_commits.add(receipt['acceptedCommit'])
             if _exists(fd, name):
                 receipt = _owned(fd, name, intent, files, namespace, expected)
                 first_commits.add(receipt['acceptedCommit'])
@@ -428,6 +467,18 @@ def publish(intent, payload, commit, guard, event):
             os.close(fd)
     need(len(first_commits) <= 1, 'asset_closure_commit_mismatch')
     first_commit = next(iter(first_commits)) if first_commits else commit
+    # A completed receipt elsewhere owns the first commit even when a retry
+    # comes from a later source. Validate all construction prefixes against that
+    # binding before creating any asset, not against the retry's source commit.
+    for namespace, parent, name, stage, expected in namespaces:
+        if not parent.exists():
+            continue
+        fd = _directory(parent)
+        try:
+            if _exists(fd, _initial_stage(stage)):
+                _initial_receipt(fd, stage, intent, files, namespace, first_commit)
+        finally:
+            os.close(fd)
     if generation == 2:
         need(first_commit != intent['assetPredecessor']['acceptedCommit'], 'asset_successor_commit_required')
     changed = False
@@ -451,16 +502,10 @@ def publish(intent, payload, commit, guard, event):
                 continue
             if not _exists(fd, stage):
                 guard()
-                os.mkdir(stage, mode=0o700, dir_fd=fd)
-                os.fsync(fd)
+                raw = encode(_receipt(intent, files, namespace, first_commit))
+                transaction._new_namespace(parent / stage, {'receipt.json': raw})
                 event('assets:' + namespace + ':stage-created')
-                stage_fd = _open_namespace(fd, stage)
-                try:
-                    raw = encode(_receipt(intent, files, namespace, first_commit))
-                    _write(stage_fd, 'receipt.json', raw, 0o600, guard, event,
-                           'assets:' + namespace + ':owner-written')
-                finally:
-                    os.close(stage_fd)
+                event('assets:' + namespace + ':owner-written')
             _owned(fd, stage, intent, files, namespace, expected, partial=True, commit=first_commit)
             stage_fd = _open_namespace(fd, stage)
             try:

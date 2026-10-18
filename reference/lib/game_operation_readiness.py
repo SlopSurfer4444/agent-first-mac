@@ -13,13 +13,14 @@ import os
 import stat
 
 
-def ready(control, commit, operation, *, checks, target_guard):
+def ready(control, commit, operation, *, checks, target_guard, extra_paths=None):
     control = Path(control)
     if str(control) not in sys.path:
         sys.path.insert(0, str(control))
     from lib.user_operation_readiness import require_scoped_operation_ready
     return require_scoped_operation_ready(control, operation, commit,
-                                         checks=checks, target_guard=target_guard)
+                                         checks=checks, target_guard=target_guard,
+                                         extra_paths=extra_paths)
 
 
 def load(control):

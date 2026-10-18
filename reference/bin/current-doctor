@@ -50,7 +50,9 @@ REASONS = frozenset(("source_changed", "fixture_invalid", "signature_invalid",
     "cli_identity_invalid", "command_failed", "schema_output_invalid",
     "capabilities_incompatible", "process_unsettled", "probe_failed",
     "fixture_capacity_required", "fixture_custody_invalid", "fixture_custody_busy",
-    "fixture_settlement_required"))
+    "fixture_settlement_required", "fixture_metadata_pending", "fixture_preparation_capacity",
+    "fixture_preparation_recovery_required", "fixture_namespace_refresh_required",
+    "fixture_legacy_identity_required"))
 SOURCE_REASONS = frozenset(("source_admission_failed", "source_checkout_dirty",
     "source_checkout_noncanonical", "protected_policy_changed", "protected_policy_missing",
     "historical_evidence_changed", "checkpoint_history_limit", "checkpoint_not_ancestor",
@@ -846,10 +848,17 @@ def main(arguments=None, *, operation=None, custody_operation=None, emit=print):
             raise
         except Exception as error:
             allowed = {"fixture_capacity_required", "fixture_custody_invalid", "fixture_custody_absent",
-                       "fixture_custody_busy", "fixture_settlement_required"}
+                       "fixture_custody_busy", "fixture_settlement_required", "fixture_metadata_pending",
+                       "fixture_preparation_capacity", "fixture_preparation_recovery_required",
+                       "fixture_namespace_refresh_required", "fixture_legacy_identity_required"}
             reason = getattr(error, "reason_class", "fixture_custody_invalid")
+            reason = reason if reason in allowed else "fixture_custody_invalid"
             emit(json.dumps({"scope": "disposable-vendor-fixture-custody",
-                             "reason": reason if reason in allowed else "fixture_custody_invalid"}))
+                             "reason": reason,
+                             "nextAction": ("reconcile-recorded-metadata-before-retry" if reason == "fixture_metadata_pending"
+                                else "preserve-preparations-for-bounded-recovery" if reason.startswith("fixture_preparation_")
+                                else "reconcile-retained-child-before-retry" if reason == "fixture_settlement_required"
+                                else "inspect-custody-status-before-retry")}))
             return 1
     if (type(args) is not list or any(type(arg) is not str for arg in args)
             or len(set(args)) != len(args)

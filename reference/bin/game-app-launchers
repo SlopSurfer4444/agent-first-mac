@@ -3,42 +3,24 @@
 import sys
 sys.dont_write_bytecode = True
 sys.pycache_prefix = "/dev/null"
+if __name__=='__main__' and not globals().get('__source_bound__') and __file__.endswith('/AIDev/control/bin/game-app-launchers'):
+    import posix
+    posix.execv(sys.executable,[sys.executable,'-I','-S','-B',__file__.rsplit('/',2)[0]+'/lib/scoped_source_admission.py',__file__,'[]',*sys.argv[1:]])
 import fcntl, hashlib, importlib.machinery, importlib.util, json, os, plistlib, pwd, re, shutil, stat, subprocess, tempfile
 from pathlib import Path
+sys.path.insert(0,str(Path(__file__).resolve().parent.parent))
+from lib import game_app_files as app_files
+from lib.game_app_files import need, digest, pinned, safe_dir, regular, sha, load, jb, policy_digest, image, bundle_inventory, copy_image, write_image, replace_image
 HOME = Path(pwd.getpwuid(os.getuid()).pw_dir)
 HERE = Path(__file__).resolve().parent.parent
 CONTROL = HOME/'AIDev/control'
 HUB = HOME/'Library/Application Support/Adapted Games'
 DS3 = HOME/'Library/Application Support/Adapted Games DS3'
 MANIFEST = 'manifests/game-app-launchers.json'
-NAMES = {'CS2.app':('games-play','cs2'), 'Prince — Ubisoft Connect.app':('games-play','prince'), 'Steam — другие игры.app':('games-play','steam'), 'Dark Souls III.app':('ds3-play','play')}
-FILES = {'Contents/Info.plist':0o600,'Contents/MacOS/launcher':0o700,'Contents/Resources/Game.icns':0o600}
+NAMES = app_files.NAMES
+FILES = app_files.FILES
 COMMANDS = {'CS2.command':('games-play','cs2'), 'Prince — Ubisoft Connect.command':('games-play','prince'), 'Steam — другие игры.command':('games-play','steam'), 'Dark Souls III.command':('ds3-play','play'), 'Stop Dark Souls III.command':('ds3-play','stop')}
 
-def need(ok,reason):
-    if not ok: raise RuntimeError(reason)
-
-def digest(data): return hashlib.sha256(data).hexdigest()
-def pinned(s): return type(s) is str and re.fullmatch('[0-9a-f]{64}',s) is not None
-
-def safe_dir(p):
-    for x in [*reversed(p.parents),p]:
-        s=x.lstat(); need(stat.S_ISDIR(s.st_mode) and s.st_uid in (0,os.getuid()) and not s.st_mode & 0o002,'unsafe_directory')
-
-def regular(p):
-    safe_dir(p.parent); s=p.lstat()
-    need(stat.S_ISREG(s.st_mode) and s.st_uid in (0,os.getuid()) and s.st_nlink == 1 and not s.st_mode & 0o022 and s.st_size <= 32*1024*1024,'unsafe_file')
-    return s
-
-def sha(p): regular(p); return digest(p.read_bytes())
-def load(p):
-    regular(p); need(p.stat().st_size <= 128*1024,'metadata_limit')
-    def unique(rows):
-        d={}
-        for k,v in rows: need(k not in d,'duplicate_key'); d[k]=v
-        return d
-    return json.loads(p.read_bytes(),object_pairs_hook=unique)
-def jb(value): return (json.dumps(value,indent=2,ensure_ascii=False)+'\n').encode()
 def run(args):
     p=subprocess.run([str(v) for v in args],capture_output=True,timeout=120)
     need(p.returncode == 0,'command_failed_'+Path(args[0]).name)
@@ -47,38 +29,10 @@ def run(args):
 ERROR_POLICY = 'manifests/game-app-launcher-errors.json'
 
 def policy(path=None):
-    if path is None: path = ERROR_POLICY if (HERE/ERROR_POLICY).exists() else MANIFEST
-    m=load(HERE/path)
-    need(m.get('schema') == 1 and type(m.get('schema')) is int and m.get('owner') == 'control-game-app-launchers','policy_identity')
-    need(set(m['apps']) == set(NAMES),'app_inventory')
-    for i,(name,route) in enumerate(NAMES.items(),1):
-        row=m['apps'][name]
-        need(row['route'] == list(route) and row['routeNumber'] == i and type(row['routeNumber']) is int,'route_drift')
-        need(type(row['iconSource']) is str and row['iconSource'].startswith(('~/','/Applications/')) and '..' not in Path(row['iconSource']).parts and pinned(row['iconSha256']),'icon_policy')
-    return m
-
-def policy_digest(m): return digest(jb(m))
+    return app_files.policy(path,root=HERE)
 
 def policy_for_digest(value):
-    for path in (ERROR_POLICY,MANIFEST):
-        if (HERE/path).exists() and sha(HERE/path) == value: return policy(path)
-    raise RuntimeError('unknown_app_policy')
-
-def image(p):
-    if not p.exists() and not p.is_symlink(): return None
-    if p.is_dir() and not p.is_symlink():
-        safe_dir(p); rows={}
-        for q in sorted(p.rglob('*')):
-            if q.is_dir() and not q.is_symlink(): safe_dir(q); continue
-            s=regular(q); rows[str(q.relative_to(p))]={'sha256':sha(q),'mode':s.st_mode & 0o777}
-        need(set(rows) == set(FILES),'bundle_inventory')
-        need(all(rows[k]['mode'] == v for k,v in FILES.items()),'bundle_mode')
-        need({str(q.relative_to(p)) for q in p.rglob('*') if q.is_dir()} == {'Contents','Contents/MacOS','Contents/Resources'},'bundle_directories')
-        return {'kind':'app','files':rows}
-    s=regular(p); return {'kind':'file','sha256':sha(p),'mode':s.st_mode & 0o777}
-
-def bundle_inventory(candidate):
-    return {name:image(candidate/name)['files'] for name in NAMES}
+    return app_files.policy_for_digest(value,root=HERE)
 
 def build(destination):
     m=policy(); safe_dir(destination.parent); need(not destination.exists() and not destination.is_symlink(),'candidate_collision')
@@ -118,11 +72,7 @@ def build(destination):
         raise
 
 def candidate_check(candidate,m):
-    safe_dir(candidate)
-    need(set(p.name for p in candidate.iterdir()) == set(NAMES)|{'build.json'},'candidate_inventory')
-    report=load(candidate/'build.json')
-    need(report == {'schema':1,'sourceSha256':sha(HERE/'bin/game-app-launcher.m'),'apps':m['builtApps']},'candidate_binding')
-    need(bundle_inventory(candidate) == m['builtApps'],'candidate_drift')
+    return app_files.candidate_check(candidate,m,root=HERE)
 
 def module(name):
     loader=importlib.machinery.SourceFileLoader('app_migration_'+name.replace('-','_'),str(HERE/'bin'/name))
@@ -165,8 +115,7 @@ def source_gate(commit,action='apply',recovery_check=None):
     need(report.get('scopedCandidateReady') is True,'scoped_operation_readiness_required');exact()
 
 def module_bridge():
-    loader=importlib.machinery.SourceFileLoader('game_scoped_ready',str(CONTROL/'lib/game_operation_readiness.py'))
-    spec=importlib.util.spec_from_loader(loader.name,loader);out=importlib.util.module_from_spec(spec);loader.exec_module(out);return out
+    return app_files.module_bridge(CONTROL)
 
 def targets():
     out={'hub-receipt':HUB/'receipt.json','ds3-lifecycle':DS3/'ds3-runtime','ds3-receipt':DS3/'receipt.json','readme':HOME/'Games/README.txt'}
@@ -174,12 +123,7 @@ def targets():
     out.update({'app-'+str(i):HOME/'Games'/name for i,name in enumerate(NAMES)})
     return out
 
-def copy_image(src,dst):
-    need(not dst.exists() and not dst.is_symlink(),'copy_collision')
-    if src.is_dir(): shutil.copytree(src,dst)
-    else: shutil.copyfile(src,dst); dst.chmod(src.stat().st_mode & 0o777)
 
-def write_image(p,data,mode=0o600): p.write_bytes(data); p.chmod(mode)
 
 def verify_apps(m):
     need(bundle_inventory(HOME/'Games') == m['builtApps'],'installed_app_drift')
@@ -230,27 +174,6 @@ def transaction_binding(transaction,m,commit):
         need(after == expected,'transaction_receipt_relation')
         need(journal[key] == {'before':file_image((transaction/(key+'.before')).read_bytes()),'after':file_image(jb(after))},'transaction_receipt_binding')
 
-def replace_image(src,target,expected):
-    safe_dir(target.parent); need(image(target) == expected,'transaction_target_changed')
-    replacement=image(src)
-    if replacement == expected: return
-    if replacement is None:
-        if expected['kind'] == 'app':
-            # Atomic removal preserves recovery after a crash; keep retired
-            # bundles with this private transaction rather than partially delete.
-            safe_dir(src.parent)
-            retired=Path(tempfile.mkdtemp(prefix='retired-app-',dir=src.parent))
-            need(image(target) == expected,'transaction_target_changed')
-            os.rename(target,retired/'app')
-        else: target.unlink()
-    else:
-        need(replacement['kind'] != 'app' or expected is None,'app_replacement_conflict')
-        scratch=Path(tempfile.mkdtemp(prefix='.game-app-stage-',dir=target.parent))
-        try:
-            staged=scratch/'payload'; copy_image(src,staged)
-            need(image(staged) == replacement and image(target) == expected,'staging_drift')
-            os.replace(staged,target)
-        finally: shutil.rmtree(scratch)
 
 def restore(transaction):
     journal=journal_check(transaction)

@@ -30,6 +30,7 @@ ALIAS = "windows-host"
 PROXY = "/Applications/Tailscale.app/Contents/MacOS/tailscale nc %h %p"
 EXPECTED_FINGERPRINT = re.compile(r"^SHA256:[A-Za-z0-9+/]{20,}$")
 EXPECTED_USER = re.compile(r"^[A-Za-z0-9_.-]{1,64}$")
+MAX_MANAGED_FILE = 1024 * 1024
 
 
 class ProfileError(RuntimeError):
@@ -209,7 +210,8 @@ def migrate_transport() -> bool:
     if not exact_managed(paths, receipt):
         fail("managed_bytes_drift")
     if receipt.get("transport") == "tailscale-nc":
-        doctor()
+        validate_local_profile(paths, receipt)
+        validate_effective_policy(paths, receipt)
         return False
     if "transport" in receipt:
         fail("unsupported_transport")
@@ -240,14 +242,74 @@ def migrate_transport() -> bool:
     return True
 
 
-def atomic_write(path: Path, data: bytes, mode: int) -> None:
-    if path.exists() or path.is_symlink():
-        fail("managed_target_collision")
-    if path.parent.is_symlink() or not path.parent.is_dir():
-        fail("unsafe_managed_parent")
-    descriptor, staged = tempfile.mkstemp(prefix=".windows-host.", dir=path.parent)
-    staged_path = Path(staged)
+def directory_fd(path: Path) -> int:
+    # macOS' two canonical system aliases are not user-controlled parents.
+    parts = path.absolute().parts[1:]
+    if parts and parts[0] in ("var", "tmp"):
+        parts = ("private", *parts)
+    held = os.open("/", os.O_RDONLY | os.O_DIRECTORY)
     try:
+        for part in parts:
+            child = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=held)
+            os.close(held)
+            held = child
+        return held
+    except OSError as exc:
+        os.close(held)
+        raise ProfileError("unsafe_managed_parent") from exc
+
+
+def read_file(path: Path, *, private: bool = True) -> bytes:
+    parent = directory_fd(path.parent)
+    try:
+        descriptor = os.open(path.name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=parent)
+        with os.fdopen(descriptor, "rb") as handle:
+            info = os.fstat(handle.fileno())
+            if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid()
+                    or info.st_mode & 0o022
+                    or info.st_nlink != 1 or info.st_size > MAX_MANAGED_FILE
+                    or (private and info.st_mode & 0o777 != 0o600)):
+                fail("managed_file_unsafe")
+            raw = handle.read(MAX_MANAGED_FILE + 1)
+            final = os.fstat(handle.fileno())
+            named = os.stat(path.name, dir_fd=parent, follow_symlinks=False)
+            if (len(raw) != info.st_size or len(raw) > MAX_MANAGED_FILE
+                    or (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns)
+                    != (final.st_dev, final.st_ino, final.st_size, final.st_mtime_ns, final.st_ctime_ns)
+                    or (final.st_dev, final.st_ino) != (named.st_dev, named.st_ino)):
+                fail("managed_file_drift")
+            return raw
+    finally:
+        os.close(parent)
+
+
+def ensure_directory(path: Path, home: Path) -> None:
+    held = directory_fd(home)
+    try:
+        for part in path.relative_to(home).parts:
+            try:
+                os.mkdir(part, mode=0o700, dir_fd=held)
+                os.fsync(held)
+            except FileExistsError:
+                pass
+            child = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=held)
+            os.close(held)
+            held = child
+            info = os.fstat(held)
+            if info.st_uid != os.getuid() or info.st_mode & 0o022:
+                fail("unsafe_managed_parent")
+    finally:
+        os.close(held)
+
+
+def atomic_write(path: Path, data: bytes, mode: int) -> None:
+    parent = directory_fd(path.parent)
+    staged = ".windows-host." + secrets.token_hex(12)
+    created = False
+    try:
+        descriptor = os.open(staged, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                             mode, dir_fd=parent)
+        created = True
         os.fchmod(descriptor, mode)
         with os.fdopen(descriptor, "wb", closefd=True) as handle:
             handle.write(data)
@@ -257,12 +319,20 @@ def atomic_write(path: Path, data: bytes, mode: int) -> None:
         # A preflight exists() check followed by replace() clobbers a concurrent
         # owner file (including a symlink) created while we stage the payload.
         try:
-            os.link(staged_path, path, follow_symlinks=False)
+            os.link(staged, path.name, src_dir_fd=parent, dst_dir_fd=parent, follow_symlinks=False)
         except FileExistsError:
             fail("managed_target_collision")
+        os.fsync(parent)
+        current = directory_fd(path.parent)
+        try:
+            if (os.fstat(current).st_dev, os.fstat(current).st_ino) != (os.fstat(parent).st_dev, os.fstat(parent).st_ino):
+                fail("unsafe_managed_parent")
+        finally:
+            os.close(current)
     finally:
-        if staged_path.exists():
-            staged_path.unlink()
+        if created:
+            os.unlink(staged, dir_fd=parent)
+        os.close(parent)
 
 
 def layout(home: Path) -> dict[str, Path]:
@@ -277,6 +347,7 @@ def layout(home: Path) -> dict[str, Path]:
         "known": ssh / "known_hosts_windows-host",
         "state": home / "AIDev/state/windows-host-ssh-client",
         "receipt": home / "AIDev/state/windows-host-ssh-client/receipt.json",
+        "enrollment": home / "AIDev/state/windows-host-ssh-client/enrollment.json",
     }
 
 
@@ -290,6 +361,41 @@ def validate_key_prestate(paths: dict[str, Path]) -> None:
             fail("dedicated_key_prestate_not_exact")
 
 
+def validate_profile_parents(paths: dict[str, Path]) -> None:
+    home = paths["ssh"].parent
+    for target in (paths["config_dir"], paths["state"]):
+        for parent in (target, *target.parents):
+            if parent == home:
+                break
+            if parent.is_symlink() or (parent.exists() and not parent.is_dir()):
+                fail("unsafe_managed_parent")
+
+
+def shared_include(data: bytes) -> bool:
+    # Only a first, top-level directive is unambiguously outside Host/Match.
+    for line in data.splitlines():
+        line = line.strip()
+        if not line or line.startswith(b"#"):
+            continue
+        return line.lower() == b"include config.d/windows-host.conf"
+    return False
+
+
+def enrollment_main(before: bytes | None) -> bytes:
+    if before is not None and shared_include(before):
+        return before
+    # Do not activate unrelated fragments merely because config.d exists.
+    # Reset the include's Host context before replaying the owner's bytes.
+    return b"Include config.d/windows-host.conf\nHost *\n" + (before or b"")
+
+
+def read_main(paths: dict[str, Path]) -> bytes | None:
+    path = paths["main"]
+    if not path.exists() and not path.is_symlink():
+        return None
+    return read_file(path, private=False)
+
+
 def prepare(fingerprint: str, user: str) -> tuple[str, str, str, str]:
     if not EXPECTED_FINGERPRINT.fullmatch(fingerprint):
         fail("invalid_expected_fingerprint")
@@ -298,8 +404,10 @@ def prepare(fingerprint: str, user: str) -> tuple[str, str, str, str]:
     home = canonical_home()
     paths = layout(home)
     validate_key_prestate(paths)
+    validate_profile_parents(paths)
+    read_main(paths)
     if any(paths[name].exists() or paths[name].is_symlink()
-           for name in ("main", "config_dir", "alias", "known", "receipt")):
+           for name in ("alias", "known", "receipt", "enrollment")):
         fail("managed_prestate_collision")
     host, key_type, public_body = scan_ed25519_host_key(resolve_windows_peer())
     observed = public_blob_fingerprint(public_body)
@@ -311,55 +419,131 @@ def prepare(fingerprint: str, user: str) -> tuple[str, str, str, str]:
 def apply_profile(fingerprint: str, user: str) -> bool:
     home = canonical_home()
     paths = layout(home)
+    validate_profile_parents(paths)
     if paths["receipt"].exists() or paths["receipt"].is_symlink():
         receipt = load_receipt(paths)
         if receipt.get("hostFingerprint") != fingerprint or receipt.get("user") != user:
             fail("already_applied_runtime_identity_mismatch")
-        doctor()
+        validate_key_prestate(paths)
+        validate_local_profile(paths, receipt)
+        validate_effective_policy(paths, receipt)
         return False
-    host, key_type, public_body, observed = prepare(fingerprint, user)
-    paths["config_dir"].mkdir(mode=0o700)
-    paths["state"].mkdir(parents=True, mode=0o700, exist_ok=False)
-    try:
-        main = render_main_config()
+    if paths["enrollment"].exists() or paths["enrollment"].is_symlink():
+        plan = load_enrollment(paths)
+        if plan["hostFingerprint"] != fingerprint or plan["user"] != user:
+            fail("preparing_runtime_identity_mismatch")
+        validate_key_prestate(paths)
+    else:
+        host, key_type, public_body, observed = prepare(fingerprint, user)
+        before = read_main(paths)
+        main = enrollment_main(before)
         alias = render_alias_config(host, user)
         known = hashed_known_host(host, key_type, public_body)
-        for path, data in ((paths["main"], main), (paths["alias"], alias),
-                           (paths["known"], known)):
-            atomic_write(path, data, 0o600)
-        receipt = {
-            "schema": 1,
-            "status": "applied",
-            "host": host,
-            "user": user,
-            "hostFingerprint": observed,
-            "managed": {
-                "config": sha256_bytes(main),
-                "alias": sha256_bytes(alias),
-                "knownHosts": sha256_bytes(known),
-            },
-            "prestate": {
-                "configAbsent": True,
-                "configDirAbsent": True,
-                "knownHostsAbsent": True,
-            },
-        }
-        atomic_write(paths["receipt"],
-                     (json.dumps(receipt, sort_keys=True) + "\n").encode(), 0o600)
-    except Exception:
-        # Retain partial publication for scoped recovery. Even a successful
-        # inode/byte comparison followed by unlink has an owner-edit race.
-        # Never delete a potentially replaced file to make failure look clean.
-        raise
+        plan = {"schema": 1, "status": "preparing", "host": host, "user": user,
+                "hostFingerprint": observed, "sharedConfig": True,
+                "managed": {"config": sha256_bytes(main), "alias": sha256_bytes(alias),
+                            "knownHosts": sha256_bytes(known)},
+                "images": {name: base64.b64encode(data).decode("ascii") for name, data in
+                           (("main", main), ("alias", alias), ("known", known))},
+                "mainBefore": None if before is None else base64.b64encode(before).decode("ascii")}
+        ensure_directory(paths["state"], home)
+        # Durable ownership precedes EVERY profile publication. It survives
+        # failure, including final receipt publication, for retry or rollback.
+        atomic_write(paths["enrollment"], (json.dumps(plan, sort_keys=True) + "\n").encode(), 0o600)
+    images = {name: base64.b64decode(value, validate=True) for name, value in plan["images"].items()}
+    journal_bytes = (json.dumps(plan, sort_keys=True) + "\n").encode()
+    if read_file(paths["enrollment"]) != journal_bytes:
+        fail("preparing_journal_drift")
+    ensure_directory(paths["config_dir"], home)
+    publish_main(paths, plan, images["main"])
+    for name in ("alias", "known"):
+        path = paths[name]
+        if path.exists() or path.is_symlink():
+            if not exact_file(path, sha256_bytes(images[name])):
+                fail("preparing_payload_drift")
+        else:
+            atomic_write(path, images[name], 0o600)
+    receipt = {key: value for key, value in plan.items() if key not in ("images", "mainBefore")}
+    receipt["status"] = "applied"
+    receipt["enrollmentHash"] = sha256_bytes(journal_bytes)
+    validate_local_profile(paths, receipt)
+    validate_effective_policy(paths, receipt)
+    if not exact_file(paths["enrollment"], receipt["enrollmentHash"]):
+        fail("preparing_journal_drift")
+    atomic_write(paths["receipt"], (json.dumps(receipt, sort_keys=True) + "\n").encode(), 0o600)
     return True
+
+
+def exact_file(path: Path, digest: str) -> bool:
+    try:
+        return sha256_bytes(read_file(path)) == digest
+    except (ProfileError, OSError):
+        return False
+
+
+def load_enrollment(paths: dict[str, Path]) -> dict:
+    path = paths["enrollment"]
+    if not path.is_file() or path.is_symlink() or path.stat().st_mode & 0o777 != 0o600:
+        fail("enrollment_journal_unsafe")
+    try:
+        plan = json.loads(read_file(path))
+        if (plan["schema"] != 1 or plan["status"] != "preparing"
+                or set(plan["images"]) != {"main", "alias", "known"}
+                or not EXPECTED_USER.fullmatch(plan["user"])
+                or not EXPECTED_FINGERPRINT.fullmatch(plan["hostFingerprint"])):
+            fail("enrollment_journal_invalid")
+        for name, digest in (("main", "config"), ("alias", "alias"), ("known", "knownHosts")):
+            image = base64.b64decode(plan["images"][name], validate=True)
+            if sha256_bytes(image) != plan["managed"][digest]:
+                fail("enrollment_journal_invalid")
+        before = (None if plan["mainBefore"] is None
+                  else base64.b64decode(plan["mainBefore"], validate=True))
+        if (base64.b64decode(plan["images"]["main"], validate=True) != enrollment_main(before)
+                or base64.b64decode(plan["images"]["alias"], validate=True)
+                != render_alias_config(plan["host"], plan["user"])):
+            fail("enrollment_journal_invalid")
+        validate_pin(base64.b64decode(plan["images"]["known"], validate=True),
+                     plan["host"], plan["hostFingerprint"])
+        return plan
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ProfileError("enrollment_journal_invalid") from exc
+
+
+def publish_main(paths: dict[str, Path], plan: dict, after: bytes) -> None:
+    current = read_main(paths)
+    before = (None if plan["mainBefore"] is None
+              else base64.b64decode(plan["mainBefore"], validate=True))
+    if current == after or (current is not None and shared_include(current) and current != before):
+        return
+    held = paths["state"] / "config-before"
+    if before is not None:
+        if current == before:
+            identity = paths["main"].lstat()
+            rename_exclusive(paths["main"], held)
+            captured = held.lstat()
+            if ((captured.st_dev, captured.st_ino) != (identity.st_dev, identity.st_ino)
+                    or not stat.S_ISREG(captured.st_mode) or read_file(held, private=False) != before):
+                try:
+                    rename_exclusive(held, paths["main"])
+                except OSError:
+                    pass
+                fail("preparing_shared_config_drift")
+        elif current is not None or not held.is_file() or held.is_symlink() or read_file(held, private=False) != before:
+            fail("preparing_shared_config_drift")
+    elif current is not None:
+        fail("preparing_shared_config_drift")
+    atomic_write(paths["main"], after, 0o600)
 
 
 def load_receipt(paths: dict[str, Path]) -> dict:
     receipt = paths["receipt"]
     if not receipt.is_file() or receipt.is_symlink() or (receipt.stat().st_mode & 0o777) != 0o600:
         fail("runtime_receipt_missing_or_unsafe")
-    data = json.loads(receipt.read_text())
-    if data.get("schema") != 1 or data.get("status") != "applied":
+    try:
+        data = json.loads(read_file(receipt))
+    except (ValueError, UnicodeError) as exc:
+        raise ProfileError("runtime_receipt_state_invalid") from exc
+    if not isinstance(data, dict) or data.get("schema") != 1 or data.get("status") != "applied":
         fail("runtime_receipt_state_invalid")
     return data
 
@@ -370,10 +554,12 @@ def exact_managed(paths: dict[str, Path], receipt: dict, *, include_main: bool =
     for path_name, hash_name in checks:
         if path_name == "main" and not include_main:
             continue
+        if path_name == "main" and receipt.get("sharedConfig") is True:
+            if not shared_include(read_main(paths) or b""):
+                return False
+            continue
         path = paths[path_name]
-        if not path.is_file() or path.is_symlink() or (path.stat().st_mode & 0o777) != 0o600:
-            return False
-        if sha256_bytes(path.read_bytes()) != expected[hash_name]:
+        if not exact_file(path, expected[hash_name]):
             return False
     return True
 
@@ -382,60 +568,13 @@ def doctor() -> None:
     home = canonical_home()
     paths = layout(home)
     validate_key_prestate(paths)
+    validate_profile_parents(paths)
     receipt = load_receipt(paths)
-    if not exact_managed(paths, receipt):
-        fail("managed_bytes_drift")
+    validate_local_profile(paths, receipt)
     current_host = resolve_windows_peer()
     if current_host != receipt["host"]:
         fail("runtime_peer_drift")
-    proxy = receipt.get("transport") == "tailscale-nc"
-    if receipt.get("transport") not in (None, "tailscale-nc"):
-        fail("unsupported_transport")
-    # Enrollment still keyscans and checks the independent fingerprint. Routine
-    # health instead validates that exact pin and lets strict SSH authenticate
-    # the actual peer; another unauthenticated scan adds no stronger identity.
-    rows = paths["known"].read_text().splitlines()
-    if len(rows) != 1:
-        fail("known_host_pin_invalid")
-    row = rows[0].split()
-    if len(row) != 3 or row[1] != "ssh-ed25519":
-        fail("known_host_pin_invalid")
-    parts = row[0].split("|")
-    try:
-        if len(parts) != 4 or parts[:2] != ["", "1"]:
-            fail("known_host_pin_invalid")
-        salt, host_digest = (base64.b64decode(value, validate=True) for value in parts[2:])
-    except ValueError as exc:
-        raise ProfileError("known_host_pin_invalid") from exc
-    if (len(salt) != 20 or len(host_digest) != 20
-            or not hmac.compare_digest(host_digest, hmac.new(
-                salt, current_host.encode(), hashlib.sha1).digest())
-            or public_blob_fingerprint(row[2]) != receipt["hostFingerprint"]):
-        fail("pinned_host_key_drift")
-    expected_alias = (render_proxy_config if proxy else render_alias_config)(
-        current_host, receipt["user"])
-    if (paths["alias"].read_bytes() != expected_alias
-            or paths["main"].read_bytes() != render_main_config()):
-        fail("managed_policy_drift")
-    effective = subprocess.run(
-        ["/usr/bin/ssh", "-G", ALIAS], check=True,
-        stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, timeout=10,
-    ).stdout.splitlines()
-    required = {
-        "stricthostkeychecking true",
-        "passwordauthentication no",
-        "kbdinteractiveauthentication no",
-        "identitiesonly yes",
-        "forwardagent no",
-        "preferredauthentications publickey",
-        "pubkeyauthentication yes",
-    }
-    if proxy:
-        required.update({f"proxycommand {PROXY}", "hostkeyalgorithms ssh-ed25519",
-                         "globalknownhostsfile /dev/null", "batchmode yes",
-                         f"userknownhostsfile {paths['known']}"})
-    if not required.issubset(set(effective)):
-        fail("effective_ssh_policy_drift")
+    validate_effective_policy(paths, receipt)
     smoke = subprocess.run(
         ["/usr/bin/ssh", "-T", "-o", "BatchMode=yes",
          "-o", "StrictHostKeyChecking=yes", "-o", "HostKeyAlgorithms=ssh-ed25519",
@@ -451,35 +590,150 @@ def doctor() -> None:
         fail("strict_key_only_smoke_failed")
 
 
+def validate_effective_policy(paths: dict[str, Path], receipt: dict) -> None:
+    """Local OpenSSH expansion only; no peer lookup, keyscan or connection.
+
+    Dedicated Include ordering fixes first-value options but IdentityFile and
+    forwarding directives can accumulate from later owner configuration.
+    Canonicalization is disabled for this diagnostic to avoid DNS resolution.
+    """
+    proxy = receipt.get("transport") == "tailscale-nc"
+    effective = subprocess.run(
+        ["/usr/bin/ssh", "-G", "-o", "CanonicalizeHostname=no", ALIAS], check=True,
+        stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, timeout=10,
+    ).stdout.splitlines()
+    required = {
+        "stricthostkeychecking true",
+        "passwordauthentication no",
+        "kbdinteractiveauthentication no",
+        "identitiesonly yes",
+        "forwardagent no",
+        "preferredauthentications publickey",
+        "permitlocalcommand no",
+        "forwardx11 no",
+    }
+    if proxy:
+        required.update({f"proxycommand {PROXY}", "hostkeyalgorithms ssh-ed25519",
+                         "globalknownhostsfile /dev/null", "batchmode yes",
+                         f"userknownhostsfile {paths['known']}"})
+    if not required.issubset(set(effective)):
+        fail("effective_ssh_policy_drift")
+    fields = {}
+    for line in effective:
+        key, _, value = line.partition(" ")
+        fields.setdefault(key, []).append(value.strip())
+    if (fields.get("identityfile") not in ([str(paths["private"])], ["~/.ssh/windows-host_ed25519"])
+            or fields.get("pubkeyauthentication") not in (["yes"], ["true"])
+            or fields.get("userknownhostsfile") not in ([str(paths["known"])], ["~/.ssh/known_hosts_windows-host"])
+            or fields.get("hostname") != [receipt["host"]]
+            or fields.get("user") != [receipt["user"]]
+            or any(name in fields for name in ("localforward", "remoteforward", "dynamicforward"))
+            or fields.get("proxyjump", ["none"]) != ["none"]
+            or fields.get("tunnel", ["false"]) not in (["false"], ["no"])
+            or (not proxy and fields.get("proxycommand", ["none"]) != ["none"])):
+        fail("effective_ssh_policy_drift")
+
+
+def validate_local_profile(paths: dict[str, Path], receipt: dict) -> None:
+    if not exact_managed(paths, receipt):
+        fail("managed_bytes_drift")
+    current_host = receipt["host"]
+    proxy = receipt.get("transport") == "tailscale-nc"
+    if receipt.get("transport") not in (None, "tailscale-nc"):
+        fail("unsupported_transport")
+    validate_pin(read_file(paths["known"]), current_host, receipt["hostFingerprint"])
+    expected_alias = (render_proxy_config if proxy else render_alias_config)(
+        current_host, receipt["user"])
+    if (read_file(paths["alias"]) != expected_alias
+            or (not receipt.get("sharedConfig") and read_main(paths) != render_main_config())):
+        fail("managed_policy_drift")
+
+
+def validate_pin(data: bytes, host: str, fingerprint: str) -> None:
+    # Enrollment keeps its independent scan; local reconciliation validates the
+    # retained pin without requiring a healthy Windows host or live network.
+    rows = data.decode("ascii").splitlines()
+    if len(rows) != 1:
+        fail("known_host_pin_invalid")
+    row = rows[0].split()
+    if len(row) != 3 or row[1] != "ssh-ed25519":
+        fail("known_host_pin_invalid")
+    parts = row[0].split("|")
+    try:
+        if len(parts) != 4 or parts[:2] != ["", "1"]:
+            fail("known_host_pin_invalid")
+        salt, host_digest = (base64.b64decode(value, validate=True) for value in parts[2:])
+    except ValueError as exc:
+        raise ProfileError("known_host_pin_invalid") from exc
+    if (len(salt) != 20 or len(host_digest) != 20
+            or not hmac.compare_digest(host_digest, hmac.new(
+                salt, host.encode(), hashlib.sha1).digest())
+            or public_blob_fingerprint(row[2]) != fingerprint):
+        fail("pinned_host_key_drift")
+
+
 def rename_exclusive(source: Path, destination: Path) -> None:
     """Move the actual directory entry without replacing any destination."""
     libc = ctypes.CDLL(None, use_errno=True)
     try:
-        rename = libc.renamex_np
+        rename = libc.renameatx_np
     except AttributeError:
         fail("exclusive_rename_unavailable")
-    rename.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_uint]
+    rename.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_uint]
     rename.restype = ctypes.c_int
-    if rename(os.fsencode(source), os.fsencode(destination), 4) != 0:
-        raise OSError(ctypes.get_errno(), "exclusive rename refused")
+    source_parent = directory_fd(source.parent)
+    try:
+        destination_parent = directory_fd(destination.parent)
+        try:
+            if rename(source_parent, os.fsencode(source.name), destination_parent,
+                      os.fsencode(destination.name), 4) != 0:
+                raise OSError(ctypes.get_errno(), "exclusive rename refused")
+            os.fsync(source_parent)
+            os.fsync(destination_parent)
+        finally:
+            os.close(destination_parent)
+    finally:
+        os.close(source_parent)
 
 
 def rollback() -> None:
     home = canonical_home()
     paths = layout(home)
-    receipt = load_receipt(paths)
-    if not exact_managed(paths, receipt, include_main=False):
+    validate_profile_parents(paths)
+    pending = not paths["receipt"].exists() and not paths["receipt"].is_symlink()
+    record_name = "enrollment" if pending else "receipt"
+    original_record = read_file(paths[record_name])
+    receipt = load_enrollment(paths) if pending else load_receipt(paths)
+    if json.loads(original_record) != receipt:
         fail("rollback_refuses_managed_drift")
+    if not pending and not exact_managed(paths, receipt, include_main=False):
+        fail("rollback_refuses_managed_drift")
+    if pending and receipt["mainBefore"] is not None:
+        held = paths["state"] / "config-before"
+        # An interruption between capture and publication must not strand the
+        # owner's pre-existing config. Never replace a newer owner entry.
+        if read_main(paths) is None and held.exists():
+            before = base64.b64decode(receipt["mainBefore"], validate=True)
+            if held.is_symlink() or not held.is_file() or read_file(held, private=False) != before:
+                fail("rollback_refuses_managed_drift")
+            rename_exclusive(held, paths["main"])
     # The top-level Include is shared infrastructure, not an exclusive alias
     # payload. Retain it even when currently empty: a new profile may appear
     # immediately after an emptiness check. Owner edits to it are also retained.
-    names = ("known", "alias", "receipt")
+    names = [name for name in ("known", "alias", "receipt", "enrollment")
+             if paths[name].exists() or paths[name].is_symlink()]
     hashes = {"known": receipt["managed"]["knownHosts"],
               "alias": receipt["managed"]["alias"]}
-    raw_receipt = paths["receipt"].read_bytes()
-    if json.loads(raw_receipt) != receipt:
-        fail("rollback_refuses_managed_drift")
-    hashes["receipt"] = sha256_bytes(raw_receipt)
+    for name in names:
+        if name in ("receipt", "enrollment"):
+            if name == record_name:
+                hashes[name] = sha256_bytes(original_record)
+            else:
+                if "enrollmentHash" not in receipt:
+                    fail("rollback_refuses_managed_drift")
+                hashes[name] = receipt["enrollmentHash"]
+        if not exact_file(paths[name], hashes[name]):
+            fail("rollback_refuses_managed_drift")
     identities = {name: paths[name].lstat() for name in names}
     if paths["state"].is_symlink() or not paths["state"].is_dir():
         fail("unsafe_managed_parent")
@@ -493,11 +747,13 @@ def rollback() -> None:
             actual, expected = held.lstat(), identities[name]
             if (not stat.S_ISREG(actual.st_mode) or actual.st_mode & 0o777 != 0o600
                     or (actual.st_dev, actual.st_ino) != (expected.st_dev, expected.st_ino)
-                    or sha256_bytes(held.read_bytes()) != hashes[name]):
+                    or sha256_bytes(read_file(held)) != hashes[name]):
                 fail("rollback_capture_drift")
         if any(paths[name].exists() or paths[name].is_symlink() for name in names):
             fail("rollback_target_reappeared")
         receipt["status"] = "rolled_back"
+        receipt.pop("images", None)
+        receipt.pop("mainBefore", None)
         receipt["rollbackRecovery"] = recovery.name
         atomic_write(paths["receipt"],
                      (json.dumps(receipt, sort_keys=True) + "\n").encode(), 0o600)
@@ -560,6 +816,7 @@ def main() -> int:
         code = str(exc) if isinstance(exc, ProfileError) else "bounded_runtime_failure"
         print("status=FAIL", file=sys.stderr)
         print(f"blocker={code}", file=sys.stderr)
+        print("next_action=inspect_private_enrollment_and_retry_or_rollback", file=sys.stderr)
         return 1
 
 

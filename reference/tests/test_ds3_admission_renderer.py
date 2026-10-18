@@ -541,7 +541,8 @@ class AdmissionRenderer(unittest.TestCase):
         candidate = self.home / 'candidate'
         shutil.copytree(self.tx / 'source', candidate)
         shutil.rmtree(self.tx)
-        def installed():
+        def installed(*, operational=False):
+            self.assertIs(operational, False)
             return tuple(json.loads((self.root / name).read_bytes()) for name in ('manifest.json', 'receipt.json'))
         with patch.object(m, 'source_gate'), patch.object(m, 'window_repair_pending_guard'), \
              patch.object(m, 'inactive'), patch.object(m, 'renderer_policy', return_value=self.policy), \

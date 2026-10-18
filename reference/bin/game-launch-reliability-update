@@ -3,6 +3,9 @@
 import sys
 sys.dont_write_bytecode=True
 sys.pycache_prefix = "/dev/null"
+if __name__=='__main__' and not globals().get('__source_bound__') and __file__.endswith('/AIDev/control/bin/game-launch-reliability-update'):
+    import posix
+    posix.execv(sys.executable,[sys.executable,'-I','-S','-B',__file__.rsplit('/',2)[0]+'/lib/scoped_source_admission.py',__file__,'[]',*sys.argv[1:]])
 import argparse,contextlib,fcntl,hashlib,importlib.machinery,importlib.util,json,os,pwd,re,stat,subprocess
 from pathlib import Path
 HOME=Path(pwd.getpwuid(os.getuid()).pw_dir)

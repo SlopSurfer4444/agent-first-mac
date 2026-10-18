@@ -13,6 +13,7 @@ import stat
 import sys
 sys.dont_write_bytecode = True
 from lib import harness_offramp as H
+from lib import scoped_source_admission as source
 
 ROOT = Path(__file__).resolve().parents[1]
 STATE = ("AIDev", "state", "quarantine-delivery")
@@ -161,7 +162,6 @@ def main(arguments=None):
     try:
         home = Path(pwd.getpwuid(os.getuid()).pw_dir)
         H.require(ROOT == home / "AIDev/control" and Path.cwd() == ROOT, "canonical_source_required")
-        from lib.workstation_maintenance_delivery import admitted_source
         if args.action in ("plan", "status"):
             result = execute(home, args.action, args.operation, admission=None)
         else:
@@ -179,10 +179,15 @@ def main(arguments=None):
                 result.append(execute(home, args.action, args.operation, admission=admission, source_guard=source_guard))
                 H.require(source_guard() is True, "source_drift")
                 return True
-            admitted_source(ROOT, full=False, operation_check=run)
+            source.observe(ROOT, operation_check=run, extra_paths=(
+                "manifests/quarantine-boundary-successor.json",
+                *(path for row in ROWS for path in row[4:])))
             H.require(len(result) == 1, "source_unadmitted")
             result = result[0]
         print(H.wire(result).decode()); return 0
     except Exception as e:
-        print(H.wire({"schema": 1, "status": "REFUSED", "reason": str(e) if isinstance(e, H.OfframpError) else "operation_unavailable"}).decode())
+        result = {"schema": 1, "status": "REFUSED", "reason": str(e) if isinstance(e, H.OfframpError) else "operation_unavailable"}
+        if isinstance(e, source.SourceError):
+            result.update(source.public_failure(e))
+        print(H.wire(result).decode())
         return 1

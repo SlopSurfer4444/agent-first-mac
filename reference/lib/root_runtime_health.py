@@ -5,7 +5,6 @@ doctor is executed; root-private contents are attested by it, not read here.
 """
 import copy
 import hashlib
-import importlib.machinery
 import json
 import os
 from pathlib import Path
@@ -13,7 +12,8 @@ import pwd
 import stat
 
 from lib import root_delivery as delivery
-from lib.workstation_maintenance_delivery import bounded
+from lib.bounded_command import bounded
+from lib.scoped_source_admission import SourceError
 
 ROOT = Path(__file__).resolve().parents[1]
 BROKER = "/usr/local/libexec/aid-admin"
@@ -213,17 +213,13 @@ def native():
     home = pwd.getpwuid(uid).pw_dir
     require(uid > 0 and ROOT == Path(home) / "AIDev/control" and ROOT.resolve(strict=True) == ROOT,
             "root_canonical_source")
-    doctor = importlib.machinery.SourceFileLoader("root_runtime_source_doctor", str(ROOT / "bin/current-doctor")).load_module()
-    from lib import current_doctor_native
     reports = []
     def inspect(head, *, source_guard):
         del head
         reports.append(native_health(delivery.load_release(ROOT), home, uid, source_guard))
         return True
-    admission = current_doctor_native.native(doctor, True, operation_check=inspect)
-    admission = doctor.public_report(admission, git_only=True)
-    require(admission["verdict"] == "GIT_ONLY_VALID" and admission["integratedMain"] is True
-            and len(reports) == 1, "root_source_unadmitted")
+    delivery.admitted_source(operation_check=inspect, entrypoint='bin/root-runtime-doctor')
+    require(len(reports) == 1, "root_source_unadmitted")
     return reports[0]
 
 
@@ -238,5 +234,9 @@ def main(arguments, *, inspect=native, emit=print):
     except Exception as error:
         # Never expose native output, owner identities, private paths or errors.
         reason = str(error) if isinstance(error, HealthError) else "root_runtime_unverified"
-        emit(json.dumps({"schema": 1, "scope": "ROOT_RUNTIME_COMPONENT", "verdict": "BLOCKED", "reason": reason, "readOnly": True, "systemMutationsPerformed": False}, sort_keys=True))
+        value = {"schema": 1, "scope": "ROOT_RUNTIME_COMPONENT", "verdict": "BLOCKED", "reason": reason, "readOnly": True, "systemMutationsPerformed": False}
+        if isinstance(error, SourceError):
+            from lib.scoped_source_admission import public_failure
+            value.update(public_failure(error))
+        emit(json.dumps(value, sort_keys=True))
         return 1

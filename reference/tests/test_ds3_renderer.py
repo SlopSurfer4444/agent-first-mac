@@ -117,7 +117,9 @@ class Renderer(unittest.TestCase):
   candidate=self.root/'candidate-next';candidate.mkdir(mode=0o700)
   for name,data in files.items():p=candidate/name;p.write_bytes(data);p.chmod(0o600)
   commit='2'*40
-  def installed():return tuple(json.loads(m.renderer_targets()[key].read_bytes()) for key in ('manifest','receipt'))
+  def installed(*,operational=False):
+   self.assertIs(operational,False)
+   return tuple(json.loads(m.renderer_targets()[key].read_bytes()) for key in ('manifest','receipt'))
   with patch.object(m,'source_gate'),patch.object(m,'window_repair_pending_guard'),patch.object(m,'inactive'),patch.object(m,'renderer_policy',return_value=policy),patch.object(m,'verify_installed',side_effect=installed),patch.object(m,'verify_borderless'):
    self.assertTrue(m.renderer_operation(commit,'upgrade',candidate)['changed'])
    current=installed()[0];self.assertEqual(current['sourceCriticalHashes'],json.loads(self.before['manifest'])['sourceCriticalHashes']);self.assertTrue(m.renderer_fields(current)['nativeBorderlessCapable']);m.renderer_verify_binding(current)
